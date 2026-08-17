@@ -1,0 +1,28 @@
+{
+    "hifi": {
+        "label": "HiFi-GAN",
+        "architecture": "hifi",
+        "config_dir": "hifi",
+        "sample_rates": [
+            32000,
+            40000,
+            48000
+        ],
+        "pretrained_dir": "hifi-gan",
+        "supports_smartcutter": true,
+        "generator": "hifi_nsf",
+        "discriminator": "mpd_msd"
+    },
+    "chouwagan": {
+        "label": "ChouwaGAN",
+        "architecture": "chouwagan",
+        "config_dir": "chouwagan",
+        "sample_rates": [
+            44100
+        ],
+        "pretrained_dir": "chouwagan",
+        "supports_smartcutter": false,
+        "generator": "chouwagan",
+        "discriminator": "chouwagan"
+    }
+}

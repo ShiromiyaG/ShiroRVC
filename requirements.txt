@@ -1,0 +1,49 @@
+# Core dependencies
+numpy==2.2.6
+requests==2.31.0
+wget
+rich>=13.7,<16.0
+
+# Audio processing
+ffmpeg-python>=0.2.0
+faiss-cpu==1.13.2
+librosa==0.11.0
+scipy==1.15
+soundfile==0.13.1
+sox==1.5.0
+soxr==0.5.0
+noisereduce
+stftpitchshift
+flatten-dict==0.4.2
+torch-dct==0.1.6
+pyloudnorm==0.1.1
+
+# Machine learning and deep learning
+numba==0.64.0
+torch==2.13.0
+torchaudio==2.11.0
+torchvision==0.28.0
+torchcrepe==0.0.23
+torch-optimizer
+einops
+transformers==4.44.2
+nnaudio==0.3.3
+triton==3.7.1; sys_platform == "linux"
+triton-windows==3.7.1.post27; sys_platform == "win32"
+peft==0.17.1
+schedulefree==1.4.1
+
+# Visualization and UI
+matplotlib==3.10.8
+tensorboard
+gradio==6.9.0
+local_attention==1.11.2
+
+# Miscellaneous utilities
+tensorboardX
+edge-tts==7.2.7
+pypresence
+beautifulsoup4
+flask
+psutil==7.0.0
+zstandard

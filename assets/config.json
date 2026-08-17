@@ -1,0 +1,13 @@
+{
+    "theme": {
+        "file": "ShiromiyaBlue.py",
+        "class": "ShiromiyaBlue"
+    },
+    "lang": {
+        "override": true,
+        "selected_lang": "en_US"
+    },
+    "flask_server": false,
+    "version": "4.3.0",
+    "model_author": "None"
+}

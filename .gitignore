@@ -1,0 +1,56 @@
+# Files to keep ==========================
+!assets/audios/.gitkeep
+!assets/datasets/.gitkeep
+!assets/audios/audio-others/.gitkeep
+!logs/.gitkeep
+!logs/mute/
+!logs/mute_spin_v1/
+!logs/mute_spin_v2/
+!logs/reference/
+!logs/reference/**
+!logs/run_tensorboard_in_model_folder.bat
+!rvc/models/pretraineds/.gitkeep
+!rvc/models/pretraineds/hifi-gan/.gitkeep
+!rvc/models/pretraineds/custom/.gitkeep
+# Files to be ignored  ==========================
+# Python and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+.tox/
+.nox/
+.uv-cache/
+
+# Local environments and installers
+env/
+.venv/
+miniconda.exe
+utmos/
+ffprobe.exe
+ffmpeg.exe
+
+# Application data and downloaded resources
+assets/audios/
+assets/datasets/
+assets/audios/audio-others/
+assets/training_presets/
+logs/
+rvc/models/pretraineds/
+rvc/models/pretraineds/hifi-gan
+rvc/models/pretraineds/custom
+rvc/models/predictors/fcpe.pt
+rvc/models/predictors/fcpe_ddsp.pt
+rvc/models/predictors/rmvpe.pt
+rvc/models/embedders/spin_v1/pytorch_model.bin
+rvc/models/embedders/spin_v2/pytorch_model.bin
+rvc/models/embedders/contentvec/pytorch_model.bin
+rvc/models/embedders/spin_v1/config.json
+rvc/models/embedders/spin_v2/config.json
+rvc/models/smartcutter/
+rvc/train/preprocess/silero_vad
+DEV/

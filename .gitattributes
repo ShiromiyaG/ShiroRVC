@@ -1,0 +1,35 @@
+* text=auto
+
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.sh    text eol=lf
+*.ipynb text eol=lf
+*.lock  text eol=lf
+.gitignore text eol=lf
+.gitkeep   text eol=lf
+LICENSE    text eol=lf
+
+*.bat  text eol=crlf
+
+*.wav binary
+*.npy binary
+*.npz binary
+*.ico binary
+*.pth binary
+*.pt  binary
+*.onnx binary
+*.bin binary
+*.zip binary
+*.whl binary
+*.exe binary
+*.pyc binary
+*.metadata binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.flac binary
+*.mp3 binary
+*.opus binary
