@@ -43,13 +43,17 @@ jobs:
       # link happens when ``PySide6.QtGui`` loads, which is before any platform
       # plugin is chosen -- so ``QT_QPA_PLATFORM=offscreen`` below does not
       # avoid it, and the failure is an ImportError at collection rather than a
-      # skip.  Kept to the four libraries the offscreen platform actually
-      # needs; the rest of Qt's usual X11 dependency list is not used here.
+      # skip.
+      #
+      # ``libpulse0`` is for QtMultimedia, which the audio player imports and
+      # which links PulseAudio even when nothing is played: the tests only
+      # construct the widget.  GStreamer is not needed -- Qt dlopens it when
+      # playback actually starts, which no test reaches.
       - name: Qt runtime libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libxkbcommon0 libdbus-1-3
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libpulse0
 
       # The isolation, version and identity tests parse imports with ast and
       # never execute the GUI. Qt is installed on top so the behavioural tests --
@@ -59,7 +63,14 @@ jobs:
       # catch a plain ImportError, and the default only catches
       # ModuleNotFoundError -- which is why a missing system library used to
       # abort collection instead of skipping.
-      - run: pip install "pytest>=8.2" "PySide6>=6.7,<7"
+      #
+      # click, psutil and rich are the whole of ``core``'s third-party import
+      # list.  They are here so the tests that read the CLI's own defaults and
+      # signatures can import it: those compare the backend against the GUI,
+      # and skipping them is the same as not having them.  Nothing here pulls
+      # in torch -- ``core`` imports it lazily, and test_gui_isolation asserts
+      # that it stays that way.
+      - run: pip install "pytest>=8.2" "PySide6>=6.7,<7" click psutil rich
 
       - name: gui/ stays deletable, one version, one app name, wheel guard holds
         env:

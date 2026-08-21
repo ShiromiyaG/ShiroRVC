@@ -92,7 +92,9 @@ def test_every_input_is_a_component_that_exists():
 def test_the_input_list_matches_the_backend_signature():
     import inspect
 
-    import core
+    core = pytest.importorskip(
+        "core", reason="the CLI carries its own dependencies"
+    )
 
     inputs = _train_inputs()
     params = list(inspect.signature(core.run_train_script).parameters)

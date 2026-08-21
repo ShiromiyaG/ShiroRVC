@@ -160,7 +160,9 @@ def test_cli_conversion_defaults_match_the_gui(app, command, page_factory, paylo
     of defaults while the tabs shipped three -- ``rvc tts`` blended the index at
     0.3 where the TTS tab uses 0.75.
     """
-    import core
+    core = pytest.importorskip(
+        "core", reason="the CLI carries its own dependencies"
+    )
     from gui.services import catalog
 
     context = {"infer": "single", "batch_infer": "batch", "tts": "tts"}[command]
@@ -185,7 +187,9 @@ def test_cli_conversion_defaults_match_the_gui(app, command, page_factory, paylo
 
 def test_cli_training_defaults_match_gradio(app):
     """Training and preprocessing click defaults against the Gradio tab."""
-    import core
+    core = pytest.importorskip(
+        "core", reason="the CLI carries its own dependencies"
+    )
 
     reference = gradio_defaults("tabs/train/train.py")
     declared = {}
