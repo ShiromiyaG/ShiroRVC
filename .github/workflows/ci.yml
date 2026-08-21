@@ -38,11 +38,28 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # PySide6 ships its own Qt build, but that Qt links against the system
+      # EGL, GL and xkbcommon, and the runner images do not carry them.  The
+      # link happens when ``PySide6.QtGui`` loads, which is before any platform
+      # plugin is chosen -- so ``QT_QPA_PLATFORM=offscreen`` below does not
+      # avoid it, and the failure is an ImportError at collection rather than a
+      # skip.  Kept to the four libraries the offscreen platform actually
+      # needs; the rest of Qt's usual X11 dependency list is not used here.
+      - name: Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
       # The isolation, version and identity tests parse imports with ast and
       # never execute the GUI. Qt is installed on top so the behavioural tests --
       # the wheel guard, the Gradio-matching defaults -- run too; they skip
       # themselves cleanly if it is missing.
-      - run: pip install pytest "PySide6>=6.7,<7"
+      # pytest 8.2 for ``importorskip(exc_type=...)``: the Qt guards need to
+      # catch a plain ImportError, and the default only catches
+      # ModuleNotFoundError -- which is why a missing system library used to
+      # abort collection instead of skipping.
+      - run: pip install "pytest>=8.2" "PySide6>=6.7,<7"
 
       - name: gui/ stays deletable, one version, one app name, wheel guard holds
         env:

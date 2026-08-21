@@ -218,7 +218,7 @@ def test_install_refuses_before_touching_the_disk(tmp_path, monkeypatch):
 
 # -- the wizard --------------------------------------------------------------
 
-pytest.importorskip("PySide6", reason="the setup wizard is a Qt application")
+pytest.importorskip("PySide6.QtWidgets", reason="the setup wizard is a Qt application", exc_type=ImportError)
 
 import os  # noqa: E402
 

@@ -87,26 +87,25 @@ jobs:
         run: |
           # A frozen entry point that cannot import its own package exits
           # instantly and silently; catching that here beats shipping it.
+          #
+          # ``--self-test`` builds the wizard offscreen and returns, so this
+          # asserts on an exit code.  Waiting for a *visible* window is what
+          # this step used to do, and it does not work on a hosted runner:
+          # the window station is not interactive, so the process stays alive
+          # with an empty MainWindowTitle and the step fails on a healthy
+          # build.  A onefile bundle also has to unpack itself before any of
+          # this runs, hence the generous timeout.
           $exe = "dist/setup/$env:APP_NAME-Setup.exe"
           if (-not (Test-Path $exe)) { throw "The build did not produce $exe." }
-          $p = Start-Process -FilePath $exe -PassThru
-
-          # Poll rather than sleep a flat 25s: a healthy wizard shows its window
-          # in a couple of seconds, and a dead one is worth reporting at once
-          # with the exit code it actually returned.
-          $deadline = (Get-Date).AddSeconds(60)
-          $titled = $null
-          while ((Get-Date) -lt $deadline) {
-            if ($p.HasExited) {
-              throw "The setup executable exited on launch with code $($p.ExitCode)."
-            }
-            $p.Refresh()
-            if ($p.MainWindowTitle -ne "") { $titled = $p.MainWindowTitle; break }
-            Start-Sleep -Milliseconds 500
+          $p = Start-Process -FilePath $exe -ArgumentList '--self-test' -PassThru
+          if (-not $p.WaitForExit(120000)) {
+            Stop-Process -Id $p.Id -Force
+            throw "The setup executable did not finish its self-test within 120s."
           }
-          if (-not $titled) { throw "The setup executable never opened a window." }
-          Write-Host "Window: $titled"
-          Stop-Process -Id $p.Id -Force
+          if ($p.ExitCode -ne 0) {
+            throw "The setup executable failed its self-test with exit code $($p.ExitCode)."
+          }
+          Write-Host "Self-test passed."
 
       - name: Check the installer pipeline is runnable
         shell: bash

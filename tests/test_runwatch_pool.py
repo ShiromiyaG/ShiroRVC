@@ -16,7 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-pytest.importorskip("PySide6", reason="the Qt interface is optional")
+pytest.importorskip("PySide6.QtWidgets", reason="the Qt interface is optional", exc_type=ImportError)
 
 import os  # noqa: E402
 

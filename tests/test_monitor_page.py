@@ -112,7 +112,7 @@ def test_human_bytes_is_readable():
 
 # -- the page ---------------------------------------------------------------
 
-pytest.importorskip("PySide6", reason="the Qt interface is optional")
+pytest.importorskip("PySide6.QtWidgets", reason="the Qt interface is optional", exc_type=ImportError)
 
 import os  # noqa: E402
 

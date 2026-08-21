@@ -484,12 +484,27 @@ class Installer(QWidget):
 
 
 def main() -> int:
-    application = QApplication(sys.argv)
+    # ``--self-test`` builds the wizard and exits without showing it, which is
+    # what the packaging smoke test needs.  The failure worth catching there is
+    # a frozen bundle that cannot import its own package or is missing a Qt
+    # plugin, and both happen while the window is being constructed rather than
+    # while it is on screen.  Asserting on a *visible* window instead needs an
+    # interactive window station, which a CI runner does not reliably provide:
+    # the process stays alive and its ``MainWindowTitle`` simply stays empty.
+    self_test = "--self-test" in sys.argv
+    if self_test:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    application = QApplication([arg for arg in sys.argv if arg != "--self-test"])
     application.setStyle("Fusion")
     application.setApplicationName(f"{config.APP_NAME} Setup")
     application.setStyleSheet(STYLE)
 
     window = Installer()
+    if self_test:
+        # Imported, constructed, styled and laid out.  Nothing past this point
+        # exercises the bundle -- it exercises the desktop.
+        return 0
     window.show()
     return application.exec()
 
