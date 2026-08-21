@@ -1,77 +1,66 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="ShiroRVC" width="220" />
+<img src="assets/logo-shirorvc.png" alt="ShiroRVC" width="570" />
 
 # ShiroRVC
 
-**Retrieval-based voice conversion, with a modern singing-voice vocoder.**
+**Turn one voice into another — speaking or singing.**
 
-Train and infer through a single Gradio interface — two vocoder architectures,
-four pitch extractors, three content embedders, and a training loop built for
-long unattended runs.
+Record yourself, convert it to a voice you have trained, and keep the melody,
+the timing and the emotion of the original performance. Runs on your own
+computer, or on a free cloud GPU.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Gradio](https://img.shields.io/badge/Gradio-6.9-F97316?logo=gradio&logoColor=white)](https://www.gradio.app/)
 [![License](https://img.shields.io/badge/License-MIT-22C55E)](LICENSE)
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ShiromiyaG/ShiroRVC/blob/main/assets/ShiroRVC_Colab.ipynb)
+
 </div>
 
 ---
 
-## Vocoders
+## What you can do with it
 
-| | **HiFi-GAN** | **ChouwaGAN** |
-|---|---|---|
-| Sample rates | 32 / 40 / 48 kHz | 44.1 kHz |
-| Frontend | Original VITS (flow + posterior) | Sequential VAE, slow + fast latents |
-| Generator | NSF HiFi-GAN | Anti-aliased harmonic decoder with excitation U-Net |
-| Discriminator | MPD + MSD | 5 period + 3 band-split complex STFT + PQMF sub-band |
+- **Convert a voice** — one file or a whole folder at once. Singing works as
+  well as speech, and you can nudge the pitch curve by hand if a note lands
+  wrong.
+- **Train your own voice** — feed it clean recordings of someone and get a model
+  you can use forever after.
+- **Type and hear it spoken** — text-to-speech routed through any voice you have.
+- **Blend two voices** — mix two models into a third one that sounds like both.
+- **Bring in voices from elsewhere** — paste a link, drop in files you already
+  have, or download ready-made starting points.
 
-**ChouwaGAN** is the architecture this fork is built around. The frontend splits
-the latent into a *slow* stream for timbre and a *fast* stream for detail, each
-governed by a KL rate controller that holds the divergence at a target instead
-of letting it collapse. The discriminator judges the compressed **complex** STFT
-— real and imaginary parts, split into frequency sub-bands — so the adversarial
-signal carries phase, which the mel reconstruction losses cannot supply. A PQMF
-sub-band branch watches inter-band consistency, where upsampling aliasing shows
-up. Every branch uses a SAN head with lazy R1 regularisation.
-
-## Features
-
-- **Inference** — single and batch conversion, with pitch-curve editing.
-- **Training** — full preprocess → extract → train pipeline with live TensorBoard
-  diagnostics for KL, per-module gradients and GAN balance.
-- **TTS** — text to speech routed through any trained voice.
-- **Voice Blender** — interpolate two models into a new one.
-- **Download** — pull models from a link, drop in `.pth`/`.index` files, or
-  fetch pretrained weights for a chosen vocoder and sample rate.
-- **Utilities** — model export, inspection and processing tools.
-
-<table>
-<tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
-<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v1</code> · <code>spin_v2</code> · custom</td></tr>
-<tr><td><b>Optimizers</b></td><td>AdamW · AdaBelief · RAdam · Ranger21 · Schedule-Free AdamW · Schedule-Free RAdam</td></tr>
-<tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel · hybrid L1 + MS-STFT</td></tr>
-</table>
-
-## Installation
-
-### Windows, prebuilt
+## Getting started on Windows
 
 Download `ShiroRVC-Setup-win64-<version>.zip` from the
 [latest release](../../releases/latest), unzip it and run `ShiroRVC-Setup.exe`.
-The wizard fetches Python, PyTorch and the application, picking a CUDA build
-automatically when an NVIDIA GPU is present. It needs no administrator rights
-and writes nothing outside the folder you choose. Budget about 14 GB of disk.
 
-When it finishes, `ShiroRVC.exe` in the install folder opens the native
-interface.
+The wizard downloads everything else for you and picks the right version for
+your graphics card automatically. It does not ask for administrator rights and
+writes nothing outside the folder you choose, so uninstalling is deleting that
+folder. Set aside about 14 GB of disk space.
 
-### From source
+When it finishes, run `ShiroRVC.exe` from that folder.
 
-The installer sets up a self-contained Conda environment in `env/` — nothing is
-installed system-wide, and no existing Python is touched.
+### Trying it without installing anything
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ShiromiyaG/ShiroRVC/blob/main/assets/ShiroRVC_Colab.ipynb)
+
+Runs in your browser on a free Google Colab GPU — useful if you do not have a
+graphics card, or just want to try it first. Set the runtime to **T4 GPU**, run
+the two cells, and open the link the second one prints.
+
+Nothing is kept between sessions: when the Colab session ends, anything you did
+not download is gone. For real training, install it properly.
+
+> Windows will likely warn you about an unrecognised app. That is because the
+> installer is not code-signed, which costs money we have not spent — not
+> because anything was detected. Every release lists checksums you can verify.
+
+### Installing from the source code
 
 <table>
 <tr><th align="left">Windows</th><th align="left">Linux</th></tr>
@@ -96,52 +85,83 @@ chmod +x run-install.sh start-gui.sh
 </tr>
 </table>
 
-Required models and executables download automatically on first launch.
+This builds a self-contained environment in `env/`. Nothing is installed
+system-wide and no Python you already have is touched. The models it needs
+download by themselves the first time you launch it.
 
 > **Note** — do not run either script as administrator or root. Both write into
-> the project tree, and doing so leaves files your normal user cannot rewrite.
+> the project folder, and doing so leaves files your normal user cannot change
+> afterwards.
 
-## Interfaces
+## Three ways to use it
 
-There are three, over the same backend. Pick whichever suits the task; they
-share `logs/`, so a model trained in one is immediately visible in the others.
+All three drive the same engine and share the same `logs/` folder, so a voice
+you train in one shows up immediately in the others.
 
-| | Launch with | Notes |
+| | Start it with | Best for |
 | --- | --- | --- |
-| **Native (Qt)** | `start-gui.bat` / `start-gui.sh` | Waveform editing, live training charts, VRAM meter, batch queue. Runs the backend out of process, so a CUDA crash does not take the window down. |
-| **Browser (Gradio)** | `start-gradio.bat` / `start-gradio.sh` | The original interface. Useful over a network or through a tunnel. |
-| **Command line** | `python core.py --help` | Everything is scriptable; both interfaces are built on these commands. |
+| **Desktop app** | `start-gui.bat` / `start-gui.sh` | Day-to-day use. Waveform editing, live training charts, a graphics-memory meter and a batch queue. If the engine crashes, the window stays up. |
+| **In your browser** | `start-gradio.bat` / `start-gradio.sh` | Reaching it from another machine, or over a tunnel. |
+| **Command line** | `python core.py --help` | Scripting and automation. The other two are built on top of these commands. |
 
-The native interface lives entirely in [`gui/`](gui/README.md) and is optional:
-deleting that directory leaves the Gradio app and the CLI working. Its
-dependencies are separate too, in `gui/requirements-gui.txt`.
+The desktop app lives entirely in [`gui/`](gui/README.md) and is optional —
+deleting that folder leaves the browser version and the command line working.
+
+## Training your own voice
+
+Put clean audio in a folder under `assets/datasets/`, then pick it in the
+Training tab.
+
+- Keep the recordings consistent — same microphone, same room, same tone.
+- Cut the silence off the start and end. **SmartCutter** can do it for you.
+- Twenty clean minutes beats two noisy hours. Quality matters far more than
+  quantity.
+
+Behind the scenes, preparation writes two copies of your audio: one at full
+quality for training and a smaller one used only to analyse pitch. The app
+offers to delete the smaller copies afterwards, which frees about a third of the
+space. Say yes unless you plan to redo the analysis with different settings —
+that step needs them back.
+
+### Watching it learn
+
+Drag a model folder onto `logs/run_tensorboard_in_model_folder.bat`, or on Linux
+pass it as an argument:
+
+```bash
+./logs/run_tensorboard_in_model_folder.sh logs/my-model
+```
+
+Charts open in your browser on port `25565`, reachable from other machines on
+your network.
 
 ## Language
 
-Both interfaces ship in English and Brazilian Portuguese, and start in the
-language your operating system is set to display. On Windows that is the
-"Windows display language" and not the format locale, so an English Windows in
-Brazil gets an English interface and Brazilian number formats, which is what
-each of those settings actually asks for.
+Both interfaces ship in English and Brazilian Portuguese, and start in whatever
+language your operating system displays. On Windows that is the "Windows display
+language" and not the format locale — so an English Windows in Brazil gets an
+English interface with Brazilian number formats, which is what each of those
+settings actually asks for.
 
-The command line stays in English deliberately: the native interface parses its
-output, and its messages end up quoted in bug reports.
-
-| | How to set it |
+| | How to change it |
 | --- | --- |
-| **Native (Qt)** | The **Language** button at the bottom of the sidebar. Remembered between sessions; it offers to restart, because every widget takes its text when the window is built. |
-| **Browser (Gradio)** | *Settings → Language*, applied on the next start. Or launch with `--language pt_BR`, which overrides the stored choice for that run the way `--share` does. |
-| **Either** | `RVC_LANGUAGE=pt_BR`, which sits between the flag and the stored preference. |
+| **Desktop app** | The **Language** button at the bottom of the sidebar. It offers to restart, because each part of the window takes its text when it is built. |
+| **In your browser** | *Settings → Language*, applied next time you start it. Or launch with `--language pt_BR`. |
+| **Either** | Set `RVC_LANGUAGE=pt_BR`. |
 
 Never having touched the switch is not the same as having chosen English:
-someone who has never opened it keeps following the operating system, while an
+someone who never opened it keeps following the operating system, while an
 explicit choice of English survives switching Windows to another language.
 
-### Translating
+The command line stays in English on purpose — the desktop app reads its output,
+and its messages end up quoted in bug reports.
+
+<details>
+<summary><b>Helping translate</b></summary>
 
 Catalogs are standard gettext `.po` files under `locales/`, so Poedit, Weblate
-and Crowdin all work on them directly. The toolchain is stdlib-only -- no Babel
-and no GNU gettext binaries to install:
+and Crowdin all work on them directly. The toolchain is standard-library only —
+no Babel and no GNU gettext binaries to install:
 
 ```bash
 python tools/i18n_tool.py extract   # sources -> locales/shiromiya.pot
@@ -152,38 +172,59 @@ python tools/i18n_tool.py stats     # what is still untranslated
 
 Adding a language is one entry in `LANGUAGES` in `rvc/lib/i18n.py`, then
 `update` and `compile`. Two rules keep it working: `install()` runs before any
-widget is built, and no translated string lives at module scope -- mark those
+widget is built, and no translated string lives at module scope — mark those
 with `N_()` and call `_()` where they are used. `tests/test_i18n.py` checks the
-template is current and that placeholders survive translation, because a
-missing catalog falls back to English silently rather than raising.
+template is current and that placeholders survive translation, because a missing
+catalog falls back to English silently rather than raising.
 
-## Monitoring a run
+</details>
 
-Drag a model folder onto `logs/run_tensorboard_in_model_folder.bat`, or pass it
-as an argument on Linux:
+## Under the hood
 
-```bash
-./logs/run_tensorboard_in_model_folder.sh logs/my-model
-```
+<details>
+<summary><b>The two voice engines</b></summary>
 
-The launcher uses the project's own environment and binds on all interfaces, so
-the board is reachable from another machine on the network at port `25565`.
+ShiroRVC ships two vocoders — the part that turns the model's internal
+representation back into sound.
 
-## Preparing a dataset
+| | **HiFi-GAN** | **ChouwaGAN** |
+|---|---|---|
+| Sample rates | 32 / 40 / 48 kHz | 44.1 kHz |
+| Frontend | Original VITS (flow + posterior) | Sequential VAE, slow + fast latents |
+| Generator | NSF HiFi-GAN | Anti-aliased harmonic decoder with excitation U-Net |
+| Discriminator | MPD + MSD | 5 period + 3 band-split complex STFT + PQMF sub-band |
 
-Place clean audio in a folder under `assets/datasets/`, then select it in the
-Training tab.
+**HiFi-GAN** is the well-tested option inherited from the original RVC, and the
+right choice if you want results that behave predictably.
 
-- Keep recordings consistent in source, tone and loudness.
-- Trim leading and trailing silence; **SmartCutter** can do this for you on
-  HiFi-GAN runs.
-- More clean minutes beats more noisy hours.
+**ChouwaGAN** is what this fork exists for, aimed at singing at 44.1 kHz. Its
+frontend splits the latent into a *slow* stream carrying timbre and a *fast*
+stream carrying detail, each held at a target divergence by a KL rate controller
+rather than being allowed to collapse. Its discriminator judges the compressed
+**complex** STFT — real and imaginary parts, split into frequency sub-bands — so
+the adversarial signal carries phase, which mel reconstruction losses cannot
+supply. A PQMF sub-band branch watches inter-band consistency, where upsampling
+aliasing shows up. Every branch uses a SAN head with lazy R1 regularisation.
 
-Preprocessing writes slices at the target rate plus 16 kHz copies. The 16 kHz
-copies feed pitch and embedder extraction only — training never reads them — so
-the extraction tab offers to delete them afterwards, which frees roughly a third
-of the preprocessing output. Re-extracting with a different f0 method or embedder
-needs them back, which means preprocessing again.
+</details>
+
+<details>
+<summary><b>What you can choose from</b></summary>
+
+<table>
+<tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
+<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v1</code> · <code>spin_v2</code> · custom</td></tr>
+<tr><td><b>Optimizers</b></td><td>AdamW · Sched-Free AdamW · Muon · Lion</td></tr>
+<tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel · hybrid L1</td></tr>
+<tr><td><b>LR schedulers</b></td><td>exponential decay per step or epoch · cosine annealing · none</td></tr>
+<tr><td><b>Export formats</b></td><td>WAV · MP3 · FLAC · OGG · M4A</td></tr>
+</table>
+
+Training writes live TensorBoard diagnostics for KL rate and per-dimension
+usage, per-module gradient norms, GAN balance and a held-out split that is the
+only signal able to see overtraining.
+
+</details>
 
 ## Credits
 

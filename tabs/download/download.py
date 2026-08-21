@@ -55,7 +55,7 @@ def save_drop_model(dropbox):
     return None
 
 
-json_url = "https://huggingface.co/IAHispano/Applio/raw/main/pretrains.json"
+json_url = "https://huggingface.co/shiromiya/ShiroRVC-Resources/raw/main/pretrains.json"
 
 
 def fetch_pretrained_data():
