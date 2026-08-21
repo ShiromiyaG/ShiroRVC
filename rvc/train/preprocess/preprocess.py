@@ -43,6 +43,10 @@ logging.getLogger("numba.core.interpreter").setLevel(logging.WARNING)
 
 OVERLAP = 0.3
 PERCENTAGE = 3.0
+# Shortest tail worth emitting as its own slice in Simple cutting. Training
+# samples a `segment_size` window out of each slice, so anything below this is
+# not useful material.
+MIN_TAIL_SECONDS = 1.0
 MAX_AMPLITUDE = 0.9
 ALPHA = 0.75
 HIGH_PASS_CUTOFF = 48
@@ -99,7 +103,15 @@ class PreProcess:
             max_sil_kept=500,
         )
         self.sr = sr
-        self.b_high, self.a_high = signal.butter(N=5, Wn=HIGH_PASS_CUTOFF, btype="high", fs=self.sr)
+        # Second-order sections rather than transfer-function coefficients:
+        # at 48 Hz / 44.1 kHz the normalized cutoff is 0.0022, which pushes the
+        # poles to |p| = 0.9979 and makes the `ba` form badly conditioned. It
+        # still holds up in float64, but `sos` is the form scipy recommends here
+        # and it lets the filter run natively in float32.
+        self.hp_sos = signal.butter(
+            N=5, Wn=HIGH_PASS_CUTOFF, btype="high", fs=self.sr, output="sos"
+        )
+        self.hp_zi = signal.sosfilt_zi(self.hp_sos)
         self.exp_dir = exp_dir
 
         self.gt_wavs_dir = os.path.join(exp_dir, "sliced_audios")
@@ -107,6 +119,24 @@ class PreProcess:
         os.makedirs(self.gt_wavs_dir, exist_ok=True)
         os.makedirs(self.wavs16k_dir, exist_ok=True)
 
+
+    def high_pass(self, audio: np.ndarray) -> np.ndarray:
+        """Remove DC offset and subsonic rumble.
+
+        The filter state is primed from the first sample instead of starting
+        from zero. A zero-state IIR treats a file that begins mid-waveform as a
+        step input, and with poles this close to the unit circle (tau = 10.7 ms)
+        that step rings for ~45 ms at up to 80% of the signal's peak -- which
+        lands squarely inside the first slice of every file.
+        """
+        if audio.size == 0:
+            return audio
+        filtered, _ = signal.sosfilt(
+            self.hp_sos, audio, zi=self.hp_zi * float(audio[0])
+        )
+        # sosfilt promotes to float64; the rest of the pipeline is float32 and
+        # the extra precision is discarded on save anyway.
+        return filtered.astype(np.float32, copy=False)
 
     def process_audio_segment(
         self,
@@ -145,40 +175,55 @@ class PreProcess:
         dataset_format: str
     ):
         chunk_len_smpl = secs_to_samples(chunk_len, self.sr)
-        stride = chunk_len_smpl - secs_to_samples(overlap_len, self.sr)
+        overlap_smpl = secs_to_samples(overlap_len, self.sr)
+        stride = chunk_len_smpl - overlap_smpl
+        if stride <= 0:
+            # A non-positive stride makes the cursor stand still (or walk
+            # backwards) and the loop writes slices until the disk fills.
+            raise ValueError(
+                f"Simple cutting needs overlap_len < chunk_len, "
+                f"got chunk_len={chunk_len}s overlap_len={overlap_len}s."
+            )
 
+        total = len(audio)
+        min_tail = secs_to_samples(MIN_TAIL_SECONDS, self.sr)
         slice_idx = 0
-        i = 0
-        while i < len(audio):
-            chunk = audio[i : i + chunk_len_smpl]
+        last_start = None
 
-            # If the last slice's below 3 seconds, we're padding it to 3 secs.
-            if len(chunk) < chunk_len_smpl:
-                padding_needed = chunk_len_smpl - len(chunk)
-                if len(chunk) > self.sr * 1.0: 
-                    padding = np.zeros(padding_needed, dtype=np.float32)
-                    chunk = np.concatenate((chunk, padding))
-                    logger.debug(f'Final slice: "{sid}_{idx0}_{slice_idx}" was padded with {padding_needed / self.sr:.2f} seconds to meet {chunk_len} secs per-slice requirement.')
-                else:
+        for start in range(0, total, stride):
+            end = start + chunk_len_smpl
+            if end > total:
+                # Tail handling. Rather than padding out to `chunk_len` with
+                # digital silence -- which puts a hard mel floor and a level the
+                # generator is then asked to reproduce into the dataset -- slide
+                # the window back so it ends on the last sample. That keeps the
+                # slice length exact and every sample real, at the cost of some
+                # extra overlap with the previous slice.
+                remainder = total - start
+                if remainder < min_tail:
                     break
+                if total >= chunk_len_smpl:
+                    start = total - chunk_len_smpl
+                    if last_start is not None and start <= last_start:
+                        break  # the re-anchored window would duplicate the previous one
+                    chunk = audio[start:]
+                else:
+                    # Whole file is shorter than one chunk. Variable-length
+                    # slices are supported downstream (the Automatic path emits
+                    # them routinely), so keep the real audio rather than
+                    # inflating it with silence.
+                    chunk = audio
+            else:
+                chunk = audio[start:end]
 
-            # Saving slices
-            save_audio(self.gt_wavs_dir, f"{sid}_{idx0}_{slice_idx}", self.sr, dataset_format, chunk)
-
-            # Resampling of slices for wavs16k ( 'sliced_audios_16k' dir )
-            if loading_resampling == "librosa":
-                chunk_16k = librosa.resample(
-                    chunk, orig_sr=self.sr, target_sr=SAMPLE_RATE_16K, res_type=RES_TYPE
-                )
-            else: # ffmpeg
-                chunk_16k = load_audio_ffmpeg(
-                    chunk, sample_rate=SAMPLE_RATE_16K, source_sr=self.sr,
-                )
-            # Saving slices for 16khz ( 'sliced_audios_16k' dir )
-            save_audio(self.wavs16k_dir, f"{sid}_{idx0}_{slice_idx}", SAMPLE_RATE_16K, dataset_format, chunk_16k)
-
+            self.process_audio_segment(
+                chunk, sid, idx0, slice_idx, loading_resampling, dataset_format
+            )
+            last_start = start
             slice_idx += 1
-            i += stride
+
+            if start + chunk_len_smpl >= total:
+                break
 
     def process_audio(
         self,
@@ -208,7 +253,7 @@ class PreProcess:
 
             # Processing, Filtering, Noise reduction
             if process_effects:
-                audio = signal.lfilter(self.b_high, self.a_high, audio)
+                audio = self.high_pass(audio)
             if noise_reduction:
                 import noisereduce as nr
                 audio = nr.reduce_noise(y=audio, sr=self.sr, prop_decrease=reduction_strength)
@@ -560,8 +605,16 @@ def preprocess_training_set(
             sc_engine.load_model()
             logger.info("SmartCutter model loaded successfully.")
         except Exception as e:
+            # Returning here aborted the whole run while still exiting 0, so the
+            # caller saw "success" and an empty sliced_audios/. Fail loudly: the
+            # user explicitly asked for SmartCutter, so silently dropping it (or
+            # the entire dataset) is worse than stopping.
             logger.error(f"Failed to load SmartCutter: {e}")
-            return
+            raise RuntimeError(
+                f"SmartCutter was enabled but could not be loaded: {e}. "
+                f"Disable SmartCutter, or use a sample rate that has a checkpoint "
+                f"in rvc/models/smartcutter."
+            ) from e
 
     speaker_map = {}
 

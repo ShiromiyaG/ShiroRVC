@@ -1,0 +1,21 @@
+/* ShiroRVC -- the sliver of style that has to be application-wide.
+ *
+ * Everything else lives in style.qss and is applied to the main window, whose
+ * subtree is every widget the user can see.  That scoping is what makes a
+ * theme switch 0.3 s instead of 2.1 s: an application-wide sheet makes Qt
+ * re-resolve rules for every widget in the process, and there are ~1500.
+ *
+ * A tooltip is the exception -- it is a top-level widget with no parent, so
+ * the window's sheet never reaches it.  Hence this file, which is set once at
+ * startup and never again: no literal colour anywhere, only palette roles, so
+ * it stays correct in both themes without being re-applied.  Add to it only
+ * for things Qt parents to the desktop rather than to us.
+ */
+
+QToolTip {
+    background: palette(button);
+    color: palette(button-text);
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 5px 8px;
+}

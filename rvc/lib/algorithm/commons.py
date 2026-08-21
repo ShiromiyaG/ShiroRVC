@@ -2,6 +2,34 @@ import math
 import torch
 from typing import List, Optional
 
+def strip_parametrizations(module: torch.nn.Module):
+    """
+    Fold every parametrization (weight norm, spectral norm, ...) into the raw
+    weights and detach the reparametrization machinery.
+
+    Training keeps `g` and `v` separate and recomputes `g * v / ||v||` on every
+    forward. At inference the weights are frozen, so that recompute is pure
+    overhead - folding it away once removes it from every subsequent forward and
+    lets torch.compile see plain convolutions.
+
+    Idempotent: modules that were already stripped are skipped.
+
+    Args:
+        module (torch.nn.Module): Module to strip, traversed recursively.
+    """
+    removed = 0
+    for submodule in module.modules():
+        parametrizations = getattr(submodule, "parametrizations", None)
+        if not parametrizations:
+            continue
+        for name in list(parametrizations.keys()):
+            torch.nn.utils.parametrize.remove_parametrizations(
+                submodule, name, leave_parametrized=True
+            )
+            removed += 1
+    return removed
+
+
 def init_weights(m, mean=0.0, std=0.01):
     """
     Initialize the weights of a module.

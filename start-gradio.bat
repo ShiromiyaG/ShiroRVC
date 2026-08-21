@@ -17,6 +17,7 @@ if not exist env (
     exit /b 1
 )
 
-env\python.exe app.py --open
+:: %* forwards anything the caller added -- --language pt_BR, --share, --port.
+env\python.exe app.py --open %*
 echo.
 pause

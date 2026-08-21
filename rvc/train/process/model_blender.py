@@ -3,6 +3,10 @@ import torch
 from collections import OrderedDict
 
 from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
+from rvc.lib.algorithm.chouwagan_svae import ARCHITECTURE_ID
+from rvc.lib.terminal import error as print_error, info, install_rich_print, success
+
+install_rich_print()
 
 deep_debug_merging = False # For dev or debugging purposes
 
@@ -23,8 +27,8 @@ def extract(ckpt):
 def model_blender(name, path1, path2, ratio):
     try:
         message = f"Model {path1} and {path2} are merged with alpha {ratio}."
-        print(f"[DEBUG] Starting model_blender with: {message}")
-        
+        info(f"Blending '{path1}' and '{path2}' at alpha {ratio}.", tag="[BLEND]")
+
         # Load checkpoints
         ckpt1 = torch.load(path1, map_location="cpu", weights_only=True)
         ckpt2 = torch.load(path2, map_location="cpu", weights_only=True)
@@ -40,7 +44,7 @@ def model_blender(name, path1, path2, ratio):
         sr2 = _normalize_sr(ckpt2["sr"])
         if sr1 != sr2:
             err_msg = "The sample rates of the two models are not the same."
-            print(f"[DEBUG] {err_msg}")
+            print_error(err_msg, tag="[BLEND]")
             return err_msg, None
 
         # Retrieve configuration values
@@ -62,25 +66,36 @@ def model_blender(name, path1, path2, ratio):
         )
         if vocoder_id != other_vocoder_id:
             err_msg = "The vocoder architectures of the two models are not the same."
-            print(f"[DEBUG] {err_msg}")
+            print_error(err_msg, tag="[BLEND]")
             return err_msg, None
         vocoder = get_vocoder_spec(vocoder_id)["label"]
         vocoder_config = ckpt1.get("vocoder_config", {})
-        print(f"[DEBUG] Config: {cfg}, sr: {cfg_sr}, version: {cfg_version}")
+        architecture_id = ckpt1.get(
+            "architecture_id",
+            vocoder_config.get(
+                "chouwagan_architecture_id",
+                ARCHITECTURE_ID,
+            )
+            if vocoder_id == "chouwagan"
+            else "hifi_gan_nsf_v1",
+        )
+        other_architecture_id = ckpt2.get(
+            "architecture_id",
+            ckpt2.get("vocoder_config", {}).get(
+                "chouwagan_architecture_id",
+                ARCHITECTURE_ID,
+            )
+            if other_vocoder_id == "chouwagan"
+            else "hifi_gan_nsf_v1",
+        )
+        if architecture_id != other_architecture_id:
+            err_msg = "The model architecture revisions are not the same."
+            print_error(err_msg, tag="[BLEND]")
+            return err_msg, None
 
         # Extract models if needed
-        if "model" in ckpt1:
-            print("[DEBUG] Extracting model from ckpt1")
-            ckpt1 = extract(ckpt1)
-        else:
-            ckpt1 = ckpt1["weight"]
-            print("[DEBUG] Using ckpt1['weight'] directly")
-        if "model" in ckpt2:
-            print("[DEBUG] Extracting model from ckpt2")
-            ckpt2 = extract(ckpt2)
-        else:
-            ckpt2 = ckpt2["weight"]
-            print("[DEBUG] Using ckpt2['weight'] directly")
+        ckpt1 = extract(ckpt1) if "model" in ckpt1 else ckpt1["weight"]
+        ckpt2 = extract(ckpt2) if "model" in ckpt2 else ckpt2["weight"]
 
         if deep_debug_merging:
             print(f"[DEBUG] ckpt1 model keys: {list(ckpt1.keys())}")
@@ -89,7 +104,7 @@ def model_blender(name, path1, path2, ratio):
         # Check model architecture compatibility
         if sorted(list(ckpt1.keys())) != sorted(list(ckpt2.keys())):
             err_msg = "Fail to merge the models. The model architectures are not the same."
-            print(f"[DEBUG] {err_msg}")
+            print_error(err_msg, tag="[BLEND]")
             return err_msg, None
 
         # Blend model weights
@@ -125,16 +140,12 @@ def model_blender(name, path1, path2, ratio):
         opt["vocoder_id"] = vocoder_id
         opt["vocoder_architecture"] = vocoder_id
         opt["vocoder_config"] = vocoder_config
+        opt["architecture_id"] = architecture_id
 
         output_path = os.path.join("logs", f"{name}.pth")
         torch.save(opt, output_path)
-        print(f"[DEBUG] Model blending successful. Saved to: {output_path}")
-        
-        ret_tuple = (message, output_path)
-        print(f"[DEBUG] Returning tuple: {ret_tuple}")
-        return ret_tuple
-    except Exception as error:
-        print(f"[DEBUG] Exception in model_blender: {error}")
-        ret_tuple = (str(error), None)
-        print(f"[DEBUG] Returning error tuple: {ret_tuple}")
-        return ret_tuple
+        success(f"Blended model saved to '{output_path}'.", tag="[BLEND]")
+        return message, output_path
+    except Exception as blend_error:
+        print_error(f"Model blending failed: {blend_error}", tag="[BLEND]")
+        return str(blend_error), None

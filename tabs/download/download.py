@@ -5,9 +5,10 @@ import shutil
 import requests
 import tempfile
 import gradio as gr
-import pandas as pd
 
 from concurrent.futures import ThreadPoolExecutor
+
+from rvc.lib.i18n import _
 
 
 now_dir = os.getcwd()
@@ -15,7 +16,7 @@ sys.path.append(now_dir)
 
 from core import run_download_script
 from rvc.lib.text import format_title
-from rvc.lib.terminal import progress_handle, progress_task
+from rvc.lib.terminal import progress_handle, progress_task, success
 
 gradio_temp_dir = os.path.join(tempfile.gettempdir(), "gradio")
 
@@ -26,7 +27,9 @@ if os.path.exists(gradio_temp_dir):
 def save_drop_model(dropbox):
     if "pth" not in dropbox and "index" not in dropbox:
         raise gr.Error(
-            message="The file you dropped is not a valid model file. Please try again."
+            message=_(
+                "The file you dropped is not a valid model file. Please try again."
+            )
         )
 
     file_name = format_title(os.path.basename(dropbox))
@@ -46,8 +49,8 @@ def save_drop_model(dropbox):
     if os.path.exists(os.path.join(model_path, file_name)):
         os.remove(os.path.join(model_path, file_name))
     shutil.move(dropbox, os.path.join(model_path, file_name))
-    print(f"{file_name} saved in {model_path}")
-    gr.Info(f"{file_name} saved in {model_path}")
+    success(f"Saved '{file_name}' in {model_path}.", tag="[DOWNLOAD]")
+    gr.Info(_("{name} saved in {folder}").format(name=file_name, folder=model_path))
 
     return None
 
@@ -129,7 +132,7 @@ def download_pretrained_model(model, sample_rate):
 
     total_size = get_file_size(d_url) + get_file_size(g_url)
 
-    gr.Info("Downloading pretrained model...")
+    gr.Info(_("Downloading pretrained model..."))
 
     with progress_task(
         total_size,
@@ -156,8 +159,8 @@ def download_pretrained_model(model, sample_rate):
             for future in futures:
                 future.result()
 
-    gr.Info("Pretrained model downloaded successfully!")
-    print("Pretrained model downloaded successfully!")
+    gr.Info(_("Pretrained model downloaded successfully!"))
+    success("Pretrained model downloaded.", tag="[DOWNLOAD]")
 
 
 def update_sample_rate_dropdown(model):
@@ -170,28 +173,28 @@ def update_sample_rate_dropdown(model):
 
 def download_tab():
     with gr.Column():
-        gr.Markdown(value="## Download Model")
+        gr.Markdown(value=_("## Download Model"))
         model_link = gr.Textbox(
-            label="Model Link",
-            placeholder="Introduce the model link",
+            label=_("Model Link"),
+            placeholder=_("Introduce the model link"),
             interactive=True,
         )
         model_download_output_info = gr.Textbox(
-            label="Output Information",
-            info="Download status.",
+            label=_("Output Information"),
+            info=_("Download status."),
             value="",
             max_lines=8,
             interactive=False,
         )
-        model_download_button = gr.Button("Download Model")
+        model_download_button = gr.Button(_("Download Model"))
         model_download_button.click(
             fn=run_download_script,
             inputs=[model_link],
             outputs=[model_download_output_info],
         )
-        gr.Markdown(value="## Quick drag-and-drop")
+        gr.Markdown(value=_("## Quick drag-and-drop"))
         dropbox = gr.File(
-            label="Drop a .pth and .index file to copy them into the model folder.",
+            label=_("Drop a .pth and .index file to copy them into the model folder."),
             type="filepath",
         )
 
@@ -200,17 +203,17 @@ def download_tab():
             inputs=[dropbox],
             outputs=[dropbox],
         )
-        gr.Markdown(value="## Download Pretrained Models")
+        gr.Markdown(value=_("## Download Pretrained Models"))
         pretrained_model = gr.Dropdown(
-            label="Pretrained",
-            info="Select the pretrained model you want to download.",
+            label=_("Pretrained"),
+            info=_("Select the pretrained model you want to download."),
             choices=get_pretrained_list(),
             value="Titan",
             interactive=True,
         )
         pretrained_sample_rate = gr.Dropdown(
-            label="Sampling Rate",
-            info="And select the sampling rate.",
+            label=_("Sampling Rate"),
+            info=_("And select the sampling rate."),
             choices=get_pretrained_sample_rates(pretrained_model.value),
             value="40k",
             interactive=True,
@@ -221,7 +224,7 @@ def download_tab():
             inputs=[pretrained_model],
             outputs=[pretrained_sample_rate],
         )
-        download_pretrained = gr.Button("Download")
+        download_pretrained = gr.Button(_("Download"))
         download_pretrained.click(
             fn=download_pretrained_model,
             inputs=[pretrained_model, pretrained_sample_rate],

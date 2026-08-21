@@ -1,6 +1,8 @@
 import os, sys
 import gradio as gr
 
+from rvc.lib.i18n import _
+
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
@@ -11,8 +13,8 @@ def analyzer_tab():
     with gr.Column():
         audio_input = gr.Audio(type="filepath")
         output_info = gr.Textbox(
-            label="Output Information",
-            info="The output information will be displayed here.",
+            label=_("Output Information"),
+            info=_("The output information will be displayed here."),
             value="",
             max_lines=8,
             interactive=False,

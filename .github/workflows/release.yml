@@ -1,0 +1,288 @@
+name: Release
+
+# Publishes two things for every tag:
+#
+#   <APP_NAME>-source-<tag>.zip        the application source
+#   <APP_NAME>-Setup-win64-<tag>.zip   a ~52 MB wizard that installs the rest
+#
+# The setup executable downloads Python, PyTorch and the source at run time
+# rather than carrying them.  A self-contained CUDA bundle is 6-9 GB, and a
+# GitHub release asset cannot exceed 2 GiB -- so a bootstrapper is not a
+# convenience here, it is the only shape that fits.
+#
+# That also means the source archive's filename is load bearing: the wizard
+# builds the URL it downloads from out of the same application name, in Python,
+# from installer/config.py.  Neither this file nor the archive step restates
+# that name -- both read it from version.py, and tests/test_app_identity.py
+# fails the build if any copy of it drifts.
+
+# Releases are cut by editing the VERSION file.  Push that edit to main and
+# this workflow tags it and publishes; no separate tagging step, and no way for
+# the published version to disagree with what the two interfaces report, since
+# both read the same file.
+on:
+  push:
+    branches: [main]
+    paths: ["VERSION"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the artifacts without publishing a release"
+        type: boolean
+        required: false
+        default: true
+
+# Never cancelled: a half-run release is worse than a queued one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Read by default; only the job that creates the release is given more.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Check the version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+      app_name: ${{ steps.meta.outputs.app_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read VERSION and decide
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$VERSION" ]; then
+            echo "::error file=VERSION::VERSION is empty."
+            exit 1
+          fi
+          # A three-part number keeps the tag, the installer filenames and the
+          # version both interfaces display in the same shape.
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "::error file=VERSION::'$VERSION' is not a valid version (expected e.g. 1.2.3)."
+            exit 1
+          fi
+
+          APP_NAME="$(python3 -c 'import version; print(version.APP_NAME)')"
+          [ -n "$APP_NAME" ] || { echo "::error::version.APP_NAME is empty."; exit 1; }
+
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Dry run: building $TAG without publishing."
+          elif gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Deliberately a *release* check and not a tag check.  Publishing
+            # used to push the tag before creating the release, so any transient
+            # failure in between left a tag with nothing attached -- and the tag
+            # check then refused to ever retry that version.  A tag without a
+            # release is now a resumable state.
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is already released; building artifacts only."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Releasing $TAG."
+          fi
+
+  checks:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  source:
+    name: Source archive
+    needs: gate
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ needs.gate.outputs.app_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the source archive
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.gate.outputs.tag }}"
+          STAGE="$RUNNER_TEMP/$APP_NAME"
+          mkdir -p "$STAGE"
+
+          # git archive respects .gitattributes export-ignore and, unlike a
+          # find/zip pipeline, cannot accidentally sweep in a local env/ or a
+          # multi-gigabyte logs/ directory.
+          git archive --format=tar HEAD | tar -x -C "$STAGE"
+
+          # Directories that exist only to be written into at runtime. Keeping
+          # the .gitkeep files means a fresh install has the layout it expects.
+          find "$STAGE/logs" -mindepth 1 -maxdepth 1 ! -name ".gitkeep" \
+            ! -name "mute*" ! -name "reference" ! -name "*.sh" ! -name "*.bat" \
+            -exec rm -rf {} + 2>/dev/null || true
+
+          # Compile the translation catalogs into the archive.
+          #
+          # gettext is asked for its catalogs with fallback=True, so a release
+          # that ships .po files without .mo files renders in English and
+          # raises nothing -- a bug that looks exactly like working software.
+          # Committed .mo files would also do, but only until someone edits a
+          # .po and forgets; building here means the archive cannot disagree
+          # with its own sources.
+          ( cd "$STAGE" && python3 tools/i18n_tool.py compile )
+
+          ( cd "$STAGE" && zip -qr "$RUNNER_TEMP/$APP_NAME-source-$TAG.zip" . )
+          ls -lh "$RUNNER_TEMP/$APP_NAME-source-$TAG.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: ${{ runner.temp }}/${{ needs.gate.outputs.app_name }}-source-*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  windows:
+    name: Windows setup executable
+    needs: [gate, source, checks]
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      tag: ${{ needs.gate.outputs.tag }}
+      upload: true
+
+  publish:
+    name: Publish release
+    needs: [gate, source, windows]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the release and its tag
+      id-token: write        # sign the provenance attestation
+      attestations: write    # record it
+    env:
+      APP_NAME: ${{ needs.gate.outputs.app_name }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect the assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -name "*.zip" -exec cp {} release/ \;
+
+          # An empty release is worse than a failed one: it publishes, the gate
+          # then reports the version as released, and nobody finds out until a
+          # user clicks a download that is not there.
+          count="$(find release -type f | wc -l)"
+          [ "$count" -gt 0 ] || { echo "::error::No assets were collected."; exit 1; }
+
+          for expected in "$APP_NAME-source-$TAG.zip" "$APP_NAME-Setup-win64-$TAG.zip"; do
+            [ -f "release/$expected" ] || {
+              echo "::error::Expected asset $expected is missing."
+              exit 1
+            }
+          done
+
+          # Nothing signs the installer, so SmartScreen will warn regardless.
+          # A checksum list is the one thing that lets somebody verify what they
+          # downloaded is what this run built.
+          ( cd release && sha256sum *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          ls -lh release
+
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*.zip
+
+      - name: Compose the release notes
+        run: |
+          set -euo pipefail
+          # Asked for and merged explicitly rather than leaving it to how
+          # --generate-notes and --notes-file combine, which is not documented.
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            -f target_commitish="$GITHUB_SHA" \
+            --jq .body > generated.md
+
+          cat > notes.md <<EOF
+          ## Install
+
+          **Windows, recommended** — download \`$APP_NAME-Setup-win64-$TAG.zip\`,
+          unzip it and run \`$APP_NAME-Setup.exe\`. The wizard fetches Python,
+          PyTorch and the application; a CUDA build is selected automatically
+          when an NVIDIA GPU is present. No administrator rights are needed
+          and nothing is written outside the folder you pick.
+
+          Budget about 14 GB of free disk. Once it finishes, \`$APP_NAME.exe\`
+          in the install folder starts the native interface.
+
+          **From source** — download \`$APP_NAME-source-$TAG.zip\`
+          and run \`run-install.bat\`, then \`start-gui.bat\` for the native
+          interface or \`start-gradio.bat\` for the browser one.
+
+          Checksums for both archives are in \`SHA256SUMS.txt\`.
+
+          ---
+
+          EOF
+          cat generated.md >> notes.md
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          # gh creates the tag as part of creating the release, at this commit
+          # rather than at whatever the default branch has drifted to. One call,
+          # so there is no window in which a tag exists without its release.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            release/*
+
+      - name: Verify the URL the installer will download
+        run: |
+          set -euo pipefail
+          # The wizard resolves this URL at install time, on the user's machine,
+          # long after anything here could report a problem. Ask the same code
+          # the installer uses where it will look, then check it is really there.
+          URL="$(python3 - <<'PY'
+          import contextlib
+          import os
+          import sys
+
+          from installer import build_windows, config
+
+          # write_release_info logs what it wrote to stdout, and stdout here is
+          # the URL. Push its chatter to stderr so it stays visible in the log
+          # without ending up inside the variable.
+          with contextlib.redirect_stdout(sys.stderr):
+              build_windows.write_release_info(
+                  os.environ["GITHUB_REPOSITORY"], os.environ["TAG"], None
+              )
+          print(config.source_url())
+          PY
+          )"
+          echo "Installer will fetch: $URL"
+
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSLI -o /dev/null "$URL"; then
+              echo "Asset is reachable."
+              exit 0
+            fi
+            echo "Not visible yet; retrying in 5s ($attempt/5)."
+            sleep 5
+          done
+          echo "::error::$URL is not reachable. Every install of $TAG would fail."
+          exit 1

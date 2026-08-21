@@ -2,6 +2,8 @@ import os, sys
 import gradio as gr
 import shutil
 
+from rvc.lib.i18n import _
+
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
@@ -13,59 +15,59 @@ def update_model_fusion(dropbox):
 
 
 def voice_blender_tab():
-    gr.Markdown("## Voice Blender")
+    gr.Markdown(_("## Voice Blender"))
     gr.Markdown(
-        "Select two voice models, set your desired blend percentage, and blend them into an entirely new voice."
+        _("Select two voice models, set your desired blend percentage, and blend them into an entirely new voice.")
     )
     with gr.Column():
         model_fusion_name = gr.Textbox(
-            label="Model Name",
-            info="Name of the new model.",
+            label=_("Model Name"),
+            info=_("Name of the new model."),
             value="",
             max_lines=1,
             interactive=True,
-            placeholder="Enter model name",
+            placeholder=_("Enter model name"),
         )
         with gr.Row():
             with gr.Column():
                 model_fusion_a_dropbox = gr.File(
-                    label="Drag and drop your model here", type="filepath"
+                    label=_("Drag and drop your model here"), type="filepath"
                 )
                 model_fusion_a = gr.Textbox(
-                    label="Path to Model",
+                    label=_("Path to Model"),
                     value="",
                     interactive=True,
-                    placeholder="Enter path to model",
-                    info="You can also use a custom path.",
+                    placeholder=_("Enter path to model"),
+                    info=_("You can also use a custom path."),
                 )
             with gr.Column():
                 model_fusion_b_dropbox = gr.File(
-                    label="Drag and drop your model here", type="filepath"
+                    label=_("Drag and drop your model here"), type="filepath"
                 )
                 model_fusion_b = gr.Textbox(
-                    label="Path to Model",
+                    label=_("Path to Model"),
                     value="",
                     interactive=True,
-                    placeholder="Enter path to model",
-                    info="You can also use a custom path.",
+                    placeholder=_("Enter path to model"),
+                    info=_("You can also use a custom path."),
                 )
         alpha_a = gr.Slider(
             minimum=0,
             maximum=1,
-            label="Blend Ratio",
+            label=_("Blend Ratio"),
             value=0.5,
             interactive=True,
-            info="Adjusting the position more towards one side or the other will make the model more similar to the first or second.",
+            info=_("Adjusting the position more towards one side or the other will make the model more similar to the first or second."),
         )
-        model_fusion_button = gr.Button("Fusion")
+        model_fusion_button = gr.Button(_("Fusion"))
         with gr.Row():
             model_fusion_output_info = gr.Textbox(
-                label="Output Information",
-                info="Blend status.",
+                label=_("Output Information"),
+                info=_("Blend status."),
                 value="",
             )
             model_fusion_pth_output = gr.File(
-                label="Download Model", type="filepath", interactive=False
+                label=_("Download Model"), type="filepath", interactive=False
             )
 
     model_fusion_button.click(

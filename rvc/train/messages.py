@@ -25,3 +25,27 @@ TORCH_COMPILE_MODES = (
     "max-autotune",
     "max-autotune-no-cudagraphs",
 )
+
+TENSORBOARD_VALIDATION_PREVIEW_DIR = "validation_samples"
+TENSORBOARD_VALIDATION_MEL_TITLES = (
+    "Mel Generated",
+    "Mel Original",
+    "Difference",
+)
+TENSORBOARD_VALIDATION_FOOTER = (
+    "Sample rate: {sample_rate} Hz   |   Hop length: {hop_length}   |   n_mels: {n_mels}"
+    "   |   Epoch: {epoch}   |   Global Step: {step}"
+)
+TENSORBOARD_VALIDATION_DIFFERENCE_LABEL = "(Mel Generated − Mel Original) in dB"
+TENSORBOARD_VALIDATION_AXIS_X = "Time (s)"
+TENSORBOARD_VALIDATION_AXIS_Y = "Frequency (Hz)"
+TENSORBOARD_VALIDATION_DB_LABEL = "dB"
+TENSORBOARD_VALIDATION_MEL_TAG = "validation_previews/mel/{sample}"
+TENSORBOARD_VALIDATION_AUDIO_TAG = "validation_previews/audio/{sample}/{kind}"
+TENSORBOARD_VALIDATION_SOURCE_TAG = "validation_previews/source/{sample}"
+TENSORBOARD_VALIDATION_FALLBACK_NAMESPACE = "validation_previews/sample_00"
+TENSORBOARD_VALIDATION_AUDIO_NAMES = {
+    "generated": "generated",
+    "original": "original",
+}
+TENSORBOARD_MEDIA_SOURCE_NAME = "source"

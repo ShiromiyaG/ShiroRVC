@@ -1,3 +1,39 @@
+/* ============================================================================
+   ShiroRVC — GUI skin
+   ----------------------------------------------------------------------------
+   Everything here is derived from Gradio's own theme variables (--primary-*,
+   --body-*, --background-fill-*) so the skin follows whichever theme the user
+   picks in Settings instead of hardcoding one palette.
+
+   Depth is expressed with BOTH a dark drop shadow and a light inset hairline:
+   the shadow carries the elevation on light themes, the hairline carries it on
+   dark ones, and each is invisible where the other does the work.
+   ========================================================================= */
+
+.gradio-container {
+    --rvc-radius-lg: 20px;
+    --rvc-radius-md: 14px;
+    --rvc-radius-sm: 11px;
+
+    --rvc-hairline: inset 0 1px 0 rgba(255, 255, 255, .07);
+    --rvc-hairline-strong: inset 0 1px 0 rgba(255, 255, 255, .12);
+
+    --rvc-shadow-sm: 0 1px 2px rgba(0, 0, 0, .18);
+    --rvc-shadow-md: 0 10px 26px rgba(0, 0, 0, .22);
+    --rvc-shadow-lg: 0 22px 55px rgba(0, 0, 0, .30);
+
+    --rvc-line: color-mix(in srgb, var(--border-color-primary) 86%, var(--primary-400));
+    --rvc-line-hover: color-mix(in srgb, var(--primary-500) 55%, var(--border-color-primary));
+    --rvc-focus: 0 0 0 3px color-mix(in srgb, var(--primary-400) 26%, transparent);
+
+    /* Neutral that follows the theme: light on dark UIs, dark on light UIs. */
+    --rvc-muted: color-mix(in srgb, var(--body-text-color) 16%, transparent);
+    --rvc-surface: color-mix(in srgb, var(--background-fill-secondary) 82%, var(--background-fill-primary));
+
+    --rvc-ease: cubic-bezier(.4, 0, .2, 1);
+    --rvc-speed: .16s;
+}
+
 html {
     overflow-y: scroll;
     scrollbar-gutter: stable;
@@ -5,13 +41,16 @@ html {
 footer {
     display: none !important;
 }
+
 .gradio-container {
     width: min(1600px, 96vw) !important;
     max-width: none !important;
     margin: 0 auto !important;
-    padding: 18px 0 34px !important;
+    padding: 16px 0 40px !important;
     box-sizing: border-box !important;
 }
+
+/* Ambient wash behind the whole app. */
 .gradio-container::before {
     content: "";
     position: fixed;
@@ -19,309 +58,194 @@ footer {
     z-index: -1;
     pointer-events: none;
     background:
-        radial-gradient(circle at 8% 0%, color-mix(in srgb, var(--primary-200) 18%, transparent), transparent 30rem),
-        radial-gradient(circle at 96% 18%, color-mix(in srgb, var(--secondary-200) 14%, transparent), transparent 34rem);
+        radial-gradient(ellipse 60rem 32rem at 12% -6%, color-mix(in srgb, var(--primary-500) 16%, transparent), transparent 70%),
+        radial-gradient(ellipse 52rem 30rem at 92% 8%, color-mix(in srgb, var(--secondary-500) 12%, transparent), transparent 70%);
 }
+
+/* ---------------------------------------------------------------- header -- */
+
 .rvc-header {
     position: relative;
     overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, .16);
-    border-radius: 26px;
-    padding: 26px 30px;
-    margin: 0 0 16px;
+    border: 1px solid color-mix(in srgb, white 18%, transparent);
+    border-radius: var(--rvc-radius-lg);
+    padding: 20px 26px;
+    margin: 0 0 14px;
     color: white;
     background:
-        radial-gradient(circle at 88% 12%, rgba(255, 255, 255, .24), transparent 26%),
-        radial-gradient(circle at 72% 110%, rgba(56, 189, 248, .24), transparent 34%),
-        linear-gradient(125deg, #5b21b6 0%, #4f46e5 56%, #1d4ed8 100%);
-    box-shadow: 0 22px 55px rgba(79, 70, 229, .22);
+        radial-gradient(circle at 84% -20%, color-mix(in srgb, white 26%, transparent), transparent 42%),
+        radial-gradient(circle at 18% 130%, color-mix(in srgb, var(--secondary-400) 34%, transparent), transparent 46%),
+        linear-gradient(118deg,
+            color-mix(in srgb, var(--primary-700) 92%, black) 0%,
+            var(--primary-600) 52%,
+            color-mix(in srgb, var(--secondary-600) 88%, var(--primary-500)) 100%);
+    box-shadow: var(--rvc-shadow-lg), var(--rvc-hairline-strong);
 }
+
+/* Hairline sheen along the top edge. */
+.rvc-header::after {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .55), transparent);
+}
+
 .rvc-header-grid {
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     justify-content: space-between;
+    /* Gradio's .row wraps by default, which drops the chips onto their own
+       line and doubles the header height. */
+    flex-wrap: nowrap !important;
     gap: 24px;
 }
 .rvc-header h1 {
-    font-size: clamp(2rem, 5vw, 3.25rem);
-    line-height: 1;
-    letter-spacing: -.045em;
-    margin: 0 0 10px;
+    font-size: clamp(1.6rem, 3.2vw, 2.3rem);
+    line-height: 1.05;
+    letter-spacing: -.035em;
+    margin: 0 0 4px;
+    text-shadow: 0 2px 12px rgba(0, 0, 0, .28);
 }
 .rvc-header p {
     max-width: 760px;
     margin: 0;
-    opacity: .90;
-    font-size: 1.02rem;
+    opacity: .88;
+    font-size: .95rem;
 }
+
+/* Right-hand runtime chips. Gradio stretches Row children evenly, so the
+   text block is given the room and the chips hug the right edge. */
+.rvc-header-grid > *:first-child {
+    flex: 1 1 0% !important;
+    min-width: 0 !important;
+}
+.rvc-header-side {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+}
+.rvc-chips {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+.rvc-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 11px;
+    border: 1px solid rgba(255, 255, 255, .22);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, .10);
+    color: rgba(255, 255, 255, .92);
+    font-size: .78rem;
+    font-weight: 600;
+    letter-spacing: .01em;
+    white-space: nowrap;
+    backdrop-filter: blur(4px);
+}
+
+/* ------------------------------------------------------- workspace + tabs -- */
+
 .rvc-workspace {
     margin: 0 0 18px !important;
-    padding: 16px 18px 12px !important;
-    border: 1px solid color-mix(in srgb, var(--primary-400) 25%, var(--border-color-primary)) !important;
-    border-radius: 18px !important;
-    background: color-mix(in srgb, var(--background-fill-primary) 94%, var(--primary-100)) !important;
-    box-shadow: 0 10px 30px rgba(15, 23, 42, .05);
+    padding: 12px 16px 14px !important;
+    border: 1px solid var(--rvc-line) !important;
+    border-radius: var(--rvc-radius-lg) !important;
+    background: color-mix(in srgb, var(--background-fill-primary) 92%, var(--primary-500) 8%) !important;
+    box-shadow: var(--rvc-shadow-md), var(--rvc-hairline);
 }
-.rvc-profile-grid {
-    gap: 20px !important;
-    align-items: flex-start !important;
-}
-.rvc-profile-section {
-    min-width: 230px !important;
-}
-.rvc-profile-label {
-    margin: 0 0 8px !important;
-    color: var(--body-text-color-subdued);
-    font-size: .74rem;
-    font-weight: 750;
-    letter-spacing: .075em;
-    text-transform: uppercase;
-}
-.rvc-profile-radio {
-    min-height: 38px !important;
-    padding: 0 !important;
-    border: 0 !important;
-    background: transparent !important;
-}
-.rvc-radio,
-.rvc-radio .wrap,
-.gradio-container fieldset:has(input[type="radio"]),
-.gradio-container fieldset:has(input[type="radio"]) .wrap {
-    overflow: visible !important;
-}
-.rvc-radio.block,
-fieldset.rvc-radio,
-.gradio-container fieldset:has(input[type="radio"]) {
-    border: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-}
-.rvc-profile-radio.rvc-radio.block,
-fieldset.rvc-profile-radio.rvc-radio {
-    padding: 0 !important;
-}
-.rvc-radio.block > .wrap,
-fieldset.rvc-radio > .wrap,
-.gradio-container fieldset:has(input[type="radio"]) > .wrap {
-    display: flex !important;
-    flex-wrap: wrap !important;
-    gap: 7px !important;
-    padding: 0 !important;
-    border: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-}
-.rvc-radio .wrap label,
-.gradio-container fieldset:has(input[type="radio"]) .wrap label {
-    position: relative;
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    min-height: 40px !important;
-    margin: 0 !important;
-    padding: 8px 12px !important;
-    border: 1px solid var(--border-color-primary) !important;
-    border-radius: 10px !important;
-    color: var(--body-text-color-subdued) !important;
-    background: var(--background-fill-secondary) !important;
-    box-shadow: none !important;
-    cursor: pointer;
-    transition: border-color .16s ease, background .16s ease, color .16s ease;
-}
-.rvc-radio .wrap label > span,
-.gradio-container fieldset:has(input[type="radio"]) .wrap label > span {
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    margin: 0 !important;
-    line-height: 1.2 !important;
-    text-align: center !important;
-}
-.rvc-radio .wrap label:hover,
-.gradio-container fieldset:has(input[type="radio"]) .wrap label:hover {
-    border-color: color-mix(in srgb, var(--primary-500) 55%, var(--border-color-primary)) !important;
-    color: var(--body-text-color) !important;
-}
-.rvc-radio .wrap label:has(input:checked),
-.gradio-container fieldset:has(input[type="radio"]) .wrap label:has(input:checked) {
-    border-color: var(--primary-500) !important;
-    color: var(--body-text-color) !important;
-    background: color-mix(in srgb, var(--primary-500) 16%, var(--background-fill-primary)) !important;
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary-500) 30%, transparent) !important;
-}
-.rvc-radio .wrap input[type="radio"],
-.gradio-container fieldset:has(input[type="radio"]) .wrap input[type="radio"] {
-    position: absolute !important;
-    width: 1px !important;
-    height: 1px !important;
-    opacity: 0 !important;
-}
-.rvc-radio .wrap label:focus-within,
-.gradio-container fieldset:has(input[type="radio"]) .wrap label:focus-within {
-    outline: 2px solid color-mix(in srgb, var(--primary-400) 65%, transparent);
-    outline-offset: -2px;
-}
-.rvc-dropdown.block,
-.gradio-container .block:has([role="combobox"]) {
-    overflow: visible !important;
-    border: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-}
-.rvc-dropdown.block > .container,
-.rvc-dropdown div:has(> .wrap [role="combobox"]),
-.gradio-container .block:has([role="combobox"])
-    div:has(> .wrap [role="combobox"]) {
-    padding: 0 !important;
-    border: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-}
-.rvc-dropdown .wrap:has([role="combobox"]),
-.gradio-container .block .wrap:has([role="combobox"]) {
-    border: 1px solid color-mix(in srgb, var(--border-color-primary) 82%, var(--primary-300)) !important;
-    border-radius: 12px !important;
-    background: color-mix(in srgb, var(--background-fill-secondary) 86%, var(--background-fill-primary)) !important;
-    box-shadow: inset 0 1px 0 color-mix(in srgb, white 4%, transparent) !important;
-    transition: border-color .16s ease, background .16s ease, box-shadow .16s ease;
-}
-.rvc-dropdown .wrap:has([role="combobox"]):hover,
-.gradio-container .block .wrap:has([role="combobox"]):hover {
-    border-color: color-mix(in srgb, var(--primary-500) 48%, var(--border-color-primary)) !important;
-    background: color-mix(in srgb, var(--background-fill-secondary) 76%, var(--primary-100)) !important;
-}
-.rvc-dropdown .wrap:has([role="combobox"]):focus-within,
-.gradio-container .block .wrap:has([role="combobox"]):focus-within {
-    border-color: var(--primary-500) !important;
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-400) 18%, transparent) !important;
-}
-.rvc-dropdown [role="combobox"],
-.gradio-container .block [role="combobox"] {
-    color: var(--body-text-color) !important;
-    background: transparent !important;
-}
-.rvc-dropdown .icon-wrap,
-.gradio-container .block:has([role="combobox"]) .icon-wrap {
-    color: var(--body-text-color-subdued) !important;
-    transition: color .16s ease, background .16s ease;
-}
-.rvc-dropdown .wrap:has([role="combobox"]):hover .icon-wrap,
-.gradio-container .block .wrap:has([role="combobox"]):hover .icon-wrap {
-    color: var(--primary-500) !important;
-}
-.rvc-dropdown .options[role="listbox"],
-.gradio-container .block:has([role="combobox"]) .options[role="listbox"] {
-    margin-top: 6px !important;
-    padding: 6px !important;
-    border: 1px solid color-mix(in srgb, var(--border-color-primary) 80%, var(--primary-300)) !important;
-    border-radius: 12px !important;
-    background: var(--background-fill-primary) !important;
-    box-shadow: 0 16px 34px rgba(15, 23, 42, .20) !important;
-}
-.rvc-dropdown [role="option"],
-.gradio-container .block:has([role="combobox"]) [role="option"] {
-    margin: 2px 0 !important;
-    border-radius: 8px !important;
-}
-.rvc-dropdown [role="option"]:hover,
-.rvc-dropdown [role="option"][aria-selected="true"],
-.gradio-container .block:has([role="combobox"]) [role="option"]:hover,
-.gradio-container .block:has([role="combobox"])
-    [role="option"][aria-selected="true"] {
-    color: var(--body-text-color) !important;
-    background: color-mix(in srgb, var(--primary-500) 14%, var(--background-fill-primary)) !important;
-}
-.rvc-config-status {
-    margin: 11px 0 0 !important;
-    padding: 10px 2px 0 !important;
-    border-top: 1px solid color-mix(in srgb, var(--border-color-primary) 72%, transparent);
-    background: transparent !important;
-}
-.rvc-config-status .prose,
-.rvc-config-status p {
-    margin: 0 !important;
-    background: transparent !important;
-}
-#rvc-main-tabs,
-#rvc-data-tabs {
+
+#rvc-main-tabs {
     display: flex !important;
     width: 100% !important;
     min-width: 0 !important;
     max-width: 100% !important;
     box-sizing: border-box !important;
-    border-radius: 18px;
+    border-radius: var(--rvc-radius-md);
 }
 #rvc-main-tabs .tabitem,
-#rvc-data-tabs .tabitem,
-#rvc-main-tabs .tabitem > .column,
-#rvc-data-tabs .tabitem > .column {
+#rvc-main-tabs .tabitem > .column {
     width: 100% !important;
     min-width: 0 !important;
     max-width: 100% !important;
     box-sizing: border-box !important;
 }
-#rvc-main-tabs button[role="tab"],
-#rvc-data-tabs button[role="tab"] {
-    min-height: 42px;
-    margin: 0 3px !important;
-    padding: 8px 16px !important;
+
+/* The tab strip reads as a segmented control rather than loose text. */
+#rvc-main-tabs > .tab-nav,
+#rvc-main-tabs > div:has(> button[role="tab"]) {
+    gap: 2px !important;
+    padding: 4px !important;
+    border: 1px solid color-mix(in srgb, var(--border-color-primary) 70%, transparent) !important;
+    border-radius: var(--rvc-radius-md) !important;
+    background: color-mix(in srgb, var(--background-fill-secondary) 55%, transparent) !important;
+    box-shadow: var(--rvc-hairline);
+}
+#rvc-main-tabs button[role="tab"] {
+    min-height: 38px;
+    margin: 0 !important;
+    padding: 8px 18px !important;
     border: 0 !important;
-    border-radius: 8px 8px 0 0 !important;
+    border-radius: 9px !important;
     color: var(--body-text-color-subdued) !important;
     background: transparent !important;
     box-shadow: none !important;
-    font-weight: 650;
-    transition: color .16s ease, border-color .16s ease, background .16s ease, box-shadow .16s ease;
+    font-weight: 600;
+    letter-spacing: -.005em;
+    transition: color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease);
 }
-#rvc-main-tabs button[role="tab"]:hover,
-#rvc-data-tabs button[role="tab"]:hover {
+#rvc-main-tabs button[role="tab"]:hover {
     color: var(--body-text-color) !important;
-    background: color-mix(in srgb, var(--primary-500) 8%, transparent) !important;
+    background: color-mix(in srgb, var(--body-text-color) 7%, transparent) !important;
 }
-#rvc-main-tabs > div > button[role="tab"][aria-selected="true"],
-#rvc-main-tabs > button[role="tab"][aria-selected="true"],
-#rvc-data-tabs button[role="tab"][aria-selected="true"] {
-    color: var(--primary-500) !important;
-    background: color-mix(in srgb, var(--primary-500) 7%, transparent) !important;
-    box-shadow: inset 0 -2px 0 var(--primary-500) !important;
+#rvc-main-tabs button[role="tab"][aria-selected="true"] {
+    color: white !important;
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--primary-500) 92%, white),
+        var(--primary-600)) !important;
+    box-shadow: 0 3px 12px color-mix(in srgb, var(--primary-600) 45%, transparent),
+                var(--rvc-hairline-strong) !important;
 }
-#rvc-data-tabs button[role="tab"][aria-selected="true"] {
-    border-radius: 0 !important;
-}
-.rvc-workflow-row {
-    display: grid !important;
-    grid-template-columns: minmax(0, 5fr) minmax(0, 6fr) !important;
-    gap: 18px !important;
-    padding-top: 8px;
-    width: 100% !important;
-    min-width: 0 !important;
-    max-width: 100% !important;
-    box-sizing: border-box !important;
-}
-.rvc-workflow-row > .gradio-column,
-.rvc-workflow-row > .rvc-card {
-    min-width: 0 !important;
-    width: auto !important;
-    max-width: none !important;
-}
+
+/* -------------------------------------------------------- cards + layout -- */
+
 .rvc-card {
-    border: 1px solid color-mix(in srgb, var(--border-color-primary) 82%, var(--primary-300));
-    border-radius: 20px;
-    padding: 18px;
+    border: 1px solid var(--rvc-line);
+    border-radius: var(--rvc-radius-lg);
+    padding: 20px;
     background: var(--background-fill-primary);
-    box-shadow: 0 12px 32px rgba(15, 23, 42, .06);
+    box-shadow: var(--rvc-shadow-md), var(--rvc-hairline);
 }
 .rvc-form-card {
-    border-top: 3px solid color-mix(in srgb, var(--primary-500) 75%, transparent);
+    position: relative;
+    /* No overflow clipping here: dropdown listboxes are absolutely positioned
+       inside this column and would be cut off. The rail rounds its own corners
+       instead. */
 }
-.rvc-log-card {
-    border-top: 3px solid color-mix(in srgb, var(--secondary-500) 70%, transparent);
+/* Gradient accent rail instead of a flat 3px border. */
+.rvc-form-card::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    border-radius: var(--rvc-radius-lg) var(--rvc-radius-lg) 0 0;
+    pointer-events: none;
+    background: linear-gradient(90deg,
+        var(--primary-500),
+        color-mix(in srgb, var(--secondary-500) 80%, var(--primary-400)) 55%,
+        transparent);
 }
 .rvc-card > .gap {
-    gap: 12px;
+    gap: 14px;
 }
 .rvc-card div.form {
-    gap: 12px !important;
+    gap: 14px !important;
     overflow: visible !important;
     border: 0 !important;
     background: transparent !important;
@@ -335,469 +259,493 @@ fieldset.rvc-radio > .wrap,
     background: transparent !important;
     box-shadow: none !important;
 }
-.rvc-retrieval {
-    gap: 12px !important;
-    padding: 4px 0 8px !important;
-    border: 0 !important;
+
+/* Field labels: a touch more presence, descriptions a touch quieter. */
+.gradio-container .block > label > span,
+.gradio-container span[data-testid="block-info"] {
+    letter-spacing: -.005em;
+}
+.gradio-container span[data-testid="block-info"] {
+    opacity: .72;
+}
+
+/* ------------------------------------------------------------ accordions -- */
+
+/* Gradio 6.9 has no `.accordion` class. An accordion is a plain `.block`
+   whose direct child is the `button.label-wrap` toggle, and the open state is
+   carried by an `open` class on that button (there is no aria-expanded).
+   `--rvc-accordion` is the marker the control rules below use to keep their
+   `:has()` selectors from reaching into an accordion's subtree. */
+.gradio-container .block:has(> button.label-wrap) {
+    --rvc-accordion: 1;
+    border: 1px solid var(--rvc-line) !important;
+    border-radius: var(--rvc-radius-md) !important;
+    background: color-mix(in srgb, var(--background-fill-secondary) 70%, var(--background-fill-primary)) !important;
+    box-shadow: var(--rvc-hairline) !important;
+    transition: border-color var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container .block:has(> button.label-wrap):hover {
+    border-color: var(--rvc-line-hover) !important;
+}
+.gradio-container button.label-wrap {
+    min-height: 44px !important;
+    padding: 10px 14px !important;
+    color: var(--body-text-color) !important;
     background: transparent !important;
-    box-shadow: none !important;
+    font-weight: 650 !important;
+    letter-spacing: -.005em;
+    transition: color var(--rvc-speed) var(--rvc-ease);
 }
-.rvc-retrieval-grid {
-    gap: 12px !important;
-    align-items: flex-start !important;
+.gradio-container button.label-wrap:hover {
+    color: var(--primary-500) !important;
 }
-.rvc-retrieval-grid > .form,
-.rvc-retrieval-grid .block {
-    min-width: 0 !important;
+/* Accent rail while the section is expanded. */
+.gradio-container .block:has(> button.label-wrap.open) {
+    border-color: color-mix(in srgb, var(--primary-500) 38%, var(--border-color-primary)) !important;
 }
+.gradio-container button.label-wrap.open {
+    box-shadow: inset 3px 0 0 var(--primary-500);
+}
+
+/* --------------------------------------------------------------- inputs -- */
+
 .rvc-card input[type="text"]:not([role="combobox"]),
-.rvc-card input[type="number"]:not([data-testid="number-input"]),
+.rvc-card input[type="password"],
+.rvc-card input[type="number"],
 .rvc-card textarea,
 .rvc-card select {
     min-height: 40px !important;
-    border: 1px solid color-mix(in srgb, var(--border-color-primary) 82%, var(--primary-300)) !important;
-    border-radius: 12px !important;
-    background: color-mix(in srgb, var(--input-background-fill) 92%, var(--primary-100)) !important;
-    box-shadow: inset 0 1px 0 color-mix(in srgb, white 4%, transparent) !important;
-    transition: border-color .16s ease, background .16s ease, box-shadow .16s ease;
+    border: 1px solid var(--rvc-line) !important;
+    border-radius: var(--rvc-radius-sm) !important;
+    background: color-mix(in srgb, var(--input-background-fill) 92%, var(--primary-500) 6%) !important;
+    box-shadow: var(--rvc-hairline) !important;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease);
+}
+/* Slider companion boxes are compact; keep the skin, drop the min-height. */
+.rvc-card input[type="number"][data-testid="number-input"] {
+    min-height: 0 !important;
 }
 .rvc-card input[type="text"]:not([role="combobox"]):hover,
-.rvc-card input[type="number"]:not([data-testid="number-input"]):hover,
+.rvc-card input[type="password"]:hover,
+.rvc-card input[type="number"]:hover,
 .rvc-card textarea:hover,
 .rvc-card select:hover {
-    border-color: color-mix(in srgb, var(--primary-500) 42%, var(--border-color-primary)) !important;
+    border-color: var(--rvc-line-hover) !important;
 }
 .rvc-card input[type="text"]:not([role="combobox"]):focus,
-.rvc-card input[type="number"]:not([data-testid="number-input"]):focus,
+.rvc-card input[type="password"]:focus,
+.rvc-card input[type="number"]:focus,
 .rvc-card textarea:focus,
 .rvc-card select:focus {
     border-color: var(--primary-500) !important;
     background: var(--input-background-fill-focus) !important;
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-400) 18%, transparent) !important;
+    box-shadow: var(--rvc-focus) !important;
 }
-.rvc-card .rvc-audio.block {
-    --block-background-fill: color-mix(in srgb, var(--background-fill-secondary) 94%, var(--primary-100));
-    --block-border-color: color-mix(in srgb, var(--primary-400) 35%, var(--border-color-primary));
-    overflow: hidden !important;
-    border: 1px solid var(--block-border-color) !important;
-    border-radius: 16px !important;
-    background:
-        radial-gradient(
-            circle at 50% 36%,
-            color-mix(in srgb, var(--primary-400) 9%, transparent),
-            transparent 48%
-        ),
-        var(--block-background-fill) !important;
-    box-shadow:
-        inset 0 1px 0 color-mix(in srgb, white 5%, transparent),
-        0 8px 22px rgba(15, 23, 42, .08) !important;
-    transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
-}
-.rvc-card .rvc-audio.block:hover {
-    border-color: color-mix(in srgb, var(--primary-500) 58%, var(--border-color-primary)) !important;
-    box-shadow:
-        inset 0 1px 0 color-mix(in srgb, white 6%, transparent),
-        0 10px 26px color-mix(in srgb, var(--primary-800) 13%, transparent) !important;
-}
-.rvc-audio label[data-testid="block-label"] {
-    top: 9px !important;
-    left: 9px !important;
-    border: 1px solid color-mix(in srgb, var(--primary-300) 42%, transparent) !important;
-    border-radius: 8px !important;
-    padding: 5px 9px !important;
-    color: white !important;
-    background: linear-gradient(135deg, var(--primary-600), var(--secondary-600)) !important;
-    box-shadow: 0 5px 14px color-mix(in srgb, var(--primary-800) 22%, transparent) !important;
-}
-.rvc-audio label[data-testid="block-label"] span {
-    opacity: .92 !important;
-}
-.rvc-audio-input .audio-container > button {
-    border: 0 !important;
-    border-radius: 15px 15px 0 0 !important;
-    color: var(--body-text-color) !important;
-    background: transparent !important;
-    transition: background .18s ease, color .18s ease !important;
-}
-.rvc-audio-input .audio-container > button:hover,
-.rvc-audio-input .audio-container > button:focus-visible {
-    color: var(--body-text-color) !important;
-    background: color-mix(in srgb, var(--primary-500) 8%, transparent) !important;
-}
-.rvc-audio-input .audio-container > button:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--primary-400) 70%, transparent) !important;
-    outline-offset: -3px !important;
-}
-.rvc-audio-input .audio-container > button > .wrap {
-    min-height: 190px !important;
-    margin: 0 18px !important;
-    padding: 42px 12px 18px !important;
-    color: var(--body-text-color) !important;
-    font-size: .96rem !important;
-    transform: translateY(-10px);
-}
-.rvc-audio-input .audio-container > button .icon-wrap {
-    display: grid !important;
-    place-items: center !important;
-    width: 44px !important;
-    height: 44px !important;
-    margin-bottom: 12px !important;
-    border: 1px solid color-mix(in srgb, var(--primary-400) 36%, transparent);
-    border-radius: 13px;
-    color: var(--primary-400) !important;
-    background: color-mix(in srgb, var(--primary-500) 12%, var(--background-fill-primary));
-    box-shadow: inset 0 1px 0 color-mix(in srgb, white 8%, transparent);
-}
-.rvc-audio-input .audio-container > button .icon-wrap svg {
-    width: 22px !important;
-    height: 22px !important;
-}
-.rvc-audio-input .audio-container > button .or {
-    margin: 3px 0 !important;
-    color: var(--body-text-color-subdued) !important;
-    font-size: .82rem !important;
-}
-.rvc-audio-input .source-selection {
-    height: 44px !important;
-    border-top: 1px solid color-mix(in srgb, var(--primary-400) 20%, var(--border-color-primary)) !important;
-    background: color-mix(in srgb, var(--background-fill-primary) 42%, transparent) !important;
-}
-.rvc-audio-input .source-selection .icon {
-    width: 30px !important;
-    height: 30px !important;
-    margin: 0 3px !important;
-    padding: 7px !important;
-    border-radius: 9px !important;
-    color: var(--body-text-color-subdued) !important;
-    transition: color .16s ease, background .16s ease, transform .16s ease !important;
-}
-.rvc-audio-input .source-selection .icon:hover,
-.rvc-audio-input .source-selection .icon:focus,
-.rvc-audio-input .source-selection .icon.selected {
-    color: var(--primary-400) !important;
-    background: color-mix(in srgb, var(--primary-500) 14%, transparent) !important;
-}
-.rvc-audio-input .source-selection .icon:hover {
-    transform: translateY(-1px);
-}
-.rvc-audio-output.block {
-    min-height: 116px !important;
-}
-.rvc-audio-output .audio-container,
-.rvc-audio-output .empty {
-    min-height: 114px !important;
-}
-.rvc-audio-output .empty {
-    margin-top: 0 !important;
-}
-.rvc-audio-output .empty .icon {
-    width: 42px !important;
-    height: 42px !important;
-    padding: 10px !important;
-    border: 1px solid color-mix(in srgb, var(--primary-400) 28%, transparent);
-    border-radius: 13px;
-    color: var(--primary-400) !important;
-    background: color-mix(in srgb, var(--primary-500) 10%, var(--background-fill-primary));
-    opacity: .82 !important;
-    transform: translateY(-16px);
-}
-.rvc-audio-output .component-wrapper {
-    padding: 18px 14px 12px !important;
-}
-.rvc-slider.block {
+
+/* ------------------------------------------------------------- dropdown -- */
+
+.gradio-container .block:has([role="combobox"]):not(:has(> button.label-wrap)) {
+    overflow: visible !important;
     border: 0 !important;
     background: transparent !important;
     box-shadow: none !important;
 }
-.rvc-slider .head {
-    display: grid !important;
-    grid-template-columns: minmax(0, 1fr) auto !important;
-    align-items: center !important;
-    gap: 6px !important;
-    margin-bottom: 10px !important;
+.gradio-container .block:has([role="combobox"])
+    div:has(> .wrap [role="combobox"]) {
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
 }
-.rvc-slider .head > label {
+.gradio-container .block .wrap:has([role="combobox"]) {
+    min-height: 40px !important;
+    border: 1px solid var(--rvc-line) !important;
+    border-radius: var(--rvc-radius-sm) !important;
+    background: color-mix(in srgb, var(--input-background-fill) 92%, var(--primary-500) 6%) !important;
+    box-shadow: var(--rvc-hairline) !important;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container .block .wrap:has([role="combobox"]):hover {
+    border-color: var(--rvc-line-hover) !important;
+}
+.gradio-container .block .wrap:has([role="combobox"]):focus-within {
+    border-color: var(--primary-500) !important;
+    box-shadow: var(--rvc-focus) !important;
+}
+.gradio-container .block [role="combobox"] {
+    color: var(--body-text-color) !important;
+    background: transparent !important;
+}
+.gradio-container .block:has([role="combobox"]) .icon-wrap {
+    color: var(--body-text-color-subdued) !important;
+    transition: color var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container .block .wrap:has([role="combobox"]):hover .icon-wrap {
+    color: var(--primary-500) !important;
+}
+/* The listbox is portalled out with position:fixed and sits directly on top of
+   page content. A drop shadow alone cannot separate it on a dark theme (black
+   on near-black), so the separation comes from a real border plus a ring, and
+   the surface is tinted to read as elevated in both light and dark themes. */
+.gradio-container .options[role="listbox"] {
+    margin-top: 6px !important;
+    padding: 6px !important;
+    border: 1px solid color-mix(in srgb, var(--primary-500) 55%, var(--border-color-primary)) !important;
+    border-radius: var(--rvc-radius-md) !important;
+    background: color-mix(in srgb, var(--background-fill-primary) 88%, var(--primary-500) 12%) !important;
+    box-shadow:
+        0 0 0 1px rgba(255, 255, 255, .07),
+        0 24px 60px rgba(0, 0, 0, .55),
+        var(--rvc-hairline) !important;
+}
+.gradio-container .options[role="listbox"] [role="option"],
+.gradio-container .options[role="listbox"] .item {
+    margin: 2px 0 !important;
+    padding: 7px 10px !important;
+    border-radius: 8px !important;
+    transition: background var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container .options[role="listbox"] .item:hover,
+.gradio-container .options[role="listbox"] .item.selected,
+.gradio-container .options[role="listbox"] .item.active {
+    color: var(--body-text-color) !important;
+    background: color-mix(in srgb, var(--primary-500) 26%, transparent) !important;
+}
+/* ------------------------------------------------------ radio pill group -- */
+
+.gradio-container fieldset:has(input[type="radio"]),
+.gradio-container fieldset:has(input[type="radio"]) .wrap {
+    overflow: visible !important;
+}
+.gradio-container fieldset:has(input[type="radio"]) {
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+.gradio-container fieldset:has(input[type="radio"]) > .wrap {
     display: flex !important;
-    align-items: center !important;
-    min-width: 0 !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
 }
-.rvc-slider .head > label span[data-testid="block-info"] {
-    position: static !important;
+.gradio-container fieldset:has(input[type="radio"]) .wrap label {
+    position: relative;
     display: inline-flex !important;
-    width: fit-content !important;
-    max-width: 100% !important;
-    white-space: normal !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-height: 38px !important;
+    margin: 0 !important;
+    /* Narrow grid columns (e.g. "Audio cutting") only fit two pills per row at
+       this size; wider padding pushes them to one per line. */
+    padding: 8px 12px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: var(--rvc-radius-sm) !important;
+    color: var(--body-text-color-subdued) !important;
+    background: var(--rvc-surface) !important;
+    box-shadow: none !important;
+    font-weight: 550;
+    cursor: pointer;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                color var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease);
 }
-.rvc-slider .tab-like-container {
-    flex: 0 0 auto !important;
-    order: initial !important;
-    justify-self: end !important;
-    margin-left: 0 !important;
-    height: 30px !important;
-    border-color: color-mix(in srgb, var(--border-color-primary) 82%, var(--primary-300)) !important;
-    border-radius: 9px !important;
-    background: var(--input-background-fill) !important;
-}
-.rvc-slider input[data-testid="number-input"] {
-    width: 56px !important;
-    min-width: 56px !important;
-    padding-right: 7px !important;
-    padding-left: 7px !important;
+.gradio-container fieldset:has(input[type="radio"]) .wrap label > span {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    margin: 0 !important;
+    line-height: 1.2 !important;
     text-align: center !important;
-    font-variant-numeric: tabular-nums;
-    border-radius: 8px 0 0 8px !important;
 }
-.rvc-slider .reset-button {
-    min-width: 26px !important;
-    padding: 0 6px !important;
-    border-radius: 0 8px 8px 0 !important;
+.gradio-container fieldset:has(input[type="radio"]) .wrap label:hover {
+    border-color: var(--rvc-line-hover) !important;
+    color: var(--body-text-color) !important;
+    background: color-mix(in srgb, var(--primary-500) 8%, var(--rvc-surface)) !important;
 }
-.rvc-slider .slider_input_container {
-    gap: 8px !important;
+.gradio-container fieldset:has(input[type="radio"]) .wrap label:has(input:checked) {
+    border-color: transparent !important;
+    color: white !important;
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--primary-500) 92%, white),
+        var(--primary-600)) !important;
+    box-shadow: 0 3px 10px color-mix(in srgb, var(--primary-600) 40%, transparent),
+                var(--rvc-hairline-strong) !important;
 }
-.rvc-slider input[type="range"] {
+.gradio-container fieldset:has(input[type="radio"]) .wrap input[type="radio"] {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    opacity: 0 !important;
+}
+.gradio-container fieldset:has(input[type="radio"]) .wrap label:focus-within {
+    outline: 2px solid color-mix(in srgb, var(--primary-400) 70%, transparent);
+    outline-offset: 2px;
+}
+
+/* -------------------------------------------------------------- checkbox -- */
+
+.gradio-container .block:has(input[type="checkbox"]):not(:has(> button.label-wrap)) {
+    overflow: visible !important;
+}
+/* Multi-select checkbox groups keep the pill treatment. */
+.gradio-container fieldset:has(input[type="checkbox"]) > .wrap {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+}
+.gradio-container fieldset:has(input[type="checkbox"]) .wrap label {
+    min-height: 38px !important;
+    padding: 8px 12px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: var(--rvc-radius-sm) !important;
+    color: var(--body-text-color-subdued) !important;
+    background: var(--rvc-surface) !important;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                color var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container fieldset:has(input[type="checkbox"]) .wrap label:hover {
+    border-color: var(--rvc-line-hover) !important;
+    color: var(--body-text-color) !important;
+}
+.gradio-container fieldset:has(input[type="checkbox"]) .wrap label:has(input:checked) {
+    border-color: var(--primary-500) !important;
+    color: var(--body-text-color) !important;
+    background: color-mix(in srgb, var(--primary-500) 18%, var(--background-fill-primary)) !important;
+}
+/* The box itself. An unchecked box needs to be visible on a dark surface, but
+   the CHECKED state must keep the browser's native tick: giving the input a
+   background/border makes Chrome drop the built-in checkmark glyph, so the
+   custom skin is scoped to :not(:checked) and accent-color paints the rest. */
+.gradio-container input[type="checkbox"] {
+    width: 18px !important;
+    height: 18px !important;
+    accent-color: var(--primary-500) !important;
+    cursor: pointer;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container input[type="checkbox"]:not(:checked) {
+    border-radius: 5px !important;
+    border: 1.5px solid color-mix(in srgb, var(--body-text-color) 32%, transparent) !important;
+    background: var(--rvc-surface) !important;
+}
+.gradio-container input[type="checkbox"]:not(:checked):hover {
+    border-color: var(--primary-500) !important;
+    background: color-mix(in srgb, var(--primary-500) 14%, var(--rvc-surface)) !important;
+}
+.gradio-container input[type="checkbox"]:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--primary-400) 70%, transparent);
+    outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- slider -- */
+
+/* `:has()` matches ANY ancestor block containing a range input, so without the
+   guard this also stripped the background off every accordion that happens to
+   hold a slider (Preprocessing, Extraction, Training, ...). Only the block that
+   directly wraps the control should be flattened. */
+.gradio-container .block:has(input[type="range"]):not(:has(> button.label-wrap)) {
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+.gradio-container input[type="range"] {
     min-width: 80px !important;
+    accent-color: var(--primary-500) !important;
+    cursor: pointer;
 }
-.rvc-slider input[type="range"]::-webkit-slider-runnable-track {
+/* The unfilled track derives from the text colour, so it stays a *subtle*
+   contrast on dark themes instead of the near-white bar a fixed neutral gives. */
+.gradio-container input[type="range"]::-webkit-slider-runnable-track {
     height: 6px !important;
     border-radius: 999px !important;
     background: linear-gradient(
         to right,
         var(--primary-500) var(--range_progress),
-        color-mix(in srgb, var(--neutral-300) 75%, transparent) var(--range_progress)
+        var(--rvc-muted) var(--range_progress)
     ) !important;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .22) !important;
 }
-.rvc-slider input[type="range"]::-webkit-slider-thumb {
-    width: 18px !important;
-    height: 18px !important;
-    margin-top: -6px !important;
+.gradio-container input[type="range"]::-webkit-slider-thumb {
+    width: 16px !important;
+    height: 16px !important;
+    margin-top: -5px !important;
     border: 3px solid var(--primary-500) !important;
-    background: white !important;
-    box-shadow: 0 3px 10px color-mix(in srgb, var(--primary-700) 30%, transparent) !important;
-    transition: transform .15s ease, box-shadow .15s ease;
+    border-radius: 50% !important;
+    background: var(--background-fill-primary) !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .35) !important;
+    transition: transform var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease);
 }
-.rvc-slider input[type="range"]:hover::-webkit-slider-thumb,
-.rvc-slider input[type="range"]:focus-visible::-webkit-slider-thumb {
+.gradio-container input[type="range"]:hover::-webkit-slider-thumb {
     transform: scale(1.12);
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary-400) 18%, transparent) !important;
+    box-shadow: 0 2px 12px color-mix(in srgb, var(--primary-500) 55%, transparent) !important;
 }
-.rvc-slider input[type="range"]::-moz-range-track {
+.gradio-container input[type="range"]::-moz-range-track {
     height: 6px !important;
     border-radius: 999px !important;
-    background: color-mix(in srgb, var(--neutral-300) 75%, transparent) !important;
+    background: var(--rvc-muted) !important;
 }
-.rvc-slider input[type="range"]::-moz-range-progress {
+.gradio-container input[type="range"]::-moz-range-progress {
     height: 6px !important;
     border-radius: 999px !important;
     background: var(--primary-500) !important;
 }
-.rvc-slider input[type="range"]::-moz-range-thumb {
+.gradio-container input[type="range"]::-moz-range-thumb {
     width: 12px !important;
     height: 12px !important;
     border: 3px solid var(--primary-500) !important;
-    background: white !important;
-    box-shadow: 0 3px 10px color-mix(in srgb, var(--primary-700) 30%, transparent) !important;
+    border-radius: 50% !important;
+    background: var(--background-fill-primary) !important;
 }
-.rvc-slider .min_value,
-.rvc-slider .max_value {
-    min-width: 18px;
-    font-size: .72rem !important;
-    font-variant-numeric: tabular-nums;
-}
-.rvc-button,
+
+/* --------------------------------------------------------------- buttons -- */
+
 .gradio-container button:not([role="tab"]):is(.primary, .secondary, .stop) {
     min-height: 42px !important;
-    border: 1px solid color-mix(in srgb, var(--primary-400) 32%, var(--border-color-primary)) !important;
-    border-radius: 11px !important;
+    border: 1px solid color-mix(in srgb, var(--primary-400) 28%, var(--border-color-primary)) !important;
+    border-radius: var(--rvc-radius-sm) !important;
     color: var(--body-text-color) !important;
-    background: linear-gradient(
-        180deg,
-        color-mix(in srgb, var(--background-fill-secondary) 92%, var(--primary-200)),
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--background-fill-secondary) 88%, var(--primary-500) 6%),
         var(--background-fill-secondary)
     ) !important;
-    box-shadow: 0 3px 9px rgba(15, 23, 42, .10), inset 0 1px 0 color-mix(in srgb, white 5%, transparent) !important;
-    font-weight: 700 !important;
-    transition: border-color .16s ease, background .16s ease, box-shadow .16s ease !important;
+    box-shadow: var(--rvc-shadow-sm), var(--rvc-hairline) !important;
+    font-weight: 650 !important;
+    letter-spacing: -.005em;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease),
+                transform var(--rvc-speed) var(--rvc-ease) !important;
 }
-.rvc-button:hover,
 .gradio-container button:not([role="tab"]):is(.primary, .secondary, .stop):hover {
-    border-color: color-mix(in srgb, var(--primary-500) 65%, var(--border-color-primary)) !important;
-    background: color-mix(in srgb, var(--primary-500) 12%, var(--background-fill-secondary)) !important;
-    box-shadow: 0 7px 18px color-mix(in srgb, var(--primary-700) 16%, transparent) !important;
+    border-color: var(--rvc-line-hover) !important;
+    background: color-mix(in srgb, var(--primary-500) 14%, var(--background-fill-secondary)) !important;
+    box-shadow: var(--rvc-shadow-md), var(--rvc-hairline) !important;
 }
-.rvc-button:focus-visible,
 .gradio-container button:not([role="tab"]):is(.primary, .secondary, .stop):focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--primary-400) 72%, transparent) !important;
+    outline: 2px solid color-mix(in srgb, var(--primary-400) 75%, transparent) !important;
     outline-offset: 2px !important;
 }
-.rvc-button:active,
 .gradio-container button:not([role="tab"]):is(.primary, .secondary, .stop):active {
-    box-shadow: inset 0 2px 5px rgba(15, 23, 42, .18) !important;
+    transform: translateY(1px);
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, .25) !important;
 }
-.rvc-icon-button {
-    width: 46px !important;
-    min-width: 46px !important;
-    padding: 0 !important;
-    font-size: 1rem !important;
-}
-.rvc-button.primary,
 .gradio-container button.primary:not([role="tab"]) {
     border-color: transparent !important;
     color: white !important;
-    background: linear-gradient(120deg, var(--primary-600), var(--secondary-600)) !important;
-    box-shadow: 0 8px 20px color-mix(in srgb, var(--primary-600) 24%, transparent) !important;
+    background: linear-gradient(120deg, var(--primary-600), var(--secondary-500)) !important;
+    box-shadow: 0 6px 18px color-mix(in srgb, var(--primary-600) 40%, transparent),
+                var(--rvc-hairline-strong) !important;
 }
-.rvc-button.stop,
+.gradio-container button.primary:not([role="tab"]):hover {
+    background: linear-gradient(120deg,
+        color-mix(in srgb, var(--primary-600) 88%, white),
+        color-mix(in srgb, var(--secondary-500) 88%, white)) !important;
+    box-shadow: 0 10px 26px color-mix(in srgb, var(--primary-600) 50%, transparent),
+                var(--rvc-hairline-strong) !important;
+}
 .gradio-container button.stop:not([role="tab"]) {
-    border-color: color-mix(in srgb, #ef4444 42%, var(--border-color-primary)) !important;
-    background: color-mix(in srgb, #ef4444 11%, var(--background-fill-secondary)) !important;
+    border-color: color-mix(in srgb, #ef4444 45%, var(--border-color-primary)) !important;
+    color: #fecaca !important;
+    background: color-mix(in srgb, #ef4444 16%, var(--background-fill-secondary)) !important;
 }
-.rvc-section-title h2, .rvc-section-title h3 {
-    margin: 0 0 2px;
-    font-size: 1.18rem;
-    letter-spacing: -.015em;
+.gradio-container button.stop:not([role="tab"]):hover {
+    border-color: #ef4444 !important;
+    color: white !important;
+    background: color-mix(in srgb, #ef4444 34%, var(--background-fill-secondary)) !important;
 }
-.rvc-hint {
-    color: var(--body-text-color-subdued);
-    font-size: .91rem;
-}
-.rvc-status {
-    min-height: 58px;
-    border: 1px solid color-mix(in srgb, var(--primary-400) 24%, var(--border-color-primary));
-    border-left: 4px solid var(--primary-500);
-    border-radius: 10px;
-    padding: 9px 12px;
-    background: color-mix(in srgb, var(--primary-100) 22%, var(--background-fill-secondary));
-}
-.rvc-conversion-status:not(:has(.prose > *)),
-.rvc-conversion-status:has(.prose > p:only-child:empty) {
-    display: none !important;
-}
-.rvc-actions {
-    align-items: stretch !important;
-    margin-top: 4px;
-}
-.rvc-actions button {
-    min-height: 44px !important;
-    border-radius: 12px !important;
-    font-weight: 700 !important;
-}
-.rvc-actions button.primary {
-    border: 0 !important;
-    background: linear-gradient(120deg, var(--primary-600), var(--secondary-600)) !important;
-    box-shadow: 0 8px 20px color-mix(in srgb, var(--primary-600) 24%, transparent) !important;
-}
-.rvc-advanced {
-    border-radius: 14px !important;
-    border-color: color-mix(in srgb, var(--border-color-primary) 75%, var(--primary-300)) !important;
-    background: color-mix(in srgb, var(--background-fill-secondary) 72%, transparent) !important;
-}
-.rvc-log textarea {
-    font-family: var(--font-mono);
-    font-size: .83rem;
-}
-.rvc-event-log {
-    max-height: 34rem;
-    overflow: auto;
-    border: 1px solid var(--border-color-primary);
-    border-radius: 13px;
-    background: color-mix(in srgb, var(--background-fill-secondary) 90%, #0f172a 10%);
-    padding: 12px 14px;
-    text-align: left;
-}
-.rvc-event-log pre {
-    margin: 0;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    text-align: left;
-}
-.rvc-event-row {
-    margin: 0 0 4px;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    font-family: var(--font-mono);
-    font-size: .83rem;
-}
-.rvc-event-row[data-level="ERROR"],
-.rvc-event-row[data-level="CRITICAL"] { color: #ef4444; }
-.rvc-event-row[data-level="WARNING"] { color: #f59e0b; }
-.rvc-event-row[data-level="SUCCESS"] { color: #22c55e; }
-.rvc-progress-card {
-    margin: 0 0 10px;
-    padding: 8px 10px;
-    border: 1px solid var(--border-color-primary);
-    border-radius: 8px;
-}
-.rvc-progress-card progress { width: 100%; accent-color: var(--primary-500); }
-.rvc-progress-meta { color: var(--body-text-color-subdued); font-size: .78rem; }
-.rvc-parameter-summary {
-    margin: 0 0 12px;
-    padding: 10px 12px;
-    border: 1px solid var(--border-color-primary);
-    border-radius: 10px;
-}
-.rvc-parameter-summary h3 { margin: 0 0 8px; font-size: .9rem; }
-.rvc-parameter-summary table { width: 100%; border-collapse: collapse; }
-.rvc-parameter-summary th,
-.rvc-parameter-summary td { padding: 5px 7px; text-align: right; }
-.rvc-parameter-summary th:first-child { text-align: left; }
-.rvc-parameter-summary thead { color: var(--body-text-color-subdued); }
-.rvc-conversion-progress:not(:has(.rvc-event-log)) {
-    display: none !important;
-}
-.rvc-conversion-progress .rvc-event-log {
-    max-height: 12rem;
-}
-#training-row,
-#training-row > .gradio-column,
-#training-row .gradio-column {
-    min-width: 0 !important;
-}
-#training-row {
-    display: grid !important;
-    grid-template-columns: minmax(0, 5fr) minmax(0, 6fr) !important;
-    gap: 18px !important;
-    width: 100% !important;
-    max-width: none !important;
-}
-#training-tab,
-#training-tab > div {
-    min-width: 0 !important;
-    width: 100% !important;
-    max-width: none !important;
-}
-#training-row > div {
-    min-width: 0 !important;
-    width: auto !important;
-    max-width: none !important;
-}
-#training-model-name,
-#training-paths {
-    min-width: 0 !important;
-    max-width: 100% !important;
-    width: 100% !important;
-}
-#training-model-name input,
-#training-model-name textarea {
-    min-width: 0 !important;
-    width: 100% !important;
-}
-#training-paths {
+
+/* ------------------------------------------------------------ file/audio -- */
+
+.gradio-container .block:has(.audio-container):not(:has(> button.label-wrap)) {
     overflow: hidden !important;
+    border: 1px solid var(--rvc-line) !important;
+    border-radius: var(--rvc-radius-md) !important;
+    background:
+        radial-gradient(ellipse at 50% 0%, color-mix(in srgb, var(--primary-500) 10%, transparent), transparent 60%),
+        var(--rvc-surface) !important;
+    box-shadow: var(--rvc-shadow-sm), var(--rvc-hairline) !important;
+    transition: border-color var(--rvc-speed) var(--rvc-ease);
 }
-#training-paths .prose,
-#training-paths p {
-    min-width: 0 !important;
-    max-width: 100% !important;
-    white-space: normal !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
+.gradio-container .block:has(.audio-container):hover:not(:has(> button.label-wrap)) {
+    border-color: var(--rvc-line-hover) !important;
 }
-#training-paths code {
-    white-space: normal !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
+.gradio-container .block:has(.audio-container) label[data-testid="block-label"] {
+    border: 0 !important;
+    border-radius: 8px !important;
+    color: white !important;
+    background: linear-gradient(135deg, var(--primary-600), var(--secondary-500)) !important;
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--primary-700) 35%, transparent) !important;
 }
+.gradio-container .audio-container,
+.gradio-container .audio-container > button {
+    color: var(--body-text-color) !important;
+    background: transparent !important;
+}
+.gradio-container .audio-container .source-selection {
+    border-top: 1px solid color-mix(in srgb, var(--primary-500) 18%, var(--border-color-primary)) !important;
+    background: color-mix(in srgb, var(--background-fill-primary) 45%, transparent) !important;
+}
+
+.gradio-container .block:has(input[type="file"]):not(:has(> button.label-wrap)) {
+    border: 1px dashed color-mix(in srgb, var(--primary-400) 50%, var(--border-color-primary)) !important;
+    border-radius: var(--rvc-radius-md) !important;
+    background: var(--rvc-surface) !important;
+    transition: border-color var(--rvc-speed) var(--rvc-ease),
+                background var(--rvc-speed) var(--rvc-ease),
+                box-shadow var(--rvc-speed) var(--rvc-ease);
+}
+.gradio-container .block:has(input[type="file"]):not(:has(> button.label-wrap)):hover,
+.gradio-container .block:has(input[type="file"]):not(:has(> button.label-wrap)):focus-within {
+    border-color: var(--primary-500) !important;
+    background: color-mix(in srgb, var(--primary-500) 10%, var(--rvc-surface)) !important;
+    box-shadow: var(--rvc-focus) !important;
+}
+
+/* ----------------------------------------------------------- misc blocks -- */
+
+.gradio-container .table-wrap,
+.gradio-container .gallery,
+.gradio-container .image-container,
+.gradio-container pre,
+.gradio-container code {
+    border-radius: var(--rvc-radius-sm) !important;
+}
+.gradio-container progress {
+    accent-color: var(--primary-500) !important;
+}
+
+/* Scrollbars, so the chrome matches the rest of the skin. */
+.gradio-container *::-webkit-scrollbar {
+    width: 11px;
+    height: 11px;
+}
+.gradio-container *::-webkit-scrollbar-track {
+    background: transparent;
+}
+.gradio-container *::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--body-text-color) 22%, transparent);
+    background-clip: content-box;
+}
+.gradio-container *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--primary-500) 65%, transparent);
+    background-clip: content-box;
+}
+
+/* ------------------------------------------------------- layout helpers -- */
+
 .rvc-preprocess-options {
     display: grid !important;
     grid-template-columns:
@@ -821,6 +769,7 @@ fieldset.rvc-radio > .wrap,
     min-width: 0 !important;
     max-width: 100% !important;
 }
+
 @media (max-width: 1200px) {
     .rvc-preprocess-options {
         grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
@@ -833,174 +782,36 @@ fieldset.rvc-radio > .wrap,
         padding-top: 10px !important;
     }
     .rvc-header {
-        padding: 24px 22px;
-        border-radius: 20px;
+        padding: 18px 18px;
+        border-radius: var(--rvc-radius-md);
     }
     .rvc-header-grid {
-        display: block;
+        flex-wrap: wrap !important;
+        justify-content: flex-start;
+        gap: 12px;
     }
-    .rvc-profile-grid {
-        flex-direction: column !important;
+    .rvc-chips {
+        justify-content: flex-start;
     }
-    .rvc-profile-section {
-        width: 100% !important;
+    .rvc-card {
+        padding: 14px;
     }
-    .rvc-workflow-row {
-        grid-template-columns: minmax(0, 1fr) !important;
-    }
-    .rvc-workflow-row > .gradio-column,
-    .rvc-workflow-row > .rvc-card {
-        width: 100% !important;
-    }
-    #training-row {
-        grid-template-columns: minmax(0, 1fr) !important;
+    #rvc-main-tabs button[role="tab"] {
+        padding: 8px 12px !important;
     }
     .rvc-preprocess-options {
         grid-template-columns: minmax(0, 1fr) !important;
     }
 }
 @media (prefers-reduced-motion: reduce) {
-    #rvc-main-tabs button[role="tab"],
-    #rvc-data-tabs button[role="tab"] {
-        transition: none;
+    .gradio-container *,
+    .gradio-container *::before,
+    .gradio-container *::after {
+        transition: none !important;
+        animation: none !important;
     }
-}
-
-/* Automatic coverage for the Gradio components used across the application. */
-.gradio-container .block:has(input[type="checkbox"]) {
-    overflow: visible !important;
-}
-.gradio-container .block:has(input[type="checkbox"]) .wrap {
-    gap: 7px !important;
-}
-.gradio-container .block:has(input[type="checkbox"]) .wrap label {
-    min-height: 38px !important;
-    padding: 8px 11px !important;
-    border: 1px solid var(--border-color-primary) !important;
-    border-radius: 10px !important;
-    color: var(--body-text-color-subdued) !important;
-    background: var(--background-fill-secondary) !important;
-    transition: border-color .16s ease, background .16s ease, color .16s ease;
-}
-.gradio-container .block:has(input[type="checkbox"]) .wrap label:hover {
-    border-color: color-mix(in srgb, var(--primary-500) 55%, var(--border-color-primary)) !important;
-    color: var(--body-text-color) !important;
-}
-.gradio-container .block:has(input[type="checkbox"]) .wrap label:has(input:checked) {
-    border-color: var(--primary-500) !important;
-    color: var(--body-text-color) !important;
-    background: color-mix(in srgb, var(--primary-500) 16%, var(--background-fill-primary)) !important;
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary-500) 30%, transparent) !important;
-}
-.gradio-container input[type="checkbox"] {
-    width: 18px !important;
-    height: 18px !important;
-    accent-color: var(--primary-500) !important;
-}
-
-.gradio-container .block:has(input[type="range"]) {
-    border: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-}
-.gradio-container input[type="range"] {
-    min-width: 80px !important;
-    accent-color: var(--primary-500) !important;
-}
-.gradio-container input[type="range"]::-webkit-slider-runnable-track {
-    height: 6px !important;
-    border-radius: 999px !important;
-    background: linear-gradient(
-        to right,
-        var(--primary-500) var(--range_progress),
-        color-mix(in srgb, var(--neutral-300) 75%, transparent) var(--range_progress)
-    ) !important;
-}
-.gradio-container input[type="range"]::-webkit-slider-thumb {
-    width: 18px !important;
-    height: 18px !important;
-    margin-top: -6px !important;
-    border: 3px solid var(--primary-500) !important;
-    background: white !important;
-    box-shadow: 0 3px 10px color-mix(in srgb, var(--primary-700) 30%, transparent) !important;
-}
-.gradio-container input[type="range"]::-moz-range-track {
-    height: 6px !important;
-    border-radius: 999px !important;
-    background: color-mix(in srgb, var(--neutral-300) 75%, transparent) !important;
-}
-.gradio-container input[type="range"]::-moz-range-progress {
-    height: 6px !important;
-    border-radius: 999px !important;
-    background: var(--primary-500) !important;
-}
-.gradio-container input[type="range"]::-moz-range-thumb {
-    width: 12px !important;
-    height: 12px !important;
-    border: 3px solid var(--primary-500) !important;
-    background: white !important;
-}
-
-.gradio-container .block:has(.audio-container) {
-    overflow: hidden !important;
-    border: 1px solid color-mix(in srgb, var(--primary-400) 35%, var(--border-color-primary)) !important;
-    border-radius: 16px !important;
-    background:
-        radial-gradient(circle at 50% 36%, color-mix(in srgb, var(--primary-400) 9%, transparent), transparent 48%),
-        color-mix(in srgb, var(--background-fill-secondary) 94%, var(--primary-100)) !important;
-    box-shadow: inset 0 1px 0 color-mix(in srgb, white 5%, transparent), 0 8px 22px rgba(15, 23, 42, .08) !important;
-}
-.gradio-container .block:has(.audio-container):hover {
-    border-color: color-mix(in srgb, var(--primary-500) 58%, var(--border-color-primary)) !important;
-}
-.gradio-container .block:has(.audio-container) label[data-testid="block-label"] {
-    border: 1px solid color-mix(in srgb, var(--primary-300) 42%, transparent) !important;
-    border-radius: 8px !important;
-    color: white !important;
-    background: linear-gradient(135deg, var(--primary-600), var(--secondary-600)) !important;
-}
-.gradio-container .audio-container,
-.gradio-container .audio-container > button {
-    color: var(--body-text-color) !important;
-    background: transparent !important;
-}
-.gradio-container .audio-container .source-selection {
-    border-top: 1px solid color-mix(in srgb, var(--primary-400) 20%, var(--border-color-primary)) !important;
-    background: color-mix(in srgb, var(--background-fill-primary) 42%, transparent) !important;
-}
-
-.gradio-container .block:has(input[type="file"]) {
-    border: 1px dashed color-mix(in srgb, var(--primary-400) 55%, var(--border-color-primary)) !important;
-    border-radius: 14px !important;
-    background: color-mix(in srgb, var(--background-fill-secondary) 88%, var(--primary-100)) !important;
-    transition: border-color .16s ease, background .16s ease, box-shadow .16s ease;
-}
-.gradio-container .block:has(input[type="file"]):hover,
-.gradio-container .block:has(input[type="file"]):focus-within {
-    border-color: var(--primary-500) !important;
-    background: color-mix(in srgb, var(--primary-500) 10%, var(--background-fill-secondary)) !important;
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-400) 16%, transparent) !important;
-}
-
-.gradio-container .accordion {
-    overflow: hidden !important;
-    border: 1px solid color-mix(in srgb, var(--border-color-primary) 78%, var(--primary-300)) !important;
-    border-radius: 14px !important;
-    background: color-mix(in srgb, var(--background-fill-secondary) 72%, transparent) !important;
-}
-.gradio-container .accordion > button {
-    min-height: 42px !important;
-    color: var(--body-text-color) !important;
-    background: transparent !important;
-}
-
-.gradio-container .table-wrap,
-.gradio-container .gallery,
-.gradio-container .image-container,
-.gradio-container pre,
-.gradio-container code {
-    border-radius: 12px !important;
-}
-.gradio-container progress {
-    accent-color: var(--primary-500) !important;
+    .gradio-container button:active,
+    .gradio-container input[type="range"]:hover::-webkit-slider-thumb {
+        transform: none !important;
+    }
 }

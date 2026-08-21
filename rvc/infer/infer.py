@@ -15,17 +15,36 @@ import faiss
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.lib.terminal import get_console, install_rich_print
+from rvc.lib.terminal import (
+    error as print_error,
+    info,
+    install_rich_print,
+    print_error_panel,
+    progress_task,
+    success,
+    warning,
+)
 
 install_rich_print()
 
 from rvc.infer.pipeline import Pipeline as VC
+from rvc.infer.retrieval import RetrievalConfig
 from rvc.lib.utils import load_audio_infer, load_embedder_model
 from rvc.lib.tools.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
+from rvc.lib.algorithm.commons import strip_parametrizations
 from rvc.lib.model_bundle import get_bundle_models, is_model_bundle, load_model_bundle
 from rvc.configs.config import Config
 from rvc.configs.vocoders import normalize_vocoder
+from rvc.lib.algorithm.chouwagan_svae import (
+    ARCHITECTURE_ID as CHOUWAGAN_ARCHITECTURE_ID,
+)
+from rvc.infer.messages import (
+    INFER_MODE_DETERMINISTIC,
+    INFER_MODE_STOCHASTIC,
+    INFER_RANDOM_SEED_EXPOSED,
+    INFER_SEED_SPECIFIED,
+)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -56,6 +75,14 @@ class VoiceConverter:
         self.use_f0 = None  # Whether the model uses F0
         self.loaded_model = None
         self.loaded_index = None # Holds the deserialized Faiss index
+        self.loaded_index_meta = None # Serialised sidecar for the bundle index
+        # Whether the embedder wants its input layer-normalised.  Extraction has
+        # always honoured this; inference used to drop it on the floor, so a
+        # custom embedder whose config asked for normalisation produced training
+        # features and query features from two different distributions -- an
+        # index that silently retrieved the wrong neighbours, with nothing
+        # anywhere reporting a problem.
+        self.hubert_do_normalize = False
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
         """
@@ -65,7 +92,9 @@ class VoiceConverter:
             embedder_model (str): Path to the pre-trained HuBERT model.
             embedder_model_custom (str): Path to the custom HuBERT model.
         """
-        self.hubert_model, _ = load_embedder_model(embedder_model, embedder_model_custom)
+        self.hubert_model, self.hubert_do_normalize = load_embedder_model(
+            embedder_model, embedder_model_custom
+        )
         self.hubert_model = self.hubert_model.to(self.config.device).float()
         self.hubert_model.eval()
 
@@ -85,7 +114,7 @@ class VoiceConverter:
             )
             return reduced_noise
         except Exception as error:
-            get_console().print(f"An error occurred removing audio noise: {error}")
+            warning(f"Noise reduction failed, keeping the raw audio: {error}", tag="[INFER]")
             return None
 
     @staticmethod
@@ -100,7 +129,6 @@ class VoiceConverter:
         """
         try:
             if output_format != "WAV":
-                get_console().print(f"Saving audio as {output_format}...")
                 audio, sample_rate = librosa.load(input_path, sr=None)
                 common_sample_rates = [
                     8000,
@@ -120,7 +148,7 @@ class VoiceConverter:
                 sf.write(output_path, audio, target_sr, format=output_format.lower())
             return output_path
         except Exception as error:
-            get_console().print(f"An error occurred converting the audio format: {error}")
+            print_error(f"Could not write the audio as {output_format}: {error}", tag="[INFER]")
 
     def convert_audio(
         self,
@@ -147,6 +175,11 @@ class VoiceConverter:
         sid: int = 0,
         seed: int = 0,
         bundle_submodel: str = None,
+        deterministic: bool = True,
+        latent_temperature: float = 1.0,
+        index_k: int = 8,
+        index_power: float = 2.0,
+        index_continuity: float = 0.5,
         **kwargs,
     ):
         """
@@ -156,6 +189,9 @@ class VoiceConverter:
             pitch (int): Key for F0 up-sampling.
             filter_radius (float): Radius for filtering.
             index_rate (float): Rate for index matching.
+            index_k (int): Neighbours averaged per frame by the retrieval.
+            index_power (float): Exponent of the inverse-distance weighting.
+            index_continuity (float): Weight of the temporal continuity bonus.
             volume_envelope (int): RMS mix rate.
             protect (float): Protection rate for certain audio segments.
             f0_method (str): Method for F0 extraction.
@@ -177,18 +213,22 @@ class VoiceConverter:
             **kwargs: Additional keyword arguments.
         """
         if not model_path:
-            get_console().print("No model provided. Aborting conversion.")
+            print_error("No model provided. Aborting conversion.", tag="[INFER]")
             return
 
         self.get_vc(model_path, sid, bundle_submodel)
-        
+
         if not self.vc:
-            get_console().print("Voice conversion pipeline not initialized. Check for model loading errors in the logs. Aborting conversion.")
+            print_error(
+                "The conversion pipeline did not initialise; see the model "
+                "loading errors above. Aborting conversion.",
+                tag="[INFER]",
+            )
             return
 
         try:
             start_time = time.time()
-            get_console().print(f"Converting audio '{audio_input_path}'...")
+            info(f"Converting '{audio_input_path}'", tag="[INFER]")
 
             # Loading the input audio and downsample to 16khz
             audio = load_audio_infer(audio_input_path, 16000, **kwargs)
@@ -215,7 +255,7 @@ class VoiceConverter:
 
             if split_audio:
                 chunks, intervals = process_audio(audio, 16000)
-                get_console().print(f"Audio split into {len(chunks)} chunks for processing.")
+                info(f"Audio split into {len(chunks)} chunks.", tag="[INFER]")
             else:
                 chunks = [audio]
 
@@ -223,43 +263,59 @@ class VoiceConverter:
             if seed != 0:
                 torch.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
-                get_console().print(f"[INFER] Seed specified: Inference is performed in deterministic mode using seed: {seed}")
+                mode = (
+                    INFER_MODE_DETERMINISTIC
+                    if deterministic
+                    else INFER_MODE_STOCHASTIC
+                )
+                info(INFER_SEED_SPECIFIED.format(mode=mode, seed=seed), tag="[INFER]")
             else:
-                get_console().print(f"[INFER] Seed unspecified: Inference is performed in randomized mode.")
-                seed = random.randint(0, 2**32 - 1) 
+                seed = random.randint(0, 2**32 - 1)
                 random.seed(seed)
                 torch.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
-                get_console().print(f"[INFER] Randomized seed exposed for reproduction: {seed}")
-
+                info(INFER_RANDOM_SEED_EXPOSED.format(seed=seed), tag="[INFER]")
 
             # Collect chunked inference outputs ( if chunking's used )
             converted_chunks = []
-            # Inference
-            for c in chunks:
-                audio_opt = self.vc.pipeline(
-                    model=self.hubert_model,
-                    net_g=self.net_g,
-                    sid=sid,
-                    audio=c,
-                    pitch=pitch,
-                    f0_method=f0_method,
-                    file_index=file_index,
-                    index_rate=index_rate,
-                    pitch_guidance=self.use_f0,
-                    filter_radius=filter_radius,
-                    volume_envelope=volume_envelope,
-                    version=self.version,
-                    protect=protect,
-                    f0_autotune=f0_autotune,
-                    f0_autotune_strength=f0_autotune_strength,
-                    f0_file=f0_file,
-                    seed=seed,
-                    loaded_index=self.loaded_index,
-                )
-                converted_chunks.append(audio_opt)
-                if split_audio:
-                    get_console().print(f"Converted audio chunk {len(converted_chunks)}")
+            retrieval_config = RetrievalConfig.build(
+                k=index_k, power=index_power, continuity=index_continuity
+            )
+            # Inference.  A single chunk finishes in one step, so the bar only
+            # earns its place when the audio was split.
+            with progress_task(
+                len(chunks),
+                "Converting",
+                disable=len(chunks) < 2,
+            ) as (chunk_progress, chunk_task):
+                for c in chunks:
+                    audio_opt = self.vc.pipeline(
+                        model=self.hubert_model,
+                        net_g=self.net_g,
+                        sid=sid,
+                        audio=c,
+                        pitch=pitch,
+                        f0_method=f0_method,
+                        file_index=file_index,
+                        index_rate=index_rate,
+                        pitch_guidance=self.use_f0,
+                        filter_radius=filter_radius,
+                        volume_envelope=volume_envelope,
+                        version=self.version,
+                        protect=protect,
+                        f0_autotune=f0_autotune,
+                        f0_autotune_strength=f0_autotune_strength,
+                        f0_file=f0_file,
+                        seed=seed,
+                        deterministic=deterministic,
+                        latent_temperature=latent_temperature,
+                        loaded_index=self.loaded_index,
+                        index_meta_payload=self.loaded_index_meta,
+                        retrieval_config=retrieval_config,
+                        do_normalize=self.hubert_do_normalize,
+                    )
+                    converted_chunks.append(audio_opt)
+                    chunk_progress.advance(chunk_task)
 
             if split_audio:
                 audio_opt = merge_audio(chunks, converted_chunks, intervals, 16000, self.tgt_sr)
@@ -288,12 +344,16 @@ class VoiceConverter:
                     pass
 
             elapsed_time = time.time() - start_time
-            get_console().print(
-                f"Conversion completed! Result available in: '{audio_output_path}'. Time taken: {elapsed_time:.2f} seconds."
+            success(
+                f"Converted in {elapsed_time:.2f}s -> '{audio_output_path}'",
+                tag="[INFER]",
             )
         except Exception as error:
-            get_console().print(f"An error occurred during audio conversion: {error}")
-            get_console().print(traceback.format_exc())
+            print_error_panel(
+                error,
+                title="Conversion failed",
+                details=traceback.format_exc(),
+            )
 
     def convert_audio_batch(
         self,
@@ -318,7 +378,7 @@ class VoiceConverter:
             ) as pid_file:
                 pid_file.write(str(pid))
             start_time = time.time()
-            get_console().print(f"Converting audio batch '{audio_input_paths}'...")
+            info(f"Converting batch '{audio_input_paths}'", tag="[INFER]")
             audio_files = [
                 f
                 for f in os.listdir(audio_input_paths)
@@ -340,7 +400,7 @@ class VoiceConverter:
                     )
                 )
             ]
-            get_console().print(f"Detected {len(audio_files)} audio files for inference.")
+            info(f"{len(audio_files)} audio files queued.", tag="[INFER]")
             for a in audio_files:
                 new_input = os.path.join(audio_input_paths, a)
                 new_output = os.path.splitext(a)[0] + "_output.wav"
@@ -352,12 +412,18 @@ class VoiceConverter:
                     audio_output_path=new_output,
                     **kwargs,
                 )
-            get_console().print(f"Conversion completed at '{audio_input_paths}'.")
             elapsed_time = time.time() - start_time
-            get_console().print(f"Batch conversion completed in {elapsed_time:.2f} seconds.")
+            success(
+                f"Batch of {len(audio_files)} files converted in {elapsed_time:.2f}s "
+                f"-> '{audio_output_path}'",
+                tag="[INFER]",
+            )
         except Exception as error:
-            get_console().print(f"An error occurred during audio batch conversion: {error}")
-            get_console().print(traceback.format_exc())
+            print_error_panel(
+                error,
+                title="Batch conversion failed",
+                details=traceback.format_exc(),
+            )
         finally:
             if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
                 os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
@@ -388,13 +454,14 @@ class VoiceConverter:
                 self.active_cpt = model_data["model_state"]
 
                 self.loaded_index = None
+                self.loaded_index_meta = model_data.get("index_meta")
                 if "index_data" in model_data:
                     try:
                         self.loaded_index = faiss.deserialize_index(model_data["index_data"])
                     except Exception as e:
-                        get_console().print(f"Failed to deserialize index: {e}")
+                        warning(f"Bundled index could not be read, retrieval is off: {e}", tag="[INFER]")
             else:
-                get_console().print(f"Sub-model '{bundle_submodel}' not found in the model bundle.")
+                print_error(f"Sub-model '{bundle_submodel}' is not in the bundle.", tag="[INFER]")
                 self.cleanup_model()
                 return
         else:
@@ -413,7 +480,7 @@ class VoiceConverter:
         Cleans up the model and releases resources.
         """
         import gc
-        for attr in ("net_g", "n_spk", "vc", "hubert_model", "tgt_sr", "cpt", "active_cpt", "loaded_model", "loaded_index"):
+        for attr in ("net_g", "n_spk", "vc", "hubert_model", "tgt_sr", "cpt", "active_cpt", "loaded_model", "loaded_index", "loaded_index_meta"):
             setattr(self, attr, None)
         gc.collect()
         if torch.cuda.is_available():
@@ -428,36 +495,36 @@ class VoiceConverter:
         """
         self.cpt = None
         self.loaded_index = None
+        self.loaded_index_meta = None
 
         if not os.path.isfile(weight_root):
-            get_console().print(f"Model file not found: {weight_root}")
+            print_error(f"Model file not found: {weight_root}", tag="[INFER]")
             return
-        
+
+        info(f"Loading model '{os.path.basename(weight_root)}'", tag="[INFER]")
         if is_model_bundle(weight_root):
-            get_console().print(f"[Infer] Loading compressed model bundle: {weight_root}")
             try:
                 bundle_data = load_model_bundle(weight_root)
 
                 # Check for new multi-model format
                 if "models" in bundle_data:
                     self.cpt = bundle_data
-                    get_console().print(f"[Infer] Loaded model bundle with {len(bundle_data['models'])} models.")
+                    info(f"Bundle holds {len(bundle_data['models'])} models.", tag="[INFER]")
                 # Backward compatibility for old single-model bundles
                 else:
                     self.cpt = bundle_data.get("model_state")
                     serialized_index = bundle_data.get("index_data")
+                    self.loaded_index_meta = bundle_data.get("index_meta")
                     if serialized_index is not None:
                         try:
                             self.loaded_index = faiss.deserialize_index(serialized_index)
-                            get_console().print("[Infer] Loaded and deserialized the bundle index.")
                         except Exception as e:
-                            get_console().print(f"Failed to deserialize bundle index: {e}")
+                            warning(f"Bundled index could not be read, retrieval is off: {e}", tag="[INFER]")
             except Exception as e:
-                get_console().print(f"An error occurred loading the model bundle: {e}")
+                print_error(f"Could not load the model bundle: {e}", tag="[INFER]")
                 self.cpt = None
 
         else:
-            get_console().print(f"Loading .pth file: {weight_root}")
             self.cpt = torch.load(weight_root, map_location="cpu", weights_only=True)
 
 
@@ -478,6 +545,12 @@ class VoiceConverter:
                     self.active_cpt.get("vocoder_architecture", self.active_cpt.get("vocoder", "hifi")),
                 )
             )
+            if self.vocoder == "chouwagan":
+                architecture_id = self.active_cpt.get("architecture_id")
+                if architecture_id != CHOUWAGAN_ARCHITECTURE_ID:
+                    raise ValueError(
+                        f"Unsupported ChouwaGAN architecture: {architecture_id or 'unknown'}."
+                    )
 
             synth_kwargs = {
                 "use_f0": self.use_f0,
@@ -489,11 +562,16 @@ class VoiceConverter:
             # Model init
             self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
 
-            del self.net_g.enc_q # Posterior encoder is training-only
-
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
+            if self.vocoder == "chouwagan":
+                self.net_g.remove_training_modules()
+            else:
+                del self.net_g.enc_q # Posterior encoder is training-only
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
+            # Fold weight norm into the weights: the generator is frozen from
+            # here on, so recomputing g * v/||v|| on every forward is wasted work.
+            strip_parametrizations(self.net_g)
 
     def setup_vc_instance(self):
         """

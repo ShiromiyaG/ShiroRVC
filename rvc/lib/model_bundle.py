@@ -30,6 +30,41 @@ def is_model_file(path: str | PathLike[str] | None) -> bool:
     return Path(path).suffix.lower() in MODEL_FILE_EXTENSIONS
 
 
+# Directories that live inside ``logs/<model>/`` but never contain a model:
+# preprocessing output, extracted features and TensorBoard runs.  A single
+# trained model can leave hundreds of thousands of files in these, which is
+# enough to make a naive recursive scan of ``logs/`` take seconds.
+TRAINING_ARTIFACT_DIRS = frozenset(
+    {
+        "sliced_audios",
+        "sliced_audios_16k",
+        "extracted",
+        "f0",
+        "f0_voiced",
+        "eval",
+        "validation_samples",
+        "zips",
+        "__pycache__",
+        ".torchinductor",
+    }
+)
+
+
+def walk_models(root: str | PathLike[str], skip=TRAINING_ARTIFACT_DIRS):
+    """``os.walk`` over a model tree with training-artifact directories pruned.
+
+    Yields the same ``(dirpath, dirnames, filenames)`` triples as ``os.walk``,
+    so callers only have to swap the call.  Arbitrary nesting of real model
+    folders still works; only the known artifact directories are skipped.
+
+    Note this walks top-down (pruning is impossible bottom-up), so the yield
+    order is shallowest-first rather than deepest-first.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [name for name in dirnames if name not in skip]
+        yield dirpath, dirnames, filenames
+
+
 def load_model_bundle(path: str | PathLike[str]) -> dict[str, Any]:
     """Load and validate a Zstandard-compressed model bundle."""
     import torch

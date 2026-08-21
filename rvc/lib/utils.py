@@ -16,7 +16,7 @@ import logging
 import warnings
 
 from rvc.lib.text import format_title
-from rvc.lib.terminal import get_console
+from rvc.lib.terminal import info, warning
 
 # Remove this to see warnings about transformers models
 warnings.filterwarnings("ignore")
@@ -84,7 +84,6 @@ def load_audio_ffmpeg(
                 .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
             )
         except ffmpeg.Error as e:
-            get_console().print(e.stderr.decode())
             raise RuntimeError(f"Failed to load audio file '{source}':\n{e.stderr.decode()}") from e
         except Exception as e:
             raise RuntimeError(f"An unexpected error occurred while loading audio: {e}") from e
@@ -110,7 +109,6 @@ def load_audio_ffmpeg(
             )
             out, err = process.communicate(input=source.tobytes())
         except ffmpeg.Error as e:
-            get_console().print(e.stderr.decode())
             raise RuntimeError(f"Failed to resample audio chunk:\n{e.stderr.decode()}") from e
         except Exception as e:
             raise RuntimeError(f"An unexpected error occurred while processing audio chunk: {e}") from e
@@ -132,11 +130,12 @@ def load_audio_infer(
             raise FileNotFoundError(f"File not found: {file}")
         audio, sr = sf.read(file)
 
-        get_console().print(f"[INFER] loaded audio: {file}")
-
         if len(audio.shape) > 1:
             audio = librosa.to_mono(audio.T)
-            get_console().print("[WARNING] Provided input audio is in stereo. Converting to mono. - For future, please use mono only.")
+            warning(
+                "Input audio is stereo; converting to mono. Prefer mono input.",
+                tag="[INFER]",
+            )
         if sr != sample_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate, res_type="soxr_vhq")
 
@@ -191,7 +190,10 @@ def load_embedder_model(embedder_model, custom_embedder=None):
         if os.path.exists(custom_embedder):
             model_path = custom_embedder
         else:
-            get_console().print(f"Custom embedder not found: {custom_embedder}, using contentvec")
+            warning(
+                f"Custom embedder not found at {custom_embedder}; using contentvec.",
+                tag="[INFER]",
+            )
             model_path = embedding_list["contentvec"]
     elif embedder_model == "spin_v1":
         model_path = embedding_list[embedder_model]
@@ -203,7 +205,10 @@ def load_embedder_model(embedder_model, custom_embedder=None):
         json_file = os.path.join(model_path, "config.json")
     else:
         if embedder_model not in embedding_list:
-            get_console().print(f"Embedder not found: {embedder_model}, using contentvec")
+            warning(
+                f"Unknown embedder {embedder_model!r}; using contentvec.",
+                tag="[INFER]",
+            )
             embedder_model = "contentvec"
         model_path = embedding_list[embedder_model]
         bin_file = os.path.join(model_path, "pytorch_model.bin")
@@ -212,12 +217,12 @@ def load_embedder_model(embedder_model, custom_embedder=None):
         if not os.path.exists(bin_file):
             url = online_embedders.get(embedder_model)
             if url is not None:
-                get_console().print(f"Downloading {url} to {model_path}...")
+                info(f"Downloading the {embedder_model} weights.", tag="[INFER]")
                 wget.download(url, out=bin_file)
         if not os.path.exists(json_file):
             url = config_files.get(embedder_model)
             if url is not None:
-                get_console().print(f"Downloading {url} to {model_path}...")
+                info(f"Downloading the {embedder_model} config.", tag="[INFER]")
                 wget.download(url, out=json_file)
 
     model = HubertModelWithFinalProj.from_pretrained(model_path)

@@ -1,12 +1,124 @@
 import os
+import random
 import numpy as np
 import torch
 import torch.utils.data
 
-from mel_processing import mel_spectrogram_torch, spectrogram_torch
+from mel_processing import spectrogram_torch
 from utils import load_filepaths_and_text, load_wav_to_torch
 
+from rvc.lib.terminal import warning
+
 debug_shapes = False
+
+
+def source_group_key(audiopath):
+    """Group slices back into the recording they were cut from.
+
+    Preprocessing names every slice ``{speaker}_{source}_{slice}``
+    (``rvc/train/preprocess/preprocess.py``), so dropping the last field
+    recovers the source.  Falls back to the whole stem for filelists that do
+    not follow the convention, which makes every slice its own group -- a
+    weaker split, but never a wrong one.
+    """
+    stem = os.path.splitext(os.path.basename(audiopath))[0]
+    head, separator, _tail = stem.rpartition("_")
+    return head if separator else stem
+
+
+def holdout_split_indices(
+    audiopaths_and_text,
+    fraction=0.02,
+    minimum=16,
+    maximum=96,
+    seed=1234,
+    lengths=None,
+    max_frames=None,
+):
+    """Partition filelist rows into ``(train_indices, holdout_indices)``.
+
+    The split is by *source recording*, not by slice.  Slices cut from one
+    recording share room tone, mic placement, level and usually phonetic
+    context, so a slice-wise holdout is most of the way to being training data:
+    a model can memorise its way to a good score on it and the curve never
+    turns over.  Whole sources held out is the only version that measures
+    generalisation, which is the entire point of having a holdout.
+
+    Deterministic in ``seed``, because a split that moved between runs would
+    leak the holdout into training one resume at a time.
+
+    Returns an empty holdout when the dataset cannot afford one, so the caller
+    can fall back rather than train on almost nothing.
+    """
+    total = len(audiopaths_and_text)
+    groups = {}
+    for index, row in enumerate(audiopaths_and_text):
+        groups.setdefault(source_group_key(row[0]), []).append(index)
+
+    target = min(int(maximum), max(int(minimum), int(total * float(fraction))))
+    # Four groups so at least two survive in training, and a 4x margin so the
+    # holdout never eats a meaningful share of a small dataset.
+    if len(groups) < 4 or target * 4 > total:
+        return list(range(total)), []
+
+    keys = sorted(groups)
+    random.Random(seed).shuffle(keys)
+
+    held_keys = set()
+    held_count = 0
+    for key in keys:
+        if held_count >= target:
+            break
+        group = groups[key]
+        # One long recording can hold more slices than the whole budget.
+        # Skipping it keeps the holdout from collapsing to a single source.
+        if len(group) > target and held_keys:
+            continue
+        held_keys.add(key)
+        held_count += len(group)
+
+    if not held_keys or len(groups) - len(held_keys) < 2:
+        return list(range(total)), []
+
+    train_indices, holdout_indices = [], []
+    for index, row in enumerate(audiopaths_and_text):
+        if source_group_key(row[0]) in held_keys:
+            holdout_indices.append(index)
+        else:
+            train_indices.append(index)
+
+    # The whole source stays out of training; only the *evaluation* list is
+    # trimmed, so trimming can never leak training data back in.
+    #
+    # Trimmed by duration and not only by count, because the evaluation cost is
+    # seconds of audio to synthesise, not slices.  On a 47 h dataset the slices
+    # average six seconds, so a 96-slice cap is ten minutes of audio per
+    # evaluation -- enough to cost several percent of training throughput for a
+    # metric that is already stable on a fraction of it.  The set is fixed, so
+    # its noise comes from the model rather than from sampling, and a couple of
+    # minutes spread over every held-out recording measures the same thing.
+    # Round-robin across the held recordings rather than straight down the
+    # list, so a budget that runs out part way still covers every recording
+    # instead of spending itself on whichever one sorts first.
+    by_source = {}
+    for index in holdout_indices:
+        by_source.setdefault(source_group_key(audiopaths_and_text[index][0]), []).append(index)
+    interleaved = []
+    for position in range(max(len(group) for group in by_source.values())):
+        for key in sorted(by_source):
+            if position < len(by_source[key]):
+                interleaved.append(by_source[key][position])
+
+    interleaved = interleaved[: int(maximum)]
+    if max_frames and lengths:
+        budgeted, used = [], 0
+        for index in interleaved:
+            if used >= max_frames and budgeted:
+                break
+            budgeted.append(index)
+            used += lengths[index]
+        interleaved = budgeted
+    return train_indices, sorted(interleaved)
 
 
 class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
@@ -17,7 +129,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         hparams: Hyperparameters.
     """
 
-    def __init__(self, hparams, voc_only=False, n_mel_bins=192):
+    def __init__(self, hparams, n_mel_bins=192):
         self.audiopaths_and_text = load_filepaths_and_text(hparams.training_files)
         self.max_wav_value = hparams.max_wav_value
         self.sample_rate = hparams.sample_rate
@@ -27,7 +139,6 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         self.sample_rate = hparams.sample_rate
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 5000)
-        self.voc_only = voc_only
         self.n_mel_bins = n_mel_bins
         self.mel_fmin = hparams.mel_fmin
         self.mel_fmax = hparams.mel_fmax
@@ -56,7 +167,10 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         try:
             sid = torch.LongTensor([int(sid)])
         except ValueError as error:
-            print(f"Error converting speaker ID '{sid}' to integer. Exception: {error}")
+            warning(
+                f"Speaker ID {sid!r} is not an integer ({error}); using 0.",
+                tag="[DATA]",
+            )
             sid = torch.LongTensor([0])
         return sid
 
@@ -81,15 +195,12 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             # After getting spec, wav, phone, pitch, pitchf
             print(f" Data_Utils [DEBUG] file: {file}")
             print(f"        spec.shape  = {spec.shape}")  # (n_mels, T)
-            if self.voc_only:
-                print(f"        phone.shape = SKIPPED (vocoder-only)")
-            else:
-                print(f"        phone.shape = {phone.shape}") # (T, dim)
+            print(f"        phone.shape = {phone.shape}") # (T, dim)
             print(f"        pitch.shape = {pitch.shape}")
             print(f"        pitchf.shape= {pitchf.shape}")
 
 
-        len_phone = len(pitch) if self.voc_only else phone.size()[0]
+        len_phone = phone.size(0)
         len_spec = spec.size()[-1]
         if len_phone != len_spec:
             if debug_shapes:
@@ -101,8 +212,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             spec = spec[:, :len_min]
             wav = wav[:, :len_wav]
 
-            if not self.voc_only:
-                phone = phone[:len_min, :]
+            phone = phone[:len_min, :]
             pitch = pitch[:len_min]
             pitchf = pitchf[:len_min]
 
@@ -117,16 +227,6 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             pitch (str): Path to pitch label file.
             pitchf (str): Path to pitchf label file.
         """
-        if self.voc_only:
-            pitch = np.load(pitch, allow_pickle=False)
-            pitchf = np.load(pitchf, allow_pickle=False)
-            n_num = min(pitch.shape[0], 900)
-            pitch = pitch[:n_num]
-            pitchf = pitchf[:n_num]
-            pitch = torch.LongTensor(pitch)
-            pitchf = torch.FloatTensor(pitchf)
-            return None, pitch, pitchf
-
         phone = np.load(phone, allow_pickle=False)
         phone = torch.from_numpy(phone).float().repeat_interleave(2, dim=0)
         if debug_shapes:
@@ -156,26 +256,13 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             )
         audio_norm = audio
         audio_norm = audio_norm.unsqueeze(0)
-        if self.voc_only:
-            spec = mel_spectrogram_torch(
-                audio_norm,
-                self.filter_length,
-                self.n_mel_bins,
-                self.sample_rate,
-                self.hop_length,
-                self.win_length,
-                self.mel_fmin,
-                self.mel_fmax,
-                center=False,
-            )
-        else:
-            spec = spectrogram_torch(
-                audio_norm,
-                self.filter_length,
-                self.hop_length,
-                self.win_length,
-                center=False,
-            )
+        spec = spectrogram_torch(
+            audio_norm,
+            self.filter_length,
+            self.hop_length,
+            self.win_length,
+            center=False,
+        )
         return torch.squeeze(spec, 0), audio_norm
 
     def __getitem__(self, index):
@@ -214,9 +301,8 @@ class TextAudioCollateMultiNSFsid:
         return_ids (bool, optional): Whether to return sample IDs. Defaults to False.
     """
 
-    def __init__(self, return_ids=False, voc_only=False):
+    def __init__(self, return_ids=False):
         self.return_ids = return_ids
-        self.voc_only = voc_only
 
     def __call__(self, batch):
         """
@@ -238,17 +324,12 @@ class TextAudioCollateMultiNSFsid:
         spec_padded.zero_()
         wave_padded.zero_()
 
-        if self.voc_only:
-            max_phone_len = max([x[3].size(0) for x in batch])
-            phone_padded = torch.FloatTensor(len(batch), 0, 1)
-            phone_lengths = torch.zeros(len(batch), dtype=torch.long)
-        else:
-            max_phone_len = max([x[2].size(0) for x in batch])
-            phone_lengths = torch.LongTensor(len(batch))
-            phone_padded = torch.FloatTensor(
-                len(batch), max_phone_len, batch[0][2].shape[1]
-            )
-            phone_padded.zero_()
+        max_phone_len = max([x[2].size(0) for x in batch])
+        phone_lengths = torch.LongTensor(len(batch))
+        phone_padded = torch.FloatTensor(
+            len(batch), max_phone_len, batch[0][2].shape[1]
+        )
+        phone_padded.zero_()
         pitch_padded = torch.LongTensor(len(batch), max_phone_len)
         pitchf_padded = torch.FloatTensor(len(batch), max_phone_len)
         pitch_padded.zero_()
@@ -266,10 +347,9 @@ class TextAudioCollateMultiNSFsid:
             wave_padded[i, :, : wave.size(1)] = wave
             wave_lengths[i] = wave.size(1)
 
-            if not self.voc_only:
-                phone = row[2]
-                phone_padded[i, : phone.size(0), :] = phone
-                phone_lengths[i] = phone.size(0)
+            phone = row[2]
+            phone_padded[i, : phone.size(0), :] = phone
+            phone_lengths[i] = phone.size(0)
 
             pitch = row[3]
             pitch_padded[i, : pitch.size(0)] = pitch

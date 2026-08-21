@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import shutil
 import time
 import torch
 from pathlib import Path
@@ -18,7 +19,14 @@ import concurrent.futures
 import multiprocessing as mp
 import json
 
-from rvc.lib.terminal import get_console, install_rich_print, progress_task
+from rvc.lib.terminal import (
+    error as print_error,
+    info,
+    install_rich_print,
+    progress_task,
+    success,
+    warning,
+)
 
 install_rich_print()
 
@@ -92,8 +100,9 @@ class FeatureInput:
             coarse_pit = self.coarse_f0(feature_pit)
             np.save(opt_path_coarse, coarse_pit, allow_pickle=False)
         except Exception as error:
-            print(
-                f"An error occurred extracting file {inp_path} on {self.device}: {error}"
+            print_error(
+                f"Could not extract {inp_path} on {self.device}: {error}",
+                tag="[EXTRACT]",
             )
 
 
@@ -110,8 +119,9 @@ def process_files(files, f0_method, device, threads):
 
 def run_pitch_extraction(files, devices, f0_method, threads):
     devices_str = ", ".join(devices)
-    get_console().print(
-        f"Starting pitch extraction with {num_processes} threads on {devices_str} using {f0_method}..."
+    info(
+        f"Pitch extraction: {f0_method}, {num_processes} threads on {devices_str}.",
+        tag="[EXTRACT]",
     )
     start_time = time.time()
 
@@ -129,14 +139,29 @@ def run_pitch_extraction(files, devices, f0_method, threads):
         for task in concurrent.futures.as_completed(tasks):
             task.result()
 
-    get_console().print(
-        f"Pitch extraction completed in {time.time() - start_time:.2f} seconds."
+    success(
+        f"Pitch extraction finished in {time.time() - start_time:.2f}s.",
+        tag="[EXTRACT]",
     )
 
 
+#: How the extracted embeddings are stored on disk.  Not a free choice between
+#: "smaller" and "bigger": these features are both the training input and the
+#: source the retrieval index is built from, and half precision puts a
+#: quantisation floor under every stored index vector while inference queries
+#: with float32 ones.  float32 doubles the feature cache (a 2 h dataset goes
+#: from ~550 MB to ~1.1 GB) and is the better default; float16 stays available
+#: for anyone short on disk.  Either dtype loads unchanged -- training casts to
+#: float and the index builder upcasts -- so an existing cache never has to be
+#: re-extracted after changing this.
+FEATURE_PRECISIONS = {"fp32": np.float32, "fp16": np.float16}
+
+
 def process_file_embedding(
-    files, embedder_model, embedder_model_custom, device_num, device, n_threads
+    files, embedder_model, embedder_model_custom, device_num, device, n_threads,
+    feature_precision="fp32",
 ):
+    dtype = FEATURE_PRECISIONS.get(feature_precision, np.float32)
     model, do_normalize = load_embedder_model(embedder_model, embedder_model_custom)
     model = model.to(device).float()
     model.eval()
@@ -160,11 +185,11 @@ def process_file_embedding(
         if np.isfinite(feats_out).all():
             np.save(
                 out_file_path,
-                feats_out.astype(np.float16, copy=False),
+                feats_out.astype(dtype, copy=False),
                 allow_pickle=False,
             )
         else:
-            print(f"{wav_file_path} produced NaN values; skipping.")
+            warning(f"{wav_file_path} produced NaN values; skipping.", tag="[EXTRACT]")
 
     with progress_task(
         len(files),
@@ -178,11 +203,13 @@ def process_file_embedding(
 
 
 def run_embedding_extraction(
-    files, devices, embedder_model, embedder_model_custom, threads
+    files, devices, embedder_model, embedder_model_custom, threads,
+    feature_precision="fp32",
 ):
     devices_str = ", ".join(devices)
-    get_console().print(
-        f"Starting embedding extraction with {num_processes} threads on {devices_str}..."
+    info(
+        f"Embedding extraction: {num_processes} threads on {devices_str}.",
+        tag="[EXTRACT]",
     )
     start_time = time.time()
     with concurrent.futures.ProcessPoolExecutor(max_workers=len(devices)) as executor:
@@ -195,14 +222,74 @@ def run_embedding_extraction(
                 i,
                 devices[i],
                 threads // len(devices),
+                feature_precision,
             )
             for i in range(len(devices))
         ]
         for task in concurrent.futures.as_completed(tasks):
             task.result()
 
-    get_console().print(
-        f"Embedding extraction completed in {time.time() - start_time:.2f} seconds."
+    success(
+        f"Embedding extraction finished in {time.time() - start_time:.2f}s.",
+        tag="[EXTRACT]",
+    )
+
+
+def discard_16k_slices(wav_path):
+    """
+    Delete the 16 kHz slices once the features derived from them exist.
+
+    Training reads `sliced_audios` at the target rate plus the `extracted`,
+    `f0` and `f0_voiced` features; the 16 kHz copies feed pitch and embedder
+    extraction only, so after this stage they are dead weight.  Re-extracting
+    with a different f0 method or embedder needs them back, which means running
+    preprocessing again.
+    """
+    if os.path.basename(os.path.normpath(wav_path)) != "sliced_audios_16k":
+        return
+    if not os.path.isdir(wav_path):
+        return
+
+    # The mute folders are a shared asset: `preparing_files` falls back to
+    # `logs/mute/sliced_audios_16k/mute.wav` when building the mute sample for
+    # a new sample rate, so never strip one of those.
+    experiment_name = os.path.basename(os.path.dirname(os.path.normpath(wav_path)))
+    if experiment_name.lower().startswith("mute"):
+        info(
+            f"Keeping 16 kHz slices: '{experiment_name}' is a shared mute asset.",
+            tag="[EXTRACT]",
+        )
+        return
+
+    # Only discard once the artifacts that replace them are actually on disk.
+    exp_dir = os.path.dirname(os.path.normpath(wav_path))
+    if not os.path.isfile(os.path.join(exp_dir, "filelist.txt")):
+        warning(
+            "Keeping 16 kHz slices: filelist.txt is missing, so extraction "
+            "looks incomplete.",
+            tag="[EXTRACT]",
+        )
+        return
+
+    freed = 0
+    count = 0
+    for root, _, names in os.walk(wav_path):
+        for name in names:
+            try:
+                freed += os.path.getsize(os.path.join(root, name))
+                count += 1
+            except OSError:
+                pass
+
+    try:
+        shutil.rmtree(wav_path)
+    except OSError as error:
+        warning(f"Could not remove the 16 kHz slices: {error}", tag="[EXTRACT]")
+        return
+
+    success(
+        f"Removed {count} 16 kHz slices, freeing {freed / (1024 ** 3):.2f} GB.",
+        tag="[EXTRACT]",
     )
 
 
@@ -220,6 +307,14 @@ if __name__ == "__main__":
     embedder_model = sys.argv[7]
     embedder_model_custom = sys.argv[8] if len(sys.argv) > 8 else None
     include_mutes = int(sys.argv[9]) if len(sys.argv) > 9 else 2
+    remove_16k_slices = sys.argv[10].lower() == "true" if len(sys.argv) > 10 else False
+    feature_precision = sys.argv[11] if len(sys.argv) > 11 else "fp32"
+    if feature_precision not in FEATURE_PRECISIONS:
+        warning(
+            f"Unknown feature precision {feature_precision!r}; using fp32.",
+            tag="[EXTRACT]",
+        )
+        feature_precision = "fp32"
 
     wav_path = os.path.join(exp_dir, "sliced_audios_16k")
     os.makedirs(os.path.join(exp_dir, "f0"), exist_ok=True)
@@ -262,8 +357,16 @@ if __name__ == "__main__":
     run_pitch_extraction(files, devices, f0_method, num_processes)
 
     run_embedding_extraction(
-        files, devices, embedder_model, embedder_model_custom, num_processes
+        files,
+        devices,
+        embedder_model,
+        embedder_model_custom,
+        num_processes,
+        feature_precision,
     )
 
     generate_config(sample_rate, exp_dir, vocoder_arch)
     generate_filelist(exp_dir, sample_rate, include_mutes, embedder_model, vocoder_arch)
+
+    if remove_16k_slices:
+        discard_16k_slices(wav_path)

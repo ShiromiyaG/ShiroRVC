@@ -6,7 +6,6 @@ import re
 import torch
 import torch.nn.functional as F
 import torchcrepe
-import faiss
 import librosa
 import numpy as np
 from scipy import signal
@@ -15,12 +14,18 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.lib.terminal import get_console, install_rich_print
+from rvc.lib.terminal import (
+    error as print_error,
+    info,
+    install_rich_print,
+    warning,
+)
 
 install_rich_print()
 
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE
 from rvc.lib.utils import extract_features
+from rvc.infer.retrieval import IndexRetriever, RetrievalConfig
 from rvc.lib.terminal import get_console
 
 import logging
@@ -204,6 +209,52 @@ class Pipeline:
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
         self.device = config.device
         self.autotune = Autotune()
+        # F0 predictors and the retriever are reused across calls; loading them
+        # per file dominates batch inference otherwise.
+        self._f0_models = {}
+        self._retriever_cache = {}
+
+    def _get_f0_model(self, f0_method: str):
+        """
+        Returns the F0 predictor for the given method, loading it on first use.
+
+        The predictors are stateless between calls, so a single instance is kept
+        alive for the lifetime of the pipeline instead of reading the checkpoint
+        from disk and re-uploading it to the GPU for every audio file.
+
+        Args:
+            f0_method (str): One of "crepe", "crepe-tiny", "rmvpe", "fcpe".
+        """
+        model = self._f0_models.get(f0_method)
+        if model is not None:
+            return model
+
+        if f0_method in ("crepe", "crepe-tiny"):
+            model = CREPE(
+                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
+            )
+        elif f0_method == "rmvpe":
+            model = RMVPE(
+                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
+            )
+        elif f0_method == "fcpe":
+            model = FCPE(
+                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
+            )
+        else:
+            raise ValueError(f"Unknown f0 method: {f0_method}")
+
+        self._f0_models[f0_method] = model
+        return model
+
+    def unload_f0_models(self):
+        """
+        Drops the cached F0 predictors and frees their GPU memory.
+        """
+        self._f0_models.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def get_f0(
         self,
@@ -229,30 +280,15 @@ class Pipeline:
             f0_autotune: Whether to apply autotune to the F0 contour.
             inp_f0: Optional input F0 contour to use instead of estimating.
         """
+        model = self._get_f0_model(f0_method)
         if f0_method == "crepe":
-            model = CREPE(
-                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
-            )
             f0 = model.get_f0(x, self.f0_min, self.f0_max, p_len, "full")
-            del model
         elif f0_method == "crepe-tiny":
-            model = CREPE(
-                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
-            )
             f0 = model.get_f0(x, self.f0_min, self.f0_max, p_len, "tiny")
-            del model
         elif f0_method == "rmvpe":
-            model = RMVPE(
-                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
-            )
             f0 = model.get_f0(x, filter_radius=0.03)
-            del model
         elif f0_method == "fcpe":
-            model = FCPE(
-                device=self.device, sample_rate=self.sample_rate, hop_size=self.window
-            )
             f0 = model.get_f0(x, p_len, filter_radius=0.006, test_time_augmentation=True)
-            del model
         # f0 adjustments
         if f0_autotune is True:
             f0 = self.autotune.autotune_f0(f0, f0_autotune_strength)
@@ -288,12 +324,15 @@ class Pipeline:
         audio0,
         pitch,
         pitchf,
-        index,
-        big_npy,
+        retriever,
         index_rate,
         version,
         protect,
         seed,
+        deterministic=True,
+        latent_temperature=1.0,
+        retrieval_config=None,
+        do_normalize=False,
     ):
         """
         Performs voice conversion on a given audio segment.
@@ -305,12 +344,15 @@ class Pipeline:
             audio0: The input audio segment.
             pitch: Quantized F0 contour for pitch guidance.
             pitchf: Original F0 contour for pitch guidance.
-            index: FAISS index for speaker embedding retrieval.
-            big_npy: Speaker embeddings stored in a NumPy array.
+            retriever: IndexRetriever for speaker embedding retrieval, or None.
             index_rate: Blending rate for speaker embedding retrieval.
             version: Model version (Keep to support old models).
             protect: Protection level for preserving the original pitch.
             seed: Seed for randomization of noise.
+            deterministic: Whether to use argmax discrete codes and deterministic NSF excitation.
+            latent_temperature: Sampling temperature for non-deterministic discrete codes.
+            retrieval_config: Neighbour count, weighting and continuity for the retrieval.
+            do_normalize: Whether the embedder wants its input layer-normalised.
         """
 
         with torch.no_grad():
@@ -325,16 +367,12 @@ class Pipeline:
             feats = feats.view(1, -1).to(self.device)
 
             # extract features with contentvec on audio0
-            feats = extract_features(model, feats, version)
+            feats = extract_features(model, feats, version, do_normalize=do_normalize)
 
             # make a copy for pitch guidance and protection
             feats0 = feats.clone() if pitch_guidance else None
-            if (
-                index
-            ):  # set by parent function, only true if index is available, loaded, and index rate > 0
-                feats = self._retrieve_speaker_embeddings(
-                    feats, index, big_npy, index_rate
-                )
+            if retriever is not None and retriever.ready and index_rate > 0:
+                feats = retriever.retrieve(feats, index_rate, retrieval_config)
 
             # feature upsampling
             feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
@@ -370,7 +408,9 @@ class Pipeline:
                     pitch=pitch,                # quantized f0 curve
                     nsff0=pitchf.float(),       # float f0 curve
                     sid=sid,                    # speaker id
-                    seed=seed                  # inference seed
+                    seed=seed,                  # inference seed
+                    deterministic=deterministic,
+                    temperature=latent_temperature,
                 )[0][0, 0]
                 .detach()
                 .cpu()
@@ -384,17 +424,43 @@ class Pipeline:
                 torch.cuda.empty_cache()
         return audio1
 
-    def _retrieve_speaker_embeddings(self, feats, index, big_npy, index_rate):
-        npy = feats[0].cpu().numpy()
-        score, ix = index.search(npy, k=8)
-        weight = np.square(1 / score)
-        weight /= weight.sum(axis=1, keepdims=True)
-        npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-        feats = (
-            torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
-            + (1 - index_rate) * feats
-        )
-        return feats
+    def _get_retriever(self, file_index, loaded_index, meta_payload, index_rate):
+        """Return the retriever for this run, building it at most once.
+
+        Batch inference calls ``pipeline`` per file, and the expensive parts --
+        reconstructing every vector out of the index and uploading them -- do not
+        depend on the file.  The cache is keyed on the index's identity so a
+        second model in the same session gets its own.
+        """
+        if index_rate <= 0:
+            return None
+
+        if loaded_index is not None:
+            key = ("loaded", id(loaded_index))
+        elif file_index and os.path.exists(file_index):
+            key = ("file", os.path.abspath(file_index))
+        else:
+            return None
+
+        cached = self._retriever_cache.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            if loaded_index is not None:
+                retriever = IndexRetriever.from_loaded(
+                    loaded_index, meta_payload, self.device
+                )
+            else:
+                retriever = IndexRetriever.from_path(file_index, self.device)
+        except Exception as error:
+            print_error(f"Could not read the index, retrieval is off: {error}", tag="[INFER]")
+            return None
+
+        info(f"Index: {retriever.describe()}.", tag="[INFER]")
+        self._retriever_cache.clear()
+        self._retriever_cache[key] = retriever
+        return retriever
 
     def pipeline(
         self,
@@ -416,6 +482,11 @@ class Pipeline:
         f0_file,
         seed,
         loaded_index=None,
+        deterministic=True,
+        latent_temperature=1.0,
+        index_meta_payload=None,
+        retrieval_config=None,
+        do_normalize=False,
     ):
         """
         The main pipeline function for performing voice conversion.
@@ -440,28 +511,20 @@ class Pipeline:
             f0_autotune: Whether to apply autotune to the F0 contour.
             f0_file: Path to a file containing an F0 contour to use.
             seed: Seed for randomization of noise.
+            deterministic: Whether to use argmax discrete codes and deterministic NSF excitation.
+            latent_temperature: Sampling temperature for non-deterministic discrete codes.
             loaded_index: A pre-loaded FAISS index object.
+            index_meta_payload: Serialised sidecar accompanying ``loaded_index``.
+            retrieval_config: Neighbour count, weighting and continuity for the retrieval.
+            do_normalize: Whether the embedder wants its input layer-normalised.
         """
 
         if seed == 0:
             seed = random.randint(1, 2**32 - 1)
 
-        # Index handling
-        index = big_npy = None
-        if loaded_index is not None and index_rate > 0:
-            try:
-                index = loaded_index
-                big_npy = index.reconstruct_n(0, index.ntotal)
-            except Exception as error:
-                get_console().print(f"An error occurred using the loaded FAISS index: {error}")
-                index = big_npy = None
-        elif file_index != "" and os.path.exists(file_index) and index_rate > 0:
-            try:
-                index = faiss.read_index(file_index)
-                big_npy = index.reconstruct_n(0, index.ntotal)
-            except Exception as error:
-                get_console().print(f"An error occurred reading the FAISS index: {error}")
-                index = big_npy = None
+        retriever = self._get_retriever(
+            file_index, loaded_index, index_meta_payload, index_rate
+        )
 
         audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
@@ -502,7 +565,7 @@ class Pipeline:
                     inp_f0.append([float(i) for i in line.split(",")])
                 inp_f0 = np.array(inp_f0, dtype="float32")
             except Exception as error:
-                get_console().print(f"An error occurred reading the F0 file: {error}")
+                warning(f"F0 file ignored, could not be read: {error}", tag="[INFER]")
 
 
         sid = torch.tensor(sid, device=self.device).unsqueeze(0).long()
@@ -536,12 +599,15 @@ class Pipeline:
                         audio_pad[s : t + self.t_pad2 + self.window],
                         pitch[:, s // self.window : (t + self.t_pad2) // self.window],
                         pitchf[:, s // self.window : (t + self.t_pad2) // self.window],
-                        index,
-                        big_npy,
+                        retriever,
                         index_rate,
                         version,
                         protect,
                         seed,
+                        deterministic,
+                        latent_temperature,
+                        retrieval_config,
+                        do_normalize,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
             else:
@@ -553,12 +619,15 @@ class Pipeline:
                         audio_pad[s : t + self.t_pad2 + self.window],
                         None,
                         None,
-                        index,
-                        big_npy,
+                        retriever,
                         index_rate,
                         version,
                         protect,
                         seed,
+                        deterministic,
+                        latent_temperature,
+                        retrieval_config,
+                        do_normalize,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
 
@@ -573,12 +642,15 @@ class Pipeline:
                     audio_pad[t:],
                     pitch[:, t // self.window :] if t is not None else pitch,
                     pitchf[:, t // self.window :] if t is not None else pitchf,
-                    index,
-                    big_npy,
+                    retriever,
                     index_rate,
                     version,
                     protect,
                     seed,
+                    deterministic,
+                    latent_temperature,
+                    retrieval_config,
+                    do_normalize,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         else:
@@ -590,12 +662,15 @@ class Pipeline:
                     audio_pad[t:],
                     None,
                     None,
-                    index,
-                    big_npy,
+                    retriever,
                     index_rate,
                     version,
                     protect,
                     seed,
+                    deterministic,
+                    latent_temperature,
+                    retrieval_config,
+                    do_normalize,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         audio_opt = np.concatenate(audio_opt)

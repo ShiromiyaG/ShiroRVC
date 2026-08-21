@@ -1,10 +1,34 @@
-import gradio as gr
 import sys
 import os
 import logging
 import asyncio
+import threading
+import traceback
 
-from rvc.lib.terminal import install_rich_print
+# Gradio's analytics does a version-check HTTP request on launch; this app is
+# local-only, so skip it. Set before importing gradio -- it is read at import.
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
+# Torch and Gradio are both ~2s to import and have no import relationship, so
+# pulling torch in on a worker while the main thread imports Gradio overlaps
+# whatever each spends outside the GIL (mostly loading native extensions).
+# The tabs import torch transitively further down and will simply find it in
+# sys.modules -- or block on the per-module import lock until this finishes.
+def _warm_torch():
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        # Nothing to do here: the real import below raises where it can be
+        # reported properly. This thread only exists to prefetch.
+        pass
+
+
+_torch_warmup = threading.Thread(target=_warm_torch, name="torch-warmup", daemon=True)
+_torch_warmup.start()
+
+import gradio as gr
+
+from rvc.lib.terminal import install_rich_print, print_error_panel, warning
 
 install_rich_print()
 
@@ -29,10 +53,15 @@ except Exception:
 # Constants
 DEFAULT_PORT = 7897
 MAX_PORT_ATTEMPTS = 10
-APP_NAME = "ShiroRVC"
-APP_VERSION = "1.0.0"
-APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
-APP_DESCRIPTION = "RVC voice conversion and training by Shiromiya."
+
+# Identity comes from version.py so that this interface, the native one and the
+# release workflow cannot disagree about which build they are.
+from version import (  # noqa: E402 - after the environment setup above
+    APP_DESCRIPTION,
+    APP_NAME,
+    APP_TITLE,
+    __version__ as APP_VERSION,
+)
 
 # Set up logging
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
@@ -47,6 +76,27 @@ GUI_CSS_PATH = os.path.join(
     "assets",
     "themes",
     "gui.css",
+)
+
+# Language, before anything builds a widget.
+#
+# Gradio resolves ``label=`` and ``info=`` when the component is constructed,
+# and the tab modules construct theirs at import time -- so the catalog has to
+# be installed above these imports, not in ``__main__``.  Read straight off
+# argv for the same reason: there is no argparse here, and adding one below
+# would be too late.
+#
+# ``--language`` overrides everything; without it the stored preference wins,
+# and failing that the operating system's display language.  See
+# rvc/lib/i18n.py for the full precedence chain.
+from rvc.lib import i18n  # noqa: E402
+
+from rvc.lib.i18n import _  # noqa: E402
+from tabs.settings.sections.language import get_language  # noqa: E402
+
+APP_LANGUAGE = i18n.install_resolved(
+    explicit=i18n.language_from_argv(),
+    stored=get_language(),
 )
 
 # Import Tabs
@@ -78,39 +128,64 @@ import assets.themes.loadThemes as loadThemes
 
 APP_THEME = loadThemes.load_theme() or "ShiromiyaBlue"
 
+def _runtime_badges():
+    """Factual chips for the header.
+
+    A probe that fails is dropped rather than reported as "unknown", so the
+    header never shows anything that was not actually measured.
+    """
+    import html
+
+    chips = []
+    try:
+        import torch
+
+        chips.append(f"torch {torch.__version__.split('+')[0]}")
+        chips.append(
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+        )
+    except Exception:
+        pass
+    return "".join(f'<span class="rvc-chip">{html.escape(c)}</span>' for c in chips)
+
+
 # Define Gradio interface
 with gr.Blocks(title=APP_TITLE) as interface:
     with gr.Column(elem_classes=["rvc-header"]):
         with gr.Row(elem_classes=["rvc-header-grid"]):
             gr.Markdown(f"# {APP_TITLE}\n\n{APP_DESCRIPTION}")
+            gr.HTML(
+                f'<div class="rvc-chips">{_runtime_badges()}</div>',
+                elem_classes=["rvc-header-side"],
+            )
 
     with gr.Column(elem_classes=["rvc-workspace"]):
         with gr.Tabs(elem_id="rvc-main-tabs"):
-            with gr.Tab("Inference"):
+            with gr.Tab(_("Inference")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     inference_tab()
 
-            with gr.Tab("Training"):
+            with gr.Tab(_("Training")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     train_tab()
 
-            with gr.Tab("TTS"):
+            with gr.Tab(_("TTS")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     tts_tab()
 
-            with gr.Tab("Voice Blender"):
+            with gr.Tab(_("Voice Blender")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     voice_blender_tab()
 
-            with gr.Tab("Download"):
+            with gr.Tab(_("Download")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     download_tab()
 
-            with gr.Tab("Utilities"):
+            with gr.Tab(_("Utilities")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     utilities_tab()
 
-            with gr.Tab("Settings"):
+            with gr.Tab(_("Settings")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     settings_tab()
 
@@ -137,15 +212,21 @@ def get_port_from_args():
 
 if __name__ == "__main__":
     port = get_port_from_args()
-    for _ in range(MAX_PORT_ATTEMPTS):
+    # Not ``for _ in`` -- ``_`` is the translation function at module scope.
+    for _attempt in range(MAX_PORT_ATTEMPTS):
         try:
             launch_gradio(port)
             break
         except OSError:
-            print(
-                f"Failed to launch on port {port}, trying again on port {port - 1}..."
+            warning(
+                f"Port {port} is taken; trying {port - 1}.",
+                tag="[APP]",
             )
             port -= 1
         except Exception as error:
-            print(f"An error occurred launching Gradio: {error}")
+            print_error_panel(
+                error,
+                title="Could not launch the interface",
+                details=traceback.format_exc(),
+            )
             break

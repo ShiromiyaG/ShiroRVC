@@ -8,7 +8,6 @@
 !logs/mute_spin_v2/
 !logs/reference/
 !logs/reference/**
-!logs/run_tensorboard_in_model_folder.bat
 !rvc/models/pretraineds/.gitkeep
 !rvc/models/pretraineds/hifi-gan/.gitkeep
 !rvc/models/pretraineds/custom/.gitkeep
@@ -25,6 +24,16 @@ __pycache__/
 .tox/
 .nox/
 .uv-cache/
+.tmp
+build/
+dist/
+*.spec
+
+# Qt interface and packaging
+# gui/.state holds the window's own preferences; installer/release_info.json is
+# written by the release workflow just before PyInstaller runs.
+gui/.state/
+installer/release_info.json
 
 # Local environments and installers
 env/
@@ -39,7 +48,9 @@ assets/audios/
 assets/datasets/
 assets/audios/audio-others/
 assets/training_presets/
-logs/
+logs/*
+!logs/run_tensorboard_in_model_folder.bat
+!logs/run_tensorboard_in_model_folder.sh
 rvc/models/pretraineds/
 rvc/models/pretraineds/hifi-gan
 rvc/models/pretraineds/custom
@@ -52,5 +63,3 @@ rvc/models/embedders/contentvec/pytorch_model.bin
 rvc/models/embedders/spin_v1/config.json
 rvc/models/embedders/spin_v2/config.json
 rvc/models/smartcutter/
-rvc/train/preprocess/silero_vad
-DEV/

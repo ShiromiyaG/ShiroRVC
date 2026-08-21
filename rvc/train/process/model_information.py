@@ -15,8 +15,6 @@ def prettify_date(date_str):
 def model_information(path):
     model_data = torch.load(path, map_location="cpu", weights_only=True)
 
-    print(f"Loaded model from {path}")
-
     model_name = model_data.get("model_name", "None")
     epochs = model_data.get("epoch", "None")
     steps = model_data.get("step", "None")
@@ -46,7 +44,7 @@ def model_information(path):
         f"Dataset Length: {dataset_lenght}\n"
         f"Creation Date: {creation_date_str}\n"
         f"Hash (ID): {model_hash}\n"
-        f"Overtrain Info: {overtrain_info}"
-        f"Embedder Model: {embedder_model}"
+        f"Overtrain Info: {overtrain_info}\n"
+        f"Embedder Model: {embedder_model}\n"
         f"Max Speakers ID: {speakers_id}"
     )

@@ -5,6 +5,10 @@ import gradio as gr
 import sys
 
 now_dir = os.getcwd()
+sys.path.append(now_dir)
+
+from rvc.lib.terminal import error as print_error, success, warning
+
 folder = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "assets",
@@ -46,7 +50,10 @@ def get_theme_list():
     try:
         themes_from_url = [item["id"] for item in read_json_file(json_file_path)]
     except FileNotFoundError:
-        print("theme_list.json not found, proceeding with available files only.")
+        warning(
+                "theme_list.json not found; listing the local themes only.",
+                tag="[THEME]",
+            )
 
     return list(set(themes_from_files + themes_from_url))
 
@@ -67,14 +74,14 @@ def select_theme(name):
             config_data["theme"]["file"] = selected_file
             config_data["theme"]["class"] = class_found
         else:
-            print(f"Theme class not found in {selected_file}.")
+            print_error(f"No theme class in {selected_file}.", tag="[THEME]")
             return
 
     with open(config_file, "w", encoding="utf8") as json_file:
         json.dump(config_data, json_file, indent=2)
 
     message = f"Theme {name} successfully selected. Restart the application."
-    print(message)
+    success(message, tag="[THEME]")
     gr.Info(message)
 
 
@@ -93,11 +100,11 @@ def load_theme():
             else:
                 return class_name
         else:
-            print("No valid theme class found.")
+            print_error("No valid theme class found.", tag="[THEME]")
             return None
 
     except Exception as error:
-        print(f"An error occurred while loading the theme: {error}")
+        print_error(f"Could not load the theme: {error}", tag="[THEME]")
         return None
 
 
@@ -111,5 +118,5 @@ def read_current_theme():
         return class_name if class_name else "ShiromiyaBlue"
 
     except Exception as error:
-        print(f"An error occurred loading the theme: {error}")
+        print_error(f"Could not load the theme: {error}", tag="[THEME]")
         return "ShiromiyaBlue"

@@ -8,11 +8,23 @@
             0.99
         ],
         "eps": 1e-09,
-        "fp16_run": true,
         "lr_decay": 0.999875,
+        "lr_final_ratio": 0.25,
+        "rolling_loss_steps": 50,
+        "validation_preview_dpi": 67,
+        "validation_preview_width": 24.0,
+        "validation_preview_height": 5.8,
         "segment_size": 12800,
         "c_mel": 45,
-        "c_kl": 1.0
+        "c_kl": 1.0,
+        "holdout_fraction": 0.02,
+        "holdout_min_slices": 16,
+        "holdout_max_slices": 96,
+        "holdout_max_seconds": 120.0,
+        "holdout_interval": 0,
+        "overtrain_patience": 8,
+        "overtrain_min_delta": 0.001,
+        "ema_decay": 0.999
     },
     "data": {
         "max_wav_value": 32768.0,

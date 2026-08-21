@@ -1,13 +1,16 @@
 import os
 import gradio as gr
 
+from rvc.lib.i18n import _
+from rvc.lib.terminal import info, success
+
 def extract_f0_curve(audio_path: str, method: str):
     import librosa
     from matplotlib import pyplot as plt
 
     from rvc.lib.predictors.F0Extractor import F0Extractor
 
-    print("Extracting F0 Curve...")
+    info("Extracting the F0 curve.", tag="[F0]")
     image_path = os.path.join("logs", "f0_plot.png")
     txt_path = os.path.join("logs", "f0_curve.txt")
     y, sr = librosa.load(audio_path, sr=None)
@@ -32,22 +35,22 @@ def extract_f0_curve(audio_path: str, method: str):
             frequency = i * sr / hop_length
             txtfile.write(f"{frequency},{f0_value}\n")
 
-    print("F0 Curve extracted successfully!")
+    success("F0 curve extracted.", tag="[F0]")
     return image_path, txt_path
 
 
 def f0_extractor_tab():
-    audio = gr.Audio(label="Upload Audio", type="filepath")
+    audio = gr.Audio(label=_("Upload Audio"), type="filepath")
     f0_method = gr.Radio(
-        label="Pitch extraction algorithm",
-        info="Pitch / f0 estimation algorithm used in extraction.",
+        label=_("Pitch extraction algorithm"),
+        info=_("Pitch / f0 estimation algorithm used in extraction."),
         choices=["crepe", "rmvpe", "fcpe"],
         value="rmvpe",
     )
-    button = gr.Button("Extract F0 Curve")
+    button = gr.Button(_("Extract F0 Curve"))
 
     with gr.Row():
-        txt_output = gr.File(label="F0 Curve", type="filepath")
+        txt_output = gr.File(label=_("F0 Curve"), type="filepath")
         image_output = gr.Image(type="filepath", interactive=False)
 
     button.click(

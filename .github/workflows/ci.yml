@@ -1,0 +1,50 @@
+name: CI
+
+# Runs on every push and pull request.
+#
+# This exists because the release workflow used to be the only one: it triggers
+# on a VERSION change, so the test suite ran roughly once per release and the
+# first sign that a commit had broken something arrived while trying to publish
+# it.  The checks here are the cheap half -- ubuntu, about a minute -- and the
+# expensive Windows installer build lives in build-windows.yml, which fires only
+# when the installer itself changes.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  # release.yml gates publishing on these same checks rather than restating
+  # them, so the suite a release must pass is the suite every commit runs.
+  workflow_call:
+
+# A newer push makes an in-flight run of the same branch pointless.  Releases
+# are not cancelled this way -- release.yml sets its own group.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The isolation, version and identity tests parse imports with ast and
+      # never execute the GUI. Qt is installed on top so the behavioural tests --
+      # the wheel guard, the Gradio-matching defaults -- run too; they skip
+      # themselves cleanly if it is missing.
+      - run: pip install pytest "PySide6>=6.7,<7"
+
+      - name: gui/ stays deletable, one version, one app name, wheel guard holds
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/ -v

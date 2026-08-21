@@ -26,7 +26,7 @@ def load_wav_to_torch(full_path, target_sr=None, return_empty_on_exception=False
     try:
         data, sample_rate = sf.read(full_path, always_2d=True)
     except Exception as error:
-        print(f"An error occurred loading {full_path}: {error}")
+        print(f"[ERROR] Could not load {full_path}: {error}")
         if return_empty_on_exception:
             return [], sample_rate or target_sr or 48000
         else:

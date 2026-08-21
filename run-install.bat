@@ -55,7 +55,9 @@ exit /b 0
 
 :cleanup
 echo Cleaning up unnecessary files...
-for %%F in (Makefile Dockerfile docker-compose.yaml *.sh) do if exist "%%F" del "%%F"
+:: `*.sh` is deliberately not in this list: run-install.sh / start.sh are the
+:: Linux counterparts of these launchers and must survive a Windows install.
+for %%F in (Makefile Dockerfile docker-compose.yaml) do if exist "%%F" del "%%F"
 echo Cleanup complete.
 echo.
 exit /b 0
@@ -102,6 +104,10 @@ echo Installing pip packages...
 uv pip install --upgrade setuptools || goto :error
 uv pip install torch==%TORCH_VERSION% torchvision==%TORCHVISION_VERSION% torchaudio==%TORCHAUDIO_VERSION% --upgrade --index-url %PYTORCH_INDEX_URL% || goto :error
 uv pip install -r "%INSTALL_DIR%\requirements.txt" || goto :error
+
+:: Translation catalogs: gettext falls back to English without raising
+:: when a .mo is missing, so a skipped build looks like working software.
+"%ENV_DIR%\python.exe" "%INSTALL_DIR%\tools\i18n_tool.py" compile
 
 call "%MINICONDA_DIR%\condabin\conda.bat" deactivate
 echo Dependencies installation complete.

@@ -11,7 +11,12 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from rvc.lib.text import format_title
-from rvc.lib.terminal import progress_handle, progress_task
+from rvc.lib.terminal import (
+    error as print_error,
+    progress_handle,
+    progress_task,
+    success,
+)
 from rvc.lib.tools import gdown
 
 
@@ -56,7 +61,7 @@ def download_from_url(url):
         rename_downloaded_files()
         return "downloaded"
     except Exception as error:
-        print(f"An error occurred downloading the file: {error}")
+        print_error(f"Download failed: {error}", tag="[DOWNLOAD]")
         return None
     finally:
         os.chdir(now_dir)
@@ -153,7 +158,7 @@ def extract(zipfile_path, unzips_path):
         os.remove(zipfile_path)
         return True
     except Exception as error:
-        print(f"An error occurred extracting the zip file: {error}")
+        print_error(f"Could not extract the archive: {error}", tag="[DOWNLOAD]")
         return False
 
 
@@ -173,7 +178,7 @@ def model_download_pipeline(url: str):
         else:
             return "Error"
     except Exception as error:
-        print(f"An unexpected error occurred: {error}")
+        print_error(f"Download failed: {error}", tag="[DOWNLOAD]")
         return "Error"
 
 
@@ -184,16 +189,16 @@ def handle_extraction_process():
             zipfile_path = os.path.join(zips_path, filename)
             model_name = format_title(os.path.basename(zipfile_path).split(".zip")[0])
             extract_folder_path = os.path.join("logs", os.path.normpath(model_name))
-            success = extract(zipfile_path, extract_folder_path)
+            extracted = extract(zipfile_path, extract_folder_path)
             clean_extracted_files(extract_folder_path, model_name)
 
-            if success:
-                print(f"Model {model_name} downloaded!")
+            if extracted:
+                success(f"Downloaded '{model_name}'.", tag="[DOWNLOAD]")
             else:
-                print(f"Error downloading {model_name}")
+                print_error(f"Could not download '{model_name}'.", tag="[DOWNLOAD]")
                 return "Error"
     if not extract_folder_path:
-        print("Zip file was not found.")
+        print_error("The downloaded archive was not found.", tag="[DOWNLOAD]")
         return "Error"
     return search_pth_index(extract_folder_path)
 

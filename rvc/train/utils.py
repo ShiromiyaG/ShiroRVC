@@ -3,31 +3,59 @@ import glob
 import json
 import signal
 import sys
-import time
 
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
-from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import soundfile as sf
 
 from collections import OrderedDict
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import matplotlib.cm as cm
+
+from rvc.train.messages import (
+    TENSORBOARD_VALIDATION_AUDIO_NAMES,
+    TENSORBOARD_VALIDATION_AUDIO_TAG,
+    TENSORBOARD_VALIDATION_AXIS_X,
+    TENSORBOARD_VALIDATION_AXIS_Y,
+    TENSORBOARD_VALIDATION_DB_LABEL,
+    TENSORBOARD_VALIDATION_DIFFERENCE_LABEL,
+    TENSORBOARD_VALIDATION_FOOTER,
+    TENSORBOARD_VALIDATION_MEL_TAG,
+    TENSORBOARD_VALIDATION_MEL_TITLES,
+    TENSORBOARD_VALIDATION_PREVIEW_DIR,
+    TENSORBOARD_VALIDATION_SOURCE_TAG,
+)
 
 
 MATPLOTLIB_FLAG = False
+#: Defaults for the validation preview figure.  Overridable per model through
+#: ``validation_preview_dpi`` / ``_width`` / ``_height`` in the config JSON.
+#:
+#: The two knobs are not interchangeable.  ``figsize`` is in inches and dpi
+#: converts to pixels, so raising **dpi** scales the whole figure -- panels and
+#: text together -- and is what "make it sharper" means.  Raising **figsize**
+#: at a fixed dpi gives the panels more room while the text stays the same
+#: physical size, so labels shrink relative to the plot.  67 x 24in lands on
+#: 1608px wide, which is the historical output.
+VALIDATION_PREVIEW_DPI = 67
+VALIDATION_PREVIEW_FIGSIZE = (24.0, 5.8)
 
 debug_save_load = False
 
 from itertools import chain
 from mel_processing import mel_spectrogram_torch
 from rvc.train.process.extract_model import extract_model
-from rvc.lib.terminal import print_settings_panel
+from rvc.lib.terminal import (
+    error as print_error,
+    info,
+    print_settings_panel,
+    warning,
+)
 
 def replace_keys_in_dict(d, old_key_part, new_key_part):
     """
@@ -90,46 +118,90 @@ def remap_optimizer_state(optimizer, model, opt_state):
     return {"state": state, "param_groups": param_groups}
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True):
+def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, ema=None):
     assert os.path.isfile(checkpoint_path), f"Checkpoint not found: {checkpoint_path}"
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
     model_state = model.module if hasattr(model, "module") else model
+    expected_architecture = getattr(model_state, "architecture_id", None)
+    checkpoint_architecture = checkpoint_dict.get("architecture_id")
+    if expected_architecture and expected_architecture != "vits_gaussian_v1":
+        if checkpoint_architecture != expected_architecture:
+            raise ValueError(
+                f"Checkpoint architecture mismatch: expected '{expected_architecture}', "
+                f"received '{checkpoint_architecture or 'unknown'}'."
+            )
     model_state.load_state_dict(checkpoint_dict["model"], strict=strict_load)
+
+    if ema is not None:
+        # Absent from every checkpoint written before the EMA existed.  Seeding
+        # the shadow from the restored weights is the correct restart: it is
+        # what the average would be if this were step zero, and it costs only
+        # the averaging already done.
+        if ema.load_state_dict(checkpoint_dict.get("ema"), model_state):
+            info(f"Loaded EMA state ({ema.updates} updates).", tag="[RESUME]")
+        else:
+            warning(
+                "No usable EMA state in the checkpoint; seeding it from the "
+                "weights.",
+                tag="[RESUME]",
+            )
 
     if optimizer:
         opt_state = checkpoint_dict.get("optimizer")
         if opt_state:
             try:
                 optimizer.load_state_dict(opt_state)
-                print("Loaded optimizer state.")
+                info("Loaded optimizer state.", tag="[RESUME]")
             except ValueError:
-                print("[WARNING] Optimizer parameter set changed ( e.g. layers were frozen ).")
-                print("[WARNING] Pruning saved optimizer state to the surviving params; LR re-anchored to the saved value.")
+                warning(
+                    "The optimizer's parameter set changed (layers were frozen, "
+                    "for instance); pruning the saved state to the surviving "
+                    "params, with the LR re-anchored to the saved value.",
+                    tag="[RESUME]",
+                )
                 pruned = remap_optimizer_state(optimizer, model_state, opt_state)
                 if pruned is not None:
                     optimizer.load_state_dict(pruned)
-                    print("Loaded optimizer state ( pruned to surviving params ).")
+                    info(
+                        "Loaded optimizer state (pruned to the surviving params).",
+                        tag="[RESUME]",
+                    )
                 else:
-                    print("[WARNING] Could not remap optimizer state; starting optimizer fresh.")
+                    warning(
+                        "Could not remap the optimizer state; starting the "
+                        "optimizer fresh.",
+                        tag="[RESUME]",
+                    )
         else:
             if strict_load:
                 raise ValueError(f"[ERROR] Missing optimizer state...")
             else:
-                print("[WARNING] No optimizer state found in checkpoint, starting optimizer fresh.")
+                warning(
+                    "No optimizer state in the checkpoint; starting the "
+                    "optimizer fresh.",
+                    tag="[RESUME]",
+                )
 
 
-    print(f"Loaded checkpoint '{checkpoint_path}' (iteration {checkpoint_dict['iteration']})")
+    info(
+        f"Loaded '{os.path.basename(checkpoint_path)}' at iteration "
+        f"{checkpoint_dict['iteration']}.",
+        tag="[RESUME]",
+    )
     return (
         model,
         optimizer,
         checkpoint_dict.get("learning_rate", 0),
         checkpoint_dict["iteration"],
-        checkpoint_dict.get("gradscaler", {})
+        # Retained so existing FP16-era checkpoints keep unpacking; training is
+        # FP32 only now, so nothing consumes it.
+        {},
     )
 
-def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, gradscaler=None):
+def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, ema=None):
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+    model_instance = model.module if hasattr(model, "module") else model
 
     checkpoint_data = {
         "model": state_dict,
@@ -137,12 +209,17 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path,
         "optimizer": optimizer.state_dict(),
         "learning_rate": learning_rate,
     }
-
-    if gradscaler is not None:
-        checkpoint_data["gradscaler"] = gradscaler.state_dict()
+    architecture_id = getattr(model_instance, "architecture_id", None)
+    if architecture_id is not None:
+        checkpoint_data["architecture_id"] = architecture_id
+    # Additive key.  "model" still holds the live weights, so anything that
+    # reads these checkpoints without knowing about the EMA -- older code, the
+    # extractor, the blender -- keeps seeing exactly what it saw before.
+    if ema is not None:
+        checkpoint_data["ema"] = ema.state_dict()
 
     torch.save(checkpoint_data, checkpoint_path)
-    print(f"Saved model to {checkpoint_path}")
+    info(f"Saved '{os.path.basename(checkpoint_path)}'.", tag="[SAVE]")
 
 def summarize(
     writer,
@@ -175,59 +252,320 @@ def summarize(
         writer.add_audio(k, v, global_step, audio_sample_rate)
 
 
-def _audio_preview_event_files(log_dir):
-    if not os.path.isdir(log_dir):
-        return []
-    return sorted(
-        (
-            path
-            for path in glob.glob(os.path.join(log_dir, "events.out.tfevents.*"))
-            if os.path.isfile(path)
-        ),
-        key=os.path.getmtime,
-    )
+def limit_audio_peak(audio, max_peak=0.98):
+    """Return a finite mono preview whose peak stays inside TensorBoard's range."""
+    if torch.is_tensor(audio):
+        preview = audio.detach().float().cpu()
+        preview = torch.nan_to_num(preview, nan=0.0, posinf=0.0, neginf=0.0)
+        preview = preview.reshape(-1)
+        if preview.numel() == 0:
+            return preview
+        peak = preview.abs().amax()
+        if torch.isfinite(peak) and peak.item() > max_peak:
+            preview = preview * (max_peak / peak)
+        return preview.clamp(-max_peak, max_peak)
+
+    preview = np.asarray(audio, dtype=np.float32)
+    preview = np.nan_to_num(
+        preview,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+        copy=True,
+    ).reshape(-1)
+    if preview.size == 0:
+        return preview
+    peak = float(np.max(np.abs(preview)))
+    if np.isfinite(peak) and peak > max_peak:
+        preview *= max_peak / peak
+    return np.clip(preview, -max_peak, max_peak).astype(np.float32, copy=False)
 
 
-def trim_audio_preview_events(log_dir, keep=10):
-    """Keep only the newest audio-preview event files in the dedicated log dir."""
-    keep = max(1, int(keep))
-    event_files = _audio_preview_event_files(log_dir)
-    for path in event_files[:-keep]:
-        try:
-            os.remove(path)
-        except OSError:
-            continue
+def _mel_to_numpy(mel):
+    if torch.is_tensor(mel):
+        mel = mel.detach().float().cpu().numpy()
+    mel = np.nan_to_num(np.asarray(mel, dtype=np.float32), copy=True)
+    mel = np.squeeze(mel)
+    if mel.ndim != 2:
+        raise ValueError("Validation mel spectrograms must be two-dimensional.")
+    return mel
 
 
-def write_audio_preview(
-    log_dir,
+def plot_validation_preview_to_figure(
+    predicted_mel,
+    target_mel,
+    epoch,
     global_step,
-    audios,
-    audio_sample_rate,
-    category,
-    keep=10,
+    sample_index=0,
+    sample_rate=22050,
+    hop_length=256,
+    dpi=None,
+    figsize=None,
 ):
-    """Write one grouped audio preview and retain only the newest previews."""
-    if not audios:
+    """Create a dark TensorBoard-style three-panel validation report.
+
+    ``hop_length`` sets the time axis and must match the config the mels were
+    produced with -- the default is a fallback, not a good guess.
+    """
+    global MATPLOTLIB_FLAG
+    if not MATPLOTLIB_FLAG:
+        plt.switch_backend("Agg")
+        MATPLOTLIB_FLAG = True
+
+    target_mel = _mel_to_numpy(target_mel)
+    predicted_mel = _mel_to_numpy(predicted_mel)
+    mel_bins = min(target_mel.shape[0], predicted_mel.shape[0])
+    frames = min(target_mel.shape[1], predicted_mel.shape[1])
+    if mel_bins <= 0 or frames <= 0:
+        raise ValueError("Validation mel spectrograms must not be empty.")
+
+    target_mel = target_mel[:mel_bins, :frames]
+    predicted_mel = predicted_mel[:mel_bins, :frames]
+    difference_mel = predicted_mel - target_mel
+
+    shared_values = np.concatenate((target_mel.ravel(), predicted_mel.ravel()))
+    shared_low = float(np.quantile(shared_values, 0.01))
+    shared_high = float(np.quantile(shared_values, 0.99))
+    if not np.isfinite(shared_low) or not np.isfinite(shared_high):
+        shared_low, shared_high = 0.0, 1.0
+    if shared_low >= shared_high:
+        shared_high = shared_low + 1.0
+
+    difference_limit = max(
+        1e-5,
+        float(np.quantile(np.abs(difference_mel), 0.99)),
+    )
+    time_axis = np.arange(frames, dtype=np.float32) * float(hop_length) / float(sample_rate)
+    # The mel filterbank spans DC to Nyquist, not DC to the sample rate. Using
+    # the sample rate as the extent labelled every frequency tick at twice its
+    # true value.
+    top_frequency = float(sample_rate) / 2.0
+    figure, axes = plt.subplots(
+        1,
+        3,
+        figsize=tuple(figsize) if figsize else VALIDATION_PREVIEW_FIGSIZE,
+        dpi=float(dpi) if dpi else VALIDATION_PREVIEW_DPI,
+        facecolor="#10161f",
+        gridspec_kw={
+            "left": 0.045,
+            "right": 0.955,
+            "wspace": 0.16,
+            "bottom": 0.25,
+            "top": 0.86,
+        },
+    )
+    figure.patch.set_facecolor("#10161f")
+    panels = (predicted_mel, target_mel, difference_mel)
+    panel_cmaps = ("inferno", "inferno", "turbo")
+    panel_norms = (
+        (shared_low, shared_high),
+        (shared_low, shared_high),
+        (-difference_limit, difference_limit),
+    )
+    for axis, mel, title, cmap, (vmin, vmax) in zip(
+        axes,
+        panels,
+        TENSORBOARD_VALIDATION_MEL_TITLES,
+        panel_cmaps,
+        panel_norms,
+    ):
+        axis.set_facecolor("#10161f")
+        rendered = axis.imshow(
+            mel,
+            origin="lower",
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            extent=(time_axis[0], time_axis[-1], 0, top_frequency),
+        )
+        axis.set_title(title, color="#f4f4f4", fontsize=17, fontweight="bold", pad=12)
+        axis.set_xlabel(TENSORBOARD_VALIDATION_AXIS_X, color="#f4f4f4", fontsize=11)
+        axis.set_ylabel(TENSORBOARD_VALIDATION_AXIS_Y, color="#f4f4f4", fontsize=11)
+        frequency_ticks = np.linspace(0.0, top_frequency, 5)
+        axis.set_yticks(frequency_ticks)
+        axis.set_yticklabels(
+            [
+                f"{frequency / 1000:g}k" if frequency else "0"
+                for frequency in frequency_ticks
+            ]
+        )
+        axis.tick_params(colors="#f4f4f4", labelsize=9)
+        for spine in axis.spines.values():
+            spine.set_color("#c9cdd3")
+        colorbar = figure.colorbar(
+            rendered,
+            ax=axis,
+            orientation="horizontal",
+            fraction=0.055,
+            pad=0.12,
+        )
+        colorbar.set_label(
+            TENSORBOARD_VALIDATION_DIFFERENCE_LABEL
+            if title == TENSORBOARD_VALIDATION_MEL_TITLES[-1]
+            else TENSORBOARD_VALIDATION_DB_LABEL,
+            color="#d7dbe1",
+            fontsize=8,
+        )
+        colorbar.ax.tick_params(colors="#d7dbe1", labelsize=8)
+        colorbar.outline.set_edgecolor("#c9cdd3")
+
+    figure.text(
+        0.5,
+        0.055,
+        TENSORBOARD_VALIDATION_FOOTER.format(
+            sample_rate=int(sample_rate),
+            hop_length=int(hop_length),
+            n_mels=int(mel_bins),
+            epoch=int(epoch),
+            step=int(global_step),
+        ),
+        color="#bfc5ce",
+        fontsize=10,
+        ha="center",
+    )
+    return figure
+
+
+def log_validation_preview(
+    writer,
+    experiment_dir,
+    epoch,
+    sample_index,
+    global_step,
+    sample_rate,
+    predicted_mel,
+    target_mel,
+    predicted_wave=None,
+    target_wave=None,
+    source=None,
+    hop_length=256,
+    dpi=None,
+    figsize=None,
+):
+    """Save and log one organized validation preview with mel difference."""
+    sample_stem = f"sample_{int(sample_index):02d}"
+    preview_dir = os.path.join(
+        str(experiment_dir),
+        TENSORBOARD_VALIDATION_PREVIEW_DIR,
+        f"epoch_{int(epoch):04d}",
+    )
+    mel_dir = os.path.join(preview_dir, "mel")
+    audio_dir = os.path.join(preview_dir, "audio")
+    os.makedirs(mel_dir, exist_ok=True)
+
+    figure = plot_validation_preview_to_figure(
+        predicted_mel=predicted_mel,
+        target_mel=target_mel,
+        epoch=epoch,
+        global_step=global_step,
+        sample_index=sample_index,
+        sample_rate=sample_rate,
+        hop_length=hop_length,
+        dpi=dpi,
+        figsize=figsize,
+    )
+    image_path = os.path.join(mel_dir, f"{sample_stem}.png")
+    try:
+        figure.canvas.draw()
+        composite = np.asarray(
+            figure.canvas.buffer_rgba(),
+            dtype=np.uint8,
+        )[..., :3].copy()
+        # ``figure.dpi`` rather than the module default: the figure may have
+        # been built at an overridden dpi, and saving at a different one would
+        # write a PNG that does not match what TensorBoard received.
+        figure.savefig(image_path, dpi=figure.dpi)
+
+        if writer is not None:
+            writer.add_image(
+                TENSORBOARD_VALIDATION_MEL_TAG.format(sample=sample_stem),
+                torch.from_numpy(composite).permute(2, 0, 1),
+                global_step,
+                dataformats="CHW",
+            )
+            if source:
+                writer.add_text(
+                    TENSORBOARD_VALIDATION_SOURCE_TAG.format(sample=sample_stem),
+                    str(source),
+                    global_step=global_step,
+                )
+    finally:
+        plt.close(figure)
+
+    if predicted_wave is None or target_wave is None:
+        return image_path
+
+    os.makedirs(audio_dir, exist_ok=True)
+    predicted_wave = limit_audio_peak(predicted_wave)
+    target_wave = limit_audio_peak(target_wave)
+    audio_length = min(predicted_wave.numel(), target_wave.numel())
+    if audio_length <= 0:
+        return image_path
+    predicted_wave = predicted_wave[:audio_length]
+    target_wave = target_wave[:audio_length]
+
+    generated_path = os.path.join(audio_dir, f"{sample_stem}_generated.wav")
+    original_path = os.path.join(audio_dir, f"{sample_stem}_original.wav")
+    sf.write(generated_path, predicted_wave.numpy(), int(sample_rate), subtype="PCM_16")
+    sf.write(original_path, target_wave.numpy(), int(sample_rate), subtype="PCM_16")
+
+    if writer is not None:
+        writer.add_audio(
+            TENSORBOARD_VALIDATION_AUDIO_TAG.format(
+                sample=sample_stem,
+                kind=TENSORBOARD_VALIDATION_AUDIO_NAMES["generated"],
+            ),
+            predicted_wave.unsqueeze(0),
+            global_step,
+            sample_rate=int(sample_rate),
+        )
+        writer.add_audio(
+            TENSORBOARD_VALIDATION_AUDIO_TAG.format(
+                sample=sample_stem,
+                kind=TENSORBOARD_VALIDATION_AUDIO_NAMES["original"],
+            ),
+            target_wave.unsqueeze(0),
+            global_step,
+            sample_rate=int(sample_rate),
+        )
+
+    return image_path
+
+
+def log_tensorboard_media(
+    writer,
+    namespace,
+    global_step,
+    sample_rate,
+    figure=None,
+    audio=None,
+    text=None,
+):
+    """Write one sample's text, mel figure, and audio under a single namespace."""
+    if writer is None:
         return
 
-    os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(
-        log_dir=log_dir,
-        flush_secs=1,
-        filename_suffix=f".{category}.{int(global_step)}.{time.time_ns()}",
-    )
-    try:
-        for name, audio in audios.items():
-            if torch.is_tensor(audio):
-                audio = audio.detach().float().cpu()
-            tag = f"audio/{category}/step_{int(global_step):08d}/{name}"
-            writer.add_audio(tag, audio, global_step, audio_sample_rate)
-        writer.flush()
-    finally:
-        writer.close()
-
-    trim_audio_preview_events(log_dir, keep=keep)
+    for name, value in (text or {}).items():
+        writer.add_text(
+            f"{namespace}/{name}",
+            str(value),
+            global_step=global_step,
+        )
+    if figure is not None:
+        writer.add_figure(
+            f"{namespace}/mel",
+            figure,
+            global_step=global_step,
+        )
+    for name, value in (audio or {}).items():
+        writer.add_audio(
+            f"{namespace}/audio/{name}",
+            limit_audio_peak(value),
+            global_step=global_step,
+            sample_rate=sample_rate,
+        )
 
 
 def latest_checkpoint_path(dir_path, regex="G_*.pth"):
@@ -272,82 +610,6 @@ def plot_spectrogram_to_numpy(spectrogram):
     return data
 
 
-def plot_mel_comparison_to_numpy(original_mel, generated_mel):
-    """Render original mel, generated mel, and absolute mel error as one image."""
-    global MATPLOTLIB_FLAG
-    if not MATPLOTLIB_FLAG:
-        plt.switch_backend("Agg")
-        MATPLOTLIB_FLAG = True
-
-    original_mel = np.asarray(original_mel, dtype=np.float32)
-    generated_mel = np.asarray(generated_mel, dtype=np.float32)
-
-    if original_mel.ndim != 2 or generated_mel.ndim != 2:
-        raise ValueError("Mel comparison expects two-dimensional arrays.")
-
-    mel_bins = min(original_mel.shape[0], generated_mel.shape[0])
-    frames = min(original_mel.shape[1], generated_mel.shape[1])
-    original_mel = original_mel[:mel_bins, :frames]
-    generated_mel = generated_mel[:mel_bins, :frames]
-    error_mel = np.abs(generated_mel - original_mel)
-
-    mel_values = np.concatenate((original_mel.ravel(), generated_mel.ravel()))
-    mel_values = mel_values[np.isfinite(mel_values)]
-    if mel_values.size:
-        mel_min = float(mel_values.min())
-        mel_max = float(mel_values.max())
-    else:
-        mel_min, mel_max = 0.0, 1.0
-    if mel_min == mel_max:
-        mel_max = mel_min + 1.0
-
-    error_values = error_mel[np.isfinite(error_mel)]
-    error_max = float(error_values.max()) if error_values.size else 1.0
-    if error_max <= 0:
-        error_max = 1.0
-
-    fig = plt.figure(figsize=(12, 7.5))
-    layout = gridspec.GridSpec(3, 1, figure=fig, hspace=0.45)
-    panels = (
-        (original_mel, "Original mel", "magma", mel_min, mel_max),
-        (generated_mel, "Generated mel", "magma", mel_min, mel_max),
-        (error_mel, "Absolute mel error", "viridis", 0.0, error_max),
-    )
-
-    axes = []
-    for index, (mel, title, cmap, vmin, vmax) in enumerate(panels):
-        axis = fig.add_subplot(layout[index])
-        image = axis.imshow(
-            mel,
-            aspect="auto",
-            origin="lower",
-            interpolation="none",
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-        )
-        axis.set_title(title)
-        axis.set_ylabel("Mel bins")
-        if index == len(panels) - 1:
-            axis.set_xlabel("Frames")
-        fig.colorbar(image, ax=axis, pad=0.01)
-        axes.append(axis)
-
-    fig.subplots_adjust(
-        left=0.08,
-        right=0.91,
-        top=0.96,
-        bottom=0.07,
-        hspace=0.55,
-    )
-    fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-    data = data[:, :, :3]
-    plt.close(fig)
-    return data
-
-
 def load_wav_to_torch(full_path):
     """
     Load a WAV file into a PyTorch tensor.
@@ -359,16 +621,47 @@ def load_wav_to_torch(full_path):
     return torch.FloatTensor(data), sample_rate
 
 
-def load_filepaths_and_text(filename, split="|"):
+#: Application root, used to resolve the relative paths in a filelist.  Taken
+#: from this file's location so it holds regardless of the working directory
+#: the trainer was launched with.
+APPLICATION_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+
+def load_filepaths_and_text(filename, split="|", path_columns=(0, 1, 2, 3), root=None):
     """
     Load filepaths and associated text from a file.
+
+    Paths are stored relative to the application root (see
+    ``rvc/train/extract/preparing_files.py``) and are resolved back to absolute
+    here.  ``os.path.join`` returns an absolute second argument unchanged, so
+    filelists written by older versions -- which stored absolute paths -- keep
+    loading without a migration step.
 
     Args:
         filename (str): The path to the file.
         split (str, optional): The delimiter used to split the lines.
+        path_columns (tuple, optional): Which columns hold paths. The trailing
+            speaker id must not be resolved, so the columns are explicit.
+        root (str, optional): Base for relative paths. Defaults to the
+            application root.
     """
+    base = root or APPLICATION_ROOT
+    rows = []
     with open(filename, encoding="utf-8") as f:
-        return [line.strip().split(split) for line in f]
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            fields = line.split(split)
+            for column in path_columns:
+                if column < len(fields):
+                    fields[column] = os.path.normpath(
+                        os.path.join(base, fields[column])
+                    )
+            rows.append(fields)
+    return rows
 
 
 class HParams:
@@ -418,8 +711,10 @@ def load_config_from_json(config_save_path):
         config = HParams(**config)
         return config
     except FileNotFoundError:
-        print(
-            f"Model config file not found at {config_save_path}. Did you run preprocessing and feature extraction steps?"
+        print_error(
+            f"No model config at {config_save_path}. Run preprocessing and "
+            "feature extraction first.",
+            tag="[INIT]",
         )
         sys.exit(1)
 
@@ -436,7 +731,10 @@ def flush_writer_grad(writer, rank, global_step):
 
 def block_tensorboard_flush_on_exit(writer):
     def handler(signum, frame):
-        print("[Warning] Training interrupted. Skipping flush to avoid partial logs.")
+        warning(
+            "Training interrupted; skipping the flush to avoid partial logs.",
+            tag="[TRAIN]",
+        )
         try:
             writer.close()
         except:
@@ -463,7 +761,7 @@ def si_sdr(preds, target, eps=1e-8):
     return si_sdr_value.mean()
 
 
-def wave_to_mel(config, waveform, half, num_mels=None):
+def wave_to_mel(config, waveform, num_mels=None, for_loss=False):
     mel_spec = mel_spectrogram_torch(
         waveform.float().squeeze(1),
         config.data.filter_length,
@@ -473,12 +771,14 @@ def wave_to_mel(config, waveform, half, num_mels=None):
         config.data.win_length,
         config.data.mel_fmin,
         config.data.mel_fmax,
+        log_compression=not for_loss,
     )
-    if half == torch.float16:
-        mel_spec = mel_spec.half()
-    elif half == torch.float32 or half == torch.bfloat16:
-        pass
-
+    # Mel/STFT values and their gradients remain in FP32.  Converting this
+    # tensor to FP16 after the transform makes the spectral loss a low
+    # precision loss even when its autocast region is disabled.
+    mel_spec = mel_spec.float()
+    if for_loss:
+        mel_spec = torch.log1p(mel_spec * 1000.0)
     return mel_spec
 
 
@@ -507,7 +807,7 @@ def old_session_cleanup(now_dir, model_name):
                         os.remove(item_path)
                 os.rmdir(folder_path)
 
-    print("[INIT] Cleanup done!")
+    info("Cleanup done.", tag="[INIT]")
 
 
 def print_init_setup(
@@ -519,8 +819,6 @@ def print_init_setup(
     optimizer_choice_d,
     lr_scheduler,
     exp_decay_gamma,
-    use_kl_annealing,
-    kl_annealing_cycle_duration,
     spectral_loss,
 ):
     if rank != 0:
@@ -530,17 +828,20 @@ def print_init_setup(
         torch.backends.cuda.matmul.allow_tf32
         and torch.backends.cudnn.allow_tf32
     )
-    if config.train.fp16_run:
-        precision = "TF32 / FP16 - AMP" if tf32_enabled else "FP32 / FP16 - AMP"
-    else:
-        precision = "TF32" if tf32_enabled else "FP32"
+    # FP32 master weights throughout; TF32 only changes how cuDNN/cuBLAS run
+    # the convolutions internally (11-bit mantissa, no autocast, no scaler).
+    precision = "FP32 (TF32 matmul/conv)" if tf32_enabled else "FP32"
 
     rows = [
         ("PRECISION", precision),
         ("cudnn.benchmark", torch.backends.cudnn.benchmark),
         ("cudnn.deterministic", torch.backends.cudnn.deterministic),
-        ("Optimizer (G)", optimizer_choice_g),
-        ("Optimizer (D)", optimizer_choice_d),
+        (
+            "Optimizer (G/D)",
+            optimizer_choice_g
+            if optimizer_choice_g == optimizer_choice_d
+            else f"G: {optimizer_choice_g} | D: {optimizer_choice_d}",
+        ),
         ("Spectral loss", spectral_loss),
     ]
 
@@ -559,14 +860,16 @@ def print_init_setup(
 
     if use_warmup:
         rows.append(("Warmup", f"{warmup_duration} epochs"))
-    if use_kl_annealing:
-        rows.append(("KL loss annealing", f"{kl_annealing_cycle_duration} epochs"))
 
     print_settings_panel(rows)
 
 def train_loader_safety(train_loader):
     if len(train_loader) < 3:
-        print("Not enough data present in the training set. Perhaps you didn't slice the audio files? ( Preprocessing step )")
+        print_error(
+            "Not enough data in the training set. Did the preprocessing step "
+            "slice the audio files?",
+            tag="[INIT]",
+        )
         os._exit(1)
 
 
@@ -587,7 +890,7 @@ def verify_spk_dim(
             embedder_name = model_info["embedder_model"]
             spk_dim = model_info["speakers_id"]
     except Exception as e:
-        print(f"Could not load model info file: {e}. Using defaults.")
+        warning(f"Could not read the model info file ({e}); using defaults.", tag="[INIT]")
 
     try:
         last_g = latest_checkpoint_path(experiment_dir, "G_*.pth")
@@ -597,65 +900,12 @@ def verify_spk_dim(
             spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
             del ckpt
     except Exception as e:
-        print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
+        warning(
+            f"Could not read the checkpoint ({e}); using the default speaker count.",
+            tag="[INIT]",
+        )
 
     if rank == 0:
-        print(f"[INIT] Initializing the generator with: {spk_dim} speakers.")
+        info(f"Initializing the generator with {spk_dim} speakers.", tag="[INIT]")
 
     return spk_dim
-
-
-def early_stopper(
-    stopper, 
-    rank, 
-    global_step, 
-    epoch, 
-    architecture, 
-    nets, 
-    optims, 
-    config, 
-    experiment_dir, 
-    gradscaler_g,
-    gradscaler_d,
-    save_weight_models,
-    model_name,
-    vocoder,
-    n_gpus
-):
-    if stopper is not None and stopper.stop_triggered:
-        net_g, net_d = nets
-        optim_g, optim_d = optims
-
-        if rank == 0:
-            print(f"[TRAINING] Saving the models at steps: '{global_step}' in progress ...")
-
-            g_path = os.path.join(experiment_dir, f"G_{global_step}.pth")
-            d_path = os.path.join(experiment_dir, f"D_{global_step}.pth")
-
-            # Save Generator checkpoint
-            save_checkpoint(net_g, optim_g, config.train.learning_rate_g, epoch, g_path, gradscaler_g)
-            # Save Discriminator checkpoint
-            save_checkpoint(net_d, optim_d, config.train.learning_rate_d, epoch, d_path, gradscaler_d)
-
-            # Save small weight model
-            if save_weight_models:
-                weight_model_name = small_model_naming(model_name, epoch, global_step)
-                model_path = os.path.join(experiment_dir, weight_model_name)
-
-                ckpt = net_g.module.state_dict() if hasattr(net_g, "module") else net_g.state_dict()
-                extract_model(
-                    ckpt=ckpt, 
-                    sr=config.data.sample_rate, 
-                    name=model_name, 
-                    model_path=model_path, 
-                    epoch=epoch, 
-                    step=global_step, 
-                    hps=config, 
-                    vocoder=vocoder, 
-                    architecture=architecture, 
-                )
-                print(f"[TRAINING] All finished .. You're good to go.")
-        if n_gpus > 1:
-            dist.barrier()
-        return True
-    return False

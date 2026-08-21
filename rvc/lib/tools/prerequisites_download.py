@@ -2,9 +2,9 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 import requests 
 
-from rvc.lib.terminal import progress_handle, progress_task
+from rvc.lib.terminal import info, progress_handle, progress_task
 
-RESOURCE_BASE = "https://huggingface.co/shiromiya/Shiromiya-RVC-Fork-Resources/resolve/main"
+RESOURCE_BASE = "https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/main"
 SMARTCUTTER_BASE = "https://huggingface.co/shiromiya/SmartCutter/resolve/main/SmartCutter-v3"
 url_base = RESOURCE_BASE
 
@@ -19,7 +19,7 @@ pretraineds_hifigan_list = [
             "f0G40k.pth",
             "f0G48k.pth",
         ],
-        f"{RESOURCE_BASE}/pretrained_models/rvc_nsf_hifigan/v2",
+        f"{RESOURCE_BASE}/RVC_v2_pretrains",
     )
 ]
 
@@ -36,8 +36,10 @@ smartcutter_list = [
 ]
 
 models_list = [
-    ("predictors/", ["rmvpe.pt"]),
-    ("predictors/", ["fcpe_ddsp.pt"], f"{RESOURCE_BASE}/f0_predictors")
+    # Both live under ``predictors/`` in the resource repo, so both go through
+    # the default path.  ``fcpe_ddsp.pt`` used to carry an override pointing at
+    # ``f0_predictors/``, which does not exist and 404'd on every run.
+    ("predictors/", ["rmvpe.pt", "fcpe_ddsp.pt"]),
 ]
 
 embedders_list = [
@@ -93,17 +95,42 @@ def download_file(url, destination_path, global_bar):
     """
     Download a file from the given URL to the specified destination path,
     updating the global progress bar as data is downloaded.
+
+    The status code is checked before anything is written, and the body lands
+    in a temporary file that is only renamed into place once it is complete.
+    Without both of those this wrote whatever came back: a 404 from Hugging Face
+    carries the fifteen-byte body ``Entry not found``, which was duly saved as
+    ``f0G40k.pth``.  Every later run then saw the file existing and skipped it,
+    so six pretrained models stayed permanently broken and only failed much
+    later, at ``torch.load``, with an error about serialization formats that had
+    nothing to do with the real problem.
     """
 
     dir_name = os.path.dirname(destination_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
+
     response = requests.get(url, stream=True)
-    block_size = 1024
-    with open(destination_path, "wb") as file:
-        for data in response.iter_content(block_size):
-            file.write(data)
-            global_bar.update(len(data))
+    response.raise_for_status()
+    expected = int(response.headers.get("content-length", 0))
+
+    temporary_path = f"{destination_path}.part"
+    written = 0
+    try:
+        with open(temporary_path, "wb") as file:
+            for data in response.iter_content(1024):
+                file.write(data)
+                written += len(data)
+                global_bar.update(len(data))
+        if expected and written != expected:
+            raise IOError(
+                f"{os.path.basename(destination_path)}: expected {expected} bytes, got {written}."
+            )
+        os.replace(temporary_path, destination_path)
+    except BaseException:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
 
 
 def download_mapping_files(file_mapping_list, global_bar):
@@ -217,7 +244,7 @@ def prequisites_download_pipeline(
                 if os.name == "nt":
                     download_mapping_files(executables_list, global_bar)
                 else:
-                    print("No executables needed")
+                    info("No executables needed.", tag="[DOWNLOAD]")
             if smartcutter:
                 download_mapping_files(smartcutter_list, global_bar)
             if pretraineds_hifigan:

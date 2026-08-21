@@ -94,7 +94,15 @@ def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
     return spec
 
 
-def spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax):
+def spec_to_mel_torch(
+    spec,
+    n_fft,
+    num_mels,
+    sample_rate,
+    fmin,
+    fmax,
+    log_compression=True,
+):
     """
     Convert a spectrogram to a mel-spectrogram.
 
@@ -118,12 +126,22 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax):
         )
 
     melspec = torch.matmul(mel_basis[fmax_dtype_device], spec)
-    melspec = spectral_normalize_torch(melspec)
+    if log_compression:
+        melspec = spectral_normalize_torch(melspec)
     return melspec
 
 
 def mel_spectrogram_torch(
-    y, n_fft, num_mels, sample_rate, hop_size, win_size, fmin, fmax, center=False
+    y,
+    n_fft,
+    num_mels,
+    sample_rate,
+    hop_size,
+    win_size,
+    fmin,
+    fmax,
+    center=False,
+    log_compression=True,
 ):
     """
     Compute the mel-spectrogram of a signal.
@@ -141,7 +159,15 @@ def mel_spectrogram_torch(
     """
     spec = spectrogram_torch(y, n_fft, hop_size, win_size, center)
 
-    melspec = spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax)
+    melspec = spec_to_mel_torch(
+        spec,
+        n_fft,
+        num_mels,
+        sample_rate,
+        fmin,
+        fmax,
+        log_compression=log_compression,
+    )
 
     return melspec
 
@@ -161,11 +187,19 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
         sample_rate: int = 48000,
         n_mels: list[int] = [5, 10, 20, 40, 80, 160, 320],
         window_lengths: list[int] = [32, 64, 128, 256, 512, 1024, 2048],
-        loss_fn=torch.nn.L1Loss(),
+        loss_fn=None,
+        safe_log: bool = False,
+        log_scale: float = 1000.0,
     ):
         super().__init__()
         self.sample_rate = sample_rate
-        self.loss_fn = loss_fn
+        # Defaulted here rather than in the signature: a module instance as a
+        # default argument is shared by every caller that omits it.  Harmless
+        # for a stateless L1, but it is the kind of default that stops being
+        # harmless the moment someone passes a stateful distance.
+        self.loss_fn = loss_fn if loss_fn is not None else torch.nn.L1Loss()
+        self.safe_log = bool(safe_log)
+        self.log_scale = float(log_scale)
         self.log_base = torch.log(torch.tensor(10.0))
         self.stft_params: list[tuple] = []
         self.hann_window: dict[int, torch.Tensor] = {}
@@ -227,7 +261,11 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
         for p in self.stft_params:
             real_mels = self.mel_spectrogram(real, *p)
             fake_mels = self.mel_spectrogram(fake, *p)
-            real_logmels = torch.log(real_mels.clamp(min=1e-5)) / self.log_base
-            fake_logmels = torch.log(fake_mels.clamp(min=1e-5)) / self.log_base
+            if self.safe_log:
+                real_logmels = torch.log1p(real_mels * self.log_scale)
+                fake_logmels = torch.log1p(fake_mels * self.log_scale)
+            else:
+                real_logmels = torch.log(real_mels.clamp(min=1e-5)) / self.log_base
+                fake_logmels = torch.log(fake_mels.clamp(min=1e-5)) / self.log_base
             loss += self.loss_fn(real_logmels, fake_logmels)
         return loss

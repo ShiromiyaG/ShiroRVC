@@ -36,6 +36,43 @@ _rich_print_installed = False
 _builtin_print = builtins.print
 DEFAULT_CPU_THREADS = max(1, min(4, cpu_count()))
 
+#: Severity of the ``[TAG]`` prefixes the codebase already prints, so an
+#: existing ``print("[WARNING] ...")`` picks up the right colour without the
+#: call site having to change.
+_TAG_STYLES = {
+    "WARNING": "bold yellow",
+    "WARN": "bold yellow",
+    "ERROR": "bold red",
+    "FATAL": "bold red",
+    "DEBUG": "dim",
+}
+
+
+def _encodable(text: str) -> bool:
+    """Whether the console's stream can render ``text``.
+
+    Windows consoles still start in a legacy code page unless something sets
+    PYTHONUTF8, and writing a glyph the stream cannot encode raises rather than
+    degrading.  Probing once lets the ASCII fallbacks below take over instead.
+    """
+    encoding = getattr(sys.stderr, "encoding", None) or "ascii"
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+_UNICODE_GLYPHS = _encodable("✓✗•▲")
+#: (glyph, style) per severity.
+_LEVELS = {
+    "info": ("•" if _UNICODE_GLYPHS else "-", "cyan"),
+    "success": ("✓" if _UNICODE_GLYPHS else "+", "bold green"),
+    "warning": ("▲" if _UNICODE_GLYPHS else "!", "bold yellow"),
+    "error": ("✗" if _UNICODE_GLYPHS else "x", "bold red"),
+    "debug": ("·" if _UNICODE_GLYPHS else ".", "dim"),
+}
+
 
 class ProgressHandle:
     def __init__(self, progress: Progress, task_id: int):
@@ -95,10 +132,15 @@ def rich_print(
             styled_objects.append(obj)
             continue
 
+        tag = match.group(2)
+        tag_style = _TAG_STYLES.get(tag[1:-1].strip().upper(), "bold cyan")
         styled = Text(match.group(1))
-        styled.append(match.group(2), style="bold cyan")
+        styled.append(tag, style=tag_style)
         styled.append(match.group(3))
-        styled.append(match.group(4))
+        # A warning or an error reads as one unit, so the message carries the
+        # severity colour too; neutral tags leave the body alone.
+        body_style = "" if tag_style == "bold cyan" else tag_style.replace("bold ", "")
+        styled.append(match.group(4), style=body_style)
         styled_objects.append(styled)
 
     console.print(
@@ -117,6 +159,64 @@ def install_rich_print() -> None:
     if not _rich_print_installed:
         builtins.print = rich_print
         _rich_print_installed = True
+
+
+def _emit(level: str, message: Any, tag: str | None = None) -> None:
+    glyph, style = _LEVELS[level]
+    line = Text()
+    line.append(f"{glyph} ", style=style)
+    if tag:
+        line.append(f"{tag} ", style="bold cyan")
+    line.append(str(message), style="" if level in ("info", "success") else style)
+    get_console().print(line, markup=False, highlight=False)
+
+
+def info(message: Any, *, tag: str | None = None) -> None:
+    """A step that happened as expected."""
+    _emit("info", message, tag)
+
+
+def success(message: Any, *, tag: str | None = None) -> None:
+    """A step that finished and produced something."""
+    _emit("success", message, tag)
+
+
+def warning(message: Any, *, tag: str | None = None) -> None:
+    """Something worked but not the way the user probably wanted."""
+    _emit("warning", message, tag)
+
+
+def error(message: Any, *, tag: str | None = None) -> None:
+    """Something did not work."""
+    _emit("error", message, tag)
+
+
+def rule(title: str) -> None:
+    """Separate phases of a long run."""
+    get_console().rule(Text(title, style="bold cyan"), style="cyan")
+
+
+def print_error_panel(
+    message: Any,
+    *,
+    title: str = "Error",
+    details: str | None = None,
+) -> None:
+    """Render a failure with its traceback folded into one bordered block."""
+    body = Text(str(message), style="red")
+    if details:
+        body.append("\n\n")
+        body.append(details.rstrip(), style="dim")
+    get_console().print(
+        Panel(
+            body,
+            title=title,
+            title_align="left",
+            border_style="red",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+    )
 
 
 def configure_logging(level: int = logging.INFO) -> None:

@@ -2,12 +2,44 @@ import os
 import shutil
 from random import shuffle
 from rvc.configs.config import Config
+from rvc.lib.terminal import info
 import json
 import librosa
 import soundfile as sf
 
 config = Config()
 current_directory = os.getcwd()
+
+#: Everything the filelist points at lives under the application root, so paths
+#: are stored relative to it.  Absolute paths bake the machine that ran the
+#: extraction into the dataset: moving ``logs/<model>/`` to another drive, to
+#: another user's install, or into a container breaks every entry, and the
+#: failure surfaces as a FileNotFoundError thousands of steps into training.
+#:
+#: Derived from this file's location rather than from ``os.getcwd()`` -- the
+#: extractor is launched as a subprocess and must not depend on where from.
+APPLICATION_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+
+
+def relative_to_root(path: str) -> str:
+    """Path relative to the application root, with forward slashes.
+
+    POSIX separators are written even on Windows: ``open()`` accepts them on
+    both platforms, and it makes a preprocessed ``logs/`` directory portable
+    between them.  A path outside the root is returned unchanged -- better an
+    absolute entry than a ``../../..`` chain that assumes a layout.
+    """
+    absolute = os.path.abspath(path)
+    try:
+        relative = os.path.relpath(absolute, APPLICATION_ROOT)
+    except ValueError:
+        # Different drive on Windows; no relative path exists.
+        return absolute.replace(os.sep, "/")
+    if relative.startswith(os.pardir):
+        return absolute.replace(os.sep, "/")
+    return relative.replace(os.sep, "/")
 
 
 def ensure_mute_audio(mute_base_path: str, sample_rate: int) -> str:
@@ -63,9 +95,9 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     config_save_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_save_path):
         shutil.copyfile(config_path, config_save_path)
-        print(f"Config saved at {config_save_path}")
+        info(f"Config saved at {config_save_path}", tag="[EXTRACT]")
     else:
-        print(f"Config file already exists at {config_save_path}")
+        info(f"Config already exists at {config_save_path}", tag="[EXTRACT]")
 
 def generate_filelist(
     model_path: str, sample_rate: int, include_mutes: int = 2, embedder_model: str = "contentvec", vocoder_arch: str = "hifi"
@@ -104,7 +136,15 @@ def generate_filelist(
         if sid not in sids:
             sids.append(sid)
         options.append(
-            f"{os.path.join(gt_wavs_dir, gt_wavs_file)}|{os.path.join(feature_dir, feature_file)}|{os.path.join(f0_dir, f0_file)}|{os.path.join(f0nsf_dir, f0nsf_file)}|{sid}"
+            "|".join(
+                (
+                    relative_to_root(os.path.join(gt_wavs_dir, gt_wavs_file)),
+                    relative_to_root(os.path.join(feature_dir, feature_file)),
+                    relative_to_root(os.path.join(f0_dir, f0_file)),
+                    relative_to_root(os.path.join(f0nsf_dir, f0nsf_file)),
+                    sid,
+                )
+            )
         )
 
     if include_mutes > 0:
@@ -116,10 +156,16 @@ def generate_filelist(
         mute_f0nsf_path = os.path.join(mute_base_path, "f0_voiced", "mute.wav.npy")
 
         # adding x files per sid
-        for sid in sids * include_mutes:
-            options.append(
-                f"{mute_audio_path}|{mute_feature_path}|{mute_f0_path}|{mute_f0nsf_path}|{sid}"
+        mute_entry = "|".join(
+            (
+                relative_to_root(mute_audio_path),
+                relative_to_root(mute_feature_path),
+                relative_to_root(mute_f0_path),
+                relative_to_root(mute_f0nsf_path),
             )
+        )
+        for sid in sids * include_mutes:
+            options.append(f"{mute_entry}|{sid}")
 
     file_path = os.path.join(model_path, "model_info.json")
     if os.path.exists(file_path):

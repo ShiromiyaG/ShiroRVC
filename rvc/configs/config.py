@@ -8,6 +8,13 @@ from rvc.lib.terminal import get_console
 
 arch_config_paths = get_vocoder_config_paths()
 
+# Training is FP32-only.  FP16 needed a GradScaler and was the source of the
+# AMP instability; BF16 has the range but only an 8-bit mantissa, which
+# measured a gradient cosine of 0.77-0.82 against a true-FP32 reference (TF32
+# and FP16, both 11-bit, sit at 0.9997 and 0.99).  TF32 already gives tensor
+# cores at 11 bits with no autocast and no scaler, and it is toggled per run
+# from the training tab rather than here.
+
 def singleton(cls):
     instances = {}
 
@@ -24,15 +31,11 @@ class Config:
 
         initial_precision = self.get_precision()
 
-        if self.device == "cpu":
-            self.is_half = False
-            get_console().log("[CONFIG] Running on CPU, forcing fp32 precision.", markup=False)
-        else:
-            self.is_half = initial_precision == "fp16"
-            get_console().log(
-                f"[CONFIG] Running on CUDA, training-only precision loaded from config: {initial_precision}",
-                markup=False,
-            )
+        get_console().log(
+            f"[CONFIG] Running on {'CPU' if self.device == 'cpu' else 'CUDA'}, "
+            f"training precision: {initial_precision}",
+            markup=False,
+        )
         self.gpu_name = (
             torch.cuda.get_device_name(int(self.device.split(":")[-1]))
             if self.device.startswith("cuda")
@@ -53,92 +56,30 @@ class Config:
         return configs
 
 
-    def set_precision(self, precision):
-        if precision not in ["fp32", "fp16"]:
-            raise ValueError("Invalid precision type. Must be: 'fp32' or 'fp16'")
-
-        fp16_run_value = precision == "fp16"
-
-        self.is_half = fp16_run_value 
-
-        for config_paths in arch_config_paths.values():
-            for config_path in config_paths:
-                full_config_path = os.path.join("rvc", "configs", config_path)
-                try:
-                    with open(full_config_path, "r") as f:
-                        config = json.load(f)
-                    config["train"]["fp16_run"] = fp16_run_value
-                    with open(full_config_path, "w") as f:
-                        json.dump(config, f, indent=4)
-                except FileNotFoundError:
-                    get_console().log(f"File not found: {full_config_path}", markup=False)
-
-        return f"Precision set to: {precision}."
-
-
     def get_precision(self):
-        if not arch_config_paths:
-            raise FileNotFoundError("No configuration paths provided.")
-
-        full_config_path = os.path.join("rvc", "configs", arch_config_paths["hifi"][0])
-        try:
-            with open(full_config_path, "r") as f:
-                config = json.load(f)
-
-            fp16_run_value = config["train"].get("fp16_run", False)
-
-            if fp16_run_value:
-                precision = "fp16"
-            else:
-                precision = "fp32"
-            return precision
-        except FileNotFoundError:
-            get_console().log(f"File not found: {full_config_path}", markup=False)
-            return None
-
+        return "fp32"
 
     def check_precision(self):
-        if not arch_config_paths:
-            raise FileNotFoundError("No configuration paths provided.")
-
-        full_config_path = os.path.join("rvc", "configs", arch_config_paths["hifi"][0])
-        try:
-            with open(full_config_path, "r") as f:
-                config = json.load(f)
-
-            fp16_run_value = config["train"].get("fp16_run", False)
-
-            if fp16_run_value:
-                precision = "fp16"
-            else:
-                precision = "fp32"
-
-            runtime_precision = "fp32"
-            if self.is_half and fp16_run_value:
-                runtime_precision = "fp16"
-
-            result = (
-                f"Config File Precision: {precision}\n"
-                f"Runtime Precision: {runtime_precision}\n"
-                f"'is_half' Flag: {self.is_half}"
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        return "\n".join(
+            (
+                "Training precision: FP32 (master weights and optimizer in FP32).",
+                f"TF32 matmul/conv currently: {'on' if tf32 else 'off'}"
+                " - toggle it per run in the Training tab.",
+                "No autocast, no GradScaler: FP16 and BF16 training were removed.",
+                "BF16 lost too much mantissa here (gradient cosine 0.77-0.82 vs"
+                " FP32; TF32 is 0.9997).",
             )
-            return result
-        except FileNotFoundError:
-            get_console().log(f"File not found: {full_config_path}", markup=False)
-            return "Configuration file not found."
+        )
 
     def device_config(self):
         if self.device.startswith("cuda"):
             self.set_cuda_config()
         else:
             self.device = "cpu"
-            self.is_half = False
-            self.set_precision("fp32")
 
         # Configuration for 6GB GPU memory
-        x_pad, x_query, x_center, x_max = (
-            (3, 10, 60, 65) if self.is_half else (1, 6, 38, 41)
-        )
+        x_pad, x_query, x_center, x_max = (1, 6, 38, 41)
         if self.gpu_mem is not None and self.gpu_mem <= 4:
             # Configuration for 5GB GPU memory
             x_pad, x_query, x_center, x_max = (1, 5, 30, 32)
@@ -149,19 +90,6 @@ class Config:
     def set_cuda_config(self):
         i_device = int(self.device.split(":")[-1])
         self.gpu_name = torch.cuda.get_device_name(i_device)
-
-        # GPUs that must be forced to fp32 ( They either don't support fp16 or the performance is tragic and outweights the pros.
-        fp32_gpus = ["P10", "P40", "1050", "1060", "1070", "1080"]
-
-        if any(gpu_str.lower() in self.gpu_name.lower() for gpu_str in fp32_gpus):
-            if self.is_half:
-                get_console().log(
-                    f"[CONFIG WARNING] Your GPU ({self.gpu_name}) does NOT support FP16 precision.",
-                    markup=False,
-                )
-                get_console().log("[CONFIG] Forcing precision to FP32.", markup=False)
-            self.is_half = False
-            self.set_precision("fp32")
 
         self.gpu_mem = torch.cuda.get_device_properties(i_device).total_memory // (1024 ** 3)
 
@@ -203,15 +131,4 @@ def microarchitecture_capability_checker():
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
 
 
-def check_if_fp16():
-    for arch_name, config_files in arch_config_paths.items():
-        for config_file in config_files:
-            full_config_path = os.path.join("rvc", "configs", config_file)
-            try:
-                with open(full_config_path, "r") as f:
-                    config = json.load(f)
-                if config.get("train", {}).get("fp16_run", False):
-                    return True
-            except FileNotFoundError:
-                continue
-    return False
+

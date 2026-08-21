@@ -12,6 +12,7 @@ from core import (
     import_voice_converter,
 )
 
+from rvc.lib.terminal import warning
 from rvc.lib.text import format_title
 from rvc.lib.model_bundle import (
     get_bundle_models,
@@ -19,8 +20,17 @@ from rvc.lib.model_bundle import (
     is_model_bundle,
     is_model_file,
     load_model_bundle,
+    walk_models,
 )
 from tabs.settings.sections.restart import stop_infer
+from rvc.infer.messages import (
+    DISCRETE_INFERENCE_MODE_INFO,
+    DISCRETE_INFERENCE_MODE_LABEL,
+    DISCRETE_TEMPERATURE_INFO,
+    DISCRETE_TEMPERATURE_LABEL,
+)
+
+from rvc.lib.i18n import _
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -58,7 +68,7 @@ sup_audioext = {
 
 names = [
     os.path.join(root, file)
-    for root, _, files in os.walk(model_root_relative, topdown=False)
+    for root, _, files in walk_models(model_root_relative)
     for file in files
     if (
         is_model_file(file)
@@ -70,7 +80,7 @@ default_weight = names[0] if names else None
 
 indexes_list = [
     os.path.join(root, name)
-    for root, _, files in os.walk(model_root_relative, topdown=False)
+    for root, _, files in walk_models(model_root_relative)
     for name in files
     if name.endswith(".index") and "trained" not in name
 ]
@@ -183,7 +193,7 @@ def output_path_fn(input_audio_path):
 def change_choices(model):
     names = [
         os.path.join(root, file)
-        for root, _, files in os.walk(model_root_relative, topdown=False)
+        for root, _, files in walk_models(model_root_relative)
         for file in files
         if (
             is_model_file(file)
@@ -193,7 +203,7 @@ def change_choices(model):
 
     indexes_list = [
         os.path.join(root, name)
-        for root, _, files in os.walk(model_root_relative, topdown=False)
+        for root, _, files in walk_models(model_root_relative)
         for name in files
         if name.endswith(".index") and "trained" not in name
     ]
@@ -219,7 +229,7 @@ def change_choices(model):
 def get_indexes():
     indexes_list = [
         os.path.join(dirpath, filename)
-        for dirpath, _, filenames in os.walk(model_root_relative)
+        for dirpath, _, filenames in walk_models(model_root_relative)
         for filename in filenames
         if filename.endswith(".index") and "trained" not in filename
     ]
@@ -261,7 +271,7 @@ def save_to_wav2(upload_audio):
 
 
 def delete_outputs():
-    gr.Info("Inference outputs cleared!")
+    gr.Info(_("Inference outputs cleared!"))
     for root, _, files in os.walk(audio_root_relative, topdown=False):
         for name in files:
             if name.endswith(tuple(sup_audioext)) and "_output" in name:
@@ -348,7 +358,7 @@ def get_speakers_id(model, sub_model_name=None):
         else:
             return [0]
     except Exception as e:
-        print(f"Error loading model to get speaker IDs: {e}")
+        warning(f"Could not read the model's speaker IDs: {e}", tag="[INFER]")
         return [0]
 
 def get_bundle_model_names(model):
@@ -359,7 +369,7 @@ def get_bundle_model_names(model):
         model_data = load_model_bundle(os.path.join(now_dir, model))
         return sorted(get_bundle_models(model_data).keys())
     except Exception as e:
-        print(f"Error checking model bundle: {e}")
+        warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []
 
 # Inference tab
@@ -367,32 +377,32 @@ def inference_tab():
     with gr.Column():
         with gr.Row():
             model_file = gr.Dropdown(
-                label="Voice Model",
-                info="Voice model used for inference.",
+                label=_("Voice Model"),
+                info=_("Voice model used for inference."),
                 choices=sorted(names, key=lambda x: extract_model_and_epoch(x)),
                 interactive=True,
                 value=default_weight,
                 allow_custom_value=True,
             )
             bundle_submodel = gr.Dropdown(
-                label="Bundle sub-model",
-                info="Sub-model inside the model bundle.",
+                label=_("Bundle sub-model"),
+                info=_("Sub-model inside the model bundle."),
                 choices=[],
                 value=None,
                 interactive=True,
                 visible=False
             )
             index_file = gr.Dropdown(
-                label="Index File",
-                info="Optional index file; unavailable for model bundles.",
+                label=_("Index File"),
+                info=_("Optional index file; unavailable for model bundles."),
                 choices=get_indexes(),
                 value=match_index(default_weight) if default_weight else "",
                 interactive=True,
                 allow_custom_value=True,
             )
         with gr.Row():
-            unload_button = gr.Button("Unload the voice model")
-            refresh_button = gr.Button("Refresh models, indexes and audios")
+            unload_button = gr.Button(_("Unload the voice model"))
+            refresh_button = gr.Button(_("Refresh models, indexes and audios"))
 
             def _unload_and_cleanup():
                 import_voice_converter().cleanup_model()
@@ -411,7 +421,8 @@ def inference_tab():
             clean_audio, clean_strength, export_format,
             embedder_model, embedder_model_custom,
             formant_shifting, formant_qfrency, formant_timbre,
-            sid, seed, bundle_submodel,
+            sid, seed, discrete_deterministic, latent_temperature, bundle_submodel,
+            index_k, index_power, index_continuity,
         ):
             if not output_path or not output_path.strip():
                 output_path = output_path_fn(audio)
@@ -437,7 +448,8 @@ def inference_tab():
                 None,
                 embedder_model, embedder_model_custom,
                 formant_shifting, formant_qfrency, formant_timbre,
-                sid, seed, bundle_submodel,
+                sid, seed, bundle_submodel, discrete_deterministic, latent_temperature,
+                index_k, index_power, index_continuity,
             )
 
         def on_model_change(model_path):
@@ -484,61 +496,76 @@ def inference_tab():
             return gr.update()
 
     # Single inference tab
-    with gr.Tab("Single input infer"):
+    with gr.Tab(_("Single input infer")):
         with gr.Column():
             upload_audio = gr.Audio(
-                label="Upload Audio", type="filepath", editable=False
+                label=_("Upload Audio"), type="filepath", editable=False
             )
             with gr.Row():
                 audio = gr.Dropdown(
-                    label="Select Audio Input",
-                    info="Audio to convert.",
+                    label=_("Select Audio Input"),
+                    info=_("Audio to convert."),
                     choices=sorted(audio_paths),
                     value=audio_paths[0] if audio_paths else "",
                     interactive=True,
                     allow_custom_value=True,
                 )
 
-        with gr.Accordion("Advanced Settings for inference", open=False):
+        with gr.Accordion(_("Advanced Settings for inference"), open=False):
             with gr.Column():
-                clear_outputs_infer = gr.Button("Clear '_output' audio files ( infer outputs ) from 'assets/audios' ")
+                clear_outputs_infer = gr.Button(_("Clear '_output' audio files ( infer outputs ) from 'assets/audios' "))
                 output_path = gr.Textbox(
-                    label="Path for infer outputs",
+                    label=_("Path for infer outputs"),
                     placeholder=os.path.join("assets", "audios", "filename_output.wav"),
-                    info="Optional output path. Empty uses assets/audios.",
+                    info=_("Optional output path. Empty uses assets/audios."),
                     value="",
                     interactive=True,
                 )
                 export_format = gr.Radio(
-                    label="Export Format",
-                    info="Output audio format.",
+                    label=_("Export Format"),
+                    info=_("Output audio format."),
                     choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
                     value="WAV",
                     interactive=True,
                 )
                 seed = gr.Number(
-                    label="Inference Seed",
-                    info="Seed for reproducible output. Use 0 for random output.",
+                    label=_("Inference Seed"),
+                    info=_("Seed for reproducible output. Use 0 for random output."),
                     value=0,
                     interactive=True,
                 )
+                discrete_deterministic = gr.Checkbox(
+                    label=DISCRETE_INFERENCE_MODE_LABEL,
+                    info=DISCRETE_INFERENCE_MODE_INFO,
+                    value=True,
+                    interactive=True,
+                )
+                latent_temperature = gr.Slider(
+                    minimum=0.1,
+                    maximum=2.0,
+                    step=0.05,
+                    label=DISCRETE_TEMPERATURE_LABEL,
+                    info=DISCRETE_TEMPERATURE_INFO,
+                    value=1.0,
+                    interactive=True,
+                )
                 sid = gr.Dropdown(
-                    label="Speaker ID",
-                    info="Speaker ID for multi-speaker models.",
+                    label=_("Speaker ID"),
+                    info=_("Speaker ID for multi-speaker models."),
                     choices=[0],
                     value=0,
                     interactive=True,
                 )
                 split_audio = gr.Checkbox(
-                    label="Audio splitting",
-                    info="Split input at silence regions.",
+                    label=_("Audio splitting"),
+                    info=_("Split input at silence regions."),
                     visible=True,
                     value=False,
                     interactive=True,
                 )
                 autotune = gr.Checkbox(
-                    label="Autotuning",
-                    info="Apply autotune.",
+                    label=_("Autotuning"),
+                    info=_("Apply autotune."),
                     visible=True,
                     value=False,
                     interactive=True,
@@ -546,15 +573,15 @@ def inference_tab():
                 autotune_strength = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Strength of autotuning",
-                    info="Higher values snap pitch to the chromatic grid.",
+                    label=_("Strength of autotuning"),
+                    info=_("Higher values snap pitch to the chromatic grid."),
                     visible=False,
                     value=1,
                     interactive=True,
                 )
                 clean_audio = gr.Checkbox(
-                    label="Audio cleanup",
-                    info="Reduce detected noise in speech.",
+                    label=_("Audio cleanup"),
+                    info=_("Reduce detected noise in speech."),
                     visible=True,
                     value=False,
                     interactive=True,
@@ -562,23 +589,23 @@ def inference_tab():
                 clean_strength = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Strength of cleaning",
-                    info="Higher values apply stronger cleanup.",
+                    label=_("Strength of cleaning"),
+                    info=_("Higher values apply stronger cleanup."),
                     visible=False,
                     value=0.3,
                     interactive=True,
                 )
                 formant_shifting = gr.Checkbox(
-                    label="Formant Shifting",
-                    info="Shift vocal formants when needed.",
+                    label=_("Formant Shifting"),
+                    info=_("Shift vocal formants when needed."),
                     value=False,
                     visible=True,
                     interactive=True,
                 )
                 with gr.Row(visible=False) as formant_row:
                     formant_preset = gr.Dropdown(
-                        label="Browse presets for formant shifting",
-                        info="Presets from assets/formant_shift.",
+                        label=_("Browse presets for formant shifting"),
+                        info=_("Presets from assets/formant_shift."),
                         choices=list_json_files(FORMANTSHIFT_DIR),
                         visible=False,
                         interactive=True,
@@ -589,8 +616,8 @@ def inference_tab():
                     )
                 formant_qfrency = gr.Slider(
                     value=1.0,
-                    info="Formant quefrency. Default: 1.0.",
-                    label="Formant Quefrency.",
+                    info=_("Formant quefrency. Default: 1.0."),
+                    label=_("Formant Quefrency."),
                     minimum=0.0,
                     maximum=16.0,
                     step=0.1,
@@ -599,24 +626,24 @@ def inference_tab():
                 )
                 formant_timbre = gr.Slider(
                     value=1.0,
-                    info="Formant timbre. Default: 1.0.",
-                    label="Formant Timbre",
+                    info=_("Formant timbre. Default: 1.0."),
+                    label=_("Formant Timbre"),
                     minimum=0.0,
                     maximum=16.0,
                     step=0.1,
                     visible=False,
                     interactive=True,
                 )
-                with gr.Accordion("Preset Settings", open=False):
+                with gr.Accordion(_("Preset Settings"), open=False):
                     with gr.Row():
                         preset_dropdown = gr.Dropdown(
-                            label="Select Custom Preset",
+                            label=_("Select Custom Preset"),
                             choices=list_json_files(PRESETS_DIR),
                             interactive=True,
                         )
-                        presets_refresh_button = gr.Button("Refresh Presets")
+                        presets_refresh_button = gr.Button(_("Refresh Presets"))
                     import_file = gr.File(
-                        label="Select file to import",
+                        label=_("Select file to import"),
                         file_count="single",
                         type="filepath",
                         interactive=True,
@@ -631,24 +658,24 @@ def inference_tab():
                     )
                     with gr.Row():
                         preset_name_input = gr.Textbox(
-                            label="Preset Name",
-                            placeholder="Enter preset name",
+                            label=_("Preset Name"),
+                            placeholder=_("Enter preset name"),
                         )
-                        export_button = gr.Button("Export Preset")
+                        export_button = gr.Button(_("Export Preset"))
                 pitch = gr.Slider(
                     minimum=-24,
                     maximum=24,
                     step=1,
-                    label="Pitch",
-                    info="Pitch shift in semitones. 12 = one octave up.",
+                    label=_("Pitch"),
+                    info=_("Pitch shift in semitones. 12 = one octave up."),
                     value=0,
                     interactive=True,
                 )
                 filter_radius = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Filter Radius",
-                    info="Smooth the extracted pitch curve. Default: 0.006.",
+                    label=_("Filter Radius"),
+                    info=_("Smooth the extracted pitch curve. Default: 0.006."),
                     value=0.006,
                     step=0.001,
                     interactive=False,
@@ -657,24 +684,62 @@ def inference_tab():
                 index_rate = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Search Feature Ratio",
-                    info="Index influence. Lower values can reduce artifacts.",
+                    label=_("Search Feature Ratio"),
+                    info=_("Index influence. Lower values can reduce artifacts."),
+                    value=0.5,
+                    interactive=True,
+                )
+                index_k = gr.Slider(
+                    minimum=1,
+                    maximum=32,
+                    step=1,
+                    label=_("Index Neighbours"),
+                    info=(
+                        _("Frames averaged per match. Fewer keeps the training "
+                        "voice's idiosyncratic articulation; more averages "
+                        "toward its mean voice.")
+                    ),
+                    value=8,
+                    interactive=True,
+                )
+                index_power = gr.Slider(
+                    minimum=0,
+                    maximum=8,
+                    step=0.25,
+                    label=_("Index Sharpness"),
+                    info=(
+                        _("How strongly closer neighbours outweigh further ones. "
+                        "0 averages them equally; high values use the nearest alone.")
+                    ),
+                    value=2.0,
+                    interactive=True,
+                )
+                index_continuity = gr.Slider(
+                    minimum=0,
+                    maximum=4,
+                    step=0.1,
+                    label=_("Index Continuity"),
+                    info=(
+                        _("Favours matches that continue the previous frame's, so "
+                        "the retrieval stops jumping between unrelated parts of "
+                        "the dataset. Needs an index built by this fork.")
+                    ),
                     value=0.5,
                     interactive=True,
                 )
                 rms_mix_rate = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="RMS Volume Envelope",
-                    info="Mix the converted and input loudness envelopes.",
+                    label=_("RMS Volume Envelope"),
+                    info=_("Mix the converted and input loudness envelopes."),
                     value=1,
                     interactive=True,
                 )
                 protect = gr.Slider(
                     minimum=0,
                     maximum=0.5,
-                    label="Protect Voiceless Consonants",
-                    info="Protect voiceless consonants. Higher values reduce index influence.",
+                    label=_("Protect Voiceless Consonants"),
+                    info=_("Protect voiceless consonants. Higher values reduce index influence."),
                     value=0.33,
                     interactive=True,
                 )
@@ -688,6 +753,7 @@ def inference_tab():
                         rms_mix_rate,
                         protect,
                     ],
+                    show_progress="hidden",
                 )
                 export_button.click(
                     export_presets_button,
@@ -701,8 +767,8 @@ def inference_tab():
                     ],
                 )
                 f0_method = gr.Radio(
-                    label="Pitch extraction algorithm",
-                    info="Pitch algorithm. RMVPE is the recommended default.",
+                    label=_("Pitch extraction algorithm"),
+                    info=_("Pitch algorithm. RMVPE is the recommended default."),
                     choices=[
                         "crepe",
                         "crepe-tiny",
@@ -713,8 +779,8 @@ def inference_tab():
                     interactive=True,
                 )
                 embedder_model = gr.Radio(
-                    label="Embedder Model",
-                    info="Model used for speaker features.",
+                    label=_("Embedder Model"),
+                    info=_("Model used for speaker features."),
                     choices=[
                         "contentvec",
                         "spin_v1",
@@ -725,83 +791,98 @@ def inference_tab():
                     interactive=True,
                 )
                 with gr.Column(visible=False) as embedder_custom:
-                    with gr.Accordion("Custom Embedder", open=True):
+                    with gr.Accordion(_("Custom Embedder"), open=True):
                         with gr.Row():
                             embedder_model_custom = gr.Dropdown(
-                                label="Select Custom Embedder",
+                                label=_("Select Custom Embedder"),
                                 choices=refresh_embedders_folders(),
                                 interactive=True,
                                 allow_custom_value=True,
                             )
-                            refresh_embedders_button = gr.Button("Refresh embedders")
-                        folder_name_input = gr.Textbox(label="Folder Name", interactive=True)
+                            refresh_embedders_button = gr.Button(_("Refresh embedders"))
+                        folder_name_input = gr.Textbox(label=_("Folder Name"), interactive=True)
                         with gr.Row():
                             bin_file_upload = gr.File(
-                                label="Upload .bin",
+                                label=_("Upload .bin"),
                                 type="filepath",
                                 interactive=True,
                             )
                             config_file_upload = gr.File(
-                                label="Upload .json",
+                                label=_("Upload .json"),
                                 type="filepath",
                                 interactive=True,
                             )
-                        move_files_button = gr.Button("Move files to custom embedder")
+                        move_files_button = gr.Button(_("Move files to custom embedder"))
 
-        convert_button1 = gr.Button("Convert")
+        convert_button1 = gr.Button(_("Convert"))
 
         with gr.Row():
             vc_output1 = gr.Textbox(
-                label="Output Information",
-                info="Inference status.",
+                label=_("Output Information"),
+                info=_("Inference status."),
             )
             vc_output2 = gr.Audio("Export Audio")
 
     # Batch inference tab
-    with gr.Tab("Batch"):
+    with gr.Tab(_("Batch")):
         with gr.Row():
             with gr.Column():
                 input_folder_batch = gr.Textbox(
-                    label="Input Folder",
-                    info="Folder containing input audio.",
-                    placeholder="Enter input path",
+                    label=_("Input Folder"),
+                    info=_("Folder containing input audio."),
+                    placeholder=_("Enter input path"),
                     value=os.path.join(now_dir, "assets", "audios"),
                     interactive=True,
                 )
                 output_folder_batch = gr.Textbox(
-                    label="Output Folder",
-                    info="Folder for converted audio.",
-                    placeholder="Enter output path",
+                    label=_("Output Folder"),
+                    info=_("Folder for converted audio."),
+                    placeholder=_("Enter output path"),
                     value=os.path.join(now_dir, "assets", "audios"),
                     interactive=True,
                 )
-        with gr.Accordion("Advanced Settings", open=False):
+        with gr.Accordion(_("Advanced Settings"), open=False):
             with gr.Column():
-                clear_outputs_batch = gr.Button("Clear Outputs")
+                clear_outputs_batch = gr.Button(_("Clear Outputs"))
                 export_format_batch = gr.Radio(
-                    label="Export Format",
-                    info="Output audio format.",
+                    label=_("Export Format"),
+                    info=_("Output audio format."),
                     choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
                     value="WAV",
                     interactive=True,
                 )
                 sid_batch = gr.Dropdown(
-                    label="Speaker ID",
-                    info="Speaker ID for conversion.",
+                    label=_("Speaker ID"),
+                    info=_("Speaker ID for conversion."),
                     choices=[0],
                     value=0,
                     interactive=True,
                 )
+                discrete_deterministic_batch = gr.Checkbox(
+                    label=DISCRETE_INFERENCE_MODE_LABEL,
+                    info=DISCRETE_INFERENCE_MODE_INFO,
+                    value=True,
+                    interactive=True,
+                )
+                latent_temperature_batch = gr.Slider(
+                    minimum=0.1,
+                    maximum=2.0,
+                    step=0.05,
+                    label=DISCRETE_TEMPERATURE_LABEL,
+                    info=DISCRETE_TEMPERATURE_INFO,
+                    value=1.0,
+                    interactive=True,
+                )
                 split_audio_batch = gr.Checkbox(
-                    label="Split Audio",
-                    info="Split input into chunks.",
+                    label=_("Split Audio"),
+                    info=_("Split input into chunks."),
                     visible=True,
                     value=False,
                     interactive=True,
                 )
                 autotune_batch = gr.Checkbox(
-                    label="Autotune",
-                    info="Apply autotune for singing.",
+                    label=_("Autotune"),
+                    info=_("Apply autotune for singing."),
                     visible=True,
                     value=False,
                     interactive=True,
@@ -809,15 +890,15 @@ def inference_tab():
                 autotune_strength_batch = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Autotune Strength",
-                    info="Higher values snap pitch to the chromatic grid.",
+                    label=_("Autotune Strength"),
+                    info=_("Higher values snap pitch to the chromatic grid."),
                     visible=False,
                     value=1,
                     interactive=True,
                 )
                 clean_audio_batch = gr.Checkbox(
-                    label="Clean Audio",
-                    info="Reduce detected noise in speech.",
+                    label=_("Clean Audio"),
+                    info=_("Reduce detected noise in speech."),
                     visible=True,
                     value=False,
                     interactive=True,
@@ -825,23 +906,23 @@ def inference_tab():
                 clean_strength_batch = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Clean Strength",
-                    info="Higher values apply stronger cleanup.",
+                    label=_("Clean Strength"),
+                    info=_("Higher values apply stronger cleanup."),
                     visible=False,
                     value=0.5,
                     interactive=True,
                 )
                 formant_shifting_batch = gr.Checkbox(
-                    label="Formant Shifting",
-                    info="Shift vocal formants when needed.",
+                    label=_("Formant Shifting"),
+                    info=_("Shift vocal formants when needed."),
                     value=False,
                     visible=True,
                     interactive=True,
                 )
                 with gr.Row(visible=False) as formant_row_batch:
                     formant_preset_batch = gr.Dropdown(
-                        label="Browse presets for formanting",
-                        info="Presets from assets/formant_shift.",
+                        label=_("Browse presets for formanting"),
+                        info=_("Presets from assets/formant_shift."),
                         choices=list_json_files(FORMANTSHIFT_DIR),
                         visible=False,
                         interactive=True,
@@ -852,8 +933,8 @@ def inference_tab():
                     )
                 formant_qfrency_batch = gr.Slider(
                     value=1.0,
-                    info="Default: 1.0.",
-                    label="Quefrency for formant shifting",
+                    info=_("Default: 1.0."),
+                    label=_("Quefrency for formant shifting"),
                     minimum=0.0,
                     maximum=16.0,
                     step=0.1,
@@ -862,8 +943,8 @@ def inference_tab():
                 )
                 formant_timbre_batch = gr.Slider(
                     value=1.0,
-                    info="Default: 1.0.",
-                    label="Timbre for formant shifting",
+                    info=_("Default: 1.0."),
+                    label=_("Timbre for formant shifting"),
                     minimum=0.0,
                     maximum=16.0,
                     step=0.1,
@@ -874,16 +955,16 @@ def inference_tab():
                     minimum=-24,
                     maximum=24,
                     step=1,
-                    label="Pitch",
-                    info="Pitch shift in semitones.",
+                    label=_("Pitch"),
+                    info=_("Pitch shift in semitones."),
                     value=0,
                     interactive=True,
                 )
                 filter_radius_batch = gr.Slider(
                     minimum=0,
                     maximum=7,
-                    label="Filter Radius",
-                    info="Median filtering for pitch smoothing.",
+                    label=_("Filter Radius"),
+                    info=_("Median filtering for pitch smoothing."),
                     value=3,
                     step=1,
                     interactive=False,
@@ -892,24 +973,62 @@ def inference_tab():
                 index_rate_batch = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Search Feature Ratio",
-                    info="Index influence. Lower values can reduce artifacts.",
+                    label=_("Search Feature Ratio"),
+                    info=_("Index influence. Lower values can reduce artifacts."),
+                    value=0.5,
+                    interactive=True,
+                )
+                index_k_batch = gr.Slider(
+                    minimum=1,
+                    maximum=32,
+                    step=1,
+                    label=_("Index Neighbours"),
+                    info=(
+                        _("Frames averaged per match. Fewer keeps the training "
+                        "voice's idiosyncratic articulation; more averages "
+                        "toward its mean voice.")
+                    ),
+                    value=8,
+                    interactive=True,
+                )
+                index_power_batch = gr.Slider(
+                    minimum=0,
+                    maximum=8,
+                    step=0.25,
+                    label=_("Index Sharpness"),
+                    info=(
+                        _("How strongly closer neighbours outweigh further ones. "
+                        "0 averages them equally; high values use the nearest alone.")
+                    ),
+                    value=2.0,
+                    interactive=True,
+                )
+                index_continuity_batch = gr.Slider(
+                    minimum=0,
+                    maximum=4,
+                    step=0.1,
+                    label=_("Index Continuity"),
+                    info=(
+                        _("Favours matches that continue the previous frame's, so "
+                        "the retrieval stops jumping between unrelated parts of "
+                        "the dataset. Needs an index built by this fork.")
+                    ),
                     value=0.5,
                     interactive=True,
                 )
                 rms_mix_rate_batch = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Volume Envelope",
-                    info="Mix the converted and input loudness envelopes.",
+                    label=_("Volume Envelope"),
+                    info=_("Mix the converted and input loudness envelopes."),
                     value=1,
                     interactive=True,
                 )
                 protect_batch = gr.Slider(
                     minimum=0,
                     maximum=0.5,
-                    label="Protect Voiceless Consonants",
-                    info="Protect voiceless consonants. Higher values reduce index influence.",
+                    label=_("Protect Voiceless Consonants"),
+                    info=_("Protect voiceless consonants. Higher values reduce index influence."),
                     value=0.3,
                     interactive=True,
                 )
@@ -923,6 +1042,7 @@ def inference_tab():
                         rms_mix_rate_batch,
                         protect_batch,
                     ],
+                    show_progress="hidden",
                 )
                 export_button.click(
                     export_presets_button,
@@ -937,8 +1057,8 @@ def inference_tab():
                     outputs=[],
                 )
                 f0_method_batch = gr.Radio(
-                    label="Pitch extraction algorithm",
-                    info="Pitch algorithm. RMVPE is the recommended default.",
+                    label=_("Pitch extraction algorithm"),
+                    info=_("Pitch algorithm. RMVPE is the recommended default."),
                     choices=[
                         "crepe",
                         "crepe-tiny",
@@ -949,8 +1069,8 @@ def inference_tab():
                     interactive=True,
                 )
                 embedder_model_batch = gr.Radio(
-                    label="Embedder Model",
-                    info="Model used for speaker features.",
+                    label=_("Embedder Model"),
+                    info=_("Model used for speaker features."),
                     choices=[
                         "contentvec",
                         "spin_v1",
@@ -961,43 +1081,43 @@ def inference_tab():
                     interactive=True,
                 )
                 f0_file_batch = gr.File(
-                    label="Edited F0 curve",
+                    label=_("Edited F0 curve"),
                     visible=True,
                 )
                 with gr.Column(visible=False) as embedder_custom_batch:
-                    with gr.Accordion("Custom Embedder", open=True):
+                    with gr.Accordion(_("Custom Embedder"), open=True):
                         with gr.Row():
                             embedder_model_custom_batch = gr.Dropdown(
-                                label="Select Custom Embedder",
+                                label=_("Select Custom Embedder"),
                                 choices=refresh_embedders_folders(),
                                 interactive=True,
                                 allow_custom_value=True,
                             )
-                            refresh_embedders_button_batch = gr.Button("Refresh embedders")
+                            refresh_embedders_button_batch = gr.Button(_("Refresh embedders"))
                         folder_name_input_batch = gr.Textbox(
-                            label="Folder Name", interactive=True
+                            label=_("Folder Name"), interactive=True
                         )
                         with gr.Row():
                             bin_file_upload_batch = gr.File(
-                                label="Upload .bin",
+                                label=_("Upload .bin"),
                                 type="filepath",
                                 interactive=True,
                             )
                             config_file_upload_batch = gr.File(
-                                label="Upload .json",
+                                label=_("Upload .json"),
                                 type="filepath",
                                 interactive=True,
                             )
-                        move_files_button_batch = gr.Button("Move files to custom embedder")
+                        move_files_button_batch = gr.Button(_("Move files to custom embedder"))
 
-        convert_button_batch = gr.Button("Convert")
-        stop_button = gr.Button("Stop convert", visible=False)
+        convert_button_batch = gr.Button(_("Convert"))
+        stop_button = gr.Button(_("Stop convert"), visible=False)
         stop_button.click(fn=stop_infer, inputs=[], outputs=[])
 
         with gr.Row():
             vc_output3 = gr.Textbox(
-                label="Output Information",
-            info="Batch status.",
+                label=_("Output Information"),
+            info=_("Batch status."),
             )
 
     def toggle_visible(checkbox):
@@ -1042,6 +1162,7 @@ def inference_tab():
         fn=on_model_change,
         inputs=[model_file],
         outputs=[index_file, sid, bundle_submodel],
+        show_progress="hidden",
     )
     bundle_submodel.change(
         fn=on_submodel_change,
@@ -1057,11 +1178,13 @@ def inference_tab():
         fn=toggle_visible,
         inputs=[autotune],
         outputs=[autotune_strength],
+        show_progress="hidden",
     )
     clean_audio.change(
         fn=toggle_visible,
         inputs=[clean_audio],
         outputs=[clean_strength],
+        show_progress="hidden",
     )
     formant_shifting.change(
         fn=toggle_visible_formant_shifting,
@@ -1073,6 +1196,7 @@ def inference_tab():
             formant_qfrency,
             formant_timbre,
         ],
+        show_progress="hidden",
     )
     formant_shifting_batch.change(
         fn=toggle_visible_formant_shifting,
@@ -1084,11 +1208,13 @@ def inference_tab():
             formant_qfrency_batch,
             formant_timbre_batch,
         ],
+        show_progress="hidden",
     )
     formant_refresh_button.click(
         fn=refresh_formant,
         inputs=[],
         outputs=[formant_preset],
+        show_progress="hidden",
     )
     formant_preset.change(
         fn=update_sliders_formant,
@@ -1097,6 +1223,7 @@ def inference_tab():
             formant_qfrency,
             formant_timbre,
         ],
+        show_progress="hidden",
     )
     formant_preset_batch.change(
         fn=update_sliders_formant,
@@ -1105,16 +1232,19 @@ def inference_tab():
             formant_qfrency,
             formant_timbre,
         ],
+        show_progress="hidden",
     )
     autotune_batch.change(
         fn=toggle_visible,
         inputs=[autotune_batch],
         outputs=[autotune_strength_batch],
+        show_progress="hidden",
     )
     clean_audio_batch.change(
         fn=toggle_visible,
         inputs=[clean_audio_batch],
         outputs=[clean_strength_batch],
+        show_progress="hidden",
     )
     refresh_button.click(
         fn=change_choices,
@@ -1146,11 +1276,13 @@ def inference_tab():
         fn=toggle_visible_embedder_custom,
         inputs=[embedder_model],
         outputs=[embedder_custom],
+        show_progress="hidden",
     )
     embedder_model_batch.change(
         fn=toggle_visible_embedder_custom,
         inputs=[embedder_model_batch],
         outputs=[embedder_custom_batch],
+        show_progress="hidden",
     )
     move_files_button.click(
         fn=create_folder_and_move_files,
@@ -1161,6 +1293,7 @@ def inference_tab():
         fn=lambda: gr.update(choices=refresh_embedders_folders()),
         inputs=[],
         outputs=[embedder_model_custom],
+        show_progress="hidden",
     )
     move_files_button_batch.click(
         fn=create_folder_and_move_files,
@@ -1175,6 +1308,7 @@ def inference_tab():
         fn=lambda: gr.update(choices=refresh_embedders_folders()),
         inputs=[],
         outputs=[embedder_model_custom_batch],
+        show_progress="hidden",
     )
     convert_button1.click(
         fn=run_single_infer,
@@ -1202,7 +1336,12 @@ def inference_tab():
             formant_timbre,
             sid,
             seed,
+            discrete_deterministic,
+            latent_temperature,
             bundle_submodel,
+            index_k,
+            index_power,
+            index_continuity,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -1233,6 +1372,11 @@ def inference_tab():
             formant_timbre_batch,
             sid_batch,
             seed,
+            discrete_deterministic_batch,
+            latent_temperature_batch,
+            index_k_batch,
+            index_power_batch,
+            index_continuity_batch,
         ],
         outputs=[vc_output3],
     )
@@ -1240,9 +1384,11 @@ def inference_tab():
         fn=enable_stop_convert_button,
         inputs=[],
         outputs=[convert_button_batch, stop_button],
+        show_progress="hidden",
     )
     stop_button.click(
         fn=disable_stop_convert_button,
         inputs=[],
         outputs=[convert_button_batch, stop_button],
+        show_progress="hidden",
     )

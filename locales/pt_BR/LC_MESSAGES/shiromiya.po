@@ -1,0 +1,2165 @@
+# pt_BR translation for ShiroRVC.
+# Translate the msgstr lines; leave an empty msgstr to fall back to English.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: ShiroRVC\n"
+"Language: pt_BR\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+msgid ""
+"\n"
+"            # Checkpoint Extractor ⚙️\n"
+"            "
+msgstr "# Extrator de checkpoint ⚙️"
+
+msgid ""
+"# Model Bundle Maker\n"
+"Combine one or more RVC `.pth` models into a compressed `{extension}` bundle.\n"
+"\n"
+"- Speaker names come from the `.pth` filenames.\n"
+"- Matching `.index` files are attached automatically.\n"
+"- Single Index binds one uploaded index to every model.\n"
+msgstr ""
+"# Criador de pacotes de modelo\n"
+"Combine um ou mais modelos RVC `.pth` em um pacote `{extension}` comprimido.\n"
+"\n"
+"- Os nomes dos locutores vêm dos nomes dos arquivos `.pth`.\n"
+"- Arquivos `.index` correspondentes são anexados automaticamente.\n"
+"- Index único vincula um index enviado a todos os modelos.\n"
+
+msgid "## Download Model"
+msgstr "## Baixar modelo"
+
+msgid "## Download Pretrained Models"
+msgstr "## Baixar modelos pré-treinados"
+
+msgid "## Quick drag-and-drop"
+msgstr "## Arraste e solte"
+
+msgid "## Voice Blender"
+msgstr "## Misturador de vozes"
+
+msgid "### Language"
+msgstr "### Idioma"
+
+msgid ""
+"### Precision\n"
+"Training runs in **FP32** end to end - there is no autocast and no GradScaler.\n"
+"\n"
+"FP16 was removed because it needs a loss scaler and was the source of the AMP instability. BF16 was removed because its 8-bit mantissa measured a gradient cosine of only **0.77-0.82** against a true-FP32 reference, while TF32 and FP16 (11-bit mantissa) sit at 0.9997 and 0.99. This model is unusually sensitive: the oscillatory NSF source and the L1-on-log-mel loss produce heavily cancelling sums.\n"
+"\n"
+"The precision knob that remains is **TF32**, which gives tensor cores at 11-bit mantissa with no autocast and no scaler. Toggle it per run with `use 'TF32' precision` in the Training tab."
+msgstr ""
+"### Precisão\n"
+"O treinamento roda em **FP32** de ponta a ponta - não há autocast nem GradScaler.\n"
+"\n"
+"FP16 foi removido porque precisa de um escalonador de perda e era a origem da instabilidade do AMP. BF16 foi removido porque sua mantissa de 8 bits mediu um cosseno de gradiente de apenas **0,77-0,82** contra uma referência FP32 real, enquanto TF32 e FP16 (mantissa de 11 bits) ficam em 0,9997 e 0,99. Este modelo é excepcionalmente sensível: a fonte NSF oscilatória e a perda L1 sobre log-mel produzem somas com forte cancelamento.\n"
+"\n"
+"O ajuste de precisão que resta é o **TF32**, que usa os tensor cores com mantissa de 11 bits, sem autocast e sem escalonador. Ative-o por execução com `usar precisão 'TF32'` na aba de Treinamento."
+
+msgid "0 is all of model A, 1 is all of model B."
+msgstr "0 é todo o modelo A, 1 é todo o modelo B."
+
+msgid "0 picks a fresh seed each run."
+msgstr "0 sorteia uma seed nova a cada execução."
+
+msgid "0 to ∞ separated by -"
+msgstr "0 a ∞ separados por -"
+
+msgid "1 keeps the output's own dynamics; 0 copies the input's."
+msgstr "1 mantém a dinâmica da própria saída; 0 copia a da entrada."
+
+msgid "1 · Model"
+msgstr "1 · Modelo"
+
+msgid "1. Generator network checkpoint (.pth)"
+msgstr "1. Checkpoint da rede geradora (.pth)"
+
+msgid "12 = one octave up, -12 = one octave down."
+msgstr "12 = uma oitava acima, -12 = uma oitava abaixo."
+
+msgid "2 · Preprocess"
+msgstr "2 · Pré-processar"
+
+msgid "3 balances size and speed."
+msgstr "3 equilibra tamanho e velocidade."
+
+msgid "3 · Extract features"
+msgstr "3 · Extrair características"
+
+msgid "4 · Train"
+msgstr "4 · Treinar"
+
+msgid "5 · Index"
+msgstr "5 · Index"
+
+msgid "A GAN generator oscillates against its discriminator; the average is usually better than any single step. Costs one extra copy of it in VRAM."
+msgstr "Um gerador GAN oscila contra o seu discriminador; a média costuma ser melhor do que qualquer passo isolado. Custa uma cópia extra dele na VRAM."
+
+msgid "Accepts Hugging Face, Google Drive, Pixeldrain and direct links."
+msgstr "Aceita Hugging Face, Google Drive, Pixeldrain e links diretos."
+
+msgid "Actual size"
+msgstr "Tamanho real"
+
+msgid "AdamW is the default. Sched-Free AdamW needs no LR scheduler and averages its own weights. Muon orthogonalises the update for matrix-shaped layers. Lion halves the optimizer memory and uses a smaller learning rate automatically."
+msgstr "AdamW é o padrão. O Sched-Free AdamW dispensa agendador de LR e faz a própria média dos pesos. O Muon ortogonaliza a atualização das camadas em forma de matriz. O Lion reduz à metade a memória do otimizador e usa automaticamente uma taxa de aprendizado menor."
+
+msgid "AdamW unless you have a reason. The others change the schedule too."
+msgstr "AdamW, a menos que você tenha um motivo. Os outros também mudam o schedule."
+
+msgid "Add silent examples so the model can reproduce silence."
+msgstr "Adiciona exemplos silenciosos para que o modelo consiga reproduzir silêncio."
+
+msgid "Adjusting the position more towards one side or the other will make the model more similar to the first or second."
+msgstr "Ajustar a posição mais para um lado ou para o outro deixa o modelo mais parecido com o primeiro ou com o segundo."
+
+msgid "Advanced Settings"
+msgstr "Configurações avançadas"
+
+msgid "Advanced Settings for inference"
+msgstr "Configurações avançadas de inferência"
+
+msgid "Advanced Settings for the preprocessing step"
+msgstr "Configurações avançadas da etapa de pré-processamento"
+
+msgid "Advanced Settings for training"
+msgstr "Configurações avançadas de treinamento"
+
+msgid "Advanced settings"
+msgstr "Configurações avançadas"
+
+msgid "Algorithm"
+msgstr "Algoritmo"
+
+msgid "Also export inference weights each save"
+msgstr "Exportar também os pesos de inferência a cada salvamento"
+
+msgid "Analysis complete."
+msgstr "Análise concluída."
+
+msgid "Analyze"
+msgstr "Analisar"
+
+msgid "Analyzing…"
+msgstr "Analisando…"
+
+msgid "And select the sampling rate."
+msgstr "E selecione a taxa de amostragem."
+
+msgid "Applied on the next start. Takes effect immediately when launched with --language, which overrides this setting."
+msgstr "Aplicado na próxima inicialização. Tem efeito imediato quando iniciado com --language, que sobrepõe esta configuração."
+
+msgid "Apply a soft autotune to your inferences, recommended for singing conversions."
+msgstr "Aplica um autotune suave às inferências; recomendado para conversões de canto."
+
+msgid "Apply autotune for singing."
+msgstr "Aplica autotune para canto."
+
+msgid "Apply autotune."
+msgstr "Aplica autotune."
+
+msgid "Apply spectral-gating noise reduction."
+msgstr "Aplica redução de ruído por spectral gating."
+
+msgid "Attach one uploaded index to every model."
+msgstr "Anexa um index enviado a todos os modelos."
+
+msgid "Audio"
+msgstr "Áudio"
+
+msgid "Audio Analyzer"
+msgstr "Analisador de áudio"
+
+msgid "Audio added. Run preprocessing when ready."
+msgstr "Áudio adicionado. Rode o pré-processamento quando quiser."
+
+msgid "Audio analyzer"
+msgstr "Analisador de áudio"
+
+msgid "Audio cleanup"
+msgstr "Limpeza de áudio"
+
+msgid "Audio cutting"
+msgstr "Corte de áudio"
+
+msgid "Audio file"
+msgstr "Arquivo de áudio"
+
+msgid "Audio splitting"
+msgstr "Divisão de áudio"
+
+msgid "Audio to convert."
+msgstr "Áudio a converter."
+
+msgid "Auto picks by dataset size."
+msgstr "Automático escolhe pelo tamanho do dataset."
+
+msgid "Automatic detects silence; Simple cuts on a fixed grid."
+msgstr "Automático detecta silêncio; Simples corta em uma grade fixa."
+
+msgid "Automatic silence trimming with short gaps preserved."
+msgstr "Corte automático de silêncio, preservando pausas curtas."
+
+msgid "Autotune"
+msgstr "Autotune"
+
+msgid "Autotune Strength"
+msgstr "Intensidade do autotune"
+
+msgid "Autotune strength"
+msgstr "Intensidade do autotune"
+
+msgid "Autotuning"
+msgstr "Autotune"
+
+msgid "Average the weights (EMA)"
+msgstr "Média dos pesos (EMA)"
+
+msgid "Backdrop: off"
+msgstr "Fundo: desligado"
+
+msgid "Backdrop: {name}"
+msgstr "Fundo: {name}"
+
+msgid "Backend log"
+msgstr "Log do backend"
+
+msgid "Backend ready."
+msgstr "Backend pronto."
+
+msgid "Backend stopped"
+msgstr "Backend parado"
+
+msgid "Batch"
+msgstr "Batch"
+
+msgid "Batch Size"
+msgstr "Tamanho do batch"
+
+msgid "Batch size"
+msgstr "Tamanho do batch"
+
+msgid "Batch status."
+msgstr "Status do batch."
+
+msgid "Blend"
+msgstr "Misturar"
+
+msgid "Blend Ratio"
+msgstr "Proporção da mistura"
+
+msgid "Blend status."
+msgstr "Status da mistura."
+
+msgid "Blending models…"
+msgstr "Misturando modelos…"
+
+msgid ""
+"Blur the desktop behind the window (Windows 11).\n"
+"Cards stay opaque, so nothing you have to read sits on a wallpaper."
+msgstr ""
+"Desfoca a área de trabalho atrás da janela (Windows 11).\n"
+"Os cartões continuam opacos, então nada que você precise ler fica sobre o papel de parede."
+
+msgid "Browse"
+msgstr "Procurar"
+
+msgid "Browse presets for formant shifting"
+msgstr "Procurar predefinições de deslocamento de formantes"
+
+msgid "Browse presets for formanting"
+msgstr "Procurar predefinições de formantes"
+
+msgid "Building index…"
+msgstr "Construindo index…"
+
+msgid "Builds the retrieval index used at inference time."
+msgstr "Constrói o index de recuperação usado na inferência."
+
+msgid "Bundle sub-model"
+msgstr "Submodelo do pacote"
+
+msgid "Bundle voice"
+msgstr "Voz do pacote"
+
+msgid "CPU / GPU settings for ' f0 ' and ' features ' extraction."
+msgstr "Configurações de CPU / GPU para a extração de ' f0 ' e ' features '."
+
+msgid "CPU Threads"
+msgstr "Threads de CPU"
+
+msgid "CPU threads"
+msgstr "Threads de CPU"
+
+msgid "CPU threads used during extraction."
+msgstr "Threads de CPU usadas durante a extração."
+
+msgid "CUDA is not available to the backend; everything will run on CPU."
+msgstr "CUDA não está disponível para o backend; tudo vai rodar na CPU."
+
+msgid "Check precision"
+msgstr "Verificar precisão"
+
+msgid "Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped."
+msgstr "Verificando os pré-requisitos com guia de pitch... Os arquivos faltantes serão baixados. Se você já os tiver, esta etapa será pulada."
+
+msgid "Checkpoint (.pth) or bundle (.srvc) under logs/."
+msgstr "Checkpoint (.pth) ou pacote (.srvc) dentro de logs/."
+
+msgid "Checkpoint read."
+msgstr "Checkpoint lido."
+
+msgid "Checkpointing"
+msgstr "Checkpointing"
+
+msgid "Checkpoints and quality"
+msgstr "Checkpoints e qualidade"
+
+msgid "Choose a vocoder; its available sample rates are selected automatically."
+msgstr "Escolha um vocoder; as taxas de amostragem disponíveis para ele são selecionadas automaticamente."
+
+msgid "Choose the compile strategy. More aggressive modes may take longer to build and use more workspace."
+msgstr "Escolha a estratégia de compilação. Modos mais agressivos podem demorar mais para construir e usar mais espaço de trabalho."
+
+msgid "Choose the loudness normalization method."
+msgstr "Escolha o método de normalização de volume."
+
+msgid "Choose which GPUs to train on, and enable multi-GPU training."
+msgstr "Escolha em quais GPUs treinar e ative o treinamento multi-GPU."
+
+msgid "ChouwaGAN is 44.1 kHz only."
+msgstr "ChouwaGAN funciona apenas em 44,1 kHz."
+
+msgid "ChouwaGAN only. Above 1 adds variation, below 1 flattens it."
+msgstr "Somente ChouwaGAN. Acima de 1 adiciona variação, abaixo de 1 achata."
+
+msgid "Chunk length (s)"
+msgstr "Duração do bloco (s)"
+
+msgid "Chunk length (sec)"
+msgstr "Duração do bloco (s)"
+
+msgid "Chunk length for Simple cutting."
+msgstr "Duração do bloco para o corte Simples."
+
+msgid "Clean Audio"
+msgstr "Limpar áudio"
+
+msgid "Clean Strength"
+msgstr "Intensidade da limpeza"
+
+msgid "Clean your audio output using noise detection algorithms, recommended for speaking audios."
+msgstr "Limpa a saída de áudio com algoritmos de detecção de ruído; recomendado para áudios falados."
+
+msgid "Cleaning strength"
+msgstr "Intensidade da limpeza"
+
+msgid "Clear"
+msgstr "Limpar"
+
+msgid "Clear '_output' audio files ( infer outputs ) from 'assets/audios' "
+msgstr "Apaga os áudios '_output' ( saídas de inferência ) de 'assets/audios' "
+
+msgid "Clear Outputs"
+msgstr "Limpar saídas"
+
+msgid "Clear previous weights and logs before training."
+msgstr "Apaga os pesos e logs anteriores antes de treinar."
+
+msgid "Click the field to pick one already in the custom pretraineds folder."
+msgstr "Clique no campo para escolher um que já esteja na pasta de pretrains customizados."
+
+msgid "Comma-separated for multi-GPU."
+msgstr "Separados por vírgula para múltiplas GPUs."
+
+msgid "Compile mode"
+msgstr "Modo de compilação"
+
+msgid "Compile the fixed-shape training decoder for higher throughput. The first batch takes longer while the graph is built."
+msgstr "Compila o decodificador de treinamento de forma fixa para maior throughput. O primeiro batch demora mais enquanto o grafo é construído."
+
+msgid "Compile vocoder decoder"
+msgstr "Compilar decodificador do vocoder"
+
+msgid "Compression level"
+msgstr "Nível de compressão"
+
+msgid "Continuity"
+msgstr "Continuidade"
+
+msgid "Conversion settings"
+msgstr "Configurações de conversão"
+
+msgid "Convert"
+msgstr "Converter"
+
+msgid "Convert a recording to a trained voice."
+msgstr "Converta uma gravação para uma voz treinada."
+
+msgid "Convert audio to a trained voice"
+msgstr "Converte áudio para uma voz treinada"
+
+msgid "Convert folder"
+msgstr "Converter pasta"
+
+msgid "Converted speech"
+msgstr "Fala convertida"
+
+msgid "Converting folder…"
+msgstr "Convertendo pasta…"
+
+msgid "Converting…"
+msgstr "Convertendo…"
+
+msgid "Copy"
+msgstr "Copiar"
+
+msgid "Could not read the event file: {error}"
+msgstr "Não foi possível ler o arquivo de eventos: {error}"
+
+msgid "Could not read {name}."
+msgstr "Não foi possível ler {name}."
+
+msgid "Could not save the copy: {error}"
+msgstr "Não foi possível salvar a cópia: {error}"
+
+msgid "Could not save the log: {error}"
+msgstr "Não foi possível salvar o log: {error}"
+
+msgid "Create model bundle"
+msgstr "Criar pacote de modelo"
+
+msgid "Creates logs/<name>/. Reuse a name to continue a run."
+msgstr "Cria logs/<nome>/. Reutilize um nome para continuar uma execução."
+
+msgid "Custom Embedder"
+msgstr "Embedder personalizado"
+
+msgid "Custom Pretrained"
+msgstr "Pré-treinado personalizado"
+
+msgid "Custom Pretrained D"
+msgstr "Pré-treinado D personalizado"
+
+msgid "Custom Pretrained G"
+msgstr "Pré-treinado G personalizado"
+
+msgid "Custom embedder"
+msgstr "Embedder personalizado"
+
+msgid "Custom lr for gen and disc"
+msgstr "LR personalizada para gerador e discriminador"
+
+msgid "Custom lr settings"
+msgstr "Configurações de LR personalizada"
+
+msgid "Cut into segments before converting. Helps on long files."
+msgstr "Corta em segmentos antes de converter. Ajuda em arquivos longos."
+
+msgid "Cyclic KL-loss annealing. Experimental."
+msgstr "Annealing cíclico da perda KL. Experimental."
+
+msgid "DC / high-pass filtering"
+msgstr "Filtragem DC / passa-alta"
+
+msgid "Dark theme"
+msgstr "Tema escuro"
+
+msgid "Dataset Format"
+msgstr "Formato do dataset"
+
+msgid "Dataset Path"
+msgstr "Caminho do dataset"
+
+msgid "Dataset folder"
+msgstr "Pasta do dataset"
+
+msgid "Dataset format"
+msgstr "Formato do dataset"
+
+msgid "Default is 1e-4 / 0.0001"
+msgstr "O padrão é 1e-4 / 0,0001"
+
+msgid "Default: 1.0."
+msgstr "Padrão: 1,0."
+
+msgid "Delete 16 kHz slices after extraction"
+msgstr "Apagar os trechos de 16 kHz após a extração"
+
+msgid "Delete 16 kHz slices afterwards"
+msgstr "Apagar os trechos de 16 kHz depois"
+
+msgid "Denoise the output. Recommended for speech, not for singing."
+msgstr "Remove ruído da saída. Recomendado para fala, não para canto."
+
+msgid "Details appear here."
+msgstr "Os detalhes aparecem aqui."
+
+msgid "Detect overtraining"
+msgstr "Detectar overtraining"
+
+msgid "Detected GPU information."
+msgstr "Informações da GPU detectada."
+
+msgid "Deterministic"
+msgstr "Determinístico"
+
+msgid "Diagnostics"
+msgstr "Diagnóstico"
+
+msgid "Discard previous training state"
+msgstr "Descartar o estado de treinamento anterior"
+
+msgid "Discriminator (D)"
+msgstr "Discriminador (D)"
+
+msgid "Discriminator LR"
+msgstr "LR do discriminador"
+
+msgid "Discriminator learning rate. Both rates are required."
+msgstr "Taxa de aprendizado do discriminador. As duas taxas são obrigatórias."
+
+msgid "Discriminator pretrained file."
+msgstr "Arquivo pré-treinado do discriminador."
+
+msgid "Download"
+msgstr "Baixar"
+
+msgid "Download Model"
+msgstr "Baixar modelo"
+
+msgid "Download a model"
+msgstr "Baixar um modelo"
+
+msgid "Download selected"
+msgstr "Baixar selecionados"
+
+msgid "Download status."
+msgstr "Status do download."
+
+msgid "Downloading prerequisites…"
+msgstr "Baixando pré-requisitos…"
+
+msgid "Downloading pretrained model..."
+msgstr "Baixando modelo pré-treinado..."
+
+msgid "Downloading…"
+msgstr "Baixando…"
+
+msgid "Downloads the shared models the application needs. Safe to re-run; anything already present is skipped."
+msgstr "Baixa os modelos compartilhados de que o aplicativo precisa. Pode ser executado de novo com segurança; o que já existe é pulado."
+
+msgid "Drag and drop your model here"
+msgstr "Arraste e solte o seu modelo aqui"
+
+msgid "Drop a .pth and .index file to copy them into the model folder."
+msgstr "Solte um arquivo .pth e um .index para copiá-los para a pasta de modelos."
+
+msgid "Drop a .pth or .srvc here"
+msgstr "Solte um .pth ou .srvc aqui"
+
+msgid "Drop an audio file here or browse…"
+msgstr "Solte um arquivo de áudio aqui ou procure…"
+
+msgid "Duration of the warmup phase"
+msgstr "Duração da fase de warmup"
+
+msgid "Edited F0 curve"
+msgstr "Curva de F0 editada"
+
+msgid "Embedder"
+msgstr "Embedder"
+
+msgid "Embedder Model"
+msgstr "Modelo embedder"
+
+msgid "Embedders and pitch models"
+msgstr "Embedders e modelos de pitch"
+
+msgid "Empty saves to logs using the first model name."
+msgstr "Vazio salva em logs usando o nome do primeiro modelo."
+
+msgid "Enable cuDNN benchmark mode."
+msgstr "Ativa o modo benchmark do cuDNN."
+
+msgid "End the run once held-out quality stops improving. The pre-overtrain model is exported either way; this only decides whether training keeps going."
+msgstr "Encerra a execução quando a qualidade no conjunto reservado para de melhorar. O modelo anterior ao overtraining é exportado de qualquer forma; isto só decide se o treinamento continua."
+
+msgid "Enter a valid dataset name."
+msgstr "Digite um nome de dataset válido."
+
+msgid "Enter input path"
+msgstr "Digite o caminho de entrada"
+
+msgid "Enter model name"
+msgstr "Digite o nome do modelo"
+
+msgid "Enter output path"
+msgstr "Digite o caminho de saída"
+
+msgid "Enter path to model"
+msgstr "Digite o caminho do modelo"
+
+msgid "Enter preset name"
+msgstr "Digite o nome da predefinição"
+
+msgid "Enter some text, or pick a text file."
+msgstr "Digite algum texto ou escolha um arquivo de texto."
+
+msgid "Enter text to synthesize"
+msgstr "Digite o texto a sintetizar"
+
+msgid "Enter the text to synthesize."
+msgstr "Digite o texto a sintetizar."
+
+msgid "Enter your nickname"
+msgstr "Digite o seu apelido"
+
+msgid "Epoch"
+msgstr "Época"
+
+msgid "Error uploading to Google Drive"
+msgstr "Erro ao enviar para o Google Drive"
+
+msgid "Every audio file below this folder is used."
+msgstr "Todos os arquivos de áudio dentro desta pasta são usados."
+
+msgid "Every audio file in the input folder is converted."
+msgstr "Todos os arquivos de áudio da pasta de entrada são convertidos."
+
+msgid "Every scalar, preview image and audio sample a training run wrote. Reads the same files TensorBoard would, without starting a server."
+msgstr "Todos os escalares, imagens de preview e amostras de áudio que um treino gravou. Lê os mesmos arquivos que o TensorBoard leria, sem subir um servidor."
+
+msgid "Everything below has a working default."
+msgstr "Tudo abaixo já tem um padrão que funciona."
+
+msgid "Exponential decay is the default. Cosine annealing and none are alternatives."
+msgstr "O decaimento exponencial é o padrão. Cosine annealing e nenhum são alternativas."
+
+msgid "Export Audio"
+msgstr "Exportar áudio"
+
+msgid "Export Format"
+msgstr "Formato de exportação"
+
+msgid "Export Model"
+msgstr "Exportar modelo"
+
+msgid "Export Preset"
+msgstr "Exportar predefinição"
+
+msgid "Export a moving average of the generator instead of one step of it. A GAN generator oscillates against its discriminator, so the average is usually better than any single step, and it makes the overtrain curve much cleaner. Costs one extra copy of the generator in VRAM."
+msgstr "Exporta uma média móvel do gerador em vez de um passo isolado dele. Um gerador GAN oscila contra o seu discriminador, então a média costuma ser melhor do que qualquer passo isolado, e deixa a curva de overtraining muito mais limpa. Custa uma cópia extra do gerador na VRAM."
+
+msgid "Export format"
+msgstr "Formato de exportação"
+
+msgid "Exported Index File"
+msgstr "Arquivo de index exportado"
+
+msgid "Exported Pth file"
+msgstr "Arquivo .pth exportado"
+
+msgid "Extract F0 Curve"
+msgstr "Extrair curva de F0"
+
+msgid "Extract Features"
+msgstr "Extrair características"
+
+msgid "Extract Small Model"
+msgstr "Extrair modelo compacto"
+
+msgid "Extracting features…"
+msgstr "Extraindo características…"
+
+msgid "Extraction"
+msgstr "Extração"
+
+msgid "Extraction status."
+msgstr "Status da extração."
+
+msgid "F0 Curve"
+msgstr "Curva de F0"
+
+msgid "F0 curve file"
+msgstr "Arquivo da curva de F0"
+
+msgid "F0-guided model"
+msgstr "Modelo guiado por F0"
+
+msgid "Faiss index. Picked automatically when there is only one next to the model."
+msgstr "Index Faiss. Escolhido automaticamente quando há apenas um ao lado do modelo."
+
+msgid "Faster on Ampere and newer, marginally less precise."
+msgstr "Mais rápido em Ampere e superiores, marginalmente menos preciso."
+
+msgid "Faster once shapes settle."
+msgstr "Mais rápido quando as formas se estabilizam."
+
+msgid "Favours matches that continue the previous frame's, instead of jumping between unrelated parts of the dataset. Needs an index built by this fork."
+msgstr "Favorece correspondências que dão continuidade às do frame anterior, em vez de pular entre partes não relacionadas do dataset. Requer um index construído por este fork."
+
+msgid "Favours matches that continue the previous frame's, so the retrieval stops jumping between unrelated parts of the dataset. Needs an index built by this fork."
+msgstr "Favorece correspondências que dão continuidade às do frame anterior, de modo que a recuperação pare de pular entre partes não relacionadas do dataset. Requer um index construído por este fork."
+
+msgid "Feature Precision"
+msgstr "Precisão das características"
+
+msgid "Feature precision"
+msgstr "Precisão das características"
+
+msgid "File to Speech"
+msgstr "Arquivo para fala"
+
+msgid "File uploaded successfully."
+msgstr "Arquivo enviado com sucesso."
+
+msgid "Filter Radius"
+msgstr "Raio do filtro"
+
+msgid "Filter radius"
+msgstr "Raio do filtro"
+
+msgid "Filter…"
+msgstr "Filtrar…"
+
+msgid "First model"
+msgstr "Primeiro modelo"
+
+msgid "Fit to window"
+msgstr "Ajustar à janela"
+
+msgid "Fold the chart away and give the width to the steps."
+msgstr "Recolhe o gráfico e cede a largura para as etapas."
+
+msgid "Folder Name"
+msgstr "Nome da pasta"
+
+msgid "Folder containing input audio."
+msgstr "Pasta com o áudio de entrada."
+
+msgid "Folder containing the training audio."
+msgstr "Pasta com o áudio de treinamento."
+
+msgid "Folder for converted audio."
+msgstr "Pasta para o áudio convertido."
+
+msgid "Folder under rvc/models/embedders/embedders_custom."
+msgstr "Pasta dentro de rvc/models/embedders/embedders_custom."
+
+msgid "Folder with audio to convert"
+msgstr "Pasta com o áudio a converter"
+
+msgid "Folder with your training audio"
+msgstr "Pasta com o seu áudio de treinamento"
+
+msgid "Folders"
+msgstr "Pastas"
+
+msgid "Follow ✓"
+msgstr "Acompanhar ✓"
+
+msgid "Formant Quefrency."
+msgstr "Quefrência do formante."
+
+msgid "Formant Shifting"
+msgstr "Deslocamento de formantes"
+
+msgid "Formant Timbre"
+msgstr "Timbre do formante"
+
+msgid "Formant quefrency"
+msgstr "Quefrência do formante"
+
+msgid "Formant quefrency. Default: 1.0."
+msgstr "Quefrência do formante. Padrão: 1,0."
+
+msgid "Formant shifting"
+msgstr "Deslocamento de formantes"
+
+msgid "Formant timbre"
+msgstr "Timbre do formante"
+
+msgid "Formant timbre. Default: 1.0."
+msgstr "Timbre do formante. Padrão: 1,0."
+
+msgid "Frames averaged per match. Fewer keeps the training voice's idiosyncratic articulation; more averages toward its mean voice."
+msgstr "Frames somados por correspondência. Menos preserva a articulação idiossincrática da voz de treinamento; mais aproxima da sua voz média."
+
+msgid "Frames averaged per match. Fewer keeps what is idiosyncratic about the training voice; more averages toward its mean."
+msgstr "Frames somados por correspondência. Menos preserva o que há de idiossincrático na voz de treinamento; mais aproxima da sua média."
+
+msgid "Frees disk once the features exist."
+msgstr "Libera disco assim que as características existirem."
+
+msgid "Fresh Training"
+msgstr "Treinamento do zero"
+
+msgid "Fusion"
+msgstr "Fundir"
+
+msgid "GPU"
+msgstr ""
+
+msgid "GPU ID"
+msgstr "ID da GPU"
+
+msgid "GPU ID override / Multi-gpu-training configuration"
+msgstr "Sobrepor ID da GPU / configuração de treinamento multi-GPU"
+
+msgid "GPU IDs for extraction, separated by '-'."
+msgstr "IDs de GPU para a extração, separados por '-'."
+
+msgid "GPU IDs for training, separated by '-'."
+msgstr "IDs de GPU para o treinamento, separados por '-'."
+
+msgid "GPU Information"
+msgstr "Informações da GPU"
+
+msgid "GPU Number"
+msgstr "Número da GPU"
+
+msgid "GPU Settings"
+msgstr "Configurações de GPU"
+
+msgid "GPU not detected"
+msgstr "GPU não detectada"
+
+msgid "GPU query failed"
+msgstr "A consulta à GPU falhou"
+
+msgid "GPU query failed: {error}"
+msgstr "A consulta à GPU falhou: {error}"
+
+msgid "Generate Index"
+msgstr "Gerar index"
+
+msgid "Generate index"
+msgstr "Gerar index"
+
+msgid "Generate speech with EdgeTTS, then convert it with the selected RVC model."
+msgstr "Gere fala com o EdgeTTS e depois converta-a com o modelo RVC selecionado."
+
+msgid "Generated"
+msgstr "Gerado"
+
+msgid "Generator (G)"
+msgstr "Gerador (G)"
+
+msgid "Generator LR"
+msgstr "LR do gerador"
+
+msgid "Generator learning rate. Both rates are required."
+msgstr "Taxa de aprendizado do gerador. As duas taxas são obrigatórias."
+
+msgid "Generator pretrained file."
+msgstr "Arquivo pré-treinado do gerador."
+
+msgid "Gradient checkpointing"
+msgstr "Gradient checkpointing"
+
+msgid "Hardware"
+msgstr "Hardware"
+
+msgid "HiFi-GAN pretrained models"
+msgstr "Modelos pré-treinados HiFi-GAN"
+
+msgid "Hide"
+msgstr "Ocultar"
+
+msgid "Higher values apply stronger cleanup."
+msgstr "Valores mais altos aplicam uma limpeza mais forte."
+
+msgid "Higher values snap pitch to the chromatic grid."
+msgstr "Valores mais altos prendem o pitch à grade cromática."
+
+msgid "Hold a few whole source recordings out of training and score them as it goes. Training loss keeps falling while a model overtrains, so this is the only signal that can see it. Exports the last good weights. Turns itself off on datasets too small to spare any."
+msgstr "Reserva algumas gravações inteiras fora do treinamento e as avalia ao longo dele. A perda de treinamento continua caindo enquanto um modelo entra em overtraining, então este é o único sinal capaz de enxergar isso. Exporta os últimos pesos bons. Desliga-se sozinho em datasets pequenos demais para dispensar gravações."
+
+msgid "Holds whole source recordings out of training and scores them as it goes. Training loss cannot see overtraining. Exports the last good weights."
+msgstr "Reserva gravações inteiras fora do treinamento e as avalia ao longo dele. A perda de treinamento não enxerga o overtraining. Exporta os últimos pesos bons."
+
+msgid "How much of the index to blend in. Higher is closer to the training voice."
+msgstr "Quanto do index misturar. Mais alto fica mais próximo da voz de treinamento."
+
+msgid "How neighbours are ranked. L2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally well."
+msgstr "Como os vizinhos são ordenados. L2 é o que o RVC original constrói. O cosseno compara apenas a direção, então uma tomada baixa e uma alta do mesmo som combinam igualmente bem."
+
+msgid "How strongly closer matches outweigh further ones. 0 averages them equally."
+msgstr "O quanto as correspondências mais próximas pesam mais que as distantes. 0 faz a média entre todas por igual."
+
+msgid "How strongly closer neighbours outweigh further ones. 0 averages them equally; high values use the nearest alone."
+msgstr "O quanto os vizinhos mais próximos pesam mais que os distantes. 0 faz a média entre todos por igual; valores altos usam apenas o mais próximo."
+
+msgid "How the extracted embeddings are stored. These are both the training input and what the retrieval index is built from, and fp16 puts a quantisation floor under every index vector while inference queries with fp32 ones. fp32 doubles the feature cache on disk (a 2 h dataset goes from roughly 550 MB to 1.1 GB); fp16 halves it. Either can be read back without re-extracting."
+msgstr "Como os embeddings extraídos são armazenados. Eles são tanto a entrada do treinamento quanto a base do index de recuperação, e fp16 impõe um piso de quantização a cada vetor do index, enquanto a inferência consulta com vetores fp32. fp32 dobra o cache de características em disco (um dataset de 2 h passa de cerca de 550 MB para 1,1 GB); fp16 o reduz à metade. Ambos podem ser lidos de volta sem extrair novamente."
+
+msgid "If the number is greater than or equal to three, employing median filtering on the collected tone results has the potential to decrease respiration."
+msgstr "Se o número for maior ou igual a três, aplicar filtragem por mediana aos resultados de tom coletados pode reduzir a respiração."
+
+msgid "Increase or decrease TTS speed."
+msgstr "Aumenta ou diminui a velocidade do TTS."
+
+msgid "Index"
+msgstr "Index"
+
+msgid "Index Algorithm"
+msgstr "Algoritmo do index"
+
+msgid "Index Continuity"
+msgstr "Continuidade do index"
+
+msgid "Index File"
+msgstr "Arquivo de index"
+
+msgid "Index Neighbours"
+msgstr "Vizinhos do index"
+
+msgid "Index Sharpness"
+msgstr "Nitidez do index"
+
+msgid "Index Similarity"
+msgstr "Similaridade do index"
+
+msgid "Index file to export."
+msgstr "Arquivo de index a exportar."
+
+msgid "Index influence. Lower values can reduce artifacts."
+msgstr "Influência do index. Valores mais baixos podem reduzir artefatos."
+
+msgid "Index method for large datasets."
+msgstr "Método de index para datasets grandes."
+
+msgid "Inference"
+msgstr "Inferência"
+
+msgid "Inference Seed"
+msgstr "Seed de inferência"
+
+msgid "Inference outputs cleared!"
+msgstr "Saídas de inferência apagadas!"
+
+msgid "Inference status."
+msgstr "Status da inferência."
+
+msgid "Input Folder"
+msgstr "Pasta de entrada"
+
+msgid "Input file"
+msgstr "Arquivo de entrada"
+
+msgid "Input folder"
+msgstr "Pasta de entrada"
+
+msgid "Input path for text file"
+msgstr "Caminho de entrada do arquivo de texto"
+
+msgid "Inspect"
+msgstr "Inspecionar"
+
+msgid "Inspect, blend and fetch models; check a dataset before training on it."
+msgstr "Inspecione, misture e baixe modelos; confira um dataset antes de treinar com ele."
+
+msgid "Inspect, blend, download, analyze"
+msgstr "Inspecionar, misturar, baixar, analisar"
+
+msgid "Interface language"
+msgstr "Idioma da interface"
+
+msgid "Interface language. Remembered between sessions and applied when the window is rebuilt."
+msgstr "Idioma da interface. Lembrado entre sessões e aplicado quando a janela é reconstruída."
+
+msgid "Intermediate file, before conversion."
+msgstr "Arquivo intermediário, antes da conversão."
+
+msgid "Interpolates two checkpoints. Both must share an architecture and sample rate."
+msgstr "Interpola dois checkpoints. Ambos precisam ter a mesma arquitetura e taxa de amostragem."
+
+msgid "Introduce the model link"
+msgstr "Informe o link do modelo"
+
+msgid "Introduce the model pth path"
+msgstr "Informe o caminho do .pth do modelo"
+
+msgid "Invalid audio file."
+msgstr "Arquivo de áudio inválido."
+
+msgid "Invalid pretrained file."
+msgstr "Arquivo pré-treinado inválido."
+
+msgid "Invalid training preset name: {name}"
+msgstr "Nome de predefinição de treinamento inválido: {name}"
+
+msgid "Keep only the latest G/D"
+msgstr "Manter apenas o G/D mais recente"
+
+msgid "Keep only the latest generator and discriminator checkpoints."
+msgstr "Mantém apenas os checkpoints mais recentes do gerador e do discriminador."
+
+msgid "L1 Mel is the safe default. Multi-Scale and Hybrid are alternatives."
+msgstr "L1 Mel é o padrão seguro. Multi-Scale e Híbrido são alternativas."
+
+msgid "LR scheduler"
+msgstr "Agendador de LR"
+
+msgid "LR scheduler (G/D)"
+msgstr "Agendador de LR (G/D)"
+
+msgid "Language set to {name}."
+msgstr "Idioma definido como {name}."
+
+msgid "Language set to {name}. Restart the interface to apply it."
+msgstr "Idioma definido como {name}. Reinicie a interface para aplicá-lo."
+
+msgid "Language: {name}"
+msgstr "Idioma: {name}"
+
+msgid "Larger batches need more VRAM. Reduce the value if training runs out of memory."
+msgstr "Batches maiores exigem mais VRAM. Reduza o valor se o treinamento ficar sem memória."
+
+msgid "Latent temperature"
+msgstr "Temperatura latente"
+
+msgid "Latest"
+msgstr "Mais recente"
+
+msgid "Learning rate for Discriminator"
+msgstr "Taxa de aprendizado do discriminador"
+
+msgid "Learning rate for Generator"
+msgstr "Taxa de aprendizado do gerador"
+
+msgid "Length of each KL annealing cycle, in epochs."
+msgstr "Duração de cada ciclo de annealing KL, em epochs."
+
+msgid "Light theme"
+msgstr "Tema claro"
+
+msgid "Link"
+msgstr "Link"
+
+msgid "Live metrics"
+msgstr "Métricas ao vivo"
+
+msgid "Load from preset"
+msgstr "Carregar de uma predefinição"
+
+msgid "Log"
+msgstr "Log"
+
+msgid "Log scale. Worth turning on for losses: the first 2% of a run covers most of the range, and flattens everything after it."
+msgstr "Escala logarítmica. Vale a pena ativar para as perdas: os primeiros 2% de uma execução cobrem quase toda a faixa e achatam todo o resto."
+
+msgid "Loudness Normalization"
+msgstr "Normalização de volume"
+
+msgid "Median filtering for pitch smoothing."
+msgstr "Filtragem por mediana para suavizar o pitch."
+
+msgid "Metrics"
+msgstr "Métricas"
+
+msgid "Metrics, previews and audio from a run"
+msgstr "Métricas, previews e áudio de um treino"
+
+msgid "Mix the converted and input loudness envelopes."
+msgstr "Mistura os envelopes de volume da entrada e da saída convertida."
+
+msgid "Model A"
+msgstr "Modelo A"
+
+msgid "Model Author Name"
+msgstr "Nome do autor do modelo"
+
+msgid "Model B"
+msgstr "Modelo B"
+
+msgid "Model Bundles"
+msgstr "Pacotes de modelo"
+
+msgid "Model Link"
+msgstr "Link do modelo"
+
+msgid "Model Name"
+msgstr "Nome do modelo"
+
+msgid "Model Processing"
+msgstr "Processamento de modelos"
+
+msgid "Model Settings"
+msgstr "Configurações do modelo"
+
+msgid "Model blender"
+msgstr "Misturador de modelos"
+
+msgid "Model file"
+msgstr "Arquivo do modelo"
+
+msgid "Model information"
+msgstr "Informações do modelo"
+
+msgid "Model information."
+msgstr "Informações do modelo."
+
+msgid "Model name"
+msgstr "Nome do modelo"
+
+msgid "Model used for learning speaker embedding."
+msgstr "Modelo usado para aprender o embedding do locutor."
+
+msgid "Model used for speaker features."
+msgstr "Modelo usado para as características do locutor."
+
+msgid "Model used to extract speaker-independent content features."
+msgstr "Modelo usado para extrair características de conteúdo independentes do locutor."
+
+msgid "Model-guided slicing. Not available at 44.1 kHz."
+msgstr "Fatiamento guiado por modelo. Indisponível em 44,1 kHz."
+
+msgid "Move files to custom embedder"
+msgstr "Mover arquivos para o embedder personalizado"
+
+msgid "Must match what you will use at inference time."
+msgstr "Precisa coincidir com o que você vai usar na inferência."
+
+msgid "Mute samples"
+msgstr "Amostras mudas"
+
+msgid "Name of the new model."
+msgstr "Nome do novo modelo."
+
+msgid "Names the run and decides the architecture."
+msgstr "Nomeia a execução e define a arquitetura."
+
+msgid "Native size: {w} x {h}"
+msgstr "Tamanho nativo: {w} x {h}"
+
+msgid "Needed to fine-tune rather than train from scratch."
+msgstr "Necessário para fazer fine-tuning em vez de treinar do zero."
+
+msgid "Neighbours"
+msgstr "Vizinhos"
+
+msgid "Next"
+msgstr "Próximo"
+
+msgid "No preview image for this epoch."
+msgstr "Sem imagem de preview para esta época."
+
+msgid "No training logs found under logs/. They appear once a run starts writing TensorBoard events."
+msgstr "Nenhum log de treino encontrado em logs/. Eles aparecem assim que um treino começa a gravar eventos do TensorBoard."
+
+msgid "Noise Reduction"
+msgstr "Redução de ruído"
+
+msgid "Noise Reduction Strength"
+msgstr "Intensidade da redução de ruído"
+
+msgid "Noise reduction"
+msgstr "Redução de ruído"
+
+msgid "Noise reduction strength"
+msgstr "Intensidade da redução de ruído"
+
+msgid "Normalisation"
+msgstr "Normalização"
+
+msgid "Off means training from scratch, which needs far more data."
+msgstr "Desligado significa treinar do zero, o que exige muito mais dados."
+
+msgid "Only used by the RMS modes."
+msgstr "Usado apenas pelos modos RMS."
+
+msgid "Only used by the SmartCutter slicer."
+msgstr "Usado apenas pelo fatiador SmartCutter."
+
+msgid "Only worth it on genuinely noisy source material."
+msgstr "Só vale a pena em material de origem realmente ruidoso."
+
+msgid "Optimisation"
+msgstr "Otimização"
+
+msgid "Optimizer"
+msgstr "Otimizador"
+
+msgid "Optimizer (G/D)"
+msgstr "Otimizador (G/D)"
+
+msgid "Optional external pitch curve"
+msgstr "Curva de pitch externa opcional"
+
+msgid "Optional index file."
+msgstr "Arquivo de index opcional."
+
+msgid "Optional index file; unavailable for model bundles."
+msgstr "Arquivo de index opcional; indisponível para pacotes de modelo."
+
+msgid "Optional output path. Empty uses assets/audios."
+msgstr "Caminho de saída opcional. Vazio usa assets/audios."
+
+msgid "Optional: read the text from a file instead"
+msgstr "Opcional: ler o texto de um arquivo"
+
+msgid "Original"
+msgstr "Original"
+
+msgid "Output"
+msgstr "Saída"
+
+msgid "Output Directory"
+msgstr "Diretório de saída"
+
+msgid "Output Folder"
+msgstr "Pasta de saída"
+
+msgid "Output Information"
+msgstr "Informações de saída"
+
+msgid "Output Model Name"
+msgstr "Nome do modelo de saída"
+
+msgid "Output Path for RVC Audio"
+msgstr "Caminho de saída do áudio RVC"
+
+msgid "Output Path for TTS Audio"
+msgstr "Caminho de saída do áudio TTS"
+
+msgid "Output audio format."
+msgstr "Formato do áudio de saída."
+
+msgid "Output folder"
+msgstr "Pasta de saída"
+
+msgid "Output format for sliced audio. WAV is larger; FLAC is lossless."
+msgstr "Formato de saída do áudio fatiado. WAV é maior; FLAC é sem perdas."
+
+msgid "Output information"
+msgstr "Informações de saída"
+
+msgid "Output name"
+msgstr "Nome da saída"
+
+msgid "Output path"
+msgstr "Caminho de saída"
+
+msgid "Overlap (s)"
+msgstr "Sobreposição (s)"
+
+msgid "Overlap between Simple chunks, in seconds."
+msgstr "Sobreposição entre os blocos do modo Simples, em segundos."
+
+msgid "Overlap length"
+msgstr "Duração da sobreposição"
+
+msgid "Override the learning rates"
+msgstr "Sobrepor as taxas de aprendizado"
+
+msgid "Overtrain detector"
+msgstr "Detector de overtraining"
+
+msgid "PTH file to export."
+msgstr "Arquivo .pth a exportar."
+
+msgid "Path for infer outputs"
+msgstr "Caminho das saídas de inferência"
+
+msgid "Path to Model"
+msgstr "Caminho do modelo"
+
+msgid "Percent faster or slower than default."
+msgstr "Porcentagem mais rápido ou mais lento que o padrão."
+
+msgid "Performance"
+msgstr "Desempenho"
+
+msgid "Pick a preset above, or tick metrics below."
+msgstr "Escolha uma predefinição acima ou marque métricas abaixo."
+
+msgid "Pick one close to your target accent; conversion handles timbre."
+msgstr "Escolha uma próxima ao sotaque desejado; a conversão cuida do timbre."
+
+msgid "Pitch"
+msgstr "Pitch"
+
+msgid "Pitch (semitones)"
+msgstr "Pitch (semitons)"
+
+msgid "Pitch / f0 estimation algorithm used in extraction."
+msgstr "Algoritmo de estimativa de pitch / f0 usado na extração."
+
+msgid "Pitch algorithm"
+msgstr "Algoritmo de pitch"
+
+msgid "Pitch algorithm. RMVPE is the recommended default."
+msgstr "Algoritmo de pitch. RMVPE é o padrão recomendado."
+
+msgid "Pitch curves and content embeddings."
+msgstr "Curvas de pitch e embeddings de conteúdo."
+
+msgid "Pitch extraction algorithm"
+msgstr "Algoritmo de extração de pitch"
+
+msgid "Pitch shift in semitones."
+msgstr "Deslocamento de pitch em semitons."
+
+msgid "Pitch shift in semitones. 12 = one octave up."
+msgstr "Deslocamento de pitch em semitons. 12 = uma oitava acima."
+
+msgid "Prepare a dataset and train a voice, one step at a time."
+msgstr "Prepare um dataset e treine uma voz, uma etapa por vez."
+
+msgid "Prepare data and train a model"
+msgstr "Preparar dados e treinar um modelo"
+
+msgid "Preprocess Dataset"
+msgstr "Pré-processar dataset"
+
+msgid "Preprocessing"
+msgstr "Pré-processamento"
+
+msgid "Preprocessing dataset…"
+msgstr "Pré-processando dataset…"
+
+msgid "Preprocessing status."
+msgstr "Status do pré-processamento."
+
+msgid "Prerequisites"
+msgstr "Pré-requisitos"
+
+msgid "Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing."
+msgstr "Verificação de pré-requisitos concluída. Os arquivos faltantes foram baixados e você já pode começar o pré-processamento."
+
+msgid "Preset Name"
+msgstr "Nome da predefinição"
+
+msgid "Preset Settings"
+msgstr "Configurações da predefinição"
+
+msgid "Preset does not exist: {name}"
+msgstr "A predefinição não existe: {name}"
+
+msgid "Presets from assets/formant_shift."
+msgstr "Predefinições de assets/formant_shift."
+
+msgid "Pretrained"
+msgstr "Pré-treinado"
+
+msgid "Pretrained Custom Settings"
+msgstr "Configurações de pré-treinado personalizado"
+
+msgid "Pretrained model downloaded successfully!"
+msgstr "Modelo pré-treinado baixado com sucesso!"
+
+msgid "Previews"
+msgstr "Previews"
+
+msgid "Previous"
+msgstr "Anterior"
+
+msgid "Protect"
+msgstr "Proteger"
+
+msgid "Protect Voiceless Consonants"
+msgstr "Proteger consoantes surdas"
+
+msgid "Protect voiceless consonants. Higher values reduce index influence."
+msgstr "Protege as consoantes surdas. Valores mais altos reduzem a influência do index."
+
+msgid "Pth file"
+msgstr "Arquivo .pth"
+
+msgid "Quefrency for formant shifting"
+msgstr "Quefrência do deslocamento de formantes"
+
+msgid "RMS Target (dBFS)"
+msgstr "Alvo de RMS (dBFS)"
+
+msgid "RMS Volume Envelope"
+msgstr "Envelope de volume RMS"
+
+msgid "RMVPE is the recommended default. CREPE is an alternative for clean audio."
+msgstr "RMVPE é o padrão recomendado. CREPE é uma alternativa para áudio limpo."
+
+msgid "Raise until VRAM is nearly full, then stop."
+msgstr "Aumente até a VRAM ficar quase cheia e pare."
+
+msgid "Ratio"
+msgstr "Proporção"
+
+msgid "Raw"
+msgstr "Bruto"
+
+msgid "Reading checkpoint…"
+msgstr "Lendo checkpoint…"
+
+msgid "Reading history…"
+msgstr "Lendo histórico…"
+
+msgid "Reads the metadata stored in a checkpoint."
+msgstr "Lê os metadados armazenados em um checkpoint."
+
+msgid "Ready"
+msgstr "Pronto"
+
+msgid "Reduce VRAM use at the cost of speed."
+msgstr "Reduz o uso de VRAM em troca de velocidade."
+
+msgid "Reduce detected noise in speech."
+msgstr "Reduz o ruído detectado na fala."
+
+msgid "Refresh"
+msgstr "Atualizar"
+
+msgid "Refresh Custom Pretraineds"
+msgstr "Atualizar pré-treinados personalizados"
+
+msgid "Refresh Presets"
+msgstr "Atualizar predefinições"
+
+msgid "Refresh embedders"
+msgstr "Atualizar embedders"
+
+msgid "Refresh models, indexes and audios"
+msgstr "Atualizar modelos, indexes e áudios"
+
+msgid "Refresh the list to use the uploaded pretrained file."
+msgstr "Atualize a lista para usar o arquivo pré-treinado enviado."
+
+msgid "Remove DC offset and low-frequency noise."
+msgstr "Remove o offset DC e o ruído de baixa frequência."
+
+msgid "Reproducible output for a given seed."
+msgstr "Saída reproduzível para uma dada seed."
+
+msgid "Resampler"
+msgstr "Reamostrador"
+
+msgid "Resampling & Loading Handler"
+msgstr "Tratamento de reamostragem e carregamento"
+
+msgid "Rescan"
+msgstr "Reescanear"
+
+msgid "Restart ShiroRVC"
+msgstr "Reiniciar o ShiroRVC"
+
+msgid "Restart backend"
+msgstr "Reiniciar o backend"
+
+msgid "Restart to change language"
+msgstr "Reiniciar para mudar o idioma"
+
+msgid "Restarting backend…"
+msgstr "Reiniciando o backend…"
+
+msgid "Restarting the backend."
+msgstr "Reiniciando o backend."
+
+msgid "Restarts the run instead of resuming it."
+msgstr "Reinicia a execução em vez de retomá-la."
+
+msgid "Run"
+msgstr "Treino"
+
+msgid "Run extraction"
+msgstr "Executar extração"
+
+msgid "Run preprocessing"
+msgstr "Executar pré-processamento"
+
+msgid "Sample Rate of the model (sr)"
+msgstr "Taxa de amostragem do modelo (sr)"
+
+msgid "Sample rate"
+msgstr "Taxa de amostragem"
+
+msgid "Sampling Rate"
+msgstr "Taxa de amostragem"
+
+msgid "Save Only Latest G/D"
+msgstr "Salvar apenas o G/D mais recente"
+
+msgid "Save a checkpoint every N epochs."
+msgstr "Salva um checkpoint a cada N epochs."
+
+msgid "Save a copy to"
+msgstr "Salvar uma cópia em"
+
+msgid "Save a copy…"
+msgstr "Salvar uma cópia…"
+
+msgid "Save every N epochs"
+msgstr "Salvar a cada N epochs"
+
+msgid "Save the compact voice model files."
+msgstr "Salva os arquivos compactos do modelo de voz."
+
+msgid "Save to"
+msgstr "Salvar em"
+
+msgid "Save to preset"
+msgstr "Salvar em uma predefinição"
+
+msgid "Save weight models"
+msgstr "Salvar modelos de pesos"
+
+msgid "Saved to {path}"
+msgstr "Salvo em {path}"
+
+msgid "Saves a lot of disk on long runs."
+msgstr "Economiza bastante disco em execuções longas."
+
+msgid "Save…"
+msgstr "Salvar…"
+
+msgid "Saving frequency"
+msgstr "Frequência de salvamento"
+
+msgid "Search Feature Ratio"
+msgstr "Proporção de busca por características"
+
+msgid "Search feature ratio"
+msgstr "Proporção de busca por características"
+
+msgid "Search metrics…"
+msgstr "Buscar métricas…"
+
+msgid "Second model"
+msgstr "Segundo modelo"
+
+msgid "See Model Information"
+msgstr "Ver informações do modelo"
+
+msgid "Seed"
+msgstr "Seed"
+
+msgid "Seed for reproducible output. Use 0 for random output."
+msgstr "Seed para saída reproduzível. Use 0 para saída aleatória."
+
+msgid "Select Audio Input"
+msgstr "Selecionar entrada de áudio"
+
+msgid "Select Custom Embedder"
+msgstr "Selecionar embedder personalizado"
+
+msgid "Select Custom Preset"
+msgstr "Selecionar predefinição personalizada"
+
+msgid "Select a run to see its validation previews."
+msgstr "Selecione um treino para ver seus previews de validação."
+
+msgid "Select file to import"
+msgstr "Selecionar arquivo a importar"
+
+msgid "Select one that corresponds to your training."
+msgstr "Selecione uma que corresponda ao seu treinamento."
+
+msgid "Select the TTS voice to use for the conversion."
+msgstr "Selecione a voz TTS a usar na conversão."
+
+msgid "Select the format to export the audio."
+msgstr "Selecione o formato de exportação do áudio."
+
+msgid "Select the pretrained model you want to download."
+msgstr "Selecione o modelo pré-treinado que quer baixar."
+
+msgid "Select the speaker ID to use for the conversion."
+msgstr "Selecione o ID de locutor a usar na conversão."
+
+msgid "Select two voice models, set your desired blend percentage, and blend them into an entirely new voice."
+msgstr "Selecione dois modelos de voz, defina a porcentagem de mistura desejada e combine-os em uma voz inteiramente nova."
+
+msgid "Set name"
+msgstr "Definir nome"
+
+msgid "Set separate generator and discriminator learning rates."
+msgstr "Define taxas de aprendizado separadas para gerador e discriminador."
+
+msgid "Set the autotune strength - the more you increase it the more it will snap to the chromatic grid."
+msgstr "Defina a intensidade do autotune - quanto mais você aumentar, mais ele prende à grade cromática."
+
+msgid "Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed."
+msgstr "Defina o nível de limpeza desejado para o áudio; quanto mais você aumentar, mais ele limpa, mas é possível que o áudio fique mais comprimido."
+
+msgid "Set the pitch of the audio, the higher the value, the higher the pitch."
+msgstr "Defina o pitch do áudio; quanto maior o valor, mais agudo o pitch."
+
+msgid "Settings"
+msgstr "Configurações"
+
+msgid "Sharpness"
+msgstr "Nitidez"
+
+msgid "Shields consonants and breaths from index artefacts."
+msgstr "Protege consoantes e respirações dos artefatos do index."
+
+msgid "Shift formants independently of pitch. For cross-gender conversion."
+msgstr "Desloca os formantes independentemente do pitch. Para conversão entre gêneros."
+
+msgid "Shift vocal formants when needed."
+msgstr "Desloca os formantes vocais quando necessário."
+
+msgid "Show in folder"
+msgstr "Mostrar na pasta"
+
+msgid "Show the unsmoothed trace behind each line."
+msgstr "Mostra o traço sem suavização atrás de cada linha."
+
+msgid "Silent ( 'mute' ) files for training."
+msgstr "Arquivos silenciosos ( 'mute' ) para o treinamento."
+
+msgid "Silent references that teach the model to stay quiet."
+msgstr "Referências silenciosas que ensinam o modelo a ficar em silêncio."
+
+msgid "Similarity"
+msgstr "Similaridade"
+
+msgid "Single index"
+msgstr "Index único"
+
+msgid "Single input infer"
+msgstr "Inferência de entrada única"
+
+msgid "Skip existing slices, use fixed chunks, or detect silence automatically."
+msgstr "Pular trechos existentes, usar blocos fixos ou detectar o silêncio automaticamente."
+
+msgid "Slice and normalise the dataset."
+msgstr "Fatia e normaliza o dataset."
+
+msgid "Slicing"
+msgstr "Fatiamento"
+
+msgid "Slow first epoch, faster afterwards."
+msgstr "Primeiro epoch lento, mais rápido depois."
+
+msgid "SmartCutter"
+msgstr ""
+
+msgid "SmartCutter model"
+msgstr "Modelo do SmartCutter"
+
+msgid "Smooth the extracted pitch curve. Default: 0.006."
+msgstr "Suaviza a curva de pitch extraída. Padrão: 0,006."
+
+msgid "Smoothing"
+msgstr "Suavização"
+
+msgid "Smooths the extracted pitch curve."
+msgstr "Suaviza a curva de pitch extraída."
+
+msgid "Snap pitch to the chromatic grid. For singing."
+msgstr "Prende o pitch à grade cromática. Para canto."
+
+msgid "Something went wrong"
+msgstr "Algo deu errado"
+
+msgid "Source"
+msgstr "Origem"
+
+msgid "Speaker"
+msgstr "Locutor"
+
+msgid "Speaker ID"
+msgstr "ID do locutor"
+
+msgid "Speaker ID for conversion."
+msgstr "ID do locutor para a conversão."
+
+msgid "Speaker ID for multi-speaker models."
+msgstr "ID do locutor para modelos multi-locutor."
+
+msgid "Speaker id inside a multi-speaker model."
+msgstr "ID do locutor dentro de um modelo multi-locutor."
+
+msgid "Speaking rate"
+msgstr "Velocidade da fala"
+
+msgid ""
+"Specify any seed to be used for inference or leave at '0' for random outputs. ( Classic RVC behavior. ) \n"
+" **Ensure you don't leave this field empty.**"
+msgstr ""
+"Informe uma seed para a inferência ou deixe em '0' para saídas aleatórias. ( Comportamento clássico do RVC. ) \n"
+" **Não deixe este campo vazio.**"
+
+msgid "Spectral loss"
+msgstr "Perda espectral"
+
+msgid "Spectrum and level report for one file."
+msgstr "Relatório de espectro e nível de um arquivo."
+
+msgid "Split Audio"
+msgstr "Dividir áudio"
+
+msgid "Split input at silence regions."
+msgstr "Divide a entrada nas regiões de silêncio."
+
+msgid "Split input into chunks."
+msgstr "Divide a entrada em blocos."
+
+msgid "Split long audio"
+msgstr "Dividir áudios longos"
+
+msgid "Split the audio into chunks for inference to obtain better results in some cases."
+msgstr "Divide o áudio em blocos para a inferência, o que em alguns casos gera resultados melhores."
+
+msgid "Standard cleanup pass on each slice."
+msgstr "Passagem de limpeza padrão em cada trecho."
+
+msgid "Start Training"
+msgstr "Iniciar treinamento"
+
+msgid "Start from a pretrained model"
+msgstr "Partir de um modelo pré-treinado"
+
+msgid "Start training"
+msgstr "Iniciar treinamento"
+
+msgid "Starting backend with {executable}"
+msgstr "Iniciando o backend com {executable}"
+
+msgid "Starting backend…"
+msgstr "Iniciando o backend…"
+
+msgid "Starting point"
+msgstr "Ponto de partida"
+
+msgid "Starting the trainer… (loading models and dataset)"
+msgstr "Iniciando o treinador… (carregando modelos e dataset)"
+
+msgid "Status messages and final file path will be displayed here."
+msgstr "As mensagens de status e o caminho final do arquivo aparecem aqui."
+
+msgid "Stop"
+msgstr "Parar"
+
+msgid "Stop Training"
+msgstr "Parar treinamento"
+
+msgid "Stop convert"
+msgstr "Parar conversão"
+
+msgid "Stop once overtrained"
+msgstr "Parar ao detectar overtraining"
+
+msgid "Stop training"
+msgstr "Parar treinamento"
+
+msgid "Stop when overtrained"
+msgstr "Parar quando houver overtraining"
+
+msgid "Stopping…"
+msgstr "Parando…"
+
+msgid "Strength of autotuning"
+msgstr "Intensidade do autotune"
+
+msgid "Strength of cleaning"
+msgstr "Intensidade da limpeza"
+
+msgid "Sub-model inside the model bundle."
+msgstr "Submodelo dentro do pacote de modelo."
+
+msgid "Synthesis voice"
+msgstr "Voz de síntese"
+
+msgid "Synthesise a line and convert it"
+msgstr "Sintetiza uma frase e a converte"
+
+msgid "Synthesise a line with Edge TTS, then convert it to your voice."
+msgstr "Sintetize uma frase com o Edge TTS e converta-a para a sua voz."
+
+msgid "Synthesise and convert"
+msgstr "Sintetizar e converter"
+
+msgid "Synthesised speech"
+msgstr "Fala sintetizada"
+
+msgid "Synthesising…"
+msgstr "Sintetizando…"
+
+msgid "TF32 matmuls"
+msgstr "Multiplicações de matriz em TF32"
+
+msgid "TTS Speed"
+msgstr "Velocidade do TTS"
+
+msgid "TTS Voices"
+msgstr "Vozes do TTS"
+
+msgid "TTS status."
+msgstr "Status do TTS."
+
+msgid "Target RMS (dB)"
+msgstr "RMS alvo (dB)"
+
+msgid "Target loudness for RMS normalization."
+msgstr "Volume alvo da normalização RMS."
+
+msgid "Target sample rate. Match it to the dataset when possible."
+msgstr "Taxa de amostragem alvo. Faça-a coincidir com o dataset quando possível."
+
+msgid "Target voice"
+msgstr "Voz de destino"
+
+msgid "Text"
+msgstr "Texto"
+
+msgid "Text file"
+msgstr "Arquivo de texto"
+
+msgid "Text to Speech"
+msgstr "Texto para fala"
+
+msgid "Text to Synthesize"
+msgstr "Texto a sintetizar"
+
+msgid "Text to speech"
+msgstr "Texto para fala"
+
+msgid "The 16 kHz copies only feed pitch and embedder extraction; training never reads them. Deleting frees roughly a third of what preprocessing wrote. Re-extracting with another f0 method or embedder needs them back, which means running preprocessing again."
+msgstr "As cópias de 16 kHz alimentam apenas a extração de pitch e do embedder; o treinamento nunca as lê. Apagá-las libera cerca de um terço do que o pré-processamento gravou. Extrair de novo com outro método de f0 ou outro embedder exige tê-las de volta, o que significa rodar o pré-processamento novamente."
+
+msgid "The Edge TTS voice used before conversion."
+msgstr "A voz do Edge TTS usada antes da conversão."
+
+msgid "The archive is unpacked into logs/."
+msgstr "O arquivo é descompactado em logs/."
+
+msgid "The audio you want converted."
+msgstr "O áudio que você quer converter."
+
+msgid "The dataset folder does not exist."
+msgstr "A pasta do dataset não existe."
+
+msgid "The directory where the final .pth file will be saved."
+msgstr "O diretório onde o arquivo .pth final será salvo."
+
+msgid "The file has been loaded!"
+msgstr "O arquivo foi carregado!"
+
+msgid "The file has to be in UTF-8 encoding."
+msgstr "O arquivo precisa estar em codificação UTF-8."
+
+msgid "The file you dropped is not a valid model file. Please try again."
+msgstr "O arquivo que você soltou não é um arquivo de modelo válido. Tente novamente."
+
+msgid "The final result."
+msgstr "O resultado final."
+
+msgid "The input file does not exist."
+msgstr "O arquivo de entrada não existe."
+
+msgid ""
+"The interface is built when the window opens, so the new language needs a restart.\n"
+"\n"
+"Restart now?"
+msgstr ""
+"A interface é montada quando a janela abre, então o novo idioma exige reiniciar.\n"
+"\n"
+"Reiniciar agora?"
+
+msgid "The long part."
+msgstr "A parte demorada."
+
+msgid "The name that will appear in the model information."
+msgstr "O nome que vai aparecer nas informações do modelo."
+
+msgid "The output file will be saved as `<name>.pth`."
+msgstr "O arquivo de saída será salvo como `<nome>.pth`."
+
+msgid "The output information will be displayed here."
+msgstr "As informações de saída aparecem aqui."
+
+msgid "The path to the text file that contains content for text to speech."
+msgstr "O caminho do arquivo de texto com o conteúdo para a conversão de texto em fala."
+
+msgid "The plot appears here."
+msgstr "O gráfico aparece aqui."
+
+msgid "The pre-overtrain model is exported either way; this only ends the run."
+msgstr "O modelo anterior ao overtraining é exportado de qualquer forma; isto só encerra a execução."
+
+msgid "The selected vocoder requires F0 guidance."
+msgstr "O vocoder selecionado exige guia de F0."
+
+msgid "There is no converted file to save yet."
+msgstr "Ainda não há arquivo convertido para salvar."
+
+msgid "This GPU has no TF32 units, so the setting would do nothing."
+msgstr "Esta GPU não tem unidades TF32, então a opção não faria nada."
+
+msgid "This run has not written validation previews yet. They appear every few hundred steps once training starts."
+msgstr "Este treino ainda não gravou previews de validação. Eles aparecem a cada algumas centenas de steps depois que o treino começa."
+
+msgid "This section contains some extra utilities. You might find some of 'em helpful."
+msgstr "Esta seção contém alguns utilitários extras. Talvez você ache alguns deles úteis."
+
+msgid "Timbre for formant shifting"
+msgstr "Timbre do deslocamento de formantes"
+
+msgid "Torch compile mode"
+msgstr "Modo de compilação do Torch"
+
+msgid "Total Epochs"
+msgstr "Total de epochs"
+
+msgid "Total epochs"
+msgstr "Total de epochs"
+
+msgid "Total training epochs."
+msgstr "Total de epochs de treinamento."
+
+msgid "Trades speed for a much smaller VRAM footprint."
+msgstr "Troca velocidade por um consumo de VRAM bem menor."
+
+msgid "Training"
+msgstr "Treinamento"
+
+msgid "Training Presets"
+msgstr "Predefinições de treinamento"
+
+msgid "Training is running; the new language applies at the next start."
+msgstr "O treinamento está em andamento; o novo idioma será aplicado na próxima inicialização."
+
+msgid "Training status."
+msgstr "Status do treinamento."
+
+msgid "Trim and de-click"
+msgstr "Aparar e remover cliques"
+
+msgid "Type a line, or load a .txt file to read from."
+msgstr "Digite uma frase ou carregue um arquivo .txt para ler."
+
+msgid "Unload Voice"
+msgstr "Descarregar voz"
+
+msgid "Unload the voice model"
+msgstr "Descarrega o modelo de voz"
+
+msgid "Unload this audio."
+msgstr "Descarrega este áudio."
+
+msgid "Upload"
+msgstr "Enviar"
+
+msgid "Upload .bin"
+msgstr "Enviar .bin"
+
+msgid "Upload .json"
+msgstr "Enviar .json"
+
+msgid "Upload Audio"
+msgstr "Enviar áudio"
+
+msgid "Upload PTH file(s)"
+msgstr "Enviar arquivo(s) .pth"
+
+msgid "Upload Pretrained Model"
+msgstr "Enviar modelo pré-treinado"
+
+msgid "Upload a .txt file"
+msgstr "Enviar um arquivo .txt"
+
+msgid "Upload index file(s) (optional)"
+msgstr "Enviar arquivo(s) de index (opcional)"
+
+msgid "Upload is available on Google Colab and saves exported files to your Google Drive."
+msgstr "O envio está disponível no Google Colab e salva os arquivos exportados no seu Google Drive."
+
+msgid "Uploading {path} to Google Drive..."
+msgstr "Enviando {path} para o Google Drive..."
+
+msgid "Use 'cuDNN benchmark' mode"
+msgstr "Usar o modo 'benchmark do cuDNN'"
+
+msgid "Use TF32 on supported GPUs for faster training."
+msgstr "Usa TF32 em GPUs compatíveis para treinar mais rápido."
+
+msgid "Use a pre-computed pitch curve instead of extracting one."
+msgstr "Usa uma curva de pitch pré-calculada em vez de extrair uma."
+
+msgid "Use custom generator and discriminator pretrained files."
+msgstr "Usa arquivos pré-treinados personalizados de gerador e discriminador."
+
+msgid "Use linear learning-rate warmup."
+msgstr "Usa warmup linear da taxa de aprendizado."
+
+msgid "Use my own pretrained files"
+msgstr "Usar os meus próprios arquivos pré-treinados"
+
+msgid "Use pretrained weights for fine-tuning."
+msgstr "Usa pesos pré-treinados para fazer fine-tuning."
+
+msgid "Used by the Generate Index button below, after training."
+msgstr "Usado pelo botão Gerar Índice abaixo, depois do treino."
+
+msgid "Utilities"
+msgstr "Utilitários"
+
+msgid "Validation sample"
+msgstr "Amostra de validação"
+
+msgid "Version"
+msgstr "Versão"
+
+msgid "View"
+msgstr "Ver"
+
+msgid "Vocoder"
+msgstr "Vocoder"
+
+msgid "Voice"
+msgstr "Voz"
+
+msgid "Voice Model"
+msgstr "Modelo de voz"
+
+msgid "Voice model"
+msgstr "Modelo de voz"
+
+msgid "Voice model used for conversion."
+msgstr "Modelo de voz usado na conversão."
+
+msgid "Voice model used for inference."
+msgstr "Modelo de voz usado na inferência."
+
+msgid "Volume Envelope"
+msgstr "Envelope de volume"
+
+msgid "Volume envelope"
+msgstr "Envelope de volume"
+
+msgid "Waiting for the first batch…"
+msgstr "Aguardando o primeiro batch…"
+
+msgid "Warm up the learning rate"
+msgstr "Aquecer a taxa de aprendizado"
+
+msgid "Warmup duration, in epochs."
+msgstr "Duração do warmup, em epochs."
+
+msgid "Warmup epochs"
+msgstr "Epochs de warmup"
+
+msgid "Warmup phase for training"
+msgstr "Fase de warmup do treinamento"
+
+msgid "Warmup settings"
+msgstr "Configurações de warmup"
+
+msgid "Weight averaging (EMA)"
+msgstr "Média de pesos (EMA)"
+
+msgid "What should the voice say?"
+msgstr "O que a voz deve dizer?"
+
+msgid "When set, this wins over the box above."
+msgstr "Quando definido, prevalece sobre a caixa acima."
+
+msgid "Where to write the results"
+msgstr "Onde gravar os resultados"
+
+msgid "Which model to convert into."
+msgstr "Para qual modelo converter."
+
+msgid "Which training log to follow."
+msgstr "Qual log de treinamento acompanhar."
+
+msgid "Which voice inside the .srvc bundle to use."
+msgstr "Qual voz dentro do pacote .srvc usar."
+
+msgid "Window"
+msgstr "Janela"
+
+msgid "Written to logs/ under this name."
+msgstr "Gravado em logs/ com este nome."
+
+msgid "You can also use a custom path."
+msgstr "Você também pode usar um caminho personalizado."
+
+msgid "checkpoints, schedule, precision, compilation, gradient clipping"
+msgstr "checkpoints, agendamento, precisão, compilação, clipping de gradiente"
+
+msgid "contentvec, RMVPE, FCPE."
+msgstr "contentvec, RMVPE, FCPE."
+
+msgid "cuDNN benchmark"
+msgstr "benchmark do cuDNN"
+
+msgid "ffmpeg and ffprobe"
+msgstr "ffmpeg e ffprobe"
+
+msgid "fp32 doubles the feature cache on disk but keeps the retrieval index free of a quantisation floor; fp16 halves it. Either is readable without re-extracting."
+msgstr "fp32 dobra o cache de características em disco, mas mantém o index de recuperação livre de um piso de quantização; fp16 o reduz à metade. Ambos podem ser lidos sem extrair novamente."
+
+msgid "https://…"
+msgstr ""
+
+msgid "l2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally."
+msgstr "l2 é o que o RVC original constrói. O cosseno compara apenas a direção, então uma tomada baixa e uma alta do mesmo som combinam igualmente."
+
+msgid "librosa: high quality. ffmpeg: alternative resampler."
+msgstr "librosa: alta qualidade. ffmpeg: reamostrador alternativo."
+
+msgid "max-autotune spends longer compiling for a faster steady state."
+msgstr "max-autotune passa mais tempo compilando para chegar a um regime estável mais rápido."
+
+msgid "normalisation, cleanup, format, threads"
+msgstr "normalização, limpeza, formato, threads"
+
+msgid "off"
+msgstr "desligado"
+
+msgid "output format, post-processing, formants, seed"
+msgstr "formato de saída, pós-processamento, formantes, seed"
+
+msgid "rmvpe is the recommended default."
+msgstr "rmvpe é o padrão recomendado."
+
+msgid "step {step}"
+msgstr "step {step}"
+
+msgid "threads, mute samples, precision, cleanup"
+msgstr "threads, amostras mudas, precisão, limpeza"
+
+msgid "torch.compile the vocoder"
+msgstr "compilar o vocoder com torch.compile"
+
+msgid "use 'TF32' precision"
+msgstr "usar precisão 'TF32'"
+
+msgid "{count} audio file found."
+msgid_plural "{count} audio files found."
+msgstr[0] "{count} arquivo de áudio encontrado."
+msgstr[1] "{count} arquivos de áudio encontrados."
+
+msgid "{count} character"
+msgid_plural "{count} characters"
+msgstr[0] "{count} caractere"
+msgstr[1] "{count} caracteres"
+
+msgid "{count} epochs with previews · {size} on disk, under logs/<model>/validation_samples/."
+msgstr "{count} épocas com previews · {size} em disco, em logs/<modelo>/validation_samples/."
+
+msgid "{duration} elapsed"
+msgstr "{duration} decorridos"
+
+msgid "{field} is required."
+msgstr "{field} é obrigatório."
+
+msgid "{label} · {n} sample(s){detail}"
+msgstr "{label} · {n} amostra(s){detail}"
+
+msgid "{label}, {sample} — the generated clip is the model's own inference path, so it is what conversion will sound like."
+msgstr "{label}, {sample} — o clipe gerado usa o próprio caminho de inferência do modelo, então é assim que a conversão vai soar."
+
+msgid "{name} saved in {folder}"
+msgstr "{name} salvo em {folder}"
+
+msgid "{tags} metrics · {points} points"
+msgstr "{tags} métricas · {points} pontos"

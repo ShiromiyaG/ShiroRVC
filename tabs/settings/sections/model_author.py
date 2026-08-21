@@ -2,6 +2,9 @@ import os
 import sys
 import json
 
+from rvc.lib.i18n import _
+from rvc.lib.terminal import success
+
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
@@ -17,7 +20,7 @@ def set_model_author(model_author: str):
     with open(os.path.join(now_dir, "assets", "config.json"), "w") as f:
         json.dump(config, f, indent=4)
 
-    print(f"Model author set to {model_author}.")
+    success(f"Model author set to {model_author}.", tag="[SETTINGS]")
     return f"Model author set to {model_author}."
 
 
@@ -30,19 +33,19 @@ def get_model_author():
 
 def model_author_tab():
     model_author_name = gr.Textbox(
-        label="Model Author Name",
-        info="The name that will appear in the model information.",
+        label=_("Model Author Name"),
+        info=_("The name that will appear in the model information."),
         value=get_model_author(),
-        placeholder="Enter your nickname",
+        placeholder=_("Enter your nickname"),
         interactive=True,
     )
     model_author_output_info = gr.Textbox(
-        label="Output Information",
-        info="The output information will be displayed here.",
+        label=_("Output Information"),
+        info=_("The output information will be displayed here."),
         value="",
         max_lines=1,
     )
-    button = gr.Button("Set name")
+    button = gr.Button(_("Set name"))
 
     button.click(
         fn=set_model_author,

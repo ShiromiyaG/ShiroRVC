@@ -91,8 +91,7 @@ def catch_none_args_opti(x, default, func_name, warning_str=None, level='WARN'):
     """Catch None, optional"""
     if x is None:
         if warning_str is not None:
-            print(f'  [{level}] {warning_str}; use default {default}')
-            print(f'  [{level}]    > call by:{func_name}')
+            print(f'[{level}] {warning_str}; using default {default} ({func_name}).')
         return default
     else:
         return x
@@ -102,8 +101,6 @@ def catch_none_args_must(x, func_name, warning_str):
     """Catch None, must"""
     level = "ERROR"
     if x is None:
-        print(f'  [{level}] {warning_str}')
-        print(f'  [{level}]    > call by:{func_name}')
         raise ValueError(f'  [{level}] {warning_str}')
     else:
         return x
@@ -120,17 +117,13 @@ def get_device(device: str, func_name: str) -> str:
         else:
             device = 'cpu'
 
-        print(f'  [INFO]: Using {device} automatically.')
-        print(f'  [INFO]    > call by: {func_name}')
     else:
-        print(f'  [INFO]: device is not None, use {device}')
-        print(f'  [INFO]    > call by:{func_name}')
         device = device
 
     # Check if the specified device is available, if not, switch to cpu
     if ((device == 'cuda' and not torch.cuda.is_available()) or
             (device == 'mps' and not torch.backends.mps.is_available())):
-        print(f'  [WARN]: Specified device ({device}) is not available, switching to cpu.')
+        print(f'[WARNING] {device} is not available; switching to the CPU.')
         device = 'cpu'
 
     return device

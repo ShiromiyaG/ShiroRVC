@@ -1,24 +1,31 @@
+import click
 import psutil
 import os
 import sys
 import json
-import argparse
 import shutil
 
+import atexit
 import platform
-import subprocess
 import signal
+import subprocess
+import time
 from multiprocessing import cpu_count
 
 
 from functools import lru_cache
-from distutils.util import strtobool
 
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.lib.terminal import DEFAULT_CPU_THREADS, install_rich_print
+from rvc.lib.terminal import (
+    DEFAULT_CPU_THREADS,
+    install_rich_print,
+    print_error_panel,
+    print_settings_panel,
+    success,
+)
 
 install_rich_print()
 
@@ -32,6 +39,7 @@ from rvc.configs.vocoders import (
     get_vocoder_sample_rates,
     normalize_vocoder,
 )
+from rvc.train.run_spec import TrainRunSpec
 from rvc.train.messages import (
     TORCH_COMPILE_MODE_CLI_HELP,
     TORCH_COMPILE_MODES,
@@ -95,6 +103,11 @@ def run_infer_script(
     sid: int = 0,
     seed: int = 0,
     bundle_submodel: str = None,
+    deterministic: bool = True,
+    latent_temperature: float = 1.0,
+    index_k: int = 8,
+    index_power: float = 2.0,
+    index_continuity: float = 0.5,
 ):
     kwargs = {
         "audio_input_path": input_path,
@@ -123,7 +136,12 @@ def run_infer_script(
         "formant_timbre": formant_timbre,
         "sid": sid,
         "seed": seed,
+        "deterministic": deterministic,
+        "latent_temperature": latent_temperature,
         "bundle_submodel": bundle_submodel,
+        "index_k": index_k,
+        "index_power": index_power,
+        "index_continuity": index_continuity,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(
@@ -170,6 +188,11 @@ def run_batch_infer_script(
     formant_timbre: float = 1.0,
     sid: int = 0,
     seed: int = 0,
+    deterministic: bool = True,
+    latent_temperature: float = 1.0,
+    index_k: int = 8,
+    index_power: float = 2.0,
+    index_continuity: float = 0.5,
 ):
     kwargs = {
         "audio_input_paths": input_folder,
@@ -198,6 +221,11 @@ def run_batch_infer_script(
         "formant_timbre": formant_timbre,
         "sid": sid,
         "seed": seed,
+        "deterministic": deterministic,
+        "latent_temperature": latent_temperature,
+        "index_k": index_k,
+        "index_power": index_power,
+        "index_continuity": index_continuity,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(
@@ -234,6 +262,9 @@ def run_tts_script(
     embedder_model_custom: str = None,
     sid: int = 0,
     seed: int = 0,
+    index_k: int = 8,
+    index_power: float = 2.0,
+    index_continuity: float = 0.5,
 ):
 
     tts_script_path = os.path.join("rvc", "lib", "tools", "tts.py")
@@ -282,6 +313,9 @@ def run_tts_script(
         formant_shifting=None,
         formant_qfrency=None,
         formant_timbre=None,
+        index_k=index_k,
+        index_power=index_power,
+        index_continuity=index_continuity,
     )
 
     return f"Text {tts_text} synthesized successfully.", output_rvc_path.replace(
@@ -350,6 +384,8 @@ def run_extract_script(
     embedder_model: str,
     embedder_model_custom: str = None,
     include_mutes: int = 2,
+    remove_16k_slices: bool = False,
+    feature_precision: str = "fp32",
 ):
     vocoder_arch = normalize_vocoder(vocoder_arch)
     if int(sample_rate) not in get_vocoder_sample_rates(vocoder_arch):
@@ -375,6 +411,8 @@ def run_extract_script(
                 embedder_model,
                 embedder_model_custom,
                 include_mutes,
+                remove_16k_slices,
+                feature_precision,
             ],
         ),
     ]
@@ -385,6 +423,29 @@ def run_extract_script(
 
 
 # Train
+def _trainer_preexec():
+    """Child setup on POSIX: own session, but tied to this interface's lifetime.
+
+    `setsid` keeps the trainer off the terminal's SIGHUP path, which is what a
+    long run wants.  On its own, though, that also means closing the terminal
+    kills the interface and leaves the trainer orphaned on the GPU with no way
+    left to reach it.  PR_SET_PDEATHSIG asks the kernel to SIGTERM the child
+    when its parent goes away, which closes that hole -- including when the
+    interface is killed outright and no handler of ours could run.
+    """
+    os.setsid()
+    try:
+        import ctypes
+
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, signal.SIGTERM
+        )
+    except Exception:
+        # No glibc prctl (macOS, musl): the atexit handler is the fallback.
+        pass
+
+
 def run_train_script(
     model_name: str,
     epoch_save_frequency: int,
@@ -407,27 +468,16 @@ def run_train_script(
     use_checkpointing: bool = False,
     use_tf32: bool = False,
     use_benchmark: bool = True,
-    use_deterministic: bool = False,
     spectral_loss: str = "L1 Mel Loss",
     lr_scheduler: str = "exp decay step",
-    exp_decay_gamma: str = "0.999875",
-    use_kl_annealing: bool = False,
-    kl_annealing_cycle_duration: int = 3,
-    rolling_loss_steps: int = 50,
-    grad_clip_scheduling: bool = False,
-    grad_clip_steps_duration: int = 0,
-    grad_clip_value_g_cap: int = 0,
-    grad_clip_value_d_cap: int = 0,
-    grad_clip_value_g_release: int = 0,
-    grad_clip_value_d_release: int = 0,
     use_custom_lr: bool = False,
     custom_lr_g: float = 1e-4,
     custom_lr_d: float = 1e-4,
-    use_2_sample_kl: bool = False,
-    use_best_step: bool = False,
-    double_d_updates: bool = False,
     compile_vocoder: bool = False,
     torch_compile_mode: str = "default",
+    overtrain_detector: bool = False,
+    stop_on_overtrain: bool = False,
+    use_ema: bool = True,
 ):
     global training_process
 
@@ -447,57 +497,48 @@ def run_train_script(
     else:
         pg, pd = "", ""
 
+    # The trainer derives the training phase from the pretrained paths, so it
+    # is not passed: two fields that must agree are one field too many.
+    spec = TrainRunSpec(
+        model_name=model_name,
+        sample_rate=int(sample_rate),
+        vocoder=str(vocoder),
+        total_epoch_count=int(total_epoch_count),
+        epoch_save_frequency=int(epoch_save_frequency),
+        batch_size=int(batch_size),
+        gpus=str(gpu),
+        save_only_latest_net_models=bool(save_only_latest_net_models),
+        save_weight_models=bool(save_weight_models),
+        cleanup=bool(cleanup),
+        pretrain_g=str(pg),
+        pretrain_d=str(pd),
+        optimizer_choice=str(optimizer_choice),
+        spectral_loss=str(spectral_loss),
+        lr_scheduler=str(lr_scheduler),
+        use_warmup=bool(use_warmup),
+        warmup_duration=int(warmup_duration),
+        use_custom_lr=bool(use_custom_lr),
+        # The UIs send the slider value even with the override off, but a CLI
+        # caller can pass nothing at all.
+        custom_lr_g=float(custom_lr_g if custom_lr_g is not None else 1e-4),
+        custom_lr_d=float(custom_lr_d if custom_lr_d is not None else 1e-4),
+        use_checkpointing=bool(use_checkpointing),
+        use_tf32=bool(use_tf32),
+        use_benchmark=bool(use_benchmark),
+        compile_vocoder=bool(compile_vocoder),
+        torch_compile_mode=str(torch_compile_mode),
+        overtrain_detector=bool(overtrain_detector),
+        stop_on_overtrain=bool(stop_on_overtrain),
+        use_ema=bool(use_ema),
+    )
+    # Written into the run's own log directory, so it survives the process and
+    # answers "what was this trained with?" long after the fact.
+    spec_path = spec.save(
+        os.path.join(now_dir, "logs", model_name, "run_spec.json")
+    )
+
     train_script_path = os.path.join("rvc", "train", "train.py")
-    command = [
-        python,
-        train_script_path,
-        *map(
-            str,
-            [
-                model_name,
-                epoch_save_frequency,
-                total_epoch_count,
-                pg,
-                pd,
-                gpu,
-                batch_size,
-                sample_rate,
-                save_only_latest_net_models,
-                save_weight_models,
-                use_warmup,
-                warmup_duration,
-                cleanup,
-                vocoder,
-                "RVC",
-                optimizer_choice,
-                optimizer_choice,
-                use_checkpointing,
-                use_tf32,
-                use_benchmark,
-                use_deterministic,
-                spectral_loss,
-                lr_scheduler,
-                exp_decay_gamma,
-                use_kl_annealing,
-                kl_annealing_cycle_duration,
-                rolling_loss_steps,
-                grad_clip_scheduling,
-                grad_clip_steps_duration,
-                grad_clip_value_g_cap,
-                grad_clip_value_d_cap,
-                grad_clip_value_g_release,
-                grad_clip_value_d_release,
-                use_custom_lr,
-                custom_lr_g,
-                custom_lr_d,
-                use_2_sample_kl,
-                use_best_step,
-                double_d_updates,
-                compile_vocoder,
-                torch_compile_mode,
-            ],
-        ),
-    ]
+    command = [python, train_script_path, str(spec_path)]
     if platform.system() == "Windows":
         global training_process
         training_process = subprocess.Popen(
@@ -507,7 +548,7 @@ def run_train_script(
     else:
         training_process = subprocess.Popen(
             command,
-            preexec_fn=os.setsid
+            preexec_fn=_trainer_preexec
         )
 
     training_process.wait()
@@ -515,84 +556,156 @@ def run_train_script(
 
 
 # Stopping the training
+# The trainer defers a stop until any checkpoint write in flight has reached
+# the disk, so this grace has to comfortably outlast one save (a couple of
+# hundred MB) before the force-kill takes over.
+TRAINING_STOP_GRACE_SECONDS = 45
+TRAINING_SCRIPT_MARKER = "rvc/train/train.py"
+
+
+def _find_trainer_processes():
+    """Every live process running the training script, whoever started it.
+
+    Used instead of matching on the `python.exe` image name, which also matched
+    this interface and TensorBoard.
+    """
+    found = []
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        if process.pid == os.getpid():
+            continue
+        try:
+            cmdline = process.info["cmdline"] or []
+        except psutil.Error:
+            continue
+        # Match the interpreter actually running the script, not any process
+        # whose command line merely mentions the path -- a grep, an editor or a
+        # shell would otherwise qualify.  The launcher always builds the command
+        # as [python, train_script_path, ...], so the script is argv[1].
+        if len(cmdline) < 2:
+            continue
+        executable = os.path.basename(str(cmdline[0])).lower()
+        if not executable.startswith("python"):
+            continue
+        if str(cmdline[1]).replace("\\", "/").endswith(TRAINING_SCRIPT_MARKER):
+            found.append(process)
+    return found
+
+
+def _request_graceful_stop(process):
+    """Ask the trainer to unwind rather than shooting it.
+
+    The launcher puts the trainer in its own process group precisely so this is
+    possible.  Both signals reach the DataLoader workers as well, and give
+    Python the chance to run its `finally` blocks and flush the TensorBoard
+    writer on the way out.
+    """
+    if platform.system() == "Windows":
+        os.kill(process.pid, signal.CTRL_BREAK_EVENT)
+    else:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+
+
+def _kill_process_tree(pid):
+    """Last resort: kill the process and every descendant. Returns survivors."""
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return []
+
+    # Snapshot the children before killing the parent, otherwise the reparented
+    # DataLoader workers become unreachable through it.
+    try:
+        victims = parent.children(recursive=True) + [parent]
+    except psutil.Error:
+        victims = [parent]
+
+    for victim in victims:
+        try:
+            victim.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _, alive = psutil.wait_procs(victims, timeout=5)
+    return alive
+
+
+def _wait_for_exit(process, timeout):
+    """Poll rather than `wait()`, which the progress watcher may already hold."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return True
+        time.sleep(0.5)
+    return process.poll() is not None
+
+
 def stop_train_script():
     global training_process
-    if training_process and training_process.poll() is None:
-        try:
-            pid = training_process.pid
-            parent_process = psutil.Process(pid)
 
-            worker_pids = []
-            for child in parent_process.children(recursive=True):
-                worker_pids.append(child.pid)
-
-            for pid in worker_pids:
-                worker_process = psutil.Process(pid)
-                worker_process.terminate()
-                print(f"[TRAINING] Terminated child worker process PID: {pid}")
-
-            parent_process.terminate()
-            print(f"[TRAINING] Terminated parent process PID: {pid}")
-
-            return ""
-
-        except psutil.NoSuchProcess as e:
-            print(f"No such process: {e}")
-            return "No running process found."
-        except psutil.AccessDenied as e:
-            print(f"Permission denied: {e}")
-            return "Failed to terminate process due to permission issues."
-        except Exception as e:
-            print(f"Error while stopping process: {e}")
-            return f"Error stopping process: {e}"
-    else:
-    # Emergency-Nuke if everything else failed.
-        if platform.system() == "Windows":
-            subprocess.run(["taskkill", "/F", "/T", "/IM", "python.exe"])
-        else:
-            subprocess.run(["pkill", "-f", "rvc/train/train.py"])
-        return "Emergency-Nuke issued."
-
-# Saving the models at given step count and stopping the training
-def early_save_stop():
-    global training_process
-
-    if training_process and training_process.poll() is None:
-        print(f"[TRAINING]  Sending Early Stopping signal to PID: {training_process.pid}")
-
-        try:
-            if platform.system() == "Windows":
-                os.kill(training_process.pid, signal.CTRL_BREAK_EVENT)
-            else:
-                os.kill(training_process.pid, signal.SIGINT)
-
+    if training_process is None or training_process.poll() is not None:
+        # Nothing tracked -- but a run from a previous session of this interface
+        # may still be alive, so look for it by command line.
+        orphans = _find_trainer_processes()
+        if not orphans:
+            return "No training process is running."
+        for orphan in orphans:
             try:
-                training_process.wait(timeout=10)
-                print("[TRAINING] Early Stopping completed.")
-                return ""
+                orphan.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, alive = psutil.wait_procs(orphans, timeout=5)
+        if alive:
+            return f"Could not stop PID(s): {', '.join(str(p.pid) for p in alive)}."
+        return f"Stopped {len(orphans)} orphaned training process(es)."
 
-            except subprocess.TimeoutExpired:
-                print("[TRAINING] Save timed out! Issuing Hard-Stop.")
-                return stop_train_script()
-
-        except Exception as e:
-            print(f"[TRAINING] Signal Error: {e}")
-            return f"Error during the Early Stopping-stop: {e}"
+    pid = training_process.pid
+    try:
+        _request_graceful_stop(training_process)
+    except (OSError, psutil.Error) as error:
+        print(f"[TRAINING] Graceful stop failed ({error}); killing instead.")
     else:
-        return "No active training process to early stop."
+        print(f"[TRAINING] Asked PID {pid} to stop, waiting up to {TRAINING_STOP_GRACE_SECONDS}s...")
+        if _wait_for_exit(training_process, TRAINING_STOP_GRACE_SECONDS):
+            return f"Training stopped (PID {pid})."
+        print(f"[TRAINING] PID {pid} did not exit in time; killing the tree.")
+
+    alive = _kill_process_tree(pid)
+    if alive:
+        return f"Could not stop PID(s): {', '.join(str(p.pid) for p in alive)}."
+    return f"Training force-stopped (PID {pid})."
+
+
+def _stop_training_at_exit():
+    """Take the trainer down when this interface exits normally."""
+    if training_process is not None and training_process.poll() is None:
+        print("[TRAINING] Interface is exiting; stopping the training run.")
+        stop_train_script()
+
+
+atexit.register(_stop_training_at_exit)
 
 
 # Index
-def run_index_script(model_name: str, index_algorithm: str):
+def run_index_script(
+    model_name: str, index_algorithm: str, index_metric: str = "l2"
+):
     index_script_path = os.path.join("rvc", "train", "process", "extract_index.py")
     command = [
         python,
         index_script_path,
         os.path.join(logs_path, model_name),
         index_algorithm,
+        index_metric,
     ]
 
-    subprocess.run(command)
+    # Checked, because it has not always succeeded: the script's ``rvc.``
+    # import failed under the subprocess's sys.path and this reported success
+    # regardless, so a missing index looked like a working one.
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        return (
+            f"Index generation for {model_name} failed (exit {result.returncode}). "
+            "See the terminal for the traceback."
+        )
     return f"Index file for {model_name} generated successfully."
 
 
@@ -600,8 +713,14 @@ def run_index_script(model_name: str, index_algorithm: str):
 def run_model_information_script(pth_path: str):
     from rvc.train.process.model_information import model_information
 
-    print(model_information(pth_path))
-    return model_information(pth_path)
+    # Loading the checkpoint is not free, so read it once and render the same
+    # text the caller gets back.
+    information = model_information(pth_path)
+    print_settings_panel(
+        (line.split(": ", 1) for line in information.splitlines() if ": " in line),
+        title=os.path.basename(pth_path),
+    )
+    return information
 
 
 # Model blender
@@ -652,1266 +771,910 @@ def run_audio_analyzer_script(
     from rvc.lib.tools.analyzer import analyze_audio
 
     audio_info, plot_path = analyze_audio(input_path, save_plot_path)
-    print(
-        f"Audio info of {input_path}: {audio_info}",
-        f"Audio file {input_path} analyzed successfully. Plot saved at: {plot_path}",
+    print_settings_panel(
+        (line.split(": ", 1) for line in str(audio_info).splitlines() if ": " in line),
+        title=os.path.basename(input_path),
     )
+    success(f"Plot saved at '{plot_path}'.", tag="[ANALYZE]")
     return audio_info, plot_path
 
 
 # Parse arguments
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Run the main.py script with specific parameters."
-    )
-    subparsers = parser.add_subparsers(
-        title="subcommands", dest="mode", help="Choose a mode"
-    )
+# =====================================================================
+# Command line interface
+# =====================================================================
+# Options shared by several commands are declared once in the groups below and
+# applied with @apply_options.  The previous argparse layer repeated them per
+# subparser, which let the accepted ranges drift apart between commands.
 
-    # Parser for 'infer' mode
-    infer_parser = subparsers.add_parser("infer", help="Run inference")
-    pitch_description = (
-        "Set the pitch of the audio. Higher values result in a higher pitch."
-    )
-    infer_parser.add_argument(
-        "--pitch",
+
+def _tts_voice_choices():
+    """Voice short names accepted by the tts command."""
+    return [voice["ShortName"] for voice in load_voices_data()]
+
+
+def apply_options(*groups):
+    """Apply one or more lists of click.option decorators to a command."""
+    def decorator(function):
+        for group in reversed(groups):
+            for option in reversed(group):
+                function = option(function)
+        return function
+
+    return decorator
+
+
+# ---- Shared option groups -------------------------------------------
+
+#: Per-command overrides for the conversion options below.  Single-file, batch
+#: and TTS ship genuinely different numbers in the Gradio tabs -- TTS leans on
+#: the index harder and protects consonants more, because a synthesised source
+#: has no breath to preserve -- so one shared set would match none of them.
+#: Anything absent here keeps the value in the list.
+INFER_DEFAULTS = {"index_rate": 0.5, "clean_strength": 0.3}
+BATCH_INFER_DEFAULTS = {"index_rate": 0.5, "clean_strength": 0.5, "protect": 0.3}
+TTS_DEFAULTS = {
+    "index_rate": 0.75,
+    "clean_strength": 0.5,
+    "protect": 0.5,
+    "clean_audio": True,
+}
+
+
+def inference_options(overrides: dict | None = None) -> list:
+    """The conversion knobs, built with one command's defaults applied."""
+    chosen = overrides or {}
+
+    def default(name, fallback):
+        return chosen.get(name, fallback)
+
+    return [
+        click.option(
+            "--pitch",
+            type=click.IntRange(-24, 24),
+            default=0,
+            show_default=True,
+            help="Set the pitch of the audio. Higher values result in a higher pitch.",
+        ),
+        click.option(
+            "--filter_radius",
+            type=click.IntRange(0, 10),
+            default=3,
+            show_default=True,
+            help="Apply median filtering to the extracted pitch values if this value is greater than or equal to three. This can help reduce breathiness in the output audio.",
+        ),
+        click.option(
+            "--index_rate",
+            type=click.FloatRange(0, 1),
+            default=default("index_rate", 0.3),
+            show_default=True,
+            help="Control the influence of the index file on the output. Higher values mean stronger influence. Lower values can help reduce artifacts but may result in less accurate voice cloning.",
+        ),
+        click.option(
+            "--index_k",
+            type=click.IntRange(1, 64),
+            default=8,
+            show_default=True,
+            help="Number of index neighbours averaged per frame. Fewer keeps what is idiosyncratic about the matched frames; more averages toward the dataset's mean voice.",
+        ),
+        click.option(
+            "--index_power",
+            type=click.FloatRange(0, 8),
+            default=2.0,
+            show_default=True,
+            help="Exponent of the inverse-distance weighting of those neighbours. 0 is a flat average, larger values approach picking only the nearest.",
+        ),
+        click.option(
+            "--index_continuity",
+            type=click.FloatRange(0, 4),
+            default=0.5,
+            show_default=True,
+            help="Reward for neighbours that continue the frame the previous one matched, which stops the retrieval jumping between unrelated parts of the dataset. Needs an index built by this fork; ignored otherwise.",
+        ),
+        click.option(
+            "--volume_envelope",
+            type=click.FloatRange(0, 1),
+            default=1,
+            show_default=True,
+            help="Control the blending of the output's volume envelope. A value of 1 means the output envelope is fully used.",
+        ),
+        click.option(
+            "--protect",
+            type=click.FloatRange(0, 0.5),
+            default=default("protect", 0.33),
+            show_default=True,
+            help="Protect consonants and breathing sounds from artifacts. A value of 0.5 offers the strongest protection, while lower values may reduce the protection level but potentially mitigate the indexing effect.",
+        ),
+        click.option(
+            "--f0_method",
+            type=click.Choice(["crepe", "crepe-tiny", "rmvpe", "fcpe"]),
+            default='rmvpe',
+            show_default=True,
+            help="Choose the pitch extraction algorithm for the conversion. 'rmvpe' is the default and generally recommended.",
+        ),
+        click.option(
+            "--pth_path",
+            type=str,
+            required=True,
+            help="Full path to the RVC model file (.pth).",
+        ),
+        click.option(
+            "--index_path",
+            type=str,
+            required=True,
+            help="Full path to the index file (.index).",
+        ),
+        click.option(
+            "--split_audio",
+            type=click.BOOL,
+            default=False,
+            show_default=True,
+            help="Split the audio into smaller segments before inference. This can improve the quality of the output for longer audio files.",
+        ),
+        click.option(
+            "--f0_autotune",
+            type=click.BOOL,
+            default=False,
+            show_default=True,
+            help="Apply a light autotune to the inferred audio. Particularly useful for singing voice conversions.",
+        ),
+        click.option(
+            "--f0_autotune_strength",
+            type=click.FloatRange(0, 1),
+            default=1.0,
+            show_default=True,
+            help="Set the autotune strength - the more you increase it the more it will snap to the chromatic grid.",
+        ),
+        click.option(
+            "--clean_audio",
+            type=click.BOOL,
+            default=default("clean_audio", False),
+            show_default=True,
+            help="Clean the output audio using noise reduction algorithms. Recommended for speech conversions.",
+        ),
+        click.option(
+            "--clean_strength",
+            type=click.FloatRange(0, 1),
+            default=default("clean_strength", 0.7),
+            show_default=True,
+            help="Adjust the intensity of the audio cleaning process. Higher values result in stronger cleaning, but may lead to a more compressed sound.",
+        ),
+        click.option(
+            "--export_format",
+            type=click.Choice(["WAV", "MP3", "FLAC", "OGG", "M4A"]),
+            default='WAV',
+            show_default=True,
+            help="Select the desired output audio format.",
+        ),
+        click.option(
+            "--embedder_model",
+            type=click.Choice(["contentvec", "spin_v1", "spin_v2", "custom"]),
+            default='contentvec',
+            show_default=True,
+            help="Choose the model used for generating speaker embeddings.",
+        ),
+        click.option(
+            "--embedder_model_custom",
+            type=str,
+            default=None,
+            help="Specify the path to a custom model for speaker embedding. Only applicable if 'embedder_model' is set to 'custom'.",
+        ),
+        click.option(
+            "--f0_file",
+            type=str,
+            default=None,
+            help="Full path to an external F0 file (.f0). This allows you to use pre-computed pitch values for the input audio.",
+        ),
+    ]
+
+FORMANT_OPTIONS = [
+    click.option(
+        "--formant_shifting",
+        type=click.BOOL,
+        default=False,
+        show_default=True,
+        help="Apply formant shifting to the input audio. This can help adjust the timbre of the voice.",
+    ),
+    click.option(
+        "--formant_qfrency",
+        type=float,
+        default=1.0,
+        show_default=True,
+        help="Control the frequency of the formant shifting effect. Higher values result in a more pronounced effect.",
+    ),
+    click.option(
+        "--formant_timbre",
+        type=float,
+        default=1.0,
+        show_default=True,
+        help="Control the timbre of the formant shifting effect. Higher values result in a more pronounced effect.",
+    ),
+    click.option(
+        "--sid",
         type=int,
-        help=pitch_description,
-        choices=range(-24, 25),
         default=0,
-    )
-    filter_radius_description = "Apply median filtering to the extracted pitch values if this value is greater than or equal to three. This can help reduce breathiness in the output audio."
-    infer_parser.add_argument(
-        "--filter_radius",
-        type=int,
-        help=filter_radius_description,
-        choices=range(11),
-        default=3,
-    )
-    index_rate_description = "Control the influence of the index file on the output. Higher values mean stronger influence. Lower values can help reduce artifacts but may result in less accurate voice cloning."
-    infer_parser.add_argument(
-        "--index_rate",
-        type=float,
-        help=index_rate_description,
-        choices=[i / 100.0 for i in range(0, 101)],
-        default=0.3,
-    )
-    volume_envelope_description = "Control the blending of the output's volume envelope. A value of 1 means the output envelope is fully used."
-    infer_parser.add_argument(
-        "--volume_envelope",
-        type=float,
-        help=volume_envelope_description,
-        choices=[i / 100.0 for i in range(0, 101)],
-        default=1,
-    )
-    protect_description = "Protect consonants and breathing sounds from artifacts. A value of 0.5 offers the strongest protection, while lower values may reduce the protection level but potentially mitigate the indexing effect."
-    infer_parser.add_argument(
-        "--protect",
-        type=float,
-        help=protect_description,
-        choices=[i / 1000.0 for i in range(0, 501)],
-        default=0.33,
-    )
-    f0_method_description = "Choose the pitch extraction algorithm for the conversion. 'rmvpe' is the default and generally recommended."
-    infer_parser.add_argument(
-        "--f0_method",
-        type=str,
-        help=f0_method_description,
-        choices=[
-            "crepe",
-            "crepe-tiny",
-            "rmvpe",
-            "fcpe",
-        ],
-        default="rmvpe",
-    )
-    infer_parser.add_argument(
+        show_default=True,
+        help="Speaker ID for multi-speaker models.",
+    ),
+]
+
+# ---- infer ----
+INFER_OWN = [
+    click.option(
         "--input_path",
         type=str,
-        help="Full path to the input audio file.",
         required=True,
-    )
-    infer_parser.add_argument(
+        help="Full path to the input audio file.",
+    ),
+    click.option(
         "--output_path",
         type=str,
-        help="Full path to the output audio file.",
         required=True,
-    )
-    pth_path_description = "Full path to the RVC model file (.pth)."
-    infer_parser.add_argument(
-        "--pth_path", type=str, help=pth_path_description, required=True
-    )
-    index_path_description = "Full path to the index file (.index)."
-    infer_parser.add_argument(
-        "--index_path", type=str, help=index_path_description, required=True
-    )
-    split_audio_description = "Split the audio into smaller segments before inference. This can improve the quality of the output for longer audio files."
-    infer_parser.add_argument(
-        "--split_audio",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=split_audio_description,
-        default=False,
-    )
-    f0_autotune_description = "Apply a light autotune to the inferred audio. Particularly useful for singing voice conversions."
-    infer_parser.add_argument(
-        "--f0_autotune",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=f0_autotune_description,
-        default=False,
-    )
-    f0_autotune_strength_description = "Set the autotune strength - the more you increase it the more it will snap to the chromatic grid."
-    infer_parser.add_argument(
-        "--f0_autotune_strength",
-        type=float,
-        help=f0_autotune_strength_description,
-        choices=[(i / 10) for i in range(11)],
-        default=1.0,
-    )
-    clean_audio_description = "Clean the output audio using noise reduction algorithms. Recommended for speech conversions."
-    infer_parser.add_argument(
-        "--clean_audio",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=clean_audio_description,
-        default=False,
-    )
-    clean_strength_description = "Adjust the intensity of the audio cleaning process. Higher values result in stronger cleaning, but may lead to a more compressed sound."
-    infer_parser.add_argument(
-        "--clean_strength",
-        type=float,
-        help=clean_strength_description,
-        choices=[(i / 10) for i in range(11)],
-        default=0.7,
-    )
-    export_format_description = "Select the desired output audio format."
-    infer_parser.add_argument(
-        "--export_format",
-        type=str,
-        help=export_format_description,
-        choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
-        default="WAV",
-    )
-    embedder_model_description = (
-        "Choose the model used for generating speaker embeddings."
-    )
-    infer_parser.add_argument(
-        "--embedder_model",
-        type=str,
-        help=embedder_model_description,
-        choices=[
-            "contentvec",
-            "spin_v1",
-            "spin_v2",
-            "custom",
-        ],
-        default="contentvec",
-    )
-    embedder_model_custom_description = "Specify the path to a custom model for speaker embedding. Only applicable if 'embedder_model' is set to 'custom'."
-    infer_parser.add_argument(
-        "--embedder_model_custom",
-        type=str,
-        help=embedder_model_custom_description,
-        default=None,
-    )
-    f0_file_description = "Full path to an external F0 file (.f0). This allows you to use pre-computed pitch values for the input audio."
-    infer_parser.add_argument(
-        "--f0_file",
-        type=str,
-        help=f0_file_description,
-        default=None,
-    )
-    formant_shifting_description = "Apply formant shifting to the input audio. This can help adjust the timbre of the voice."
-    infer_parser.add_argument(
-        "--formant_shifting",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=formant_shifting_description,
-        default=False,
-    )
-    formant_qfrency_description = "Control the frequency of the formant shifting effect. Higher values result in a more pronounced effect."
-    infer_parser.add_argument(
-        "--formant_qfrency",
-        type=float,
-        help=formant_qfrency_description,
-        default=1.0,
-    )
-    formant_timbre_description = "Control the timbre of the formant shifting effect. Higher values result in a more pronounced effect."
-    infer_parser.add_argument(
-        "--formant_timbre",
-        type=float,
-        help=formant_timbre_description,
-        default=1.0,
-    )
-    sid_description = "Speaker ID for multi-speaker models."
-    infer_parser.add_argument(
-        "--sid",
-        type=int,
-        help=sid_description,
-        default=0,
-    )
-    # Parser for 'batch_infer' mode
-    batch_infer_parser = subparsers.add_parser(
-        "batch_infer",
-        help="Run batch inference",
-    )
-    batch_infer_parser.add_argument(
-        "--pitch",
-        type=int,
-        help=pitch_description,
-        choices=range(-24, 25),
-        default=0,
-    )
-    batch_infer_parser.add_argument(
-        "--filter_radius",
-        type=int,
-        help=filter_radius_description,
-        choices=range(11),
-        default=3,
-    )
-    batch_infer_parser.add_argument(
-        "--index_rate",
-        type=float,
-        help=index_rate_description,
-        choices=[i / 100.0 for i in range(0, 101)],
-        default=0.3,
-    )
-    batch_infer_parser.add_argument(
-        "--volume_envelope",
-        type=float,
-        help=volume_envelope_description,
-        choices=[i / 100.0 for i in range(0, 101)],
-        default=1,
-    )
-    batch_infer_parser.add_argument(
-        "--protect",
-        type=float,
-        help=protect_description,
-        choices=[i / 1000.0 for i in range(0, 501)],
-        default=0.33,
-    )
-    batch_infer_parser.add_argument(
-        "--f0_method",
-        type=str,
-        help=f0_method_description,
-        choices=[
-            "crepe",
-            "crepe-tiny",
-            "rmvpe",
-            "fcpe",
-        ],
-        default="rmvpe",
-    )
-    batch_infer_parser.add_argument(
+        help="Full path to the output audio file.",
+    ),
+]
+
+# ---- batch_infer ----
+BATCH_INFER_OWN = [
+    click.option(
         "--input_folder",
         type=str,
-        help="Path to the folder containing input audio files.",
         required=True,
-    )
-    batch_infer_parser.add_argument(
+        help="Path to the folder containing input audio files.",
+    ),
+    click.option(
         "--output_folder",
         type=str,
+        required=True,
         help="Path to the folder for saving output audio files.",
+    ),
+]
+
+# ---- tts ----
+TTS_OWN = [
+    click.option(
+        "--tts_file",
+        type=str,
         required=True,
-    )
-    batch_infer_parser.add_argument(
-        "--pth_path", type=str, help=pth_path_description, required=True
-    )
-    batch_infer_parser.add_argument(
-        "--index_path", type=str, help=index_path_description, required=True
-    )
-    batch_infer_parser.add_argument(
-        "--split_audio",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=split_audio_description,
-        default=False,
-    )
-    batch_infer_parser.add_argument(
-        "--f0_autotune",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=f0_autotune_description,
-        default=False,
-    )
-    batch_infer_parser.add_argument(
-        "--f0_autotune_strength",
-        type=float,
-        help=clean_strength_description,
-        choices=[(i / 10) for i in range(11)],
-        default=1.0,
-    )
-    batch_infer_parser.add_argument(
-        "--clean_audio",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=clean_audio_description,
-        default=False,
-    )
-    batch_infer_parser.add_argument(
-        "--clean_strength",
-        type=float,
-        help=clean_strength_description,
-        choices=[(i / 10) for i in range(11)],
-        default=0.7,
-    )
-    batch_infer_parser.add_argument(
-        "--export_format",
-        type=str,
-        help=export_format_description,
-        choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
-        default="WAV",
-    )
-    batch_infer_parser.add_argument(
-        "--embedder_model",
-        type=str,
-        help=embedder_model_description,
-        choices=[
-            "contentvec",
-            "spin_v1",
-            "spin_v2",
-            "custom",
-        ],
-        default="contentvec",
-    )
-    batch_infer_parser.add_argument(
-        "--embedder_model_custom",
-        type=str,
-        help=embedder_model_custom_description,
-        default=None,
-    )
-    batch_infer_parser.add_argument(
-        "--f0_file",
-        type=str,
-        help=f0_file_description,
-        default=None,
-    )
-    batch_infer_parser.add_argument(
-        "--formant_shifting",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=formant_shifting_description,
-        default=False,
-    )
-    batch_infer_parser.add_argument(
-        "--formant_qfrency",
-        type=float,
-        help=formant_qfrency_description,
-        default=1.0,
-    )
-    batch_infer_parser.add_argument(
-        "--formant_timbre",
-        type=float,
-        help=formant_timbre_description,
-        default=1.0,
-    )
-    batch_infer_parser.add_argument(
-        "--sid",
-        type=int,
-        help=sid_description,
-        default=0,
-    )
-    # Parser for 'tts' mode
-    tts_parser = subparsers.add_parser("tts", help="Run TTS inference")
-    tts_parser.add_argument(
-        "--tts_file", type=str, help="File with a text to be synthesized", required=True
-    )
-    tts_parser.add_argument(
-        "--tts_text", type=str, help="Text to be synthesized", required=True
-    )
-    tts_parser.add_argument(
+        help="File with a text to be synthesized",
+    ),
+    click.option("--tts_text", type=str, required=True, help="Text to be synthesized"),
+    click.option(
         "--tts_voice",
-        type=str,
-        help="Voice to be used for TTS synthesis.",
-        choices=locales,
+        type=click.Choice(_tts_voice_choices()),
         required=True,
-    )
-    tts_parser.add_argument(
+        help="Voice to be used for TTS synthesis.",
+    ),
+    click.option(
         "--tts_rate",
-        type=int,
+        type=click.IntRange(-100, 100),
+        default=0,
+        show_default=True,
         help="Control the speaking rate of the TTS. Values range from -100 (slower) to 100 (faster).",
-        choices=range(-100, 101),
-        default=0,
-    )
-    tts_parser.add_argument(
-        "--pitch",
-        type=int,
-        help=pitch_description,
-        choices=range(-24, 25),
-        default=0,
-    )
-    tts_parser.add_argument(
-        "--filter_radius",
-        type=int,
-        help=filter_radius_description,
-        choices=range(11),
-        default=3,
-    )
-    tts_parser.add_argument(
-        "--index_rate",
-        type=float,
-        help=index_rate_description,
-        choices=[(i / 10) for i in range(11)],
-        default=0.3,
-    )
-    tts_parser.add_argument(
-        "--volume_envelope",
-        type=float,
-        help=volume_envelope_description,
-        choices=[(i / 10) for i in range(11)],
-        default=1,
-    )
-    tts_parser.add_argument(
-        "--protect",
-        type=float,
-        help=protect_description,
-        choices=[(i / 10) for i in range(6)],
-        default=0.33,
-    )
-    tts_parser.add_argument(
-        "--f0_method",
-        type=str,
-        help=f0_method_description,
-        choices=[
-            "crepe",
-            "crepe-tiny",
-            "rmvpe",
-            "fcpe",
-        ],
-        default="rmvpe",
-    )
-    tts_parser.add_argument(
+    ),
+    click.option(
         "--output_tts_path",
         type=str,
-        help="Full path to save the synthesized TTS audio.",
         required=True,
-    )
-    tts_parser.add_argument(
+        help="Full path to save the synthesized TTS audio.",
+    ),
+    click.option(
         "--output_rvc_path",
         type=str,
+        required=True,
         help="Full path to save the voice-converted audio using the synthesized TTS.",
-        required=True,
-    )
-    tts_parser.add_argument(
-        "--pth_path", type=str, help=pth_path_description, required=True
-    )
-    tts_parser.add_argument(
-        "--index_path", type=str, help=index_path_description, required=True
-    )
-    tts_parser.add_argument(
-        "--split_audio",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=split_audio_description,
-        default=False,
-    )
-    tts_parser.add_argument(
-        "--f0_autotune",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=f0_autotune_description,
-        default=False,
-    )
-    tts_parser.add_argument(
-        "--f0_autotune_strength",
-        type=float,
-        help=clean_strength_description,
-        choices=[(i / 10) for i in range(11)],
-        default=1.0,
-    )
-    tts_parser.add_argument(
-        "--clean_audio",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=clean_audio_description,
-        default=False,
-    )
-    tts_parser.add_argument(
-        "--clean_strength",
-        type=float,
-        help=clean_strength_description,
-        choices=[(i / 10) for i in range(11)],
-        default=0.7,
-    )
-    tts_parser.add_argument(
-        "--export_format",
-        type=str,
-        help=export_format_description,
-        choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
-        default="WAV",
-    )
-    tts_parser.add_argument(
-        "--embedder_model",
-        type=str,
-        help=embedder_model_description,
-        choices=[
-            "contentvec",
-            "spin_v1",
-            "spin_v2",
-            "custom",
-        ],
-        default="contentvec",
-    )
-    tts_parser.add_argument(
-        "--embedder_model_custom",
-        type=str,
-        help=embedder_model_custom_description,
-        default=None,
-    )
-    tts_parser.add_argument(
-        "--f0_file",
-        type=str,
-        help=f0_file_description,
-        default=None,
-    )
+    ),
+]
 
-    # Parser for 'preprocess' mode
-    preprocess_parser = subparsers.add_parser(
-        "preprocess", help="Preprocess a dataset for training."
-    )
-    preprocess_parser.add_argument(
-        "--model_name", type=str, help="Name of the model to be trained.", required=True
-    )
-    preprocess_parser.add_argument(
-        "--dataset_path", type=str, help="Path to the dataset directory.", required=True
-    )
-    preprocess_parser.add_argument(
-        "--sample_rate",
-        type=int,
-        help="Target sampling rate for the audio data.",
-        choices=get_all_vocoder_sample_rates(),
+# ---- preprocess ----
+PREPROCESS_OWN = [
+    click.option(
+        "--model_name",
+        type=str,
         required=True,
-    )
-    preprocess_parser.add_argument(
+        help="Name of the model to be trained.",
+    ),
+    click.option(
+        "--dataset_path",
+        type=str,
+        required=True,
+        help="Path to the dataset directory.",
+    ),
+    click.option(
+        "--sample_rate",
+        type=click.Choice(get_all_vocoder_sample_rates()),
+        required=True,
+        help="Target sampling rate for the audio data.",
+    ),
+    click.option(
         "--cpu_threads",
-        type=int,
+        type=click.IntRange(1, min(cpu_count(), 192)),
+        default=4,
+        show_default=True,
         help="Number of CPU threads to use for preprocessing.",
-        choices=range(1, min(cpu_count(), 192) + 1),
-        default=DEFAULT_CPU_THREADS
-    )
-    preprocess_parser.add_argument(
+    ),
+    click.option(
         "--cut_preprocess",
-        type=str,
-        choices=["Skip", "Simple", "Automatic"],
+        type=click.Choice(["Skip", "Simple", "Automatic"]),
+        default='Simple',
+        show_default=True,
         help="Cut the dataset into smaller segments for faster preprocessing.",
-        default="Simple",
-    )
-    preprocess_parser.add_argument(
+    ),
+    click.option(
         "--process_effects",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Enable high-pass filtering during preprocessing.",
+        type=click.BOOL,
         default=True,
-    )
-    preprocess_parser.add_argument(
+        show_default=True,
+        help="Enable high-pass filtering during preprocessing.",
+    ),
+    click.option(
         "--noise_reduction",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
+        default=False,
+        show_default=True,
         help="Enable noise reduction during preprocessing.",
-        default=False,
-    )
-    preprocess_parser.add_argument(
+    ),
+    click.option(
         "--noise_reduction_strength",
-        type=float,
-        help="Strength of the noise reduction filter.",
-        choices=[(i / 10) for i in range(11)],
+        type=click.FloatRange(0, 1),
         default=0.7,
-    )
-    preprocess_parser.add_argument(
+        show_default=True,
+        help="Strength of the noise reduction filter.",
+    ),
+    click.option(
         "--chunk_len",
-        type=float,
-        help="Chunk length.",
-        choices=[i * 0.5 for i in range(1, 11)],
+        type=click.FloatRange(0.5, 5.0),
         default=3.0,
-    )
-    preprocess_parser.add_argument(
+        show_default=True,
+        help="Chunk length.",
+    ),
+    click.option(
         "--overlap_len",
-        type=float,
+        type=click.FloatRange(0.0, 0.4),
+        default=0.36,
+        show_default=True,
         help="Overlap length.",
-        choices=[0.0, 0.1, 0.2, 0.3, 0.4],
-        default=0.3,
-    )
-    preprocess_parser.add_argument(
+    ),
+    click.option(
         "--normalization_mode",
-        type=str,
+        type=click.Choice(["none", "post_peak", "post_peak_rvc", "post_rms"]),
+        default='post_peak',
+        show_default=True,
         help="Normalization mode.",
-        choices=["none", "post_peak", "post_peak_rvc", "post_rms"],
-        default="post_rms",
-    )
-    preprocess_parser.add_argument(
+    ),
+    click.option(
         "--loading_resampling",
-        type=str,
+        type=click.Choice(["librosa", "ffmpeg"]),
+        default='librosa',
+        show_default=True,
         help="Librosa's using SoXr, FFmpeg's using Windowed Sinc filter with Blackman-Nuttall window.",
-        choices=["librosa", "ffmpeg"],
-        default="librosa",
-    )
-    preprocess_parser.add_argument(
+    ),
+    click.option(
         "--use_smart_cutter",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Enable SmartCutter silence-truncation during preprocessing.",
+        type=click.BOOL,
         default=False,
-    )
-    # Parser for 'extract' mode
-    extract_parser = subparsers.add_parser(
-        "extract", help="Extract features from a dataset."
-    )
-    extract_parser.add_argument(
-        "--model_name", type=str, help="Name of the model.", required=True
-    )
-    extract_parser.add_argument(
+        show_default=True,
+        help="Enable SmartCutter silence-truncation during preprocessing.",
+    ),
+]
+
+# ---- extract ----
+EXTRACT_OWN = [
+    click.option("--model_name", type=str, required=True, help="Name of the model."),
+    click.option(
         "--f0_method",
-        type=str,
+        type=click.Choice(["crepe", "crepe-tiny", "rmvpe", "fcpe"]),
+        default='rmvpe',
+        show_default=True,
         help="Pitch extraction method to use.",
-        choices=[
-            "crepe",
-            "crepe-tiny",
-            "rmvpe",
-            "fcpe",
-        ],
-        default="rmvpe",
-    )
-    extract_parser.add_argument(
+    ),
+    click.option(
         "--cpu_threads",
-        type=int,
+        type=click.IntRange(1, min(cpu_count(), 192)),
+        default=4,
+        show_default=True,
         help="Number of CPU threads to use for feature extraction (optional).",
-        choices=range(1, min(cpu_count(), 192) + 1),
-        default=DEFAULT_CPU_THREADS,
-    )
-    extract_parser.add_argument(
+    ),
+    click.option(
         "--gpu",
         type=str,
+        default='-',
+        show_default=True,
         help="GPU device to use for feature extraction (optional).",
-        default="-",
-    )
-    extract_parser.add_argument(
+    ),
+    click.option(
         "--sample_rate",
-        type=int,
-        help="Target sampling rate for the audio data.",
-        choices=get_all_vocoder_sample_rates(),
+        type=click.Choice(get_all_vocoder_sample_rates()),
         required=True,
-    )
-    extract_parser.add_argument(
+        help="Target sampling rate for the audio data.",
+    ),
+    click.option(
         "--vocoder_arch",
-        type=str,
+        type=click.Choice(get_vocoder_cli_choices()),
+        default='hifi',
+        show_default=True,
         help="Choose the vocoder architecture",
-        choices=get_vocoder_cli_choices(),
-        default="hifi",
-    )
-    extract_parser.add_argument(
+    ),
+    click.option(
         "--embedder_model",
-        type=str,
-        help=embedder_model_description,
-        choices=[
-            "contentvec",
-            "spin_v1",
-            "spin_v2",
-            "custom",
-        ],
-        default="contentvec",
-    )
-    extract_parser.add_argument(
+        type=click.Choice(["contentvec", "spin_v1", "spin_v2", "custom"]),
+        default='contentvec',
+        show_default=True,
+        help="Choose the model used for generating speaker embeddings.",
+    ),
+    click.option(
         "--embedder_model_custom",
         type=str,
-        help=embedder_model_custom_description,
         default=None,
-    )
-    extract_parser.add_argument(
+        help="Specify the path to a custom model for speaker embedding. Only applicable if 'embedder_model' is set to 'custom'.",
+    ),
+    click.option(
         "--include_mutes",
-        type=int,
-        help="Number of silent files to include.",
-        choices=range(0, 11),
+        type=click.IntRange(0, 10),
         default=2,
-    )
+        show_default=True,
+        help="Number of silent files to include.",
+    ),
+    click.option(
+        "--remove_16k_slices",
+        type=click.BOOL,
+        default=False,
+        show_default=True,
+        help="Delete the 16 kHz slices once extraction has consumed them.",
+    ),
+    click.option(
+        "--feature_precision",
+        type=click.Choice(["fp32", "fp16"]),
+        default="fp32",
+        show_default=True,
+        help="Precision the extracted embeddings are stored at. fp32 doubles the feature cache on disk but keeps the retrieval index free of a quantisation floor; fp16 halves it. Either can be read back without re-extracting.",
+    ),
+]
 
-    # Parser for 'train' mode
-    train_parser = subparsers.add_parser("train", help="Train an RVC model.")
-    train_parser.add_argument(
-        "--model_name", type=str, help="Name of the model to be trained.", required=True
-    )
-    train_parser.add_argument(
+# ---- train ----
+TRAIN_OWN = [
+    click.option(
+        "--model_name",
+        type=str,
+        required=True,
+        help="Name of the model to be trained.",
+    ),
+    click.option(
         "--vocoder",
-        type=str,
+        type=click.Choice(get_vocoder_cli_choices()),
+        default='hifi',
+        show_default=True,
         help="Vocoder name",
-        choices=get_vocoder_cli_choices(),
-        default="hifi",
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--optimizer_choice",
-        type=str,
-        choices=["AdamW", "AdaBelief", "RAdam", "Ranger21", "Sched-Free AdamW", "Sched-Free RAdam"],
-        help="Choose the optimizer used for Generator and Discriminator.",
-        default="AdamW",
-    )
-    train_parser.add_argument(
+        type=click.Choice(["AdamW", "Sched-Free AdamW", "Muon", "Lion"]),
+        default='AdamW',
+        show_default=True,
+        help="Optimizer for the generator and discriminator. Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; kept as a literal so --help does not import torch.",
+    ),
+    click.option(
         "--use_checkpointing",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
+        default=False,
+        show_default=True,
         help="Enables usage of checkpointing.",
-        default=False,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--compile_vocoder",
-        "--compile_chouwagan",
-        dest="compile_vocoder",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help=VOCODER_COMPILE_CLI_HELP,
+        type=click.BOOL,
         default=False,
-    )
-    train_parser.add_argument(
+        show_default=True,
+        help="Compile the selected vocoder decoder during training.",
+    ),
+    click.option(
         "--torch_compile_mode",
-        type=str,
-        choices=TORCH_COMPILE_MODES,
-        help=TORCH_COMPILE_MODE_CLI_HELP,
-        default="default",
-    )
-    train_parser.add_argument(
+        type=click.Choice(["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]),
+        default='default',
+        show_default=True,
+        help="Torch compile mode used for the vocoder decoder.",
+    ),
+    click.option(
         "--custom_lr_g",
         type=float,
+        default=0.0001,
+        show_default=True,
         help="Custom learning rate for generator.",
-        default=1e-4,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--custom_lr_d",
         type=float,
+        default=0.0001,
+        show_default=True,
         help="Custom learning rate for discriminator.",
-        default=1e-4,
-    )
-    train_parser.add_argument(
-        "--use_2_sample_kl",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="uses 2 samples to calculate KL Loss.",
+    ),
+    click.option(
+        "--overtrain_detector",
+        type=click.BOOL,
         default=False,
-    )
-    train_parser.add_argument(
-        "--use_best_step",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Tracks the step with lowest FM+Mel loss each epoch and uses those weights for eval preview and model extraction.",
+        show_default=True,
+        help="Holds a few whole source recordings out of training and scores them periodically. Training loss cannot see overtraining; this is the only signal that can. Auto-disables on datasets too small to give any away.",
+    ),
+    click.option(
+        "--stop_on_overtrain",
+        type=click.BOOL,
         default=False,
-    )
-    train_parser.add_argument(
-        "--double_d_updates",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Runs the discriminator backward/update step twice per batch. Gives D more gradient signal on small datasets.",
-        default=False,
-    )
-    train_parser.add_argument(
-        "--epoch_save_frequency",
-        type=int,
-        help="Save the model every specified number of epochs.",
-        choices=range(1, 101),
-        required=True,
-    )
-    train_parser.add_argument(
-        "--save_only_latest_net_models",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Save only the latest G/D files.",
-        default=False,
-    )
-    train_parser.add_argument(
-        "--save_weight_models",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Save model weights every epoch.",
+        show_default=True,
+        help="Ends the run once held-out quality has stopped improving. Off by default: the pre-overtrain weights are exported either way, this only decides whether training keeps going.",
+    ),
+    click.option(
+        "--use_ema",
+        type=click.BOOL,
         default=True,
-    )
-    train_parser.add_argument(
-        "--total_epoch_count",
-        type=int,
-        help="Total number of epochs to train for.",
-        choices=range(1, 10001),
-        default=1000,
-    )
-    train_parser.add_argument(
-        "--sample_rate",
-        type=int,
-        help="Sampling rate of the training data.",
-        choices=get_all_vocoder_sample_rates(),
+        show_default=True,
+        help="Keeps an exponential moving average of the generator weights and exports that instead of a single step. Usually better than any one step of a GAN vocoder, and it makes the overtrain curve far less noisy. Costs one extra copy of the generator in VRAM.",
+    ),
+    click.option(
+        "--epoch_save_frequency",
+        type=click.IntRange(1, 100),
         required=True,
-    )
-    train_parser.add_argument(
+        help="Save the model every specified number of epochs.",
+    ),
+    click.option(
+        "--save_only_latest_net_models",
+        type=click.BOOL,
+        default=True,
+        show_default=True,
+        help="Save only the latest G/D files.",
+    ),
+    click.option(
+        "--save_weight_models",
+        type=click.BOOL,
+        default=True,
+        show_default=True,
+        help="Save model weights every epoch.",
+    ),
+    click.option(
+        "--total_epoch_count",
+        type=click.IntRange(1, 10000),
+        default=500,
+        show_default=True,
+        help="Total number of epochs to train for.",
+    ),
+    click.option(
+        "--sample_rate",
+        type=click.Choice(get_all_vocoder_sample_rates()),
+        required=True,
+        help="Sampling rate of the training data.",
+    ),
+    click.option(
         "--batch_size",
-        type=int,
-        help="Batch size for training.",
-        choices=range(1, 51),
+        type=click.IntRange(1, 50),
         default=8,
-    )
-    train_parser.add_argument(
+        show_default=True,
+        help="Batch size for training.",
+    ),
+    click.option(
         "--gpu",
         type=str,
+        default='0',
+        show_default=True,
         help="GPU device to use for training (e.g., '0').",
-        default="0",
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--pretrained",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Use a pretrained model for initialization.",
+        type=click.BOOL,
         default=True,
-    )
-    train_parser.add_argument(
+        show_default=True,
+        help="Use a pretrained model for initialization.",
+    ),
+    click.option(
         "--custom_pretrained",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Use a custom pretrained model.",
+        type=click.BOOL,
         default=False,
-    )
-    train_parser.add_argument(
+        show_default=True,
+        help="Use a custom pretrained model.",
+    ),
+    click.option(
         "--g_pretrained_path",
         type=str,
-        nargs="?",
         default=None,
         help="Path to the pretrained generator model file.",
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--d_pretrained_path",
         type=str,
-        nargs="?",
         default=None,
         help="Path to the pretrained discriminator model file.",
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--use_warmup",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
+        default=False,
+        show_default=True,
         help="Enables usage of warmup.",
-        default=False,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--warmup_duration",
-        type=int,
+        type=click.IntRange(1, 999),
+        default=5,
+        show_default=True,
         help="Duration of warmup phase (in epochs).",
-        choices=range(1, 1000),
-        default=10,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--use_tf32",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
+        default=False,
+        show_default=True,
         help="Lets you choose between FP32 and TF32 precision used in training.",
-        default=False,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--use_benchmark",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Enable cuDNN benchmark mode for potential speedup.",
+        type=click.BOOL,
         default=True,
-    )
-    train_parser.add_argument(
-        "--use_deterministic",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Toggle deterministic mode for reproducibility at possible performance cost.",
-        default=False,
-    )
-    train_parser.add_argument(
+        show_default=True,
+        help="Enable cuDNN benchmark mode for potential speedup.",
+    ),
+    click.option(
         "--spectral_loss",
-        type=str,
-        choices=["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"],
+        type=click.Choice(["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"]),
+        default='L1 Mel Loss',
+        show_default=True,
         help="Available types of spectral loss functions. ",
-        default="L1 Mel Loss",
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--lr_scheduler",
-        type=str,
-        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
+        type=click.Choice(["exp decay step", "exp decay epoch", "cosine annealing", "none"]),
+        default='exp decay epoch',
+        show_default=True,
         help="Pick the shared LR scheduler for generator and discriminator.",
-        default="exp decay step",
-    )
-    train_parser.add_argument(
-        "--exp_decay_gamma",
-        type=str,
-        choices=["0.9999996", "0.999875", "0.999", "0.9975", "0.995"],
-        help="Gamma for the shared exponential decay scheduler.",
-        default="0.999875",
-    )
-    train_parser.add_argument(
-        "--use_kl_annealing",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Whether you wanna use kl annealing.",
-        default=False,
-    )
-    train_parser.add_argument(
-        "--kl_annealing_cycle_duration",
-        type=int,
-        help="Duration of kl annealing phase (in epochs).",
-        default=3,
-    )
-    train_parser.add_argument(
-        "--rolling_loss_steps",
-        type=int,
-        help="interval for rolling avg loss (in steps).",
-        default=50,
-    )
-    train_parser.add_argument(
-        "--grad_clip_scheduling",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Whether you wanna enable grads clipping scheduling",
-        default=False,
-    )
-    train_parser.add_argument(
-        "--grad_clip_steps_duration",
-        type=int,
-        help="Duration ( in steps ) for grads clipping",
-        default=0,
-    )
-    train_parser.add_argument(
-        "--grad_clip_value_g_cap",
-        type=int,
-        help="Specify clipping value for Generator's clip_grad_norm",
-        default=0,
-    )
-    train_parser.add_argument(
-        "--grad_clip_value_d_cap",
-        type=int,
-        help="Specify clipping value for Discriminator's clip_grad_norm",
-        default=0,
-    )
-    train_parser.add_argument(
-        "--grad_clip_value_g_release",
-        type=int,
-        help="Specify what kind of clipping value you want after the scheduling, for G. Set to 0 to leave unconstrained.",
-        default=0,
-    )
-    train_parser.add_argument(
-        "--grad_clip_value_d_release",
-        type=int,
-        help="Specify what kind of clipping value you want after the scheduling, for D. Set to 0 to leave unconstrained.",
-        default=0,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--use_custom_lr",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
+        default=False,
+        show_default=True,
         help="Enables customization of learning rate for Generator and Discriminator.",
-        default=False,
-    )
-    train_parser.add_argument(
+    ),
+    click.option(
         "--cleanup",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Cleanup previous training attempt.",
+        type=click.BOOL,
         default=False,
-    )
-    train_parser.add_argument(
+        show_default=True,
+        help="Cleanup previous training attempt.",
+    ),
+    click.option(
         "--index_algorithm",
-        type=str,
-        choices=["Auto", "Faiss", "KMeans"],
+        type=click.Choice(["Auto", "Faiss", "KMeans"]),
+        default='Auto',
+        show_default=True,
         help="Choose the method for generating the index file.",
-        default="Auto",
-    )
+    ),
+]
 
-    # Parser for 'index' mode
-    index_parser = subparsers.add_parser(
-        "index", help="Generate an index file for an RVC model."
-    )
-    index_parser.add_argument(
-        "--model_name", type=str, help="Name of the model.", required=True
-    )
-    index_parser.add_argument(
+# ---- index ----
+INDEX_OWN = [
+    click.option("--model_name", type=str, required=True, help="Name of the model."),
+    click.option(
         "--index_algorithm",
-        type=str,
-        choices=["Auto", "Faiss", "KMeans"],
+        type=click.Choice(["Auto", "Faiss", "KMeans"]),
+        default='Auto',
+        show_default=True,
         help="Choose the method for generating the index file.",
-        default="Auto",
-    )
+    ),
+    click.option(
+        "--index_metric",
+        type=click.Choice(["l2", "cosine"]),
+        default="l2",
+        show_default=True,
+        help="Similarity used to find neighbours. l2 reproduces what upstream RVC builds; cosine ranks by direction alone, which suits embeddings whose magnitude tracks loudness.",
+    ),
+]
 
-    # Parser for 'model_information' mode
-    model_information_parser = subparsers.add_parser(
-        "model_information", help="Display information about a trained model."
-    )
-    model_information_parser.add_argument(
-        "--pth_path", type=str, help="Path to the .pth model file.", required=True
-    )
+# ---- model_information ----
+MODEL_INFORMATION_OWN = [
+    click.option(
+        "--pth_path",
+        type=str,
+        required=True,
+        help="Path to the .pth model file.",
+    ),
+]
 
-    # Parser for 'model_blender' mode
-    model_blender_parser = subparsers.add_parser(
-        "model_blender", help="Fuse two RVC models together."
-    )
-    model_blender_parser.add_argument(
-        "--model_name", type=str, help="Name of the new fused model.", required=True
-    )
-    model_blender_parser.add_argument(
+# ---- model_blender ----
+MODEL_BLENDER_OWN = [
+    click.option(
+        "--model_name",
+        type=str,
+        required=True,
+        help="Name of the new fused model.",
+    ),
+    click.option(
         "--pth_path_1",
         type=str,
-        help="Path to the first .pth model file.",
         required=True,
-    )
-    model_blender_parser.add_argument(
+        help="Path to the first .pth model file.",
+    ),
+    click.option(
         "--pth_path_2",
         type=str,
-        help="Path to the second .pth model file.",
         required=True,
-    )
-    model_blender_parser.add_argument(
+        help="Path to the second .pth model file.",
+    ),
+    click.option(
         "--ratio",
-        type=float,
-        help="Ratio for blending the two models (0.0 to 1.0).",
-        choices=[(i / 10) for i in range(11)],
+        type=click.FloatRange(0, 1),
         default=0.5,
-    )
+        show_default=True,
+        help="Ratio for blending the two models (0.0 to 1.0).",
+    ),
+]
 
-    # Parser for 'tensorboard' mode
-    subparsers.add_parser(
-        "tensorboard", help="Launch TensorBoard for monitoring training progress."
-    )
+# ---- download ----
+DOWNLOAD_OWN = [
+    click.option(
+        "--model_link",
+        type=str,
+        required=True,
+        help="Direct link to the model file.",
+    ),
+]
 
-    # Parser for 'download' mode
-    download_parser = subparsers.add_parser(
-        "download", help="Download a model from a provided link."
-    )
-    download_parser.add_argument(
-        "--model_link", type=str, help="Direct link to the model file.", required=True
-    )
-
-    # Parser for 'prerequisites' mode
-    prerequisites_parser = subparsers.add_parser(
-        "prerequisites", help="Install prerequisites for RVC."
-    )
-    prerequisites_parser.add_argument(
+# ---- prerequisites ----
+PREREQUISITES_OWN = [
+    click.option(
         "--pretraineds_hifigan",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
         default=True,
+        show_default=True,
         help="Download pretrained models for RVC v2.",
-    )
-    prerequisites_parser.add_argument(
+    ),
+    click.option(
         "--models",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
         default=True,
+        show_default=True,
         help="Download additional models.",
-    )
-    prerequisites_parser.add_argument(
+    ),
+    click.option(
         "--exe",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
         default=True,
+        show_default=True,
         help="Download required executables.",
-    )
-    prerequisites_parser.add_argument(
+    ),
+    click.option(
         "--smartcutter",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
+        type=click.BOOL,
         default=True,
+        show_default=True,
         help="Download required SmartCutter models.",
-    )
-    # Parser for 'audio_analyzer' mode
-    audio_analyzer = subparsers.add_parser(
-        "audio_analyzer", help="Analyze an audio file."
-    )
-    audio_analyzer.add_argument(
-        "--input_path", type=str, help="Path to the input audio file.", required=True
-    )
+    ),
+]
 
-    return parser.parse_args()
+# ---- audio_analyzer ----
+AUDIO_ANALYZER_OWN = [
+    click.option(
+        "--input_path",
+        type=str,
+        required=True,
+        help="Path to the input audio file.",
+    ),
+]
+
+# ---- Commands -------------------------------------------------------
+
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+def cli():
+    """Command line interface for the RVC fork."""
+
+
+@cli.command("infer")
+@apply_options(INFER_OWN, inference_options(INFER_DEFAULTS), FORMANT_OPTIONS)
+def infer(**kwargs):
+    """Run inference on a single audio file."""
+    run_infer_script(**kwargs)
+
+
+@cli.command("batch_infer")
+@apply_options(BATCH_INFER_OWN, inference_options(BATCH_INFER_DEFAULTS), FORMANT_OPTIONS)
+def batch_infer(**kwargs):
+    """Run inference on every audio file in a folder."""
+    run_batch_infer_script(**kwargs)
+
+
+@cli.command("tts")
+@apply_options(TTS_OWN, inference_options(TTS_DEFAULTS))
+def tts(**kwargs):
+    """Synthesize speech with edge-tts and convert it."""
+    run_tts_script(**kwargs)
+
+
+@cli.command("preprocess")
+@apply_options(PREPROCESS_OWN)
+def preprocess(**kwargs):
+    """Preprocess a dataset for training."""
+    # run_preprocess_script names this argument differently from its flag.
+    kwargs["noise_reduction_strength"] = kwargs.pop("clean_strength")
+    run_preprocess_script(**kwargs)
+
+
+@cli.command("extract")
+@apply_options(EXTRACT_OWN)
+def extract(**kwargs):
+    """Extract features and F0 from a preprocessed dataset."""
+    run_extract_script(**kwargs)
+
+
+@cli.command("train")
+@apply_options(TRAIN_OWN)
+def train(**kwargs):
+    """Train a model."""
+    run_train_script(**kwargs)
+
+
+@cli.command("index")
+@apply_options(INDEX_OWN)
+def index(**kwargs):
+    """Build the FAISS index for a trained model."""
+    run_index_script(**kwargs)
+
+
+@cli.command("model_information")
+@apply_options(MODEL_INFORMATION_OWN)
+def model_information(**kwargs):
+    """Print the metadata stored in a .pth file."""
+    run_model_information_script(**kwargs)
+
+
+@cli.command("model_blender")
+@apply_options(MODEL_BLENDER_OWN)
+def model_blender(**kwargs):
+    """Blend two models into one."""
+    run_model_blender_script(**kwargs)
+
+
+@cli.command("tensorboard")
+def tensorboard():
+    """Launch TensorBoard."""
+    run_tensorboard_script()
+
+
+@cli.command("download")
+@apply_options(DOWNLOAD_OWN)
+def download(**kwargs):
+    """Download a model from a link."""
+    run_download_script(**kwargs)
+
+
+@cli.command("prerequisites")
+@apply_options(PREREQUISITES_OWN)
+def prerequisites(**kwargs):
+    """Download the prerequisite models and executables."""
+    run_prerequisites_script(**kwargs)
+
+
+@cli.command("audio_analyzer")
+@apply_options(AUDIO_ANALYZER_OWN)
+def audio_analyzer(**kwargs):
+    """Analyze an audio file and print a report."""
+    run_audio_analyzer_script(**kwargs)
 
 
 def main():
-    if len(sys.argv) == 1:
-        print("Please run the script with '-h' for more information.")
-        sys.exit(1)
-
-    args = parse_arguments()
-
     try:
-        if args.mode == "infer":
-            run_infer_script(
-                pitch=args.pitch,
-                filter_radius=args.filter_radius,
-                index_rate=args.index_rate,
-                volume_envelope=args.volume_envelope,
-                protect=args.protect,
-                f0_method=args.f0_method,
-                input_path=args.input_path,
-                output_path=args.output_path,
-                pth_path=args.pth_path,
-                index_path=args.index_path,
-                split_audio=args.split_audio,
-                f0_autotune=args.f0_autotune,
-                f0_autotune_strength=args.f0_autotune_strength,
-                clean_audio=args.clean_audio,
-                clean_strength=args.clean_strength,
-                export_format=args.export_format,
-                f0_file=args.f0_file,
-                embedder_model=args.embedder_model,
-                embedder_model_custom=args.embedder_model_custom,
-                formant_shifting=args.formant_shifting,
-                formant_qfrency=args.formant_qfrency,
-                formant_timbre=args.formant_timbre,
-                sid=args.sid,
-            )
-        elif args.mode == "batch_infer":
-            run_batch_infer_script(
-                pitch=args.pitch,
-                filter_radius=args.filter_radius,
-                index_rate=args.index_rate,
-                volume_envelope=args.volume_envelope,
-                protect=args.protect,
-                f0_method=args.f0_method,
-                input_folder=args.input_folder,
-                output_folder=args.output_folder,
-                pth_path=args.pth_path,
-                index_path=args.index_path,
-                split_audio=args.split_audio,
-                f0_autotune=args.f0_autotune,
-                f0_autotune_strength=args.f0_autotune_strength,
-                clean_audio=args.clean_audio,
-                clean_strength=args.clean_strength,
-                export_format=args.export_format,
-                f0_file=args.f0_file,
-                embedder_model=args.embedder_model,
-                embedder_model_custom=args.embedder_model_custom,
-                formant_shifting=args.formant_shifting,
-                formant_qfrency=args.formant_qfrency,
-                formant_timbre=args.formant_timbre,
-                sid=args.sid,
-            )
-        elif args.mode == "tts":
-            run_tts_script(
-                tts_file=args.tts_file,
-                tts_text=args.tts_text,
-                tts_voice=args.tts_voice,
-                tts_rate=args.tts_rate,
-                pitch=args.pitch,
-                filter_radius=args.filter_radius,
-                index_rate=args.index_rate,
-                volume_envelope=args.volume_envelope,
-                protect=args.protect,
-                f0_method=args.f0_method,
-                output_tts_path=args.output_tts_path,
-                output_rvc_path=args.output_rvc_path,
-                pth_path=args.pth_path,
-                index_path=args.index_path,
-                split_audio=args.split_audio,
-                f0_autotune=args.f0_autotune,
-                f0_autotune_strength=args.f0_autotune_strength,
-                clean_audio=args.clean_audio,
-                clean_strength=args.clean_strength,
-                export_format=args.export_format,
-                f0_file=args.f0_file,
-                embedder_model=args.embedder_model,
-                embedder_model_custom=args.embedder_model_custom,
-            )
-        elif args.mode == "preprocess":
-            run_preprocess_script(
-                model_name=args.model_name,
-                dataset_path=args.dataset_path,
-                sample_rate=args.sample_rate,
-                cpu_threads=args.cpu_threads,
-                cut_preprocess=args.cut_preprocess,
-                process_effects=args.process_effects,
-                noise_reduction=args.noise_reduction,
-                clean_strength=args.noise_reduction_strength,
-                chunk_len=args.chunk_len,
-                overlap_len=args.overlap_len,
-                normalization_mode=args.normalization_mode,
-                loading_resampling=args.loading_resampling,
-                use_smart_cutter=args.use_smart_cutter,
-            )
-        elif args.mode == "extract":
-            run_extract_script(
-                model_name=args.model_name,
-                f0_method=args.f0_method,
-                cpu_threads=args.cpu_threads,
-                gpu=args.gpu,
-                sample_rate=args.sample_rate,
-                vocoder_arch=args.vocoder_arch,
-                embedder_model=args.embedder_model,
-                embedder_model_custom=args.embedder_model_custom,
-                include_mutes=args.include_mutes,
-            )
-        elif args.mode == "train":
-            run_train_script(
-                model_name=args.model_name,
-                epoch_save_frequency=args.epoch_save_frequency,
-                save_only_latest_net_models=args.save_only_latest_net_models,
-                save_weight_models=args.save_weight_models,
-                total_epoch_count=args.total_epoch_count,
-                sample_rate=args.sample_rate,
-                batch_size=args.batch_size,
-                gpu=args.gpu,
-                use_warmup=args.use_warmup,
-                warmup_duration=args.warmup_duration,
-                pretrained=args.pretrained,
-                cleanup=args.cleanup,
-                index_algorithm=args.index_algorithm,
-                custom_pretrained=args.custom_pretrained,
-                g_pretrained_path=args.g_pretrained_path,
-                d_pretrained_path=args.d_pretrained_path,
-                vocoder=args.vocoder,
-                optimizer_choice=args.optimizer_choice,
-                use_checkpointing=args.use_checkpointing,
-                compile_vocoder=args.compile_vocoder,
-                torch_compile_mode=args.torch_compile_mode,
-                use_tf32=args.use_tf32,
-                use_benchmark=args.use_benchmark,
-                use_deterministic=args.use_deterministic,
-                spectral_loss=args.spectral_loss,
-                lr_scheduler=args.lr_scheduler,
-                exp_decay_gamma=args.exp_decay_gamma,
-                rolling_loss_steps=args.rolling_loss_steps,
-                grad_clip_scheduling=args.grad_clip_scheduling,
-                grad_clip_steps_duration=args.grad_clip_steps_duration,
-                grad_clip_value_g_cap=args.grad_clip_value_g_cap,
-                grad_clip_value_d_cap=args.grad_clip_value_d_cap,
-                grad_clip_value_g_release=args.grad_clip_value_g_release,
-                grad_clip_value_d_release=args.grad_clip_value_d_release,
-                use_custom_lr=args.use_custom_lr,
-                custom_lr_g=args.custom_lr_g,
-                custom_lr_d=args.custom_lr_d,
-                use_2_sample_kl=args.use_2_sample_kl,
-                use_best_step=args.use_best_step,
-                double_d_updates=args.double_d_updates,
-            )
-        elif args.mode == "index":
-            run_index_script(
-                model_name=args.model_name,
-                index_algorithm=args.index_algorithm,
-            )
-        elif args.mode == "model_information":
-            run_model_information_script(
-                pth_path=args.pth_path,
-            )
-        elif args.mode == "model_blender":
-            run_model_blender_script(
-                model_name=args.model_name,
-                pth_path_1=args.pth_path_1,
-                pth_path_2=args.pth_path_2,
-                ratio=args.ratio,
-            )
-        elif args.mode == "tensorboard":
-            run_tensorboard_script()
-        elif args.mode == "download":
-            run_download_script(
-                model_link=args.model_link,
-            )
-        elif args.mode == "prerequisites":
-            run_prerequisites_script(
-                pretraineds_hifigan=args.pretraineds_hifigan,
-                models=args.models,
-                exe=args.exe,
-                smartcutter=args.smartcutter,
-            )
-        elif args.mode == "audio_analyzer":
-            run_audio_analyzer_script(
-                input_path=args.input_path,
-            )
+        cli.main(standalone_mode=False)
+    except click.ClickException as error:
+        error.show()
+        sys.exit(error.exit_code)
+    except click.Abort:
+        print("Aborted.")
+        sys.exit(1)
     except Exception as error:
-        print(f"An error occurred during execution: {error}")
-
         import traceback
 
-        traceback.print_exc()
+        print_error_panel(
+            error,
+            title="Command failed",
+            details=traceback.format_exc(),
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -442,21 +442,41 @@ class RMVPE0Predictor:
         self.model = self.model.to(device)
         cents_mapping = 20 * np.arange(N_CLASS) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))
+        # On-device copy so decoding never has to leave the GPU.
+        self.cents_mapping_tensor = (
+            torch.from_numpy(self.cents_mapping).float().to(device)
+        )
 
-    def mel2hidden(self, mel):
+    def mel2hidden(self, mel, chunk_size=32000):
         """
         Converts Mel-spectrogram features to hidden representation.
 
+        Long inputs are run in blocks so activation memory stays bounded instead
+        of scaling with the length of the file.
+
         Args:
             mel (torch.Tensor): Mel-spectrogram features.
+            chunk_size (int): Maximum frames per forward pass. Rounded down to a
+                multiple of 32, the downsampling factor of the E2E stack.
         """
         with torch.no_grad():
             n_frames = mel.shape[-1]
             mel = F.pad(
                 mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode="reflect"
             )
-            hidden = self.model(mel)
-            return hidden[:, :n_frames]
+            padded_frames = mel.shape[-1]
+
+            chunk_size -= chunk_size % 32
+            if chunk_size <= 0 or padded_frames <= chunk_size:
+                return self.model(mel)[:, :n_frames]
+
+            # Both padded_frames and chunk_size are multiples of 32, so every
+            # block - including the last one - satisfies the model's constraint.
+            chunks = [
+                self.model(mel[..., start : start + chunk_size])
+                for start in range(0, padded_frames, chunk_size)
+            ]
+            return torch.cat(chunks, dim=1)[:, :n_frames]
 
     def decode(self, hidden, thred=0.03):
         """
@@ -479,39 +499,45 @@ class RMVPE0Predictor:
             audio (np.ndarray): Audio signal.
             thred (float, optional): Threshold for salience. Defaults to 0.03.
         """
-        audio = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
+        if not torch.is_tensor(audio):
+            audio = torch.from_numpy(audio)
+        audio = audio.float().to(self.device).unsqueeze(0)
         mel = self.mel_extractor(audio, center=True)
         hidden = self.mel2hidden(mel)
-        hidden = hidden.squeeze(0).cpu().numpy()
-        f0 = self.decode(hidden, thred=thred)
-        return f0
+        # Decoded on-device; only the finished F0 contour crosses back to host.
+        with torch.no_grad():
+            f0 = self.decode(hidden.squeeze(0), thred=thred)
+        return f0.cpu().numpy()
 
     def to_local_average_cents(self, salience, thred=0.05):
         """
         Converts salience to local average cents.
 
+        Vectorized: gathers the +/-4 bin neighbourhood around each frame's peak
+        in one indexed read rather than looping over frames in Python.
+
         Args:
-            salience (np.ndarray): Salience values.
+            salience (torch.Tensor | np.ndarray): Salience values, shape (T, N_CLASS).
             thred (float, optional): Threshold for salience. Defaults to 0.05.
         """
-        center = np.argmax(salience, axis=1)
-        salience = np.pad(salience, ((0, 0), (4, 4)))
-        center += 4
-        todo_salience = []
-        todo_cents_mapping = []
-        starts = center - 4
-        ends = center + 5
-        for idx in range(salience.shape[0]):
-            todo_salience.append(salience[:, starts[idx] : ends[idx]][idx])
-            todo_cents_mapping.append(self.cents_mapping[starts[idx] : ends[idx]])
-        todo_salience = np.array(todo_salience)
-        todo_cents_mapping = np.array(todo_cents_mapping)
-        product_sum = np.sum(todo_salience * todo_cents_mapping, 1)
-        weight_sum = np.sum(todo_salience, 1)
+        if not torch.is_tensor(salience):
+            salience = torch.from_numpy(salience)
+        salience = salience.to(self.cents_mapping_tensor.device).float()
+
+        center = torch.argmax(salience, dim=1) + 4
+        salience = F.pad(salience, (4, 4))
+
+        offsets = torch.arange(-4, 5, device=salience.device)
+        idx = center[:, None] + offsets[None, :]
+        rows = torch.arange(salience.shape[0], device=salience.device)[:, None]
+        local_salience = salience[rows, idx]
+
+        product_sum = (local_salience * self.cents_mapping_tensor[idx]).sum(dim=1)
+        weight_sum = local_salience.sum(dim=1)
         devided = product_sum / weight_sum
-        maxx = np.max(salience, axis=1)
-        devided[maxx <= thred] = 0
-        return devided
+
+        maxx = salience.max(dim=1).values
+        return torch.where(maxx <= thred, torch.zeros_like(devided), devided)
 
 
 class BiGRU(nn.Module):

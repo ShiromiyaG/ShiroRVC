@@ -3,6 +3,8 @@ import gradio as gr
 import os
 import sys
 
+from rvc.lib.i18n import _
+
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
@@ -14,19 +16,21 @@ from tabs.utilities.model_processing.model_processing import extract_small_model
 
 def utilities_tab():
     gr.Markdown(
-        value="This section contains some extra utilities. You might find some of 'em helpful."
+        value=_(
+            "This section contains some extra utilities. You might find some of 'em helpful."
+        )
     )
-    with gr.TabItem("Model information"):
+    with gr.TabItem(_("Model information")):
         processing_tab()
 
-    with gr.TabItem("F0 Curve"):
+    with gr.TabItem(_("F0 Curve")):
         f0_extractor_tab()
 
-    with gr.TabItem("Audio Analyzer"):
+    with gr.TabItem(_("Audio Analyzer")):
         analyzer_tab()
     
-    with gr.TabItem("Model Bundles"):
+    with gr.TabItem(_("Model Bundles")):
         model_bundle_tab()
 
-    with gr.TabItem("Model Processing"):
+    with gr.TabItem(_("Model Processing")):
         extract_small_model_tab()

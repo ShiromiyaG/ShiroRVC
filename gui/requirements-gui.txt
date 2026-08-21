@@ -1,0 +1,10 @@
+# Dependencies for the Qt interface only.
+#
+# Kept separate from the root requirements.txt so a Gradio-only or CLI-only
+# install never pulls Qt, and so deleting gui/ leaves nothing behind to
+# uninstall.  Everything else the GUI touches (numpy, soundfile) is already a
+# backend dependency.
+#
+#   pip install -r gui/requirements-gui.txt
+
+PySide6>=6.7,<7

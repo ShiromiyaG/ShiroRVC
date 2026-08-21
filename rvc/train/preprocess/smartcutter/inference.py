@@ -9,6 +9,7 @@ import numpy as np
 import math
 import gc
 
+from rvc.lib.terminal import error as print_error, info, warning
 from rvc.train.preprocess.smartcutter.model_v5 import CGA_ResUNet
 from rvc.train.preprocess.smartcutter.model_v3 import DSCA_ResUNet_v3
 
@@ -297,8 +298,6 @@ def process_grid_aligned(model, transform, waveform, sr, hop_length, device, sta
     # Total framess estimation for CPU buffer allocation
     total_frames = int(math.ceil(total_samples / hop_length)) + 100 # ample buffer
 
-    print(f"    -> WOLA chunking: Chunk={chunk_samples}, Overlap={overlap_samples}, Total Frames={total_frames}")
-
     # Accumulators for the final mask and the window weights.
     mask_accumulator = torch.zeros((1, total_frames), dtype=torch.float32, device='cpu')
     weight_accumulator = torch.zeros((1, total_frames), dtype=torch.float32, device='cpu')
@@ -585,24 +584,75 @@ def processing():
 
 
 class SmartCutterInterface:
+    """Silence-gap compressor.
+
+    The checkpoints are sample-rate specific, but the *analysis* rate does not
+    have to match the rate the dataset is being built at. The model only ever
+    produces a speech/silence mask, and ``SmartCutter`` stretches that mask to
+    whatever sample count the waveform has before cutting. So a rate with no
+    checkpoint of its own (44.1 kHz) can be served by analysing at a rate that
+    does have one, while the audio that actually gets cut and written stays at
+    the requested rate and is never resampled.
+    """
+
     def __init__(self, sr, ckpt_dir, device="cuda"):
-        self.sr = sr
+        self.sr = sr                       # output rate: what gets written
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model_version = MODEL_VERSION
         self.ckpt_dir = ckpt_dir
 
+        self.model_sr = None               # analysis rate: what the model saw
         self.model = None
         self.mel_transform = None
         self.static_buffer = None
+        self.analysis_resampler = None
         self.loaded = False
+
+    def available_model_rates(self):
+        """Sample rates that have a checkpoint for the selected model version."""
+        pattern = os.path.join(self.ckpt_dir, f"{self.model_version}_model_*.pth")
+        rates = []
+        for path in glob.glob(pattern):
+            stem = os.path.splitext(os.path.basename(path))[0]
+            suffix = stem.rsplit("_", 1)[-1]
+            if suffix.isdigit():
+                rates.append(int(suffix))
+        return sorted(rates)
+
+    def _select_model_rate(self):
+        """Pick the analysis rate: exact match, else the nearest one available.
+
+        Ties and shortfalls resolve upwards. Analysing an upsampled signal only
+        adds an empty band above the original Nyquist, whereas downsampling
+        discards content the model's mel bands were trained to see.
+        """
+        rates = self.available_model_rates()
+        if not rates:
+            raise FileNotFoundError(
+                f"[SmartCutter] No {self.model_version} checkpoints in {self.ckpt_dir}"
+            )
+        if self.sr in rates:
+            return self.sr
+        higher = [r for r in rates if r > self.sr]
+        return min(higher) if higher else max(rates)
 
     def load_model(self):
         if self.loaded: return
 
-        print(f"[SmartCutter] Loading model on {self.device}...")
+        info(f"Loading the model on {self.device}.", tag="[SMARTCUTTER]")
+
+        self.model_sr = self._select_model_rate()
+        if self.model_sr != self.sr:
+            warning(
+                f"No {self.sr} Hz checkpoint; analysing at {self.model_sr} Hz. "
+                f"Output stays at {self.sr} Hz and is not resampled.",
+                tag="[SMARTCUTTER]",
+            )
 
         # Load Model
-        model_path = os.path.join(self.ckpt_dir, f"{self.model_version}_model_{self.sr}.pth")
+        model_path = os.path.join(
+            self.ckpt_dir, f"{self.model_version}_model_{self.model_sr}.pth"
+        )
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"[SmartCutter] Model not found: {model_path}")
 
@@ -614,17 +664,23 @@ class SmartCutterInterface:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
 
-        # Config Mel
-        curr_hop = self.sr // 100
-        if self.sr in [48000, 40000]: n_fft, n_mels = 2048, 160
+        # Mel config follows the ANALYSIS rate: it has to reproduce the layout
+        # the checkpoint was trained with, not the dataset's rate.
+        curr_hop = self.model_sr // 100
+        if self.model_sr in [48000, 40000]: n_fft, n_mels = 2048, 160
         else: n_fft, n_mels = 1024, 128
 
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=self.sr, n_mels=n_mels, n_fft=n_fft, hop_length=curr_hop
+            sample_rate=self.model_sr, n_mels=n_mels, n_fft=n_fft, hop_length=curr_hop
         ).to(self.device)
 
+        if self.model_sr != self.sr:
+            self.analysis_resampler = torchaudio.transforms.Resample(
+                self.sr, self.model_sr
+            ).to(self.device)
+
         # Pre-allocate buffer
-        dummy_frames = int(math.ceil((SEGMENT_LEN * self.sr) / curr_hop)) + 5
+        dummy_frames = int(math.ceil((SEGMENT_LEN * self.model_sr) / curr_hop)) + 5
         self.static_buffer = torch.zeros((1, 2, n_mels, dummy_frames), device=self.device)
         self.loaded = True
 
@@ -636,8 +692,11 @@ class SmartCutterInterface:
         if not self.loaded: self.load_model()
 
         try:
-            # Load
-            wav, load_sr = torchaudio.load(input_path)
+            # Load. torchaudio 2.x routes its own load/save through TorchCodec,
+            # which is not a dependency of this project; soundfile is, and it is
+            # what the rest of the preprocessing pipeline already uses.
+            data, load_sr = sf.read(input_path, dtype="float32", always_2d=True)
+            wav = torch.from_numpy(data.T.copy())          # (channels, samples)
 
             # Resample if needed (SmartCutter models are SR specific)
             if load_sr != self.sr:
@@ -654,22 +713,37 @@ class SmartCutterInterface:
             peak = torch.abs(wav_gpu).max()
             if peak > 0: wav_gpu = wav_gpu * (0.9 / peak)
 
+            # Analysis copy. Only this branch sees the model's rate; `wav`
+            # itself is untouched and is what gets cut and saved.
+            analysis_wav = wav_gpu
+            if self.analysis_resampler is not None:
+                analysis_wav = self.analysis_resampler(wav_gpu)
+
             # Inference
-            curr_hop = self.sr // 100
+            curr_hop = self.model_sr // 100
             mask = process_grid_aligned(
-                self.model, self.mel_transform, wav_gpu, 
-                self.sr, curr_hop, self.device, self.static_buffer
+                self.model, self.mel_transform, analysis_wav,
+                self.model_sr, curr_hop, self.device, self.static_buffer
             )
 
-            # Cutting
+            # `mask` is at a ~100 Hz frame rate (hop = sr // 100) regardless of
+            # which rate produced it, and SmartCutter interpolates it to the
+            # waveform's sample count -- so a mask analysed at another rate maps
+            # onto the target waveform without any extra conversion.
             cleaned, _ = SmartCutter(wav, mask, sr=self.sr)
 
-            # Save
-            torchaudio.save(output_path, cleaned, self.sr)
+            # Save. Float32 rather than 16-bit PCM: this is an intermediate the
+            # slicer reads straight back, so there is no reason to quantize it.
+            sf.write(
+                output_path,
+                cleaned.squeeze(0).cpu().numpy(),
+                self.sr,
+                subtype="FLOAT",
+            )
             return True
 
         except Exception as e:
-            print(f"[SmartCutter] Error on {input_path}: {e}")
+            print_error(f"Failed on {input_path}: {e}", tag="[SMARTCUTTER]")
             return False
 
     def unload(self):

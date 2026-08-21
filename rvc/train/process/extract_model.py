@@ -8,6 +8,8 @@ from collections import OrderedDict
 import torch
 
 from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
+from rvc.lib.algorithm.chouwagan_svae import ARCHITECTURE_ID
+from rvc.lib.terminal import error as print_error, success
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -68,9 +70,19 @@ def extract_model(
             data = json.load(f)
             model_author = data.get("model_author", None)
 
+        def is_training_only_key(key):
+            return (
+                "enc_q" in key
+                or key.startswith("chouwagan_discrete.posterior")
+                or key.startswith("chouwagan_discrete.coarse_spectral")
+                or key.startswith("chouwagan_discrete.usage_ema")
+            )
+
         opt = OrderedDict(
             weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
+                key: value.half()
+                for key, value in ckpt.items()
+                if not is_training_only_key(key)
             }
         )
 
@@ -124,6 +136,14 @@ def extract_model(
         opt["vocoder_id"] = vocoder_id
         opt["vocoder_architecture"] = vocoder_architecture
         opt["vocoder_config"] = vocoder_config
+        opt["architecture_id"] = (
+            vocoder_config.get(
+                "chouwagan_architecture_id",
+                ARCHITECTURE_ID,
+            )
+            if vocoder_id == "chouwagan"
+            else "hifi_gan_nsf_v1"
+        )
 
         # Since fork uses new API for weight norm ( parametrizations )
         # and mainline RVC ( Original ), W-okada and such rely on old API, we're performing keys conversion.
@@ -152,7 +172,10 @@ def extract_model(
                 opt = replace_keys_in_dict(opt, old, new)
 
         torch.save(opt, model_path)
-        print(f"Saved model '{model_path}' (epoch {epoch} and step {step})")
+        success(
+            f"Saved '{os.path.basename(model_path)}' (epoch {epoch}, step {step}).",
+            tag="[EXPORT]",
+        )
 
     except Exception as error:
-        print(f"An error occurred extracting the model: {error}")
+        print_error(f"Could not export the model: {error}", tag="[EXPORT]")

@@ -3,6 +3,8 @@ import os
 import sys
 import json
 
+from rvc.lib.i18n import _
+
 now_dir = os.getcwd()
 
 def stop_infer():
@@ -29,7 +31,7 @@ def restart_application():
 def restart_tab():
     with gr.Row():
         with gr.Column():
-            restart_button = gr.Button("Restart ShiroRVC")
+            restart_button = gr.Button(_("Restart ShiroRVC"))
             restart_button.click(
                 fn=restart_application,
                 inputs=[],

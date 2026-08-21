@@ -13,6 +13,9 @@ from rvc.configs.vocoders import (
     normalize_vocoder,
 )
 
+from rvc.lib.i18n import _
+from rvc.lib.terminal import error as print_error
+
 
 def extract_small_model(
     path: str,
@@ -45,7 +48,12 @@ def extract_small_model(
 
         opt = OrderedDict(
             weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
+                key: value.half()
+                for key, value in ckpt.items()
+                if "enc_q" not in key
+                and not key.startswith("chouwagan_discrete.posterior")
+                and not key.startswith("chouwagan_discrete.coarse_spectral")
+                and not key.startswith("chouwagan_discrete.usage_ema")
             }
         )
 
@@ -100,6 +108,11 @@ def extract_small_model(
                     for key, value in model_config.items()
                     if key.startswith("chouwagan_")
                 },
+                "architecture_id": model_config.get(
+                    "chouwagan_architecture_id"
+                )
+                if vocoder_id == "chouwagan"
+                else "hifi_gan_nsf_v1",
             }
         )
 
@@ -108,35 +121,35 @@ def extract_small_model(
         return f" Successfully extracted and saved model to {final_pth_path} ..."
 
     except Exception as error:
-        print(f"An error occurred extracting the model: {error}")
+        print_error(f"Could not extract the model: {error}", tag="[EXPORT]")
         return f" Failed to extract model: {error}\n{traceback.format_exc()}"
 
 def extract_small_model_tab():
     with gr.Column():
         gr.Markdown(
-            """
+            _("""
             # Checkpoint Extractor ⚙️
-            """
+            """)
         )
 
         with gr.Row():
             model_path_input = gr.File(
-                label="1. Generator network checkpoint (.pth)",
+                label=_("1. Generator network checkpoint (.pth)"),
                 file_types=[".pth"],
                 file_count="single",
                 interactive=True,
                 scale=2
             )
             model_name_input = gr.Textbox(
-                label="Output Model Name",
-                info="The output file will be saved as `<name>.pth`.",
+                label=_("Output Model Name"),
+                info=_("The output file will be saved as `<name>.pth`."),
                 value="My_extracted_model_123",
                 interactive=True,
                 scale=1
             )
             output_dir_input = gr.Textbox(
-                label="Output Directory",
-                info="The directory where the final .pth file will be saved.",
+                label=_("Output Directory"),
+                info=_("The directory where the final .pth file will be saved."),
                 value="logs/EXTRACTED_SMALL_MODELS",
                 interactive=True,
                 scale=1
@@ -144,7 +157,7 @@ def extract_small_model_tab():
 
         with gr.Row():
             sr_input = gr.Dropdown(
-                label="Sample Rate of the model (sr)",
+                label=_("Sample Rate of the model (sr)"),
                 choices=get_vocoder_sample_rates("hifi"),
                 value=48000, 
                 type="value",
@@ -152,7 +165,7 @@ def extract_small_model_tab():
                 scale=1
             )
             vocoder_input = gr.Dropdown(
-                label="Vocoder",
+                label=_("Vocoder"),
                 choices=get_vocoder_choices(),
                 value="hifi",
                 type="value",
@@ -160,15 +173,15 @@ def extract_small_model_tab():
                 scale=1,
             )
             pitch_guidance_input = gr.Checkbox(
-                label="F0-guided model", 
+                label=_("F0-guided model"), 
                 value=True,
-                info="The selected vocoder requires F0 guidance.",
+                info=_("The selected vocoder requires F0 guidance."),
                 interactive=False,
                 scale=1
             )
             version_input = gr.Dropdown(
-                label="Version",
-                info="Select one that corresponds to your training.",
+                label=_("Version"),
+                info=_("Select one that corresponds to your training."),
                 choices=['v1', 'v2'],
                 value='v2',
                 interactive=True,
@@ -185,11 +198,11 @@ def extract_small_model_tab():
             outputs=[sr_input],
         )
 
-        extract_button = gr.Button("Extract Small Model", variant="primary")
+        extract_button = gr.Button(_("Extract Small Model"), variant="primary")
 
         output_info = gr.Textbox(
-            label="Output Information",
-            info="Status messages and final file path will be displayed here.",
+            label=_("Output Information"),
+            info=_("Status messages and final file path will be displayed here."),
             value="",
             max_lines=8,
             interactive=False 

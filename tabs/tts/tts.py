@@ -5,6 +5,8 @@ import sys
 
 import gradio as gr
 
+from rvc.lib.i18n import _
+
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
@@ -34,10 +36,10 @@ def process_input(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             file.read()
-        gr.Info(f"The file has been loaded!")
+        gr.Info(_("The file has been loaded!"))
         return file_path, file_path
     except UnicodeDecodeError:
-        gr.Info(f"The file has to be in UTF-8 encoding.")
+        gr.Info(_("The file has to be in UTF-8 encoding."))
         return None, None
 
 
@@ -46,8 +48,8 @@ def tts_tab():
     with gr.Column():
         with gr.Row():
             model_file = gr.Dropdown(
-                label="Voice Model",
-            info="Voice model used for conversion.",
+                label=_("Voice Model"),
+            info=_("Voice model used for conversion."),
                 choices=sorted(names, key=lambda x: extract_model_and_epoch(x)),
                 interactive=True,
                 value=default_weight,
@@ -55,16 +57,16 @@ def tts_tab():
             )
             best_default_index_path = match_index(model_file.value)
             index_file = gr.Dropdown(
-                label="Index File",
-            info="Optional index file.",
+                label=_("Index File"),
+            info=_("Optional index file."),
                 choices=get_indexes(),
                 value=best_default_index_path,
                 interactive=True,
                 allow_custom_value=True,
             )
         with gr.Row():
-            unload_button = gr.Button("Unload Voice")
-            refresh_button = gr.Button("Refresh")
+            unload_button = gr.Button(_("Unload Voice"))
+            refresh_button = gr.Button(_("Refresh"))
 
             def _unload_and_cleanup():
                 import_voice_converter().cleanup_model()
@@ -82,10 +84,10 @@ def tts_tab():
                 outputs=[index_file],
             )
 
-    gr.Markdown("Generate speech with EdgeTTS, then convert it with the selected RVC model.")
+    gr.Markdown(_("Generate speech with EdgeTTS, then convert it with the selected RVC model."))
     tts_voice = gr.Dropdown(
-        label="TTS Voices",
-        info="Select the TTS voice to use for the conversion.",
+        label=_("TTS Voices"),
+        info=_("Select the TTS voice to use for the conversion."),
         choices=short_names,
         interactive=True,
         value=random.choice(short_names),
@@ -95,76 +97,76 @@ def tts_tab():
         minimum=-100,
         maximum=100,
         step=1,
-        label="TTS Speed",
-        info="Increase or decrease TTS speed.",
+        label=_("TTS Speed"),
+        info=_("Increase or decrease TTS speed."),
         value=0,
         interactive=True,
     )
 
     with gr.Tabs():
-        with gr.Tab(label="Text to Speech"):
+        with gr.Tab(label=_("Text to Speech")):
             tts_text = gr.Textbox(
-                label="Text to Synthesize",
-                info="Enter the text to synthesize.",
-                placeholder="Enter text to synthesize",
+                label=_("Text to Synthesize"),
+                info=_("Enter the text to synthesize."),
+                placeholder=_("Enter text to synthesize"),
                 lines=3,
             )
-        with gr.Tab(label="File to Speech"):
+        with gr.Tab(label=_("File to Speech")):
             txt_file = gr.File(
-                label="Upload a .txt file",
+                label=_("Upload a .txt file"),
                 type="filepath",
             )
             input_tts_path = gr.Textbox(
-                label="Input path for text file",
-                placeholder="The path to the text file that contains content for text to speech.",
+                label=_("Input path for text file"),
+                placeholder=_("The path to the text file that contains content for text to speech."),
                 value="",
                 interactive=True,
             )
 
-    with gr.Accordion("Advanced Settings", open=False):
+    with gr.Accordion(_("Advanced Settings"), open=False):
         with gr.Column():
             output_tts_path = gr.Textbox(
-                label="Output Path for TTS Audio",
-                placeholder="Enter output path",
+                label=_("Output Path for TTS Audio"),
+                placeholder=_("Enter output path"),
                 value=os.path.join(now_dir, "assets", "audios", "tts_output.wav"),
                 interactive=True,
             )
             output_rvc_path = gr.Textbox(
-                label="Output Path for RVC Audio",
-                placeholder="Enter output path",
+                label=_("Output Path for RVC Audio"),
+                placeholder=_("Enter output path"),
                 value=os.path.join(now_dir, "assets", "audios", "tts_rvc_output.wav"),
                 interactive=True,
             )
             export_format = gr.Radio(
-                label="Export Format",
-                info="Select the format to export the audio.",
+                label=_("Export Format"),
+                info=_("Select the format to export the audio."),
                 choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
                 value="WAV",
                 interactive=True,
             )
             seed = gr.Number(
-                label="Inference Seed",
-                info="Specify any seed to be used for inference or leave at '0' for random outputs. ( Classic RVC behavior. ) \n **Ensure you don't leave this field empty.**",
+                label=_("Inference Seed"),
+                info=_("Specify any seed to be used for inference or leave at '0' for random outputs. ( Classic RVC behavior. ) \n **Ensure you don't leave this field empty.**"),
                 value=0,
                 interactive=True,
             )
             sid = gr.Dropdown(
-                label="Speaker ID",
-                info="Select the speaker ID to use for the conversion.",
+                label=_("Speaker ID"),
+                info=_("Select the speaker ID to use for the conversion."),
                 choices=get_speakers_id(model_file.value),
                 value=0,
                 interactive=True,
             )
             split_audio = gr.Checkbox(
-                label="Split Audio",
-                info="Split the audio into chunks for inference to obtain better results in some cases.",
+                label=_("Split Audio"),
+                info=_("Split the audio into chunks for inference to obtain better results in some cases."),
                 visible=True,
                 value=False,
                 interactive=True,
             )
             autotune = gr.Checkbox(
-                label="Autotune",
-                info="Apply a soft autotune to your inferences, recommended for singing conversions.",
+                label=_("Autotune"),
+                info=_("Apply a soft autotune to your inferences, recommended for singing conversions."),
                 visible=True,
                 value=False,
                 interactive=True,
@@ -172,15 +174,15 @@ def tts_tab():
             autotune_strength = gr.Slider(
                 minimum=0,
                 maximum=1,
-                label="Autotune Strength",
-                info="Set the autotune strength - the more you increase it the more it will snap to the chromatic grid.",
+                label=_("Autotune Strength"),
+                info=_("Set the autotune strength - the more you increase it the more it will snap to the chromatic grid."),
                 visible=False,
                 value=1,
                 interactive=True,
             )
             clean_audio = gr.Checkbox(
-                label="Clean Audio",
-                info="Clean your audio output using noise detection algorithms, recommended for speaking audios.",
+                label=_("Clean Audio"),
+                info=_("Clean your audio output using noise detection algorithms, recommended for speaking audios."),
                 visible=True,
                 value=True,
                 interactive=True,
@@ -188,8 +190,8 @@ def tts_tab():
             clean_strength = gr.Slider(
                 minimum=0,
                 maximum=1,
-                label="Clean Strength",
-                info="Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed.",
+                label=_("Clean Strength"),
+                info=_("Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed."),
                 visible=True,
                 value=0.5,
                 interactive=True,
@@ -198,16 +200,16 @@ def tts_tab():
                 minimum=-24,
                 maximum=24,
                 step=1,
-                label="Pitch",
-                info="Set the pitch of the audio, the higher the value, the higher the pitch.",
+                label=_("Pitch"),
+                info=_("Set the pitch of the audio, the higher the value, the higher the pitch."),
                 value=0,
                 interactive=True,
             )
             filter_radius = gr.Slider(
                 minimum=0,
                 maximum=7,
-                label="Filter Radius",
-                info="If the number is greater than or equal to three, employing median filtering on the collected tone results has the potential to decrease respiration.",
+                label=_("Filter Radius"),
+                info=_("If the number is greater than or equal to three, employing median filtering on the collected tone results has the potential to decrease respiration."),
                 value=3,
                 step=1,
                 interactive=True,
@@ -215,30 +217,57 @@ def tts_tab():
             index_rate = gr.Slider(
                 minimum=0,
                 maximum=1,
-                label="Search Feature Ratio",
-                info="Index influence. Lower values can reduce artifacts.",
+                label=_("Search Feature Ratio"),
+                info=_("Index influence. Lower values can reduce artifacts."),
                 value=0.75,
+                interactive=True,
+            )
+            index_k = gr.Slider(
+                minimum=1,
+                maximum=32,
+                step=1,
+                label=_("Index Neighbours"),
+                info=_("Frames averaged per match. Fewer keeps the training voice's idiosyncratic articulation; more averages toward its mean voice."),
+                value=8,
+                interactive=True,
+            )
+            index_power = gr.Slider(
+                minimum=0,
+                maximum=8,
+                step=0.25,
+                label=_("Index Sharpness"),
+                info=_("How strongly closer neighbours outweigh further ones. 0 averages them equally; high values use the nearest alone."),
+                value=2.0,
+                interactive=True,
+            )
+            index_continuity = gr.Slider(
+                minimum=0,
+                maximum=4,
+                step=0.1,
+                label=_("Index Continuity"),
+                info=_("Favours matches that continue the previous frame's, so the retrieval stops jumping between unrelated parts of the dataset. Needs an index built by this fork."),
+                value=0.5,
                 interactive=True,
             )
             rms_mix_rate = gr.Slider(
                 minimum=0,
                 maximum=1,
-                label="Volume Envelope",
-                info="Mix the converted and input loudness envelopes.",
+                label=_("Volume Envelope"),
+                info=_("Mix the converted and input loudness envelopes."),
                 value=1,
                 interactive=True,
             )
             protect = gr.Slider(
                 minimum=0,
                 maximum=0.5,
-                label="Protect Voiceless Consonants",
-                info="Protect voiceless consonants. Higher values reduce index influence.",
+                label=_("Protect Voiceless Consonants"),
+                info=_("Protect voiceless consonants. Higher values reduce index influence."),
                 value=0.5,
                 interactive=True,
             )
             f0_method = gr.Radio(
-                label="Pitch extraction algorithm",
-                info="Pitch algorithm. RMVPE is the recommended default.",
+                label=_("Pitch extraction algorithm"),
+                info=_("Pitch algorithm. RMVPE is the recommended default."),
                 choices=[
                     "crepe",
                     "crepe-tiny",
@@ -249,8 +278,8 @@ def tts_tab():
                 interactive=True,
             )
             embedder_model = gr.Radio(
-                label="Embedder Model",
-                info="Model used for learning speaker embedding.",
+                label=_("Embedder Model"),
+                info=_("Model used for learning speaker embedding."),
                 choices=[
                     "contentvec",
                     "spin_v1",
@@ -261,43 +290,43 @@ def tts_tab():
                 interactive=True,
             )
             with gr.Column(visible=False) as embedder_custom:
-                with gr.Accordion("Custom Embedder", open=True):
+                with gr.Accordion(_("Custom Embedder"), open=True):
                     with gr.Row():
                         embedder_model_custom = gr.Dropdown(
-                            label="Select Custom Embedder",
+                            label=_("Select Custom Embedder"),
                             choices=refresh_embedders_folders(),
                             interactive=True,
                             allow_custom_value=True,
                         )
-                        refresh_embedders_button = gr.Button("Refresh embedders")
+                        refresh_embedders_button = gr.Button(_("Refresh embedders"))
                     folder_name_input = gr.Textbox(
-                        label="Folder Name", interactive=True
+                        label=_("Folder Name"), interactive=True
                     )
                     with gr.Row():
                         bin_file_upload = gr.File(
-                            label="Upload .bin",
+                            label=_("Upload .bin"),
                             type="filepath",
                             interactive=True,
                         )
                         config_file_upload = gr.File(
-                            label="Upload .json",
+                            label=_("Upload .json"),
                             type="filepath",
                             interactive=True,
                         )
-                    move_files_button = gr.Button("Move files to custom embedder")
+                    move_files_button = gr.Button(_("Move files to custom embedder"))
             f0_file = gr.File(
-                label="Edited F0 curve",
+                label=_("Edited F0 curve"),
                 visible=True,
             )
 
-    convert_button = gr.Button("Convert")
+    convert_button = gr.Button(_("Convert"))
 
     with gr.Row():
         vc_output1 = gr.Textbox(
-            label="Output Information",
-            info="TTS status.",
+            label=_("Output Information"),
+            info=_("TTS status."),
         )
-        vc_output2 = gr.Audio(label="Export Audio")
+        vc_output2 = gr.Audio(label=_("Export Audio"))
 
     def toggle_visible(checkbox):
         return {"visible": checkbox, "__type__": "update"}
@@ -311,11 +340,13 @@ def tts_tab():
         fn=toggle_visible,
         inputs=[autotune],
         outputs=[autotune_strength],
+        show_progress="hidden",
     )
     clean_audio.change(
         fn=toggle_visible,
         inputs=[clean_audio],
         outputs=[clean_strength],
+        show_progress="hidden",
     )
     refresh_button.click(
         fn=change_choices,
@@ -331,6 +362,7 @@ def tts_tab():
         fn=toggle_visible_embedder_custom,
         inputs=[embedder_model],
         outputs=[embedder_custom],
+        show_progress="hidden",
     )
     move_files_button.click(
         fn=create_folder_and_move_files,
@@ -341,6 +373,7 @@ def tts_tab():
         fn=lambda: gr.update(choices=refresh_embedders_folders()),
         inputs=[],
         outputs=[embedder_model_custom],
+        show_progress="hidden",
     )
     convert_button.click(
         fn=run_tts_script,
@@ -370,6 +403,9 @@ def tts_tab():
             embedder_model_custom,
             sid,
             seed,
+            index_k,
+            index_power,
+            index_continuity,
         ],
         outputs=[vc_output1, vc_output2],
     )

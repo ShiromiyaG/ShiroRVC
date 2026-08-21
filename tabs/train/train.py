@@ -1,6 +1,8 @@
 import os
 import signal
 
+from rvc.lib.i18n import _
+
 process_pids = []
 
 import shutil
@@ -17,9 +19,8 @@ from core import (
     run_prerequisites_script,
     run_train_script,
     stop_train_script,
-    early_save_stop,
 )
-from rvc.configs.config import get_gpu_info, get_number_of_gpus, max_vram_gpu, microarchitecture_capability_checker, check_if_fp16
+from rvc.configs.config import get_gpu_info, get_number_of_gpus, max_vram_gpu, microarchitecture_capability_checker
 from rvc.configs.vocoders import (
     get_vocoder_choices,
     get_vocoder_sample_rates,
@@ -27,7 +28,12 @@ from rvc.configs.vocoders import (
     normalize_vocoder,
 )
 from rvc.lib.text import format_title
-from rvc.lib.terminal import DEFAULT_CPU_THREADS
+from rvc.lib.terminal import (
+    DEFAULT_CPU_THREADS,
+    error as print_error,
+    warning,
+)
+from rvc.lib.model_bundle import walk_models
 from tabs.train.descs import *
 
 now_dir = os.getcwd()
@@ -145,25 +151,25 @@ def get_presets_list():
 # Drop Model
 def save_drop_model(dropbox):
     if ".pth" not in dropbox:
-        gr.Info("Invalid pretrained file.")
+        gr.Info(_("Invalid pretrained file."))
     else:
         file_name = os.path.basename(dropbox)
         pretrained_path = os.path.join(pretraineds_custom_path_relative, file_name)
         if os.path.exists(pretrained_path):
             os.remove(pretrained_path)
         shutil.copy(dropbox, pretrained_path)
-        gr.Info("Refresh the list to use the uploaded pretrained file.")
+        gr.Info(_("Refresh the list to use the uploaded pretrained file."))
     return None
 
 # Drop Dataset
 def save_drop_dataset_audio(dropbox, dataset_name):
     if not dataset_name:
-        gr.Info("Enter a valid dataset name.")
+        gr.Info(_("Enter a valid dataset name."))
         return None, None
     else:
         file_extension = os.path.splitext(dropbox)[1][1:].lower()
         if file_extension not in supported_audio_ext:
-            gr.Info("Invalid audio file.")
+            gr.Info(_("Invalid audio file."))
         else:
             dataset_name = format_title(dataset_name)
             audio_file = format_title(os.path.basename(dropbox))
@@ -175,7 +181,7 @@ def save_drop_dataset_audio(dropbox, dataset_name):
                 os.remove(destination_path)
             shutil.copy(dropbox, destination_path)
             gr.Info(
-                "Audio added. Run preprocessing when ready."
+                _("Audio added. Run preprocessing when ready.")
             )
             dataset_path = os.path.dirname(destination_path)
             relative_dataset_path = os.path.relpath(dataset_path, now_dir)
@@ -217,7 +223,7 @@ def refresh_embedders_folders():
 def get_pth_list():
     return [
         os.path.relpath(os.path.join(dirpath, filename), now_dir)
-        for dirpath, _, filenames in os.walk(models_path)
+        for dirpath, _, filenames in walk_models(models_path)
         for filename in filenames
         if filename.endswith(".pth")
     ]
@@ -225,7 +231,7 @@ def get_pth_list():
 def get_index_list():
     return [
         os.path.relpath(os.path.join(dirpath, filename), now_dir)
-        for dirpath, _, filenames in os.walk(models_path)
+        for dirpath, _, filenames in walk_models(models_path)
         for filename in filenames
         if filename.endswith(".index") and "trained" not in filename
     ]
@@ -245,7 +251,7 @@ def export_pth(pth_path):
     if normalized_pth_path in normalized_allowed_paths:
         return pth_path
     else:
-        print(f"Attempted to export invalid pth path: {pth_path}")
+        warning(f"Not a valid .pth path, skipping: {pth_path}", tag="[EXPORT]")
         return None
 
 def export_index(index_path):
@@ -256,7 +262,7 @@ def export_index(index_path):
     if normalized_index_path in normalized_allowed_paths:
         return index_path
     else:
-        print(f"Attempted to export invalid index path: {index_path}")
+        warning(f"Not a valid index path, skipping: {index_path}", tag="[EXPORT]")
         return None
 
 # Upload to Google Drive
@@ -264,7 +270,7 @@ def upload_to_google_drive(pth_path, index_path):
     def upload_file(file_path):
         if file_path:
             try:
-                gr.Info(f"Uploading {pth_path} to Google Drive...")
+                gr.Info(_("Uploading {path} to Google Drive...").format(path=pth_path))
                 google_drive_folder = "/content/drive/MyDrive/Shiromiya-RVC-Fork-Exported"
                 if not os.path.exists(google_drive_folder):
                     os.makedirs(google_drive_folder)
@@ -274,10 +280,10 @@ def upload_to_google_drive(pth_path, index_path):
                 if os.path.exists(google_drive_file_path):
                     os.remove(google_drive_file_path)
                 shutil.copy2(file_path, google_drive_file_path)
-                gr.Info("File uploaded successfully.")
+                gr.Info(_("File uploaded successfully."))
             except Exception as error:
-                print(f"An error occurred uploading to Google Drive: {error}")
-                gr.Info("Error uploading to Google Drive")
+                print_error(f"Upload to Google Drive failed: {error}", tag="[EXPORT]")
+                gr.Info(_("Error uploading to Google Drive"))
 
     upload_file(pth_path)
     upload_file(index_path)
@@ -323,71 +329,58 @@ def update_vocoder_settings(vocoder_id, current_sample_rate, use_smartcutter):
     )
 
 # Microarch. dependent features, options, functionalities etc.. Might expand in future.
-fp16_check = None
-
 initial_optimizer = "AdamW"
-initial_optimizer_choices = [("AdamW", "AdamW"), ("AdaBelief", "AdaBelief"), ("RAdam", "RAdam"), ("Ranger21", "Ranger21"), ("Sched-Free AdamW", "Sched-Free AdamW"), ("Sched-Free RAdam", "Sched-Free RAdam")]
-fp16_check = True
-
-# FP16 checker
-if fp16_check:
-    if check_if_fp16():
-        initial_optimizer = "AdamW"
-        initial_optimizer_choices = [("AdamW", "AdamW"), ("AdaBelief", "AdaBelief"), ("RAdam", "RAdam"), ("Ranger21", "Ranger21"), ("Sched-Free AdamW", "Sched-Free AdamW"), ("Sched-Free RAdam", "Sched-Free RAdam")]
-
+# Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES.
+initial_optimizer_choices = [
+    ("AdamW", "AdamW"),
+    ("Sched-Free AdamW", "Sched-Free AdamW"),
+    ("Muon", "Muon"),
+    ("Lion", "Lion"),
+]
 
 # Train Tab
 def train_tab():
     # Training presets section
-    with gr.Accordion("Training Presets", open=False):
+    with gr.Accordion(_("Training Presets"), open=False):
         with gr.Row():
-            refresh_presets_button = gr.Button("Refresh Presets")
+            refresh_presets_button = gr.Button(_("Refresh Presets"))
         with gr.Row():
             with gr.Column():
                 preset_dropdown = gr.Dropdown(
                     choices=get_presets_list(),
-                    label="Preset Name",
+                    label=_("Preset Name"),
                     allow_custom_value=True,
                     interactive=True
                 )
             with gr.Column():
-                save_preset_button = gr.Button("Save to preset")
-                load_preset_button = gr.Button("Load from preset")
+                save_preset_button = gr.Button(_("Save to preset"))
+                load_preset_button = gr.Button(_("Load from preset"))
 
     # Model settings section
-    with gr.Accordion("Model Settings"):
+    with gr.Accordion(_("Model Settings")):
         with gr.Row():
             with gr.Column():
                 model_name = gr.Dropdown(
-                    label="Model Name",
-                    info="Name of the new model.",
+                    label=_("Model Name"),
+                    info=_("Name of the new model."),
                     choices=get_models_list(),
                     value="example-model-name",
                     interactive=True,
                     allow_custom_value=True,
                     key='model_name'
                 )
-                optimizer_choice = gr.Radio(
-                    label="Optimizer (G/D)",
-                    info=OPTIMIZER_INFO,
-                    choices=initial_optimizer_choices,
-                    value=initial_optimizer,
-                    interactive=True,
-                    visible=True,
-                    key='optimizer_choice'
-                )
             with gr.Column():
                 sampling_rate = gr.Radio(
-                    label="Sampling Rate",
-                    info="Target sample rate. Match it to the dataset when possible.",
+                    label=_("Sampling Rate"),
+                    info=_("Target sample rate. Match it to the dataset when possible."),
                     choices=initial_sample_rate_choices,
                     value=initial_sample_rate,
                     interactive=True,
                     key='sampling_rate'
                 )
                 vocoder = gr.Radio(
-                    label="Vocoder",
-                    info=VOCODER_INFO_RVC,
+                    label=_("Vocoder"),
+                    info=_(VOCODER_INFO_RVC),
                     choices=get_vocoder_choices(),
                     value="hifi",
                     interactive=True,
@@ -395,7 +388,7 @@ def train_tab():
                     key='vocoder'
                 )
         with gr.Accordion(
-            "CPU / GPU settings for ' f0 ' and ' features ' extraction.",
+            _("CPU / GPU settings for ' f0 ' and ' features ' extraction."),
             open=False,
         ):
             with gr.Row():
@@ -405,46 +398,46 @@ def train_tab():
                         min(cpu_count(), 192),  # max 192 parallel processes
                         DEFAULT_CPU_THREADS,
                         step=1,
-                        label="CPU Threads",
-                        info="CPU threads used during extraction.",
+                        label=_("CPU Threads"),
+                        info=_("CPU threads used during extraction."),
                         interactive=True,
                         key='cpu_threads'
                     )
                 with gr.Column():
                     extract_gpu = gr.Textbox(
-                        label="GPU ID",
-                        info="GPU IDs for extraction, separated by '-'.",
-                        placeholder="0 to ∞ separated by -",
+                        label=_("GPU ID"),
+                        info=_("GPU IDs for extraction, separated by '-'."),
+                        placeholder=_("0 to ∞ separated by -"),
                         value=str(get_number_of_gpus()),
                         interactive=True,
                         key='extract_gpu'
                     )
                     gr.Textbox(
-                        label="GPU Information",
-                        info="Detected GPU information.",
+                        label=_("GPU Information"),
+                        info=_("Detected GPU information."),
                         value=get_gpu_info(),
                         interactive=False,
                     )
 
     # Preprocess section
-    with gr.Accordion("Preprocessing"):
+    with gr.Accordion(_("Preprocessing")):
         dataset_path = gr.Dropdown(
-            label="Dataset Path",
-            info="Folder containing the training audio.",
+            label=_("Dataset Path"),
+            info=_("Folder containing the training audio."),
             choices=get_datasets_list(),
             allow_custom_value=True,
             interactive=True,
             key='dataset_path'
         )
-        refresh = gr.Button("Refresh")
+        refresh = gr.Button(_("Refresh"))
 
-        with gr.Accordion("Advanced Settings for the preprocessing step", open=True):
+        with gr.Accordion(_("Advanced Settings for the preprocessing step"), open=True):
             gr.Markdown()
             with gr.Row(elem_classes=["rvc-preprocess-options"]):
                 with gr.Column(min_width=0):
                     dataset_format = gr.Radio(
-                        label="Dataset Format",
-                        info=DATASET_FORMAT_INFO,
+                        label=_("Dataset Format"),
+                        info=_(DATASET_FORMAT_INFO),
                         choices=["WAV", "FLAC"],
                         value="WAV",
                         interactive=True,
@@ -452,8 +445,8 @@ def train_tab():
                     )
                 with gr.Column(min_width=0):
                     loading_resampling = gr.Radio(
-                        label="Resampling & Loading Handler",
-                        info=RESAMPLER_INFO,
+                        label=_("Resampling & Loading Handler"),
+                        info=_(RESAMPLER_INFO),
                         choices=["librosa", "ffmpeg"],
                         value="librosa",
                         interactive=True,
@@ -461,8 +454,8 @@ def train_tab():
                     )
                 with gr.Column(min_width=0):
                     use_smart_cutter = gr.Checkbox(
-                        label="SmartCutter",
-                        info=SMARTCUTTER_INFO,
+                        label=_("SmartCutter"),
+                        info=_(SMARTCUTTER_INFO),
                         value=False,
                         interactive=True,
                         visible=True,
@@ -470,8 +463,8 @@ def train_tab():
                     )
                 with gr.Column(min_width=0):
                     normalization_mode = gr.Radio(
-                        label="Loudness Normalization",
-                        info=NORMALIZATION_INFO,
+                        label=_("Loudness Normalization"),
+                        info=_(NORMALIZATION_INFO),
                         choices=["none", "post_peak", "post_peak_rvc", "post_rms"],
                         value="post_peak",
                         interactive=True,
@@ -481,16 +474,16 @@ def train_tab():
             with gr.Row():
                 rms_norm_db = gr.Slider(
                     -24.0, -3.0, -18.0, step=1.0,
-                    label="RMS Target (dBFS)",
-                    info=PREPROCESS_RMS_VALUE_INFO,
+                    label=_("RMS Target (dBFS)"),
+                    info=_(PREPROCESS_RMS_VALUE_INFO),
                     interactive=True,
                     visible=False,
                     key='rms_norm_db'
                 )
             with gr.Row():
                 cut_preprocess = gr.Radio(
-                    label="Audio cutting",
-                    info=AUDIO_FILE_SLICING_INFO,
+                    label=_("Audio cutting"),
+                    info=_(AUDIO_FILE_SLICING_INFO),
                     choices=["Skip", "Simple", "Automatic"],
                     value="Simple",
                     interactive=True,
@@ -501,8 +494,8 @@ def train_tab():
                     30.0,
                     3.0,
                     step=0.1,
-                    label="Chunk length (sec)",
-                    info="Chunk length for Simple cutting.",
+                    label=_("Chunk length (sec)"),
+                    info=_("Chunk length for Simple cutting."),
                     interactive=True,
                     scale=46,
                     key='chunk_len'
@@ -512,16 +505,16 @@ def train_tab():
                     0.42,
                     0.36,
                     step=0.01,
-                    label="Overlap length",
-                    info="Overlap between Simple chunks, in seconds.",
+                    label=_("Overlap length"),
+                    info=_("Overlap between Simple chunks, in seconds."),
                     interactive=True,
                     scale=57,
                     key='overlap_len'
                 )
             with gr.Column():
                 process_effects = gr.Checkbox(
-                    label="DC / high-pass filtering",
-                    info="Remove DC offset and low-frequency noise.",
+                    label=_("DC / high-pass filtering"),
+                    info=_("Remove DC offset and low-frequency noise."),
                     value=True,
                     interactive=True,
                     visible=True,
@@ -529,8 +522,8 @@ def train_tab():
                 )
             with gr.Column():
                 noise_reduction = gr.Checkbox(
-                    label="Noise Reduction",
-                    info="Apply spectral-gating noise reduction.",
+                    label=_("Noise Reduction"),
+                    info=_("Apply spectral-gating noise reduction."),
                     value=False,
                     interactive=True,
                     visible=True,
@@ -539,23 +532,23 @@ def train_tab():
                 clean_strength = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label="Noise Reduction Strength",
-                    info="Higher values apply stronger cleanup.",
+                    label=_("Noise Reduction Strength"),
+                    info=_("Higher values apply stronger cleanup."),
                     visible=False,
                     value=0.5,
                     interactive=True,
                     key='clean_strength'
                 )
         preprocess_output_info = gr.Textbox(
-            label="Output Information",
-            info="Preprocessing status.",
+            label=_("Output Information"),
+            info=_("Preprocessing status."),
             value="",
             max_lines=8,
             interactive=False,
         )
 
         with gr.Row():
-            preprocess_button = gr.Button("Preprocess Dataset")
+            preprocess_button = gr.Button(_("Preprocess Dataset"))
             preprocess_button.click(
                 fn=run_preprocess_script,
                 inputs=[
@@ -579,11 +572,11 @@ def train_tab():
             )
 
     # Extract section
-    with gr.Accordion("Extraction"):
+    with gr.Accordion(_("Extraction")):
         with gr.Row():
             f0_method = gr.Radio(
-                label="Pitch extraction algorithm",
-                info=PITCH_EXTRACTION_INFO,
+                label=_("Pitch extraction algorithm"),
+                info=_(PITCH_EXTRACTION_INFO),
                 choices=["crepe", "crepe-tiny", "rmvpe", "fcpe"],
                 value="rmvpe",
                 interactive=True,
@@ -591,8 +584,8 @@ def train_tab():
             )
 
             embedder_model = gr.Radio(
-                label="Embedder Model",
-                info="Model used for speaker features.",
+                label=_("Embedder Model"),
+                info=_("Model used for speaker features."),
                 choices=[
                     "contentvec",
                     "spin_v1",
@@ -608,41 +601,68 @@ def train_tab():
             10,
             2,
             step=1,
-            label="Silent ( 'mute' ) files for training.",
-            info="Add silent examples so the model can reproduce silence.",
-            value=True,
+            label=_("Silent ( 'mute' ) files for training."),
+            info=_("Add silent examples so the model can reproduce silence."),
             interactive=True,
             key='include_mutes'
         )
+        remove_16k_slices = gr.Checkbox(
+            label=_("Delete 16 kHz slices after extraction"),
+            info=(
+                _("The 16 kHz copies only feed pitch and embedder extraction; training "
+                "never reads them. Deleting frees roughly a third of what preprocessing "
+                "wrote. Re-extracting with another f0 method or embedder needs them "
+                "back, which means running preprocessing again.")
+            ),
+            value=False,
+            interactive=True,
+            key='remove_16k_slices'
+        )
+        feature_precision = gr.Radio(
+            label=_("Feature Precision"),
+            info=(
+                _("How the extracted embeddings are stored. These are both the "
+                "training input and what the retrieval index is built from, and "
+                "fp16 puts a quantisation floor under every index vector while "
+                "inference queries with fp32 ones. fp32 doubles the feature "
+                "cache on disk (a 2 h dataset goes from roughly 550 MB to "
+                "1.1 GB); fp16 halves it. Either can be read back without "
+                "re-extracting.")
+            ),
+            choices=["fp32", "fp16"],
+            value="fp32",
+            interactive=True,
+            key="feature_precision",
+        )
         with gr.Row(visible=False) as embedder_custom:
-            with gr.Accordion("Custom Embedder", open=True):
+            with gr.Accordion(_("Custom Embedder"), open=True):
                 with gr.Row():
                     embedder_model_custom = gr.Dropdown(
-                        label="Select Custom Embedder",
+                        label=_("Select Custom Embedder"),
                         choices=refresh_embedders_folders(),
                         interactive=True,
                         allow_custom_value=True,
                         key='embedder_model_custom'
                     )
-                    refresh_embedders_button = gr.Button("Refresh embedders")
-                folder_name_input = gr.Textbox(label="Folder Name", interactive=True)
+                    refresh_embedders_button = gr.Button(_("Refresh embedders"))
+                folder_name_input = gr.Textbox(label=_("Folder Name"), interactive=True)
                 with gr.Row():
                     bin_file_upload = gr.File(
-                        label="Upload .bin", type="filepath", interactive=True
+                        label=_("Upload .bin"), type="filepath", interactive=True
                     )
                     config_file_upload = gr.File(
-                        label="Upload .json", type="filepath", interactive=True
+                        label=_("Upload .json"), type="filepath", interactive=True
                     )
-                move_files_button = gr.Button("Move files to custom embedder")
+                move_files_button = gr.Button(_("Move files to custom embedder"))
 
         extract_output_info = gr.Textbox(
-            label="Output Information",
-            info="Extraction status.",
+            label=_("Output Information"),
+            info=_("Extraction status."),
             value="",
             max_lines=8,
             interactive=False,
         )
-        extract_button = gr.Button("Extract Features")
+        extract_button = gr.Button(_("Extract Features"))
         extract_button.click(
             fn=run_extract_script,
             inputs=[
@@ -655,20 +675,22 @@ def train_tab():
                 embedder_model,
                 embedder_model_custom,
                 include_mutes,
+                remove_16k_slices,
+                feature_precision,
             ],
             outputs=[extract_output_info],
         )
 
     # Training section
-    with gr.Accordion("Training"):
+    with gr.Accordion(_("Training")):
         with gr.Row():
             batch_size = gr.Slider(
                 1,
                 128,
                 max_vram_gpu(0),
                 step=1,
-                label="Batch Size",
-                info=BATCH_SIZE_INFO,
+                label=_("Batch Size"),
+                info=_(BATCH_SIZE_INFO),
                 interactive=True,
                 key='batch_size'
             )
@@ -677,8 +699,8 @@ def train_tab():
                 100,
                 1,
                 step=1,
-                label="Saving frequency",
-                info="Save a checkpoint every N epochs.",
+                label=_("Saving frequency"),
+                info=_("Save a checkpoint every N epochs."),
                 interactive=True,
                 key='epoch_save_frequency'
             )
@@ -687,332 +709,344 @@ def train_tab():
                 10000,
                 500,
                 step=1,
-                label="Total Epochs",
-                info="Total training epochs.",
+                label=_("Total Epochs"),
+                info=_("Total training epochs."),
                 interactive=True,
                 key='total_epoch_count'
             )
-        with gr.Accordion("Advanced Settings for training", open=False):
+        with gr.Accordion(_("Advanced Settings for training"), open=False):
+            # Grouped by what the setting decides, not by widget type.  The
+            # previous layout was two columns of "checkboxes I wrote first" and
+            # "radios", with a full-width pile underneath -- so ``Pretrained``
+            # sat six controls above ``Custom Pretrained``, the LR scheduler was
+            # in a different column from warmup and the custom learning rates,
+            # and the index options were buried among training flags although
+            # the button that uses them is outside this accordion entirely.
+
+            # -- where the weights come from ---------------------------------
+            gr.Markdown(f"#### {_('Starting point')}")
             with gr.Row():
-                with gr.Column(scale=9):
+                with gr.Column(min_width=0):
+                    pretrained = gr.Checkbox(
+                        label=_("Pretrained"),
+                        info=_("Use pretrained weights for fine-tuning."),
+                        value=True,
+                        interactive=True,
+                        key='pretrained'
+                    )
+                with gr.Column(min_width=0):
+                    custom_pretrained = gr.Checkbox(
+                        label=_("Custom Pretrained"),
+                        info=_("Use custom generator and discriminator pretrained files."),
+                        value=False,
+                        interactive=True,
+                        key='custom_pretrained'
+                    )
+                with gr.Column(min_width=0):
+                    cleanup = gr.Checkbox(
+                        label=_("Fresh Training"),
+                        info=_("Clear previous weights and logs before training."),
+                        value=False,
+                        interactive=True,
+                        key='cleanup'
+                    )
+            with gr.Column(visible=False) as pretrained_custom_settings:
+                with gr.Accordion(_("Pretrained Custom Settings")):
+                    upload_pretrained = gr.File(
+                        label=_("Upload Pretrained Model"),
+                        type="filepath",
+                        interactive=True,
+                    )
+                    refresh_custom_pretaineds_button = gr.Button(_("Refresh Custom Pretraineds"))
+                    g_pretrained_path = gr.Dropdown(
+                        label=_("Custom Pretrained G"),
+                        info=_("Generator pretrained file."),
+                        choices=sorted(pretraineds_list_g),
+                        interactive=True,
+                        allow_custom_value=True,
+                        key='g_pretrained_path'
+                    )
+                    d_pretrained_path = gr.Dropdown(
+                        label=_("Custom Pretrained D"),
+                        info=_("Discriminator pretrained file."),
+                        choices=sorted(pretraineds_list_d),
+                        interactive=True,
+                        allow_custom_value=True,
+                        key='d_pretrained_path'
+                    )
+
+            # -- the optimisation recipe, read top-down ----------------------
+            gr.Markdown(f"#### {_('Optimisation')}")
+            with gr.Row():
+                with gr.Column(min_width=0):
+                    optimizer_choice = gr.Radio(
+                        label=_("Optimizer (G/D)"),
+                        info=_(OPTIMIZER_INFO),
+                        choices=initial_optimizer_choices,
+                        value=initial_optimizer,
+                        interactive=True,
+                        visible=True,
+                        key='optimizer_choice'
+                    )
+                with gr.Column(min_width=0):
+                    spectral_loss = gr.Radio(
+                        label=_("Spectral loss"),
+                        info=_(SPECTRAL_LOSS_INFO),
+                        choices=["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"],
+                        value="L1 Mel Loss",
+                        interactive=True,
+                        key='spectral_loss'
+                    )
+                with gr.Column(min_width=0):
+                    lr_scheduler = gr.Radio(
+                        label=_("LR scheduler (G/D)"),
+                        info=_(LR_SCHEDULER_INFO),
+                        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
+                        value="exp decay epoch",
+                        interactive=True,
+                        key='lr_scheduler'
+                    )
+            # Both shape the learning rate, so they belong beside the scheduler
+            # rather than in the pile that used to follow the two columns.
+            with gr.Row():
+                with gr.Column(min_width=0):
+                    use_warmup = gr.Checkbox(
+                        label=_("Warmup phase for training"),
+                        info=_("Use linear learning-rate warmup."),
+                        value=False,
+                        interactive=True,
+                        key='use_warmup'
+                    )
+                    with gr.Column(visible=False) as warmup_settings:
+                        with gr.Accordion(_("Warmup settings")):
+                            warmup_duration = gr.Slider(
+                                1,
+                                100,
+                                5,
+                                step=1,
+                                label=_("Duration of the warmup phase"),
+                                info=_("Warmup duration, in epochs."),
+                                interactive=True,
+                                key='warmup_duration'
+                            )
+                with gr.Column(min_width=0):
+                    use_custom_lr = gr.Checkbox(
+                        label=_("Custom lr for gen and disc"),
+                        info=_("Set separate generator and discriminator learning rates."),
+                        value=False,
+                        interactive=True,
+                        key='use_custom_lr'
+                    )
+                    with gr.Column(visible=False) as custom_lr_settings:
+                        with gr.Accordion(_("Custom lr settings")):
+                            custom_lr_g = gr.Textbox(
+                                label=_("Learning rate for Generator"),
+                                placeholder=_("Default is 1e-4 / 0.0001"),
+                                info=_("Generator learning rate. Both rates are required."),
+                                interactive=True,
+                                key='custom_lr_g'
+                            )
+                            custom_lr_d = gr.Textbox(
+                                label=_("Learning rate for Discriminator"),
+                                placeholder=_("Default is 1e-4 / 0.0001"),
+                                info=_("Discriminator learning rate. Both rates are required."),
+                                interactive=True,
+                                key='custom_lr_d'
+                            )
+
+            # -- what gets written, and when to stop -------------------------
+            gr.Markdown(f"#### {_('Checkpoints and quality')}")
+            with gr.Row():
+                with gr.Column(min_width=0):
                     save_only_latest_net_models = gr.Checkbox(
-                        label="Save Only Latest G/D",
-                        info="Keep only the latest generator and discriminator checkpoints.",
+                        label=_("Save Only Latest G/D"),
+                        info=_("Keep only the latest generator and discriminator checkpoints."),
                         value=True,
                         interactive=True,
                         key='save_only_latest_net_models'
                     )
                     save_weight_models = gr.Checkbox(
-                        label="Save weight models",
-                        info="Save the compact voice model files.",
+                        label=_("Save weight models"),
+                        info=_("Save the compact voice model files."),
                         value=True,
                         interactive=True,
                         key='save_weight_models'
                     )
-                    pretrained = gr.Checkbox(
-                        label="Pretrained",
-                        info="Use pretrained weights for fine-tuning.",
+                with gr.Column(min_width=0):
+                    use_ema = gr.Checkbox(
+                        label=_(USE_EMA_LABEL),
+                        info=_(USE_EMA_INFO),
                         value=True,
                         interactive=True,
-                        key='pretrained'
+                        key='use_ema'
                     )
-                    cleanup = gr.Checkbox(
-                        label="Fresh Training",
-                        info="Clear previous weights and logs before training.",
+                with gr.Column(min_width=0):
+                    overtrain_detector = gr.Checkbox(
+                        label=_(OVERTRAIN_DETECTOR_LABEL),
+                        info=_(OVERTRAIN_DETECTOR_INFO),
                         value=False,
                         interactive=True,
-                        key='cleanup'
+                        key='overtrain_detector'
                     )
+                    stop_on_overtrain = gr.Checkbox(
+                        label=_(STOP_ON_OVERTRAIN_LABEL),
+                        info=_(STOP_ON_OVERTRAIN_INFO),
+                        value=False,
+                        interactive=True,
+                        # Hidden with the detector off, which is the default.
+                        visible=False,
+                        key='stop_on_overtrain'
+                    )
+                    # Meaningless without the detector that produces the signal.
+                    # ``interactive`` only greys a Gradio checkbox out, leaving
+                    # a dead control sitting there; hide it instead.
+                    overtrain_detector.change(
+                        fn=lambda enabled: gr.update(visible=enabled),
+                        inputs=[overtrain_detector],
+                        outputs=[stop_on_overtrain],
+                        # Without this the default "full" progress tracker paints
+                        # a spinner on the output component, and a component that
+                        # was hidden when the request started never receives the
+                        # completion status -- it unhides stuck on "processing".
+                        show_progress="hidden",
+                    )
+
+            # -- speed, memory and precision ---------------------------------
+            gr.Markdown(f"#### {_('Performance')}")
+            with gr.Row():
+                with gr.Column(min_width=0):
                     use_checkpointing = gr.Checkbox(
-                        label="Checkpointing",
-                        info="Reduce VRAM use at the cost of speed.",
+                        label=_("Checkpointing"),
+                        info=_("Reduce VRAM use at the cost of speed."),
                         value=auto_enable_checkpointing,
                         interactive=True,
                         key='use_checkpointing'
                     )
+                    use_benchmark = gr.Checkbox(
+                        label=_("Use 'cuDNN benchmark' mode"),
+                        info=_("Enable cuDNN benchmark mode."),
+                        value=True,
+                        interactive=True,
+                        key='use_benchmark'
+                    )
+                with gr.Column(min_width=0):
+                    use_tf32 = gr.Checkbox(
+                        label=_("use 'TF32' precision"),
+                        info=_("Use TF32 on supported GPUs for faster training."),
+                        value=microarchitecture_capability_checker(),
+                        interactive=microarchitecture_capability_checker(),
+                        key='use_tf32'
+                    )
+                with gr.Column(min_width=0):
                     compile_vocoder = gr.Checkbox(
-                        label=VOCODER_COMPILE_LABEL,
-                        info=VOCODER_COMPILE_INFO,
+                        label=_(VOCODER_COMPILE_LABEL),
+                        info=_(VOCODER_COMPILE_INFO),
                         value=False,
                         interactive=True,
                         key='compile_vocoder'
                     )
                     torch_compile_mode = gr.Radio(
-                        label=TORCH_COMPILE_MODE_LABEL,
-                        info=TORCH_COMPILE_MODE_INFO,
+                        label=_(TORCH_COMPILE_MODE_LABEL),
+                        info=_(TORCH_COMPILE_MODE_INFO),
                         choices=TORCH_COMPILE_MODE_CHOICES,
                         value=TORCH_COMPILE_MODE_CHOICES[0],
                         interactive=True,
                         visible=False,
                         key='torch_compile_mode'
                     )
-                    use_tf32 = gr.Checkbox(
-                        label="use 'TF32' precision",
-                        info="Use TF32 on supported GPUs for faster training.",
-                        value=microarchitecture_capability_checker(),
-                        interactive=microarchitecture_capability_checker(),
-                        key='use_tf32'
-                    )
-                    use_benchmark = gr.Checkbox(
-                        label="Use 'cuDNN benchmark' mode",
-                        info="Enable cuDNN benchmark mode.",
-                        value=True,
-                        interactive=True,
-                        key='use_benchmark'
-                    )
-                    use_deterministic = gr.Checkbox(
-                        label="Use 'cuDNN deterministic' mode",
-                        info="Improve reproducibility, possibly reducing speed.",
-                        value=False,
-                        interactive=True,
-                        key='use_deterministic'
-                    )
-                with gr.Column(scale=7):
-                    rolling_loss_steps = gr.Slider(
-                        3,
-                        1000,
-                        50,
-                        step=1,
-                        label="Rolling avg loss steps",
-                        info="Steps between rolling loss and gradient logs.",
-                        interactive=True,
-                        visible=True,
-                        key='rolling_loss_steps'
-                    )
-                    grad_clip_scheduling = gr.Checkbox(
-                        label="Grad clipping scheduling",
-                        info="Schedule gradient clipping values.",
-                        value=False,
-                        interactive=True,
-                        key='grad_clip_scheduling'
-                    )
-                    grad_clip_steps_duration = gr.Number(
-                        label="Clipping duration",
-                        info="Initial clipping duration, in steps.",
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                        key='grad_clip_steps_duration'
-                    )
-                    grad_clip_value_g_cap = gr.Number(
-                        label="G grads initial clip",
-                        info="Initial generator gradient cap.",
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                        key='grad_clip_value_g_cap'
-                    )
-                    grad_clip_value_d_cap = gr.Number(
-                        label="D grads initial clip",
-                        info="Initial discriminator gradient cap.",
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                        key='grad_clip_value_d_cap'
-                    )
-                    grad_clip_value_g_release = gr.Number(
-                        label="G grads secondary clip",
-                        info="Generator gradient cap after the schedule.",
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                        key='grad_clip_value_g_release'
-                    )
-                    grad_clip_value_d_release = gr.Number(
-                        label="D grads secondary clip",
-                        info="Discriminator gradient cap after the schedule.",
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                        key='grad_clip_value_d_release'
-                    )
-                with gr.Column(scale=9):
-                    spectral_loss = gr.Radio(
-                        label="Spectral loss",
-                        info=SPECTRAL_LOSS_INFO,
-                        choices=["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"],
-                        value="L1 Mel Loss",
-                        interactive=True,
-                        key='spectral_loss'
-                    )
-                    lr_scheduler = gr.Radio(
-                        label="LR scheduler (G/D)",
-                        info=LR_SCHEDULER_INFO,
-                        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
-                        value="exp decay epoch",
-                        interactive=True,
-                        key='lr_scheduler'
-                    )
-                    exp_decay_gamma = gr.Radio(
-                        label="Exp decay gamma (G/D)",
-                        info="Decay factor for exponential scheduling.",
-                        choices=["0.9999996", "0.999875", "0.999", "0.9975", "0.995"],
-                        value="0.999875",
-                        interactive=True,
-                        visible=True,
-                        key='exp_decay_gamma'
-                    )
-                    use_kl_annealing = gr.Checkbox(
-                        label="KL loss annealing",
-                        info=KL_ANNEALING_INFO,
-                        value=False,
-                        interactive=True,
-                        key='use_kl_annealing'
-                    )
-                    kl_annealing_cycle_duration = gr.Slider(
-                        1,
-                        100,
-                        3,
-                        step=1,
-                        label="KL annealing cycle duration",
-                        info=KL_ANNEALING_CYCLE_INFO,
-                        interactive=True,
-                        visible=False,
-                        key='kl_annealing_cycle_duration'
-                    )
-                    use_2_sample_kl = gr.Checkbox(
-                        label="Use 2-sample KL",
-                        info="Use two samples for KL loss. Experimental.",
-                        value=False,
-                        interactive=True,
-                        key='use_2_sample_kl'
-                    )
-                    use_best_step = gr.Checkbox(
-                        label=BEST_STEP_LABEL,
-                        info=BEST_STEP_INFO,
-                        value=False,
-                        interactive=True,
-                        key='use_best_step'
-                    )
-                    double_d_updates = gr.Checkbox(
-                        label="Double Discriminator Update",
-                        info="Update the discriminator twice per batch.",
-                        value=False,
-                        interactive=True,
-                        key='double_d_updates'
-                    )
-            with gr.Column():
-                custom_pretrained = gr.Checkbox(
-                    label="Custom Pretrained",
-                    info="Use custom generator and discriminator pretrained files.",
-                    value=False,
-                    interactive=True,
-                    key='custom_pretrained'
-                )
-                with gr.Column(visible=False) as pretrained_custom_settings:
-                        with gr.Accordion("Pretrained Custom Settings"):
-                            upload_pretrained = gr.File(
-                                label="Upload Pretrained Model",
-                                type="filepath",
-                                interactive=True,
-                            )
-                            refresh_custom_pretaineds_button = gr.Button("Refresh Custom Pretraineds")
-                            g_pretrained_path = gr.Dropdown(
-                                label="Custom Pretrained G",
-                                info="Generator pretrained file.",
-                                choices=sorted(pretraineds_list_g),
-                                interactive=True,
-                                allow_custom_value=True,
-                                key='g_pretrained_path'
-                            )
-                            d_pretrained_path = gr.Dropdown(
-                                label="Custom Pretrained D",
-                                info="Discriminator pretrained file.",
-                                choices=sorted(pretraineds_list_d),
-                                interactive=True,
-                                allow_custom_value=True,
-                                key='d_pretrained_path'
-                            )
-                multiple_gpu = gr.Checkbox(
-                    label="GPU Settings",
-                    info=(
-                        "Enable multi-GPU training.",
-                    ),
-                    value=False,
-                    interactive=True,
-                    key='multiple_gpu'
-                )
-                with gr.Column(visible=False) as gpu_custom_settings:
-                    with gr.Accordion("GPU ID override / Multi-gpu-training configuration"):
-                        training_gpu = gr.Textbox(
-                            label="GPU Number",
-                            info="GPU IDs for training, separated by '-'.",
-                            placeholder="0 to ∞ separated by -",
-                            value=str(get_number_of_gpus()),
-                            interactive=True,
-                            key="training_gpu"
-                        )
-                        gr.Textbox(
-                            label="GPU Information",
-                            info="Detected GPU information.",
-                            value=get_gpu_info(),
-                            interactive=False,
-                        )
-                use_warmup = gr.Checkbox(
-                    label="Warmup phase for training",
-                    info="Use linear learning-rate warmup.",
-                    value=False,
-                    interactive=True,
-                    key='use_warmup'
-                )
-                with gr.Column(visible=False) as warmup_settings:
-                    with gr.Accordion("Warmup settings"):
-                        warmup_duration = gr.Slider(
-                            1,
-                            100,
-                            5,
-                            step=1,
-                            label="Duration of the warmup phase",
-                            info="Warmup duration, in epochs.",
-                            interactive=True,
-                            key='warmup_duration'
-                        )
 
-                use_custom_lr = gr.Checkbox(
-                    label="Custom lr for gen and disc",
-                    info="Set separate generator and discriminator learning rates.",
-                    value=False,
-                    interactive=True,
-                    key='use_custom_lr'
-                )
-                with gr.Column(visible=False) as custom_lr_settings:
-                    with gr.Accordion("Custom lr settings"):
-                        custom_lr_g = gr.Textbox(
-                            label="Learning rate for Generator",
-                            placeholder="Default is 1e-4 / 0.0001",
-                            info="Generator learning rate. Both rates are required.",
-                            interactive=True,
-                            key='custom_lr_g'
-                        )
-                        custom_lr_d = gr.Textbox(
-                            label="Learning rate for Discriminator",
-                            placeholder="Default is 1e-4 / 0.0001",
-                            info="Discriminator learning rate. Both rates are required.",
-                            interactive=True,
-                            key='custom_lr_d'
-                        )
+            # -- which devices -----------------------------------------------
+            gr.Markdown(f"#### {_('Hardware')}")
+            with gr.Row():
+                with gr.Column(min_width=0):
+                    multiple_gpu = gr.Checkbox(
+                        label=_("GPU Settings"),
+                        # A tuple, not a string, until 2026-08-21: the trailing
+                        # comma made Gradio serialise the info as an array, and
+                        # being outside ``_()`` it was the one line in the tab
+                        # that could never be translated.
+                        info=_("Choose which GPUs to train on, and enable "
+                               "multi-GPU training."),
+                        value=False,
+                        interactive=True,
+                        key='multiple_gpu'
+                    )
+                    # Revealed by ``multiple_gpu.change`` further down.  Kept in
+                    # the same column as its toggle, like ``warmup_settings`` and
+                    # ``custom_lr_settings``.
+                    with gr.Column(visible=False) as gpu_custom_settings:
+                        with gr.Accordion(_("GPU ID override / Multi-gpu-training configuration")):
+                            training_gpu = gr.Textbox(
+                                label=_("GPU Number"),
+                                info=_("GPU IDs for training, separated by '-'."),
+                                placeholder=_("0 to ∞ separated by -"),
+                                # Despite the name this returns the ID list
+                                # ("0", "0-1", ...), not a count, so it is
+                                # already the right shape for this field.
+                                value=str(get_number_of_gpus()),
+                                interactive=True,
+                                key="training_gpu"
+                            )
+                            gr.Textbox(
+                                label=_("GPU Information"),
+                                info=_("Detected GPU information."),
+                                value=get_gpu_info(),
+                                interactive=False,
+                            )
 
-                with gr.Row():
+            # -- the retrieval index -----------------------------------------
+            # Last, and labelled, because these two are not training options at
+            # all: they are read by the "Generate Index" button further down.
+            gr.Markdown(f"#### {_('Index')}")
+            gr.Markdown(
+                f"<sub>{_('Used by the Generate Index button below, after training.')}</sub>"
+            )
+            with gr.Row():
+                with gr.Column(min_width=0):
                     index_algorithm = gr.Radio(
-                    label="Index Algorithm",
-                    info="Index method for large datasets.",
-                    choices=["Auto", "Faiss", "KMeans"],
-                    value="Auto",
-                    interactive=True,
-                    key='index_algorithm'
-                )
+                        label=_("Index Algorithm"),
+                        info=_("Index method for large datasets."),
+                        choices=["Auto", "Faiss", "KMeans"],
+                        value="Auto",
+                        interactive=True,
+                        key='index_algorithm'
+                    )
+                with gr.Column(min_width=0):
+                    index_metric = gr.Radio(
+                        label=_("Index Similarity"),
+                        info=(
+                            _("How neighbours are ranked. L2 is what upstream RVC "
+                            "builds. Cosine compares direction only, so a quiet and "
+                            "a loud take of the same sound match equally well.")
+                        ),
+                        choices=["l2", "cosine"],
+                        value="l2",
+                        interactive=True,
+                        key="index_metric",
+                    )
 
         train_output_info = gr.Textbox(
-            label="Output Information",
-            info="Training status.",
+            label=_("Output Information"),
+            info=_("Training status."),
             value="",
             max_lines=8,
             interactive=False,
         )
 
         with gr.Row():
-            train_button = gr.Button("Start Training")
+            train_button = gr.Button(_("Start Training"))
+            # Announce first so the box says something straight away, then run
+            # the blocking call with Gradio's spinner off: a run lasts hours,
+            # and an overlay counting seconds on an empty box reads as a hang.
             train_button.click(
+                fn=lambda: (
+                    "Training started. Epoch, step and loss progress is shown "
+                    "in the terminal window."
+                ),
+                inputs=[],
+                outputs=[train_output_info],
+                show_progress="hidden",
+            ).then(
                 fn=run_train_script,
                 inputs=[
                     model_name,
@@ -1036,69 +1070,60 @@ def train_tab():
                     use_checkpointing,
                     use_tf32,
                     use_benchmark,
-                    use_deterministic,
                     spectral_loss,
                     lr_scheduler,
-                    exp_decay_gamma,
-                    use_kl_annealing,
-                    kl_annealing_cycle_duration,
-                    rolling_loss_steps,
-                    grad_clip_scheduling,
-                    grad_clip_steps_duration,
-                    grad_clip_value_g_cap,
-                    grad_clip_value_d_cap,
-                    grad_clip_value_g_release,
-                    grad_clip_value_d_release,
                     use_custom_lr,
                     custom_lr_g,
                     custom_lr_d,
-                    use_2_sample_kl,
-                    use_best_step,
-                    double_d_updates,
                     compile_vocoder,
                     torch_compile_mode,
+                    overtrain_detector,
+                    stop_on_overtrain,
+                    use_ema,
                 ],
                 outputs=[train_output_info],
+                show_progress="hidden",
             )
 
-            stop_train_button = gr.Button("Stop Training", visible=True)
+            stop_train_button = gr.Button(_("Stop Training"), visible=True)
+            # Stopping can take a moment while a checkpoint write finishes, so
+            # the same announce-then-run treatment applies.
             stop_train_button.click(
+                fn=lambda: "Stopping training - letting any checkpoint write finish first...",
+                inputs=[],
+                outputs=[train_output_info],
+                show_progress="hidden",
+            ).then(
                 fn=stop_train_script,
                 inputs=[],
                 outputs=[train_output_info],
+                show_progress="hidden",
             )
 
-            early_stop_button = gr.Button("Early Stopping", visible=True)
-            early_stop_button.click(
-                fn=early_save_stop,
-                inputs=[],
-                outputs=[train_output_info],
-            )
-
-            index_button = gr.Button("Generate Index")
+            index_button = gr.Button(_("Generate Index"))
             index_button.click(
                 fn=run_index_script,
-                inputs=[model_name, index_algorithm],
+                inputs=[model_name, index_algorithm, index_metric],
                 outputs=[train_output_info],
             )
 
     # Export Model section
-    with gr.Accordion("Export Model", open=False):
+    with gr.Accordion(_("Export Model"), open=False):
         if not os.name == "nt":
             gr.Markdown(
-                "Upload is available on Google Colab and saves exported files to your Google Drive."
+                _("Upload is available on Google Colab and saves exported files to your Google Drive.")
             )
         with gr.Row():
             with gr.Column():
                 pth_file_export = gr.File(
-                    label="Exported Pth file",
+                    label=_("Exported Pth file"),
                     type="filepath",
                     value=None,
                     interactive=False,
                 )
                 pth_dropdown_export = gr.Dropdown(
-                    label="Pth file",
-                info="PTH file to export.",
+                    label=_("Pth file"),
+                info=_("PTH file to export."),
                     choices=get_pth_list(),
                     value=None,
                     interactive=True,
@@ -1106,14 +1131,14 @@ def train_tab():
                 )
             with gr.Column():
                 index_file_export = gr.File(
-                    label="Exported Index File",
+                    label=_("Exported Index File"),
                     type="filepath",
                     value=None,
                     interactive=False,
                 )
                 index_dropdown_export = gr.Dropdown(
-                    label="Index File",
-                info="Index file to export.",
+                    label=_("Index File"),
+                info=_("Index file to export."),
                     choices=get_index_list(),
                     value=None,
                     interactive=True,
@@ -1121,9 +1146,9 @@ def train_tab():
                 )
         with gr.Row():
             with gr.Column():
-                refresh_export = gr.Button("Refresh")
+                refresh_export = gr.Button(_("Refresh"))
                 if not os.name == "nt":
-                    upload_exported = gr.Button("Upload")
+                    upload_exported = gr.Button(_("Upload"))
                     upload_exported.click(
                         fn=upload_to_google_drive,
                         inputs=[pth_dropdown_export, index_dropdown_export],
@@ -1136,14 +1161,9 @@ def train_tab():
             def toggle_compile_mode(compile_enabled):
                 return gr.update(visible=bool(compile_enabled))
 
-            def toggle_visible_gamma(lr_scheduler):
-                return gr.update(
-                    visible=lr_scheduler in ["exp decay step", "exp decay epoch"]
-                )
-
             def download_prerequisites():
                     gr.Info(
-                        "Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped."
+                        _("Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped.")
                     )
                     run_prerequisites_script(
                         pretraineds_hifigan=True,
@@ -1151,7 +1171,7 @@ def train_tab():
                         exe=False,
                     )
                     gr.Info(
-                        "Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing."
+                        _("Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing.")
                     )
 
             def toggle_visible_embedder_custom(embedder_model):
@@ -1165,7 +1185,7 @@ def train_tab():
 
             saved_components.extend([
                 # Model settings
-                optimizer_choice, vocoder, sampling_rate, cpu_threads, extract_gpu,
+                vocoder, sampling_rate, cpu_threads, extract_gpu,
 
                 # Preprocessing
                 dataset_path, dataset_format, loading_resampling, use_smart_cutter,
@@ -1174,22 +1194,20 @@ def train_tab():
 
                 # Feature extract
                 f0_method, embedder_model, include_mutes,
-                embedder_model_custom,
+                embedder_model_custom, remove_16k_slices, feature_precision,
 
                 # Training
                 batch_size, epoch_save_frequency, total_epoch_count,
                 save_only_latest_net_models, save_weight_models, pretrained,
                 cleanup, use_checkpointing, compile_vocoder, torch_compile_mode,
-                use_tf32, use_benchmark, use_deterministic, spectral_loss,
-                lr_scheduler, exp_decay_gamma,
+                use_tf32, use_benchmark,
+                optimizer_choice, spectral_loss, lr_scheduler,
                 custom_pretrained, g_pretrained_path,
                 d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
                 warmup_duration, use_custom_lr, custom_lr_g,
-                custom_lr_d, use_kl_annealing, kl_annealing_cycle_duration,
-                rolling_loss_steps, grad_clip_scheduling, grad_clip_steps_duration,
-                grad_clip_value_g_cap, grad_clip_value_d_cap, grad_clip_value_g_release,
-                grad_clip_value_d_release, index_algorithm, use_2_sample_kl, use_best_step,
-                double_d_updates
+                custom_lr_d,
+                index_algorithm, index_metric,
+                overtrain_detector, stop_on_overtrain, use_ema
             ])
 
             def save_training_preset(inputs):
@@ -1200,14 +1218,21 @@ def train_tab():
                 preset_path = os.path.normpath(os.path.abspath(os.path.join(presets_path, inputs[preset_dropdown] + '.json')))
 
                 if not preset_path.startswith(presets_path):
-                    raise gr.Error(f"Invalid training preset name: {inputs[preset_dropdown]}", duration=5)
+                    raise gr.Error(
+                        _("Invalid training preset name: {name}").format(
+                            name=inputs[preset_dropdown]
+                        ),
+                        duration=5,
+                    )
 
                 with open(preset_path, 'w', encoding='utf-8') as of:
                     json.dump(settings, of, indent=4, ensure_ascii=False)
 
             def load_training_preset(preset_name):
                 if preset_name not in get_presets_list():
-                    raise gr.Error(f'Preset does not exist: {preset_name}')
+                    raise gr.Error(
+                        _("Preset does not exist: {name}").format(name=preset_name)
+                    )
 
                 preset_path = os.path.normpath(os.path.abspath(os.path.join(presets_path, preset_name + '.json')))
 
@@ -1227,7 +1252,8 @@ def train_tab():
 
             refresh_presets_button.click(
                 fn=lambda: gr.Dropdown(choices=get_presets_list()), 
-                outputs=[preset_dropdown]
+                outputs=[preset_dropdown],
+                show_progress="hidden",
             )
 
             save_preset_button.click(
@@ -1282,11 +1308,7 @@ def train_tab():
                 fn=toggle_visible_embedder_custom,
                 inputs=[embedder_model],
                 outputs=[embedder_custom],
-            )
-            embedder_model.change(
-                fn=toggle_visible_embedder_custom,
-                inputs=[embedder_model],
-                outputs=[embedder_custom],
+                show_progress="hidden",
             )
             move_files_button.click(
                 fn=create_folder_and_move_files,
@@ -1303,6 +1325,7 @@ def train_tab():
                 ),
                 inputs=[pretrained, custom_pretrained],
                 outputs=[custom_pretrained, pretrained_custom_settings],
+                show_progress="hidden",
             )
             # placeholder_trigger.change(
                 # fn=lambda value: {"visible": not value, "__type__": "update"},
@@ -1313,6 +1336,7 @@ def train_tab():
                 fn=toggle_visible,
                 inputs=[custom_pretrained],
                 outputs=[pretrained_custom_settings],
+                show_progress="hidden",
             )
             refresh_custom_pretaineds_button.click(
                 fn=refresh_custom_pretraineds,
@@ -1328,36 +1352,25 @@ def train_tab():
                 fn=toggle_visible,
                 inputs=[use_warmup],
                 outputs=[warmup_settings],
+                show_progress="hidden",
             )
             compile_vocoder.change(
                 fn=toggle_compile_mode,
                 inputs=[compile_vocoder],
                 outputs=[torch_compile_mode],
+                show_progress="hidden",
             )
             use_custom_lr.change(
                 fn=toggle_visible,
                 inputs=[use_custom_lr],
                 outputs=[custom_lr_settings],
-            )
-            use_kl_annealing.change(
-                fn=lambda v: gr.update(visible=bool(v)),
-                inputs=[use_kl_annealing],
-                outputs=[kl_annealing_cycle_duration]
-            )
-            grad_clip_scheduling.change(
-                fn=lambda v: [gr.update(visible=bool(v)) for _ in range(5)],
-                inputs=[grad_clip_scheduling],
-                outputs=[grad_clip_steps_duration, grad_clip_value_g_cap, grad_clip_value_d_cap, grad_clip_value_g_release, grad_clip_value_d_release]
-            )
-            lr_scheduler.change(
-                fn=toggle_visible_gamma,
-                inputs=[lr_scheduler],
-                outputs=[exp_decay_gamma],
+                show_progress="hidden",
             )
             multiple_gpu.change(
                 fn=toggle_visible,
                 inputs=[multiple_gpu],
                 outputs=[gpu_custom_settings],
+                show_progress="hidden",
             )
             pth_dropdown_export.change(
                 fn=export_pth,
