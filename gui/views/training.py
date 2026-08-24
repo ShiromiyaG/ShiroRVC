@@ -412,9 +412,6 @@ class TrainingPage(Page):
 
         # -- performance ----------------------------------------------------
         advanced.add_group("Performance")
-        self.spectral_loss = SearchableCombo(editable=False)
-        self.spectral_loss.refresh_button.hide()
-        self.spectral_loss.set_items(catalog.SPECTRAL_LOSSES)
         self.checkpointing = Toggle(_("Gradient checkpointing"), _("Trades speed for a much smaller VRAM footprint."))
         # Left off and disabled until the backend reports what the card is;
         # ``_apply_tf32_support`` turns it on when the hardware has the units.
@@ -440,7 +437,6 @@ class TrainingPage(Page):
         self.compile_vocoder.toggled.connect(self.torch_compile_mode_field.setVisible)
 
         advanced.add(
-            Field(_("Spectral loss"), self.spectral_loss, ""),
             self.checkpointing, self.tf32, self.benchmark,
             self.compile_vocoder, self.torch_compile_mode_field,
         )
@@ -787,7 +783,6 @@ class TrainingPage(Page):
             "use_checkpointing": self.checkpointing.isChecked(),
             "use_tf32": self.tf32.isChecked(),
             "use_benchmark": self.benchmark.isChecked(),
-            "spectral_loss": self.spectral_loss.text(),
             "lr_scheduler": self.lr_scheduler.text(),
             "use_custom_lr": self.use_custom_lr.isChecked(),
             "custom_lr_g": self.custom_lr_g.value(),

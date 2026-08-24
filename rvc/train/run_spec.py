@@ -76,7 +76,6 @@ class TrainRunSpec:
 
     # -- optimisation -----------------------------------------------------
     optimizer_choice: str = "AdamW"
-    spectral_loss: str = "L1 Mel Loss"
     lr_scheduler: str = "exp decay step"
     use_warmup: bool = False
     warmup_duration: int = 5

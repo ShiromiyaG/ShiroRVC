@@ -25,7 +25,6 @@ EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
 #: to keep the GUI's first paint free of backend imports; the first entry is the
 #: default the combo lands on.
 OPTIMIZERS = ["AdamW", "Sched-Free AdamW", "Muon", "Lion"]
-SPECTRAL_LOSSES = ["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"]
 LR_SCHEDULERS = ["exp decay step", "exp decay epoch", "cosine annealing", "none"]
 INDEX_ALGORITHMS = ["Auto", "Faiss", "KMeans"]
 #: How the index ranks neighbours.  "l2" is the default and is what upstream RVC

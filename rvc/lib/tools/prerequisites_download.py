@@ -44,7 +44,7 @@ models_list = [
 
 embedders_list = [
     ("embedders/contentvec/", ["pytorch_model.bin", "config.json"]),
-    ("embedders/spin_v1", ["pytorch_model.bin", "config.json"], f"{RESOURCE_BASE}/embedders/spin"),
+    ("embedders/spin_v1", ["pytorch_model.bin", "config.json"], f"{RESOURCE_BASE}/embedders/spin_v1"),
     ("embedders/spin_v2", ["pytorch_model.bin", "config.json"], f"{RESOURCE_BASE}/embedders/spin_v2"),
 ]
 
@@ -67,6 +67,12 @@ def get_file_size_if_missing(file_list):
     """
     Calculate the total size of files to be downloaded only if they do not exist locally.
     Supports optional third element (custom base URL) in the tuple.
+
+    The HEAD has to follow redirects.  Hugging Face answers ``resolve/main``
+    with a 302 to its CDN, and ``requests.head`` does not follow redirects by
+    default, so this read the *redirect's* content-length -- about 950 bytes per
+    file.  The progress bar was therefore sized at ~15 kB for a ~1.7 GB download
+    and hit 100% on the first chunk.
     """
     total_size = 0
     for entry in file_list:
@@ -85,7 +91,7 @@ def get_file_size_if_missing(file_list):
                     url = f"{base_url}/{remote_folder}{file}"
                 else:
                     url = f"{base_url}/{file}"
-                response = requests.head(url)
+                response = requests.head(url, allow_redirects=True, timeout=30)
                 total_size += int(response.headers.get("content-length", 0))
     return total_size
 
@@ -110,7 +116,7 @@ def download_file(url, destination_path, global_bar):
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
 
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=30)
     response.raise_for_status()
     expected = int(response.headers.get("content-length", 0))
 

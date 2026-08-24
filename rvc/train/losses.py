@@ -1,5 +1,7 @@
 import math
 
+import librosa
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -223,6 +225,113 @@ def peak_headroom_loss(generated: Tensor, threshold: float = 0.85) -> Tensor:
     return generated.float().abs().sub(float(threshold)).clamp_min(0.0).mean()
 
 
+def mel_low_frequency_weights(
+    num_mels: int,
+    sample_rate: int,
+    mel_fmin: float = 0.0,
+    mel_fmax: float | None = None,
+    emphasis: float = 1.0,
+    cutoff_hz: float = 1000.0,
+    taper_octaves: float = 1.0,
+) -> Tensor:
+    """Per-mel-bin weights that stop the low bins being outvoted.
+
+    The mel distance reduces with a mean, so every bin pulls with the same
+    authority, and past the Huber knee the pull no longer even scales with how
+    wrong the bin is.  On a 44.1 kHz ChouwaGAN pretrain measured at step 104k
+    that arithmetic bit: bins 0-32 (31 Hz to 992 Hz) held **46% of the mel
+    error and received 32% of the gradient**, and the lowest 16 bins were worse
+    still at 31% against 17%.  A region can be 3x more wrong than the rest of
+    the spectrum and still be a minority of the vote, so it never gets fixed --
+    the 96 nearly-right bins above 1 kHz outnumber it.
+
+    Weighting by frequency restores the proportionality the reduction threw
+    away.  The weights are normalised to a mean of 1, which matters more than it
+    looks: the mel term feeds the adaptive adversarial balance through
+    ``adv_to_rec_ratio``, so a reweighting that also changed the loss *scale*
+    would move the GAN's operating point as a side effect.
+
+    ``taper_octaves`` fades the emphasis out over an octave above ``cutoff_hz``
+    rather than stepping it, so no bin sits on a discontinuity in the objective.
+    """
+
+    if num_mels <= 0:
+        raise ValueError("mel_low_frequency_weights needs at least one bin")
+    if emphasis <= 0.0:
+        raise ValueError("mel_low_frequency_weights emphasis must be positive")
+    if cutoff_hz <= 0.0:
+        raise ValueError("mel_low_frequency_weights cutoff must be positive")
+
+    top = float(sample_rate) / 2.0 if mel_fmax is None else float(mel_fmax)
+    # ``htk=False`` matches ``librosa.filters.mel``'s default, which is the
+    # basis the mels being weighted were actually built with.
+    centres = librosa.mel_frequencies(
+        n_mels=int(num_mels) + 2, fmin=float(mel_fmin), fmax=top, htk=False
+    )[1:-1]
+
+    weights = np.ones(int(num_mels), dtype=np.float64)
+    if emphasis != 1.0:
+        end = float(cutoff_hz) * (2.0 ** float(taper_octaves))
+        # Cosine ramp in log frequency: octaves are the axis the ear and the
+        # mel scale both use, so a ramp that is linear in Hz would spend most
+        # of its length on the top half of the taper.
+        with np.errstate(divide="ignore"):
+            position = np.log2(np.maximum(centres, 1e-6) / float(cutoff_hz))
+        position = np.clip(position / max(float(taper_octaves), 1e-6), 0.0, 1.0)
+        fade = 0.5 * (1.0 + np.cos(np.pi * position))
+        weights = 1.0 + (float(emphasis) - 1.0) * fade
+        weights[centres <= float(cutoff_hz)] = float(emphasis)
+        weights[centres >= end] = 1.0
+
+    weights = weights / weights.mean()
+    return torch.from_numpy(weights.astype(np.float32))
+
+
+class BandWeightedSpectralLoss(nn.Module):
+    """A mel distance whose per-bin reduction is weighted, not uniform.
+
+    Wraps an unreduced elementwise distance so the weighting is orthogonal to
+    the choice of Huber/L1/L2 -- the two knobs answer different questions, and
+    entangling them would mean you cannot change the robustness of the distance
+    without also changing which frequencies it cares about.
+    """
+
+    def __init__(self, base: nn.Module, weights: Tensor, weight_factory=None):
+        super().__init__()
+        if getattr(base, "reduction", "none") != "none":
+            raise ValueError("BandWeightedSpectralLoss needs an unreduced base")
+        self.base = base
+        self.register_buffer("weights", weights.detach().reshape(1, -1, 1))
+        #: ``callable(num_mels) -> Tensor``, for callers that legitimately hand
+        #: this several bin counts.  Absent -- the default -- a mismatch stays a
+        #: hard error, because for a single-resolution mel it means the config
+        #: and the weights disagree, and silently reweighting the wrong bands is
+        #: worse than stopping.
+        self._weight_factory = weight_factory
+        self._cache: dict[int, Tensor] = {}
+
+    def _weights_for(self, bins: int, like: Tensor) -> Tensor:
+        if bins == self.weights.shape[-2]:
+            return self.weights.to(like.dtype)
+        if self._weight_factory is None:
+            raise ValueError(
+                f"Band weights cover {self.weights.shape[-2]} mel bins but the "
+                f"loss was handed {bins}."
+            )
+        cached = self._cache.get(bins)
+        if cached is None or cached.device != like.device:
+            cached = (
+                self._weight_factory(bins).detach().reshape(1, -1, 1).to(like.device)
+            )
+            self._cache[bins] = cached
+        return cached.to(like.dtype)
+
+    def forward(self, target: Tensor, prediction: Tensor) -> Tensor:
+        elementwise = self.base(target, prediction)
+        weights = self._weights_for(elementwise.shape[-2], elementwise)
+        return (elementwise * weights).mean()
+
+
 def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     """
     Compute the Kullback-Leibler divergence loss.
@@ -254,11 +363,26 @@ class MultiScaleSTFTLoss(nn.Module):
         fft_sizes: Tuple[int, ...] = (512, 1024, 2048),
         hop_sizes: Tuple[int, ...] = (128, 256, 512),
         win_sizes: Tuple[int, ...] = (512, 1024, 2048),
+        log_scale: float = 1000.0,
+        spectral_convergence: bool = False,
     ):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_sizes = hop_sizes
         self.win_sizes = win_sizes
+        #: Compression knee, matching ``wave_to_mel(for_loss=True)``.  See
+        #: :meth:`forward` for why the compression is ``log1p`` and not ``log``.
+        self.log_scale = float(log_scale)
+        #: Spectral convergence, off by default.  ``||X - X̂||_F / ||X||_F`` is
+        #: taken over the whole spectrogram, and a Frobenius norm is dominated
+        #: by the largest entries -- measured on this dataset the top 1% of bins
+        #: are above 7.1 while the median is 0.013, so the term is in practice a
+        #: "match the loudest bins" loss.  That is the low end, which the mel
+        #: term beside it already covers and already emphasises
+        #: (``chouwagan_mel_low_emphasis``).  The reason to reach for MS-STFT at
+        #: all is the *linear* frequency resolution it brings to the top of the
+        #: band; spending half the term on the bottom of it works against that.
+        self.spectral_convergence = bool(spectral_convergence)
 
     def _stft(self, x: torch.Tensor, fft_size: int, hop_size: int, win_size: int) -> torch.Tensor:
         """Compute STFT magnitude."""
@@ -280,8 +404,25 @@ class MultiScaleSTFTLoss(nn.Module):
         """
         Compute multi-scale STFT loss.
 
-        Per-sample spectral convergence with silence masking —
-        mute samples (||X||_F ≈ 0) are excluded since SC is undefined for zero-energy.
+        The compression is ``log1p(mag * log_scale)``, the same one
+        ``wave_to_mel(for_loss=True)`` uses, and not ``log(mag.clamp(1e-5))``.
+
+        That clamp is not a harmless guard against ``-inf`` here.  Measured over
+        24 slices of this dataset with a 2048-point window, **8.06% of bins fall
+        below 1e-5 and the 1st and 5th percentiles are exactly zero** -- real
+        digital silence, which these slices contain.  For those bins the target
+        pins to ``log(1e-5) = -11.51``, so a model emitting a plausible 1e-3
+        there scores an error of 4.6, against 0.23 for a genuinely audible 2 dB
+        error at the median magnitude of 0.013.  Worse, the gradient of
+        ``|log p - log t|`` is ``1/p``: 1000 at that silent bin against 77 at
+        the median one.  Eight percent of the spectrogram would carry an order
+        of magnitude more gradient than the audible content, all of it pushing
+        silence towards more silence -- which is not what limits quality.
+
+        ``log1p`` is logarithmic where the signal is (the two agree to three
+        decimals at audible levels) and turns linear below ``1 / log_scale``, so
+        a bin that should be zero is scored on how far from zero it is rather
+        than on the ratio between two numbers that are both inaudible.
 
         Args:
             pred: (B, T) predicted audio
@@ -294,23 +435,24 @@ class MultiScaleSTFTLoss(nn.Module):
             pred_mag = self._stft(pred, fft_size, hop_size, win_size)      # [B, F, T]
             target_mag = self._stft(target, fft_size, hop_size, win_size)  # [B, F, T]
 
-            # Per-sample Frobenius norms
-            flat_target = target_mag.reshape(target_mag.size(0), -1)           # [B, F*T]
-            flat_diff = (target_mag - pred_mag).reshape(target_mag.size(0), -1)
-            target_nrg = torch.norm(flat_target, p=2, dim=1)                # [B]
-            diff_nrg = torch.norm(flat_diff, p=2, dim=1)                    # [B]
+            if self.spectral_convergence:
+                # Per-sample Frobenius norms
+                flat_target = target_mag.reshape(target_mag.size(0), -1)        # [B, F*T]
+                flat_diff = (target_mag - pred_mag).reshape(target_mag.size(0), -1)
+                target_nrg = torch.norm(flat_target, p=2, dim=1)                # [B]
+                diff_nrg = torch.norm(flat_diff, p=2, dim=1)                    # [B]
 
-            # Mask out silent samples (SC is undefined for zero-energy)
-            mask = target_nrg > 1e-4
-            if mask.any():
-                sc_loss += (diff_nrg[mask] / target_nrg[mask]).mean()
+                # Mask out silent samples (SC is undefined for zero-energy)
+                mask = target_nrg > 1e-4
+                if mask.any():
+                    sc_loss += (diff_nrg[mask] / target_nrg[mask]).mean()
 
-            # Log magnitude loss — safe for all samples (clamp avoids -inf)
             mag_loss += F.l1_loss(
-                torch.log(pred_mag.clamp(min=1e-5)),
-                torch.log(target_mag.clamp(min=1e-5)),
+                torch.log1p(pred_mag * self.log_scale),
+                torch.log1p(target_mag * self.log_scale),
             )
 
-        sc_loss = sc_loss / len(self.fft_sizes) if sc_loss != 0.0 else 0.0
+        if self.spectral_convergence and sc_loss != 0.0:
+            sc_loss = sc_loss / len(self.fft_sizes)
         mag_loss = mag_loss / len(self.fft_sizes)
         return sc_loss + mag_loss

@@ -2,8 +2,6 @@
 
 <img src="assets/logo-shirorvc.png" alt="ShiroRVC" width="570" />
 
-# ShiroRVC
-
 **Turn one voice into another — speaking or singing.**
 
 Record yourself, convert it to a voice you have trained, and keep the melody,
@@ -44,17 +42,6 @@ writes nothing outside the folder you choose, so uninstalling is deleting that
 folder. Set aside about 14 GB of disk space.
 
 When it finishes, run `ShiroRVC.exe` from that folder.
-
-### Trying it without installing anything
-
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ShiromiyaG/ShiroRVC/blob/main/assets/ShiroRVC_Colab.ipynb)
-
-Runs in your browser on a free Google Colab GPU — useful if you do not have a
-graphics card, or just want to try it first. Set the runtime to **T4 GPU**, run
-the two cells, and open the link the second one prints.
-
-Nothing is kept between sessions: when the Colab session ends, anything you did
-not download is gone. For real training, install it properly.
 
 > Windows will likely warn you about an unrecognised app. That is because the
 > installer is not code-signed, which costs money we have not spent — not

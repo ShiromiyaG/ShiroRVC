@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
+import librosa
 import numpy as np
 import soundfile as sf
 
@@ -44,6 +45,14 @@ MATPLOTLIB_FLAG = False
 #: 1608px wide, which is the historical output.
 VALIDATION_PREVIEW_DPI = 67
 VALIDATION_PREVIEW_FIGSIZE = (24.0, 5.8)
+
+#: Candidate ticks for the frequency axis, in Hz.  A mel axis is close to
+#: logarithmic, so the evenly spaced ticks a linear axis wants would crowd the
+#: bottom octaves into a few pixels and label almost nothing where the voice
+#: actually lives.  Whatever falls outside the filterbank's range is dropped.
+VALIDATION_PREVIEW_FREQUENCY_TICKS = (
+    0.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+)
 
 debug_save_load = False
 
@@ -291,6 +300,31 @@ def _mel_to_numpy(mel):
     return mel
 
 
+def _mel_axis_positions(frequencies, mel_bins, mel_fmin, mel_fmax):
+    """Where ``frequencies`` land on a mel filterbank's bin-index axis.
+
+    The filterbank's ``mel_bins + 2`` band edges are evenly spaced *in mel*, so
+    a frequency's position in bin-index space is linear in ``hz_to_mel``.  Bin 0
+    is centred on edge 1 and the last bin on edge ``mel_bins``, which is where
+    the ``mel_bins + 1`` scaling and the -1 offset come from.
+
+    ``htk=False`` is not a preference: it is librosa's default, and so it is
+    what ``librosa.filters.mel`` used to build the basis in ``mel_processing``.
+    Reading the axis off a different mel scale than the data was binned with
+    would swap one wrong answer for another.
+    """
+    low = librosa.hz_to_mel(float(mel_fmin), htk=False)
+    high = librosa.hz_to_mel(float(mel_fmax), htk=False)
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        raise ValueError("The mel axis needs a positive frequency range.")
+    mels = librosa.hz_to_mel(np.asarray(frequencies, dtype=float), htk=False)
+    return (mels - low) / (high - low) * (mel_bins + 1) - 1.0
+
+
+def _format_frequency(frequency):
+    return f"{frequency:g}" if frequency < 1000.0 else f"{frequency / 1000:g}k"
+
+
 def plot_validation_preview_to_figure(
     predicted_mel,
     target_mel,
@@ -299,13 +333,17 @@ def plot_validation_preview_to_figure(
     sample_index=0,
     sample_rate=22050,
     hop_length=256,
+    mel_fmin=0.0,
+    mel_fmax=None,
     dpi=None,
     figsize=None,
 ):
     """Create a dark TensorBoard-style three-panel validation report.
 
     ``hop_length`` sets the time axis and must match the config the mels were
-    produced with -- the default is a fallback, not a good guess.
+    produced with -- the default is a fallback, not a good guess.  The same goes
+    for ``mel_fmin`` / ``mel_fmax``, which set the frequency axis; ``mel_fmax``
+    of ``None`` means Nyquist, matching the mel extraction.
     """
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
@@ -339,7 +377,25 @@ def plot_validation_preview_to_figure(
     # The mel filterbank spans DC to Nyquist, not DC to the sample rate. Using
     # the sample rate as the extent labelled every frequency tick at twice its
     # true value.
-    top_frequency = float(sample_rate) / 2.0
+    top_frequency = float(sample_rate) / 2.0 if mel_fmax is None else float(mel_fmax)
+    # The vertical axis is bin index, and mel bins are not evenly spaced in Hz.
+    # Stretching them onto a linear 0..Nyquist ruler -- which is what an extent
+    # of ``(0, top_frequency)`` does -- put every label except the two endpoints
+    # in the wrong place, and not by a little: at 128 bins over 44.1 kHz the
+    # tick reading "5.5k" sits on bin 32, whose real centre is 1.02 kHz. A
+    # deficit under 1 kHz reads as a defect at 4 kHz, which is a diagnosis this
+    # axis has no business making. Keep the image in bin space and move the
+    # ticks instead, so what the eye measures is the filterbank's own spacing.
+    tick_positions = _mel_axis_positions(
+        VALIDATION_PREVIEW_FREQUENCY_TICKS, mel_bins, mel_fmin, top_frequency
+    )
+    visible = (tick_positions >= -0.5) & (tick_positions <= mel_bins - 0.5)
+    tick_positions = tick_positions[visible]
+    tick_labels = [
+        _format_frequency(frequency)
+        for frequency, keep in zip(VALIDATION_PREVIEW_FREQUENCY_TICKS, visible)
+        if keep
+    ]
     figure, axes = plt.subplots(
         1,
         3,
@@ -378,19 +434,15 @@ def plot_validation_preview_to_figure(
             cmap=cmap,
             vmin=vmin,
             vmax=vmax,
-            extent=(time_axis[0], time_axis[-1], 0, top_frequency),
+            # Half a bin past the first and last centres, so a data coordinate
+            # of ``i`` lands exactly on the centre of bin ``i``.
+            extent=(time_axis[0], time_axis[-1], -0.5, mel_bins - 0.5),
         )
         axis.set_title(title, color="#f4f4f4", fontsize=17, fontweight="bold", pad=12)
         axis.set_xlabel(TENSORBOARD_VALIDATION_AXIS_X, color="#f4f4f4", fontsize=11)
         axis.set_ylabel(TENSORBOARD_VALIDATION_AXIS_Y, color="#f4f4f4", fontsize=11)
-        frequency_ticks = np.linspace(0.0, top_frequency, 5)
-        axis.set_yticks(frequency_ticks)
-        axis.set_yticklabels(
-            [
-                f"{frequency / 1000:g}k" if frequency else "0"
-                for frequency in frequency_ticks
-            ]
-        )
+        axis.set_yticks(tick_positions)
+        axis.set_yticklabels(tick_labels)
         axis.tick_params(colors="#f4f4f4", labelsize=9)
         for spine in axis.spines.values():
             spine.set_color("#c9cdd3")
@@ -441,6 +493,8 @@ def log_validation_preview(
     target_wave=None,
     source=None,
     hop_length=256,
+    mel_fmin=0.0,
+    mel_fmax=None,
     dpi=None,
     figsize=None,
 ):
@@ -463,6 +517,8 @@ def log_validation_preview(
         sample_index=sample_index,
         sample_rate=sample_rate,
         hop_length=hop_length,
+        mel_fmin=mel_fmin,
+        mel_fmax=mel_fmax,
         dpi=dpi,
         figsize=figsize,
     )
@@ -810,6 +866,14 @@ def old_session_cleanup(now_dir, model_name):
     info("Cleanup done.", tag="[INIT]")
 
 
+#: Schedulers whose decay is defined by an endpoint when ``lr_final_ratio`` is
+#: set, which makes ``lr_decay``/``exp_decay_gamma`` dead config for them.  Kept
+#: next to the panel because the panel is the only place that has to know.
+_ENDPOINT_SCHEDULERS = frozenset(
+    {"exp decay epoch", "exp decay step", "cosine annealing", "cosine annealing epoch"}
+)
+
+
 def print_init_setup(
     warmup_duration,
     rank,
@@ -820,6 +884,7 @@ def print_init_setup(
     lr_scheduler,
     exp_decay_gamma,
     spectral_loss,
+    lr_final_ratio=None,
 ):
     if rank != 0:
         return
@@ -848,6 +913,14 @@ def print_init_setup(
     def scheduler_value(name, gamma):
         if name == "none":
             return "Disabled"
+        # ``lr_final_ratio`` decides the decay by its endpoint and supersedes
+        # the per-step/per-epoch gamma entirely, so printing the gamma there
+        # advertises a number that has no effect -- and invites tuning it.  Show
+        # the endpoint that is actually in force instead; the gamma comes back
+        # the moment there is no ratio to override it.
+        if lr_final_ratio is not None and name in _ENDPOINT_SCHEDULERS:
+            shown = "cosine annealing" if name.startswith("cosine annealing") else name
+            return f"{shown}, to {lr_final_ratio:g}x over the run"
         if name in ("cosine annealing", "cosine annealing epoch"):
             return "cosine annealing"
         return f"{name}, gamma: {gamma}"

@@ -178,6 +178,18 @@ class AntiAliasedSnakeBeta(nn.Module):
 # Seed for the reproducible excitation noise used when ``deterministic`` is set.
 DETERMINISTIC_NOISE_SEED = 0
 
+# Same idea for the harmonic phase offsets.  Training draws a fresh offset per
+# harmonic on every batch, so the decoder only ever sees excitations from that
+# random-phase distribution and must be phase-agnostic.  ``deterministic``
+# inference used to leave the offsets at zero instead, which is not a draw from
+# that distribution -- it is its extreme: aligning every harmonic maximises the
+# crest factor.  Measured at f0=200 Hz against 200 random draws, the aligned
+# excitation is 1.31x peakier than a training one at 16 harmonics and 1.57x at
+# 32, so the gap widens with every harmonic added.  Drawing a fixed-seed offset
+# keeps inference reproducible while keeping it in distribution, exactly as
+# DETERMINISTIC_NOISE_SEED does for the noise term.
+DETERMINISTIC_PHASE_SEED = 1
+
 # Half-width of the voiced/unvoiced amplitude crossfade.  Measured on a 180 Hz
 # burst, this drops the waveform discontinuity at the boundary from 0.140 to
 # 0.006; anything longer buys nothing and only smears the transition.
@@ -264,10 +276,25 @@ class BandLimitedNSFSource(nn.Module):
             device=f0.device,
             dtype=f0.dtype,
         )
-        if self.training and self.harmonic_count > 1:
-            phase_offset[..., 1:] = (
-                torch.rand_like(phase_offset[..., 1:]) * (2.0 * math.pi)
-            )
+        if self.harmonic_count > 1:
+            if self.training or not self.deterministic:
+                phase_offset[..., 1:] = (
+                    torch.rand_like(phase_offset[..., 1:]) * (2.0 * math.pi)
+                )
+            else:
+                # See DETERMINISTIC_PHASE_SEED: leaving these at zero hands the
+                # decoder the one excitation shape it never trained on.
+                generator = torch.Generator(device=f0.device)
+                generator.manual_seed(DETERMINISTIC_PHASE_SEED)
+                phase_offset[..., 1:] = (
+                    torch.rand(
+                        phase_offset[..., 1:].shape,
+                        generator=generator,
+                        device=f0.device,
+                        dtype=f0.dtype,
+                    )
+                    * (2.0 * math.pi)
+                )
         harmonic_wave = torch.sin(
             phase.unsqueeze(-1) * harmonics.view(1, 1, -1) + phase_offset
         )
@@ -322,9 +349,19 @@ class BandLimitedNSFSource(nn.Module):
             dtype=f0.dtype,
         )
         harmonic_frequency = f0.unsqueeze(-1) * harmonics.view(1, 1, -1)
+        # The centre sits at 0.45 rather than 0.48 of the sample rate.  This is
+        # a soft mask on purpose -- a hard cutoff makes a harmonic blink on and
+        # off as vibrato walks it across the threshold -- but soft means it
+        # leaks, and at 0.48 the leak was 27% *at Nyquist itself*.  Anything
+        # past Nyquist aliases back into the top of the band, so with 48
+        # harmonics an f0 above 459 Hz (routine in singing) put inharmonic tones
+        # at -29 to -31 dB into 20-21.7 kHz.  Inaudible, but the MS-STFT term
+        # and the discriminator both see it and the decoder has to learn to
+        # cancel it.  At 0.45 the leak at Nyquist is 7.6%, the transition stays
+        # 882 Hz wide, and all that is given up is 19.8-22 kHz.
         transition = max(1.0, float(sample_rate) * 0.02)
         nyquist_mask = torch.sigmoid(
-            (float(sample_rate) * 0.48 - harmonic_frequency) / transition
+            (float(sample_rate) * 0.45 - harmonic_frequency) / transition
         )
         amplitude = harmonics.rsqrt().view(1, 1, -1)
         harmonic_wave = (harmonic_wave * amplitude * nyquist_mask).sum(dim=-1)
@@ -573,7 +610,7 @@ class ChouwaGANGenerator(nn.Module):
         chouwagan_hierarchical: bool = False,
         chouwagan_content_channels: int = 128,
         chouwagan_detail_channels: int = 64,
-        chouwagan_detail_gate_init: float = -1.5,
+        chouwagan_detail_gate_init: float = 0.0,
         chouwagan_late_detail_fusion: bool = False,
         chouwagan_excitation_unet: bool = False,
         chouwagan_excitation_kernel: int = 7,
@@ -661,6 +698,15 @@ class ChouwaGANGenerator(nn.Module):
                     self.fast_detail_stage_projections.append(
                         weight_norm(nn.Conv1d(self.detail_channels, channels, 1))
                     )
+                # Init at 0.0 (sigmoid 0.5), not negative.  A gate that starts
+                # mostly shut does not reliably open: measured on the 44.1 kHz
+                # pretrain at 65k steps from an init of -1.5, the input gates
+                # had moved 0.18 -> 0.21 and the stage gates had drifted *down*
+                # to 0.15-0.21.  That is a lock-in, not a slow start -- little
+                # gradient reaches the detail latent, so its dimensions park on
+                # the free-bits floor, so ablating one changes nothing, so the
+                # decoder never learns to open the gate.  Half-open costs a
+                # noisier early decoder and lets the loop close the other way.
                 self.slow_detail_input_gate = nn.Parameter(
                     torch.tensor(float(chouwagan_detail_gate_init))
                 )

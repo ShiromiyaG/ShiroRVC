@@ -789,15 +789,6 @@ def train_tab():
                         key='optimizer_choice'
                     )
                 with gr.Column(min_width=0):
-                    spectral_loss = gr.Radio(
-                        label=_("Spectral loss"),
-                        info=_(SPECTRAL_LOSS_INFO),
-                        choices=["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"],
-                        value="L1 Mel Loss",
-                        interactive=True,
-                        key='spectral_loss'
-                    )
-                with gr.Column(min_width=0):
                     lr_scheduler = gr.Radio(
                         label=_("LR scheduler (G/D)"),
                         info=_(LR_SCHEDULER_INFO),
@@ -1070,7 +1061,6 @@ def train_tab():
                     use_checkpointing,
                     use_tf32,
                     use_benchmark,
-                    spectral_loss,
                     lr_scheduler,
                     use_custom_lr,
                     custom_lr_g,
@@ -1201,7 +1191,7 @@ def train_tab():
                 save_only_latest_net_models, save_weight_models, pretrained,
                 cleanup, use_checkpointing, compile_vocoder, torch_compile_mode,
                 use_tf32, use_benchmark,
-                optimizer_choice, spectral_loss, lr_scheduler,
+                optimizer_choice, lr_scheduler,
                 custom_pretrained, g_pretrained_path,
                 d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
                 warmup_duration, use_custom_lr, custom_lr_g,

@@ -1001,9 +1001,6 @@ msgstr "Manter apenas o G/D mais recente"
 msgid "Keep only the latest generator and discriminator checkpoints."
 msgstr "Mantém apenas os checkpoints mais recentes do gerador e do discriminador."
 
-msgid "L1 Mel is the safe default. Multi-Scale and Hybrid are alternatives."
-msgstr "L1 Mel é o padrão seguro. Multi-Scale e Híbrido são alternativas."
-
 msgid "LR scheduler"
 msgstr "Agendador de LR"
 
@@ -1685,9 +1682,6 @@ msgid ""
 msgstr ""
 "Informe uma seed para a inferência ou deixe em '0' para saídas aleatórias. ( Comportamento clássico do RVC. ) \n"
 " **Não deixe este campo vazio.**"
-
-msgid "Spectral loss"
-msgstr "Perda espectral"
 
 msgid "Spectrum and level report for one file."
 msgstr "Relatório de espectro e nível de um arquivo."

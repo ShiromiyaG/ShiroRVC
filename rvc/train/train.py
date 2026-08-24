@@ -90,6 +90,8 @@ from losses import (
     envelope_loss,
     local_log_rms_loss,
     peak_headroom_loss,
+    mel_low_frequency_weights,
+    BandWeightedSpectralLoss,
     MultiScaleSTFTLoss,
 )
 
@@ -140,7 +142,6 @@ optimizer_choice_g = optimizer_choice_d = spec.optimizer_choice
 use_checkpointing = spec.use_checkpointing
 use_tf32 = spec.use_tf32
 use_benchmark = spec.use_benchmark
-spectral_loss = spec.spectral_loss
 lr_scheduler = spec.lr_scheduler
 
 use_custom_lr = spec.use_custom_lr
@@ -181,6 +182,13 @@ config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
 # names -- changing it starts a fresh set of series.  Both are read with a
 # fallback so a config written before this change still loads.
 exp_decay_gamma = float(getattr(config.train, "lr_decay", 0.999875))
+# Which reconstruction term the run uses.  This belongs to the vocoder, not to
+# the run: a 128-band mel cannot resolve a harmonic comb above ~2 kHz (at 8 kHz
+# a bin spans four harmonics at f0=120), so ChouwaGAN needs the linear-frequency
+# MS-STFT term beside it and ships "Hybrid L1", while HiFi-GAN ships the plain
+# mel it was designed around.  Leaving it on the UI meant every run re-answered
+# a question the vocoder had already answered, and answered it wrong by default.
+spectral_loss = str(getattr(config.train, "spectral_loss", "L1 Mel Loss"))
 # Horizon-derived decay, and the preferred way to set one.
 #
 # ``lr_decay`` is a per-epoch gamma, so the decay a run actually receives is a
@@ -256,6 +264,13 @@ enable_persistent_workers = True
 pretrain_preview = True
 pretrain_preview_interval = 500  # Measured in steps.
 finetune_preview_interval = 100  # Measured in steps.
+
+# How often the per-loss `Grad_Source/*` probes fire, in steps.  Each firing
+# costs 8 extra `autograd.grad` calls, 4 of which are full decoder backwards,
+# so this is the most expensive diagnostic in the loop by a wide margin.  The
+# series it feeds moves on the scale of tens of thousands of steps, so a
+# coarser interval loses nothing and hands the time back to training.
+grad_source_probe_interval = 200
 
 force_from_scratch = False
 strict_load = True
@@ -513,7 +528,7 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
             "chouwagan_architecture_id": CHOUWAGAN_ARCHITECTURE_ID,
             "chouwagan_content_channels": 128,
             "chouwagan_detail_channels": 64,
-            "chouwagan_detail_gate_init": -1.5,
+            "chouwagan_detail_gate_init": 0.0,
             "chouwagan_late_detail_fusion": True,
             "chouwagan_posterior_channels": 160,
             "chouwagan_prior_hidden_channels": 128,
@@ -527,24 +542,36 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
             "chouwagan_svae_prior_kernel_size": 31,
             "chouwagan_svae_posterior_blocks": 4,
             "chouwagan_svae_posterior_slow_blocks": 2,
-            # Two thirds of the 0.15 rate target.  The floor only protects
-            # dimensions below it, so at the old 0.05 -- one third of target --
-            # every dimension between 0.05 and 0.15 was still being pushed at
-            # the prior, and two thirds of the fast branch sat in that band.
-            # Raising it does not raise the total rate: the controller pins the
-            # per-dim mean at the target either way, so this redistributes the
-            # same budget instead of adding to it.
-            "chouwagan_svae_free_bits_slow": 0.10,
-            "chouwagan_svae_free_bits_fast": 0.10,
+            # A fraction of the 0.15 rate target, not most of it.  These were
+            # briefly 0.10 -- 63% of the budget -- on the reasoning that a
+            # higher floor stops dimensions between the floor and the target
+            # from being pushed at the prior.  It does, and it is the wrong
+            # trade: the controller pins the per-dim *mean* at the target, so
+            # raising the floor does not add rate, it only decides how much of
+            # the fixed budget is spent before allocation starts.  At 0.10 only
+            # 0.05 nats/dim were allocatable and latent collapse became the
+            # optimum -- measured at step 75.6k, 62 of 64 fast dims parked
+            # exactly at the floor while two carried everything, and
+            # ``kl_effective_dims_fast`` fell from 51.7 to 17.6.  The rate
+            # controller cannot see that: the mean reads as satisfied either
+            # way.  Do not "fix" a collapse by raising these.
+            "chouwagan_svae_free_bits_slow": 0.05,
+            "chouwagan_svae_free_bits_fast": 0.03,
             "chouwagan_svae_kl_scale_anchor": 1.0,
             "chouwagan_svae_feature_scale_anchor": 1.0,
             # The decoder only learns to make good audio from prior latents on
             # the replaced fraction of the batch, and inference is 100% prior.
             # At 0.25 that gap stays wide in low-level material, where ContentVec
             # and an unvoiced f0 give the prior almost nothing to predict from.
-            "chouwagan_prior_replacement_max": 0.5,
-            "chouwagan_prior_replacement_start": 8000,
-            "chouwagan_prior_replacement_ramp": 20000,
+            #
+            # The start and ramp are early on purpose.  The reconstruction
+            # gradient is the only pressure that makes the prior *informative*
+            # rather than merely cheap to match, and at the old 8000/20000 it
+            # arrived around step 28k -- after the window in which the latent
+            # collapses had already closed.
+            "chouwagan_prior_replacement_max": 0.7,
+            "chouwagan_prior_replacement_start": 2000,
+            "chouwagan_prior_replacement_ramp": 12000,
             "chouwagan_prior_uses_logs": True,
             "chouwagan_excitation_unet": True,
             "chouwagan_excitation_kernel": 7,
@@ -646,7 +673,40 @@ def _chouwagan_ablation_margin(
     dimension,
     margin,
 ):
-    """Measure one FSQ dimension and return a safe usefulness margin loss."""
+    """Measure one latent dimension: is the decoder actually using it?
+
+    Returns ``(loss, delta, ablated_error)``.  ``delta`` is the measurement and
+    is the reason to call this at all: mel L1 with the dimension zeroed minus
+    mel L1 with it intact, so positive means zeroing the dimension hurt, i.e.
+    it was load-bearing.  It is the only signal here that distinguishes a dead
+    dimension from one the prior simply predicts well -- per-dimension KL
+    cannot, because KL measures ``posterior || prior`` with both learned, and a
+    low value means "the prior predicts it" at least as often as it means
+    "nothing is there".  Measured over this pretrain the rank correlation
+    between the two is 0.24.
+
+    ``loss`` is kept for callers that still want it, but it should be weighted
+    at zero, and the reasons are worth stating so it does not get switched back
+    on by intuition:
+
+    * It has no gradient toward its stated purpose.  ``ablated_error`` is
+      detached -- and computed under ``no_grad`` besides -- so the only
+      derivative is ``d/d full_error = 1``.  The term therefore adds *generic
+      reconstruction pressure*, scaled by how useless the probed dimension was.
+      It cannot make that dimension carry information, which is the thing it is
+      named for.  The detach is not the bug: without it the cheapest way to
+      raise ``ablated_error`` is to inflate the dimension's output scale, which
+      makes ablation more destructive without making it more informative.
+    * Even with a correct gradient it would be too dilute to matter.  One
+      dimension is drawn uniformly per interval out of 96, so a given dimension
+      is touched about once every ``96 * interval`` steps -- roughly 35 times
+      across an entire 434k-step run at an interval of 128.  That is ample for
+      a histogram and nowhere near enough to shape a parameter.
+
+    The dilution argument is what makes this a diagnostic rather than a loss: a
+    measurement only has to be dense enough to average, while a gradient has to
+    be dense enough to steer.
+    """
     with torch.no_grad():
         ablated_detail, slow_detail, fast_detail = discrete_model.ablate_dimension(
             discrete_parts,
@@ -719,10 +779,24 @@ def _add_decoder_only_gradients(loss, net_g):
         retain_graph=False,
         allow_unused=True,
     )
+    # Accumulate with one multi-tensor kernel rather than one per parameter.
+    # The decoder has 332 of them, and the old `parameter.grad + gradient` was
+    # also out-of-place, so it allocated 332 tensors it immediately dropped:
+    # measured 5.15 ms per step against 0.30 ms here, bitwise identical, on a
+    # ~270 ms step.  This is the same in-place accumulation the autograd engine
+    # itself does, so it is safe on grads that `backward()` just populated.
+    existing_grads = []
+    incoming_grads = []
     for parameter, gradient in zip(decoder_parameters, decoder_gradients):
         if gradient is None:
             continue
-        parameter.grad = gradient if parameter.grad is None else parameter.grad + gradient
+        if parameter.grad is None:
+            parameter.grad = gradient
+        else:
+            existing_grads.append(parameter.grad)
+            incoming_grads.append(gradient)
+    if existing_grads:
+        torch._foreach_add_(existing_grads, incoming_grads)
 
 
 def _normalize_san_weights(net_d):
@@ -838,7 +912,75 @@ PRIOR_WARMUP_STEPS_DEFAULT = 10000
 #: at 0.11, well above the 0.08 collapse floor.  4.5x that is the allowance
 #: here: generous enough that the normal case never trips the ramp, far short of
 #: the runaway the ramp exists to catch.
-HEALTHY_DISC_DRIFT_PER_10K = 0.01
+#:
+#: Re-measured 2026-08-22 and raised from 0.01.  A later 44.1 kHz pretrain drifts
+#: at 0.0095 per 10k -- 4.3x the run this was calibrated against, and *healthy*:
+#: headroom held at 0.19, 2.4x the collapse floor, with the holdout still setting
+#: records.  Sitting a threshold on top of the normal case lets noise decide, and
+#: it did: ``ceiling_holding`` averaged 0.36 after ``ramp_start`` and the ceiling
+#: went backwards from 1.380 to 1.170 while the balance rule asked for 2.49.  The
+#: allowance is now 3x the measured healthy drift rather than 1.05x it.
+HEALTHY_DISC_DRIFT_PER_10K = 0.03
+
+
+def planned_step_count(total_epoch_count: int, train_loader, max_steps: int = 0) -> int:
+    """How many optimizer steps this run will actually take.
+
+    Every schedule below this line is denominated in steps, and a step count
+    only means something against the length of the run it is scheduling.  A
+    pretrain runs for hundreds of thousands of steps, so a 10k warmup is the
+    first 2% of it.  A fine-tune on one speaker's dataset is 8k steps or fewer,
+    where that same literal is the whole run: the warmup never reaches full
+    weight, the ramp never reaches its ceiling, and the holdout is scored too
+    few times for the patience to be reachable.  The values are not wrong, they
+    are stated in absolute units against a run length that varies by two orders
+    of magnitude.
+
+    Returns 0 when the budget cannot be known, which every caller treats as
+    "leave the configured value alone".
+    """
+    per_epoch = max(1, len(train_loader))
+    planned = max(0, int(total_epoch_count)) * per_epoch
+    limit = max(0, int(max_steps))
+    if limit:
+        planned = min(planned, limit) if planned else limit
+    return planned
+
+
+def fit_schedule(configured: int, planned_steps: int, fraction: float, minimum: int = 1) -> int:
+    """Shrink a step-denominated schedule to fit inside the run.
+
+    Only ever shrinks.  On a run long enough for the configured value the
+    configured value comes back untouched, so pretraining is bit-for-bit
+    unaffected and this cannot quietly re-tune a recipe that already works.
+    ``fraction`` is the share of the run the schedule is allowed to occupy.
+    """
+    configured = max(0, int(configured))
+    if planned_steps <= 0 or configured <= 0:
+        return configured
+    return max(minimum, min(configured, int(planned_steps * fraction)))
+
+
+def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int:
+    """An evaluation interval that lets ``patience`` actually be reached.
+
+    The overtrain detector stops on ``patience`` consecutive evaluations
+    without a new best, so the interval and the run length together decide
+    whether it can fire at all.  At one evaluation per 2000 steps an 8k
+    fine-tune gets four of them against a patience of eight: the detector is
+    not strict there, it is *inert*, and a fine-tune is exactly where
+    overtraining is most likely because the dataset is smallest.
+
+    Sizing for ~3x patience is what makes it a detector again: enough
+    evaluations that the counter can run out with training still left to
+    discard, rather than arriving at the last step to report that the run is
+    over.  Only ever shrinks, for the same reason as :func:`fit_schedule`.
+    """
+    configured = max(1, int(configured))
+    if planned_steps <= 0:
+        return configured
+    wanted = planned_steps // max(1, 3 * max(1, int(patience)))
+    return max(1, min(configured, wanted)) if wanted else configured
 
 
 def _constant_discriminator_loss(san_direction_weight: float, san_active: bool) -> float:
@@ -924,12 +1066,23 @@ class _AdversarialCeilingGovernor:
         slow_momentum: float = 1e-4,
         tolerance: float | None = None,
         headroom_floor: float = 0.08,
+        collapse_ceiling: float = 0.01,
     ):
         self.start_step = max(0, int(start_step))
         self.ramp_steps = max(0, int(ramp_steps))
         self.ceiling_start = float(ceiling_start)
         self.ceiling_end = float(ceiling_end)
         self.floor_loss = float(floor_loss)
+        # Where the ceiling goes when the discriminator has actually collapsed.
+        # ``ceiling_start`` used to be the hard bottom, which left the one case
+        # the backstop exists for only half-answered: against a discriminator
+        # emitting one constant for real and fake, the balance rule asks for a
+        # huge weight, the request saturates the ceiling, and the ceiling could
+        # not retreat below 1.0 -- so full adversarial pressure stayed applied
+        # to a dead discriminator for the rest of the run.  Retreating to the
+        # configured ``adaptive_adv_min`` lets the generator fall back on
+        # reconstruction until the discriminator recovers.
+        self.collapse_ceiling = min(float(collapse_ceiling), float(ceiling_start))
         self.fast_momentum = float(fast_momentum)
         self.slow_momentum = float(slow_momentum)
         # Derived, not chosen.  Two EMAs following a linear drift of ``r`` per
@@ -962,29 +1115,117 @@ class _AdversarialCeilingGovernor:
         # Long enough for the EMAs to mean something, short enough that a
         # finetune's own ramp is not spent entirely inside it.
         self.warmup_steps = min(2000, max(200, self.ramp_steps // 8))
+        # Negative progress is the retreat below ``ceiling_start``.  Sized so a
+        # sustained collapse (-4 per step) reaches ``collapse_ceiling`` in about
+        # 2500 steps: fast enough to matter, slow enough that a brief dip does
+        # not throw away the ramp.
+        self.retreat_span = max(1.0, self.ramp_steps / 8.0)
         self.progress = 0.0
         self.fast: float | None = None
         self.slow: float | None = None
         self.best_headroom = 0.0
         self.holding = False
+        self.seeded = False
+        #: Steps *this governor* has observed, which is not ``global_step`` once
+        #: a run resumes.  Every guard below counts in these.
+        self.observations = 0
+
+    def _seed(self, step: int) -> None:
+        """Put the ramp where the *run* is, not where this process is.
+
+        ``progress`` is a counter that advances at most +1 per step, and it is
+        built fresh on every process start.  The class docstring says the
+        pretraining ramp follows ``global_step`` "so resuming picks the ramp up
+        where it left off", but nothing implemented that: resuming reset the
+        counter to zero, dropped the ceiling back to ``ceiling_start`` and made
+        the run re-earn a ramp it had already earned.  On the 44.1 kHz pretrain
+        that meant a resume at step 168k would spend ~3.5k steps under *less*
+        adversarial pressure than the step before it, and 64k steps getting
+        back.
+
+        Seeding assumes the skipped steps were healthy, which is the optimistic
+        reading -- holds and retreats in the original run are forgotten.  That
+        is the right way to be wrong here.  A hold only pauses the ramp, so the
+        worst case is a ceiling as high as an unheld run would have had; and if
+        the discriminator really is in trouble, the EMAs are seeded from the
+        first ``loss_disc`` of the resumed run, so the headroom backstop sees a
+        true headroom and starts retreating on this very same call.  Starting
+        from zero, by contrast, is wrong in every case including the healthy
+        one.
+        """
+        self.seeded = True
+        if self.ramp_steps > 0 and step > self.start_step:
+            self.progress = min(float(self.ramp_steps), float(step - self.start_step))
 
     def update(self, step: int, loss_disc: float | None) -> float:
         if loss_disc is not None and math.isfinite(loss_disc):
+            self.observations += 1
             if self.fast is None:
                 self.fast = self.slow = float(loss_disc)
+            elif self.observations <= self.warmup_steps:
+                # Running mean, not the EMA, until there are enough samples for
+                # the EMA to mean anything.
+                #
+                # The slow EMA has a time constant of 1/slow_momentum = 10k
+                # steps, so whatever the *first* batch happens to produce
+                # dominates ``slow`` for tens of thousands of steps after it is
+                # seeded.  On a resume that is a live hazard rather than a
+                # cosmetic one: the first batch of a resumed run reads high,
+                # ``headroom`` therefore reads far below its true value, and the
+                # collapse backstop rewinds a ramp that nothing was wrong with.
+                # Measured on the 44.1 kHz pretrain at the 187013 resume --
+                # ``ceiling_holding`` pinned at 1.0 for every step, the ceiling
+                # walking 3.0 -> 2.82 on the -4/step retreat, while ``loss_disc``
+                # of 2.2604 put the true headroom at 0.1117, well clear of the
+                # 0.08 floor.
+                #
+                # A running mean has no memory of the seed to shake off: after k
+                # samples it *is* the mean of those k.  It hands over to the EMA
+                # at the end of warmup with an estimate worth acting on.
+                self.fast += (loss_disc - self.fast) / self.observations
+                self.slow += (loss_disc - self.slow) / self.observations
             else:
                 self.fast += self.fast_momentum * (loss_disc - self.fast)
                 self.slow += self.slow_momentum * (loss_disc - self.slow)
-            if step >= self.warmup_steps:
+            if self.observations >= self.warmup_steps:
                 self.best_headroom = max(self.best_headroom, self.headroom)
+        if not self.seeded:
+            # After the EMAs above, so the backstop is armed with a real
+            # headroom before the seeded progress can be acted on.  A fresh
+            # pretrain seeds at step 0 against ``start_step`` and a fresh
+            # fine-tune seeds at ``phase_step`` 0, so both are no-ops.
+            self._seed(step)
         if self.ramp_steps > 0 and step > self.start_step:
             self.progress = min(
-                float(self.ramp_steps), max(0.0, self.progress + self._increment(step))
+                float(self.ramp_steps),
+                max(-self.retreat_span, self.progress + self._increment(step)),
             )
         return self.ceiling
 
     def _increment(self, step: int) -> float:
-        if self.fast is None or self.slow is None or step < self.warmup_steps:
+        """+1 advance, 0 pause, -4 retreat.
+
+        The middle value is the fix for a measured stall.  A rising ``loss_disc``
+        has two causes that this trend check cannot tell apart: the generator
+        improving, which is the GAN working, and the generator running away,
+        which is what the ramp exists to catch.  Penalising both at -1 makes the
+        healthy case *cost* ramp progress, and since the counter only gains +1
+        the net rate is ``1 - 2h``: a discriminator merely holding a third of the
+        time cancels two thirds of the ramp.  Measured on the 44.1 kHz pretrain
+        with h = 0.36, the ceiling reached 1.184 of a configured 3.0 after 55.6k
+        steps and was *falling* while the balance rule asked for 2.49.
+
+        Pausing instead of rewinding makes the trend gate what it is described
+        as -- an early warning that stops the ramp -- rather than a mechanism
+        that actively unwinds progress on healthy behaviour.  Retreat is left to
+        the headroom backstop, which fires on the operational definition of a
+        dead discriminator rather than on the sign of a noisy derivative.
+        """
+        # Counted in observations, not in ``step``.  ``step`` is ``global_step``
+        # during pretraining, so on a resume it is already far past any warmup
+        # while these EMAs have seen a single batch -- which is exactly when
+        # their verdict is worthless and the guard is needed most.
+        if self.fast is None or self.slow is None or self.observations < self.warmup_steps:
             self.holding = False
             return 1.0
         if self.headroom < self.headroom_floor:
@@ -992,7 +1233,7 @@ class _AdversarialCeilingGovernor:
             return -4.0
         if self.fast - self.slow > self.tolerance:
             self.holding = True
-            return -1.0
+            return 0.0
         self.holding = False
         return 1.0
 
@@ -1005,6 +1246,12 @@ class _AdversarialCeilingGovernor:
     def ceiling(self) -> float:
         if self.ramp_steps <= 0:
             return self.ceiling_end
+        if self.progress < 0.0:
+            # Retreat below the starting ceiling.  Linear rather than cosine:
+            # this branch is an emergency, and easing it would spend the first
+            # few hundred steps of a collapse barely moving.
+            retreat = min(1.0, -self.progress / self.retreat_span)
+            return self.ceiling_start + (self.collapse_ceiling - self.ceiling_start) * retreat
         progress = min(1.0, self.progress / self.ramp_steps)
         eased = 0.5 * (1.0 - math.cos(math.pi * progress))
         return self.ceiling_start + (self.ceiling_end - self.ceiling_start) * eased
@@ -1103,6 +1350,23 @@ class _OvertrainMonitor:
     evaluations rather than steps so it does not silently change meaning when
     the interval does, and ``min_delta`` is relative so it means the same thing
     at any loss scale.
+
+    There are two questions here and they want opposite thresholds, which is
+    why they are tracked separately:
+
+    * *Which weights do we keep?*  The lowest held-out loss, full stop.  A
+      threshold here throws away a real improvement for being small.  It did:
+      the 44.1 kHz pretrain's true minimum was 0.70210 at step 166k, but a
+      single ``min_delta`` gate had frozen ``best`` at 0.70250 from step 140k
+      because the improvement was 0.06% against a required 0.1%, and
+      :func:`_deliverable_weights` hands out ``state_dict`` in preference to
+      everything else -- so the run would have exported weights it had itself
+      measured as worse.
+    * *Has the run stopped improving?*  Here a threshold is the whole point.
+      Without one, noise resets the counter forever and the detector never
+      fires; the counter has to ignore improvements too small to be real.
+
+    Using one number for both means picking which of the two to get wrong.
     """
 
     def __init__(self, patience: int = 8, min_delta: float = 0.001):
@@ -1111,27 +1375,34 @@ class _OvertrainMonitor:
         self.best = float("inf")
         self.best_step: int | None = None
         self.state_dict: dict | None = None
+        # The last value good enough to count as progress.  Separate from
+        # ``best`` because it moves on a coarser ratchet.
+        self.patience_reference = float("inf")
         self.since_best = 0
         self.history: list[tuple[int, float]] = []
 
     def update(self, source, value: float, step: int) -> bool:
         """``source`` is whatever produced ``value``: a model, or a ``WeightEMA``.
 
-        Keeping the weights that were actually scored is the whole contract --
-        snapshotting the live model while having measured the average would
-        deliver a model nobody evaluated.
+        Returns whether this is a new best, which is what the caller marks in
+        the log.  Keeping the weights that were actually scored is the whole
+        contract -- snapshotting the live model while having measured the
+        average would deliver a model nobody evaluated.
         """
         if not math.isfinite(value):
             return False
         self.history.append((int(step), float(value)))
-        if value < self.best * (1.0 - self.min_delta):
+        improved = value < self.best
+        if improved:
             self.best = float(value)
             self.best_step = int(step)
-            self.since_best = 0
             self.state_dict = _cpu_state_dict(source)
-            return True
-        self.since_best += 1
-        return False
+        if value < self.patience_reference * (1.0 - self.min_delta):
+            self.patience_reference = float(value)
+            self.since_best = 0
+        else:
+            self.since_best += 1
+        return improved
 
     @property
     def overtrained(self) -> bool:
@@ -1788,18 +2059,12 @@ def prepare_schedulers(
             scheduler_d = torch.optim.lr_scheduler.LambdaLR(
                 optim_d, shape, last_epoch=resume_at
             )
-            superseded = (
-                "eta_min=3e-5"
-                if scheduler_name == "cosine annealing epoch"
-                else f"lr_decay={exp_decay_gamma:g}"
-            )
-            info(
-                f"'{scheduler_name}' reaches {lr_final_ratio:g}x the starting LR "
-                f"over {total_epoch_count} epochs "
-                f"({total_units} {'epochs' if per_epoch else 'steps'}); "
-                f"{superseded} is unused.",
-                tag="[INIT]",
-            )
+            # No announcement here.  What this branch does -- decay to
+            # ``lr_final_ratio`` by the end of the run -- is what the settings
+            # panel already prints for the scheduler, and the half of the old
+            # line that named the superseded ``lr_decay``/``eta_min`` only had
+            # to exist because the panel was printing that dead number as though
+            # it were live.  It no longer is.
         elif scheduler_name == "exp decay epoch":
             scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
                 optim_g, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
@@ -2027,6 +2292,7 @@ def run(
         lr_scheduler,
         exp_decay_gamma,
         spectral_loss,
+        lr_final_ratio,
     )
 
     # Initial setup
@@ -2057,18 +2323,57 @@ def run(
         getattr(config.train, "chouwagan_mel_distance", "huber")
     ).lower()
     mel_huber_beta = float(getattr(config.train, "chouwagan_mel_huber_beta", 0.3))
+    # Frequency weighting for that distance.  A mean over bins gives every bin
+    # the same vote, and past the Huber knee the vote stops scaling with the
+    # error, so a badly wrong minority of bins stays wrong: measured at 46% of
+    # the mel error against 32% of the gradient below 1 kHz.  1.0 is off, which
+    # is what a config that predates this key gets.
+    mel_low_emphasis = float(
+        getattr(config.train, "chouwagan_mel_low_emphasis", 1.0)
+    )
+    mel_low_emphasis_hz = float(
+        getattr(config.train, "chouwagan_mel_low_emphasis_hz", 1000.0)
+    )
 
     def _make_mel_distance():
         if not chouwagan_active or mel_distance in ("l1", "mae"):
-            return torch.nn.L1Loss()
-        if mel_distance == "huber":
-            return torch.nn.SmoothL1Loss(beta=mel_huber_beta)
-        if mel_distance in ("mse", "l2"):
-            return torch.nn.MSELoss()
-        raise ValueError(
-            f"Unknown chouwagan_mel_distance {mel_distance!r}: "
-            "expected 'huber', 'l1' or 'mse'."
-        )
+            base, weighted = torch.nn.L1Loss, chouwagan_active
+        elif mel_distance == "huber":
+            base, weighted = (
+                lambda **kw: torch.nn.SmoothL1Loss(beta=mel_huber_beta, **kw)
+            ), True
+        elif mel_distance in ("mse", "l2"):
+            base, weighted = torch.nn.MSELoss, True
+        else:
+            raise ValueError(
+                f"Unknown chouwagan_mel_distance {mel_distance!r}: "
+                "expected 'huber', 'l1' or 'mse'."
+            )
+        if not weighted or mel_low_emphasis == 1.0:
+            return base()
+
+        def _weights(num_mels: int):
+            return mel_low_frequency_weights(
+                num_mels=num_mels,
+                sample_rate=config.data.sample_rate,
+                mel_fmin=config.data.mel_fmin,
+                mel_fmax=config.data.mel_fmax,
+                emphasis=mel_low_emphasis,
+                cutoff_hz=mel_low_emphasis_hz,
+            )
+
+        # The factory is what makes this usable by the multi-scale mel loss,
+        # which evaluates the same distance at 5/10/20/40/80/160/320 bands.
+        # Without it that mode raised ``Band weights cover 128 mel bins but the
+        # loss was handed 5`` on its first step, so selecting "Multi-Scale Mel
+        # Loss" in the UI could not run at all with a low-emphasis config.  The
+        # weighting is defined by frequency, not by bin count, so rebuilding it
+        # per resolution is the same statement about which bands matter.
+        return BandWeightedSpectralLoss(
+            base(reduction="none"),
+            _weights(config.data.n_mel_channels).to(device),
+            weight_factory=_weights,
+        ).to(device)
 
     if spectral_loss == "L1 Mel Loss":
         fn_spectral_loss = _make_mel_distance()
@@ -2234,13 +2539,24 @@ def run(
     # Read straight from the config rather than from ``training_loop``'s
     # locals, which are out of scope here and are the reason this ended up
     # inside the per-epoch function in the first place.
-    adversarial_ceiling_governor = _AdversarialCeilingGovernor(
-        start_step=(
-            0
-            if finetune_phase
-            else max(0, int(getattr(config.train, "chouwagan_adaptive_adv_ramp_start", 20000)))
-        ),
-        ramp_steps=max(
+    #
+    # Both the delay and the ramp are fitted to the run: a ramp that outlives
+    # its own run leaves the ceiling pinned somewhere below the configured
+    # maximum for every step that run ever takes, which reads as "the ceiling
+    # is too low" when the real problem is that it was still climbing.  The
+    # shares differ because the two mean different things -- the delay is dead
+    # time and is worth at most a fifth of a run, while the ramp is the
+    # transition itself and can have half of one.
+    planned_steps = planned_step_count(total_epoch_count, train_loader, max_steps)
+    adv_ramp_start = fit_schedule(
+        0
+        if finetune_phase
+        else max(0, int(getattr(config.train, "chouwagan_adaptive_adv_ramp_start", 20000))),
+        planned_steps,
+        0.2,
+    )
+    adv_ramp_steps = fit_schedule(
+        max(
             0,
             int(
                 getattr(config.train, "chouwagan_adaptive_adv_ramp_steps_finetune", 2000)
@@ -2248,6 +2564,12 @@ def run(
                 else getattr(config.train, "chouwagan_adaptive_adv_ramp_steps", 80000)
             ),
         ),
+        planned_steps,
+        0.5 if not finetune_phase else 0.25,
+    )
+    adversarial_ceiling_governor = _AdversarialCeilingGovernor(
+        start_step=adv_ramp_start,
+        ramp_steps=adv_ramp_steps,
         ceiling_start=1.0,
         ceiling_end=max(
             max(0.0, float(getattr(config.train, "chouwagan_adaptive_adv_min", 0.01))),
@@ -2256,6 +2578,9 @@ def run(
         floor_loss=_constant_discriminator_loss(
             max(0.0, min(1.0, float(getattr(config.train, "chouwagan_san_direction_weight", 0.25)))),
             bool(getattr(config.model, "chouwagan_use_san", True)),
+        ),
+        collapse_ceiling=max(
+            0.0, float(getattr(config.train, "chouwagan_adaptive_adv_min", 0.01))
         ),
     )
 
@@ -2270,9 +2595,24 @@ def run(
         interval = int(getattr(config.train, "holdout_interval", 0))
         if interval <= 0:
             interval = max(200, min(2000, len(train_loader)))
+        # An explicit ``holdout_interval`` is fitted too.  It is a statement
+        # about how often to score, not about how long the run is, and the
+        # value that makes the detector inert is just as inert when it was
+        # typed in as when it was derived.
+        fitted = fit_eval_interval(interval, planned_steps, overtrain_monitor.patience)
+        evaluations = planned_steps // fitted if planned_steps else 0
+        if fitted != interval:
+            print(
+                f"[HOLDOUT] Interval {interval} -> {fitted} steps: at {interval} "
+                f"this {planned_steps}-step run would fit "
+                f"{planned_steps // interval} evaluations against a patience of "
+                f"{overtrain_monitor.patience}, and the detector could never fire."
+            )
+        interval = fitted
         print(
             f"[HOLDOUT] Evaluating every {interval} steps, "
-            f"patience {overtrain_monitor.patience} evaluations."
+            f"patience {overtrain_monitor.patience} evaluations"
+            + (f" ({evaluations} evaluations planned)." if evaluations else ".")
         )
     else:
         interval = 0
@@ -3027,9 +3367,15 @@ def training_loop(
                     + peak_headroom_weight * loss_peak
                 )
 
+                # The probe is instrumentation first and a loss second, so it
+                # is gated on the interval alone.  It used to also require
+                # ``chouwagan_ablation_weight > 0``, which meant the only way to
+                # stop paying for a term that does nothing was to also go blind
+                # to the one measurement that says whether a latent dimension is
+                # load-bearing.  ``loss_ablation`` is still scaled by the weight
+                # below, so a weight of zero costs exactly the forward pass.
                 if (
                     chouwagan_discrete is not None
-                    and chouwagan_ablation_weight > 0.0
                     and chouwagan_ablation_interval > 0
                     and global_step % chouwagan_ablation_interval == 0
                 ):
@@ -3229,7 +3575,11 @@ def training_loop(
             # Generator backward and update:
             optim_g.zero_grad(set_to_none=True)
             module_grad_metrics = {}
-            if chouwagan_active and global_step % 50 == 0:
+            if (
+                chouwagan_active
+                and rank == 0
+                and global_step % grad_source_probe_interval == 0
+            ):
                 decoder_parameters = _decoder_parameters(net_g)
                 grad_source_losses = {
                     "spectral": loss_spectral,
@@ -3239,17 +3589,16 @@ def training_loop(
                 if loss_waveform.requires_grad:
                     grad_source_losses["waveform"] = loss_waveform
                 for name, source_loss in grad_source_losses.items():
-                    if rank == 0:
-                        writer.add_scalar(
-                            f"Grad_Source/decoder_{name}",
-                            _gradient_norm(source_loss, decoder_parameters).item(),
-                            global_step,
-                        )
-                        writer.add_scalar(
-                            f"Grad_Source/wave_{name}",
-                            _tensor_gradient_norm(source_loss, y_hat).item(),
-                            global_step,
-                        )
+                    writer.add_scalar(
+                        f"Grad_Source/decoder_{name}",
+                        _gradient_norm(source_loss, decoder_parameters).item(),
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        f"Grad_Source/wave_{name}",
+                        _tensor_gradient_norm(source_loss, y_hat).item(),
+                        global_step,
+                    )
             if chouwagan_active:
                 loss_core.backward(retain_graph=True)
                 _add_decoder_only_gradients(loss_gan, net_g)
@@ -3647,6 +3996,11 @@ def training_loop(
                         # while every shipped config uses sample_rate/100
                         # (441 at 44.1 kHz), which labelled the axis 1.7x short.
                         hop_length=config.data.hop_length,
+                        # Same story one axis over: the frequency ticks are only
+                        # right if they are placed on the mel range the mels
+                        # were actually binned with.
+                        mel_fmin=config.data.mel_fmin,
+                        mel_fmax=config.data.mel_fmax,
                         dpi=validation_preview_dpi,
                         figsize=validation_preview_figsize,
                     )
@@ -3780,6 +4134,12 @@ def training_loop(
                     predicted_wave=o,
                     target_wave=reference_audio,
                     source=reference_source,
+                    # This branch was still on the function's fallbacks, so its
+                    # previews carried the hop-256 time axis the other call site
+                    # was already fixed for.
+                    hop_length=config.data.hop_length,
+                    mel_fmin=config.data.mel_fmin,
+                    mel_fmax=config.data.mel_fmax,
                 )
             else:
                 log_tensorboard_media(

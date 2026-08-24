@@ -20,7 +20,6 @@ PITCH_EXTRACTION_INFO = N_("RMVPE is the recommended default. CREPE is an altern
 
 BATCH_SIZE_INFO = N_("Larger batches need more VRAM. Reduce the value if training runs out of memory.")
 
-SPECTRAL_LOSS_INFO = N_("L1 Mel is the safe default. Multi-Scale and Hybrid are alternatives.")
 
 LR_SCHEDULER_INFO = N_("Exponential decay is the default. Cosine annealing and none are alternatives.")
 

@@ -127,6 +127,29 @@ def test_hop_length_sets_the_time_axis(mels):
         plt.close(figure)
 
 
+def test_frequency_ticks_follow_the_mel_scale(mels):
+    """A linear ruler put "5.5k" on bin 32, whose real centre is 1.02 kHz."""
+    import librosa
+
+    figure = _figure(mels, hop_length=441)
+    try:
+        axis = figure.axes[0]
+        centres = librosa.mel_frequencies(n_mels=130, fmin=0.0, fmax=22050.0)[1:-1]
+        labelled = {
+            text.get_text(): position
+            for position, text in zip(axis.get_yticks(), axis.get_yticklabels())
+        }
+        assert "1k" in labelled, "the voice range lost its tick"
+        # The tick has to sit on the bin whose centre is nearest to it.
+        for label, want in (("1k", 1000.0), ("4k", 4000.0), ("16k", 16000.0)):
+            bin_index = int(round(labelled[label]))
+            assert centres[bin_index] == pytest.approx(want, rel=0.05), label
+        # And the axis must span bin space, not 0..Nyquist.
+        assert axis.get_ylim()[1] == pytest.approx(127.5)
+    finally:
+        plt.close(figure)
+
+
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: f"{p.parent.name}/{p.stem}")
 def test_every_config_declares_preview_geometry(path):
     """A missing key falls back silently, so the shipped configs must carry it."""
