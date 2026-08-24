@@ -11,10 +11,15 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rvc" / "train"))
+
+# A bare ``import torch`` here fails *collection* rather than the test, and a
+# collection error aborts the whole session with exit 2 -- so on a runner
+# without torch this one module took the entire suite down with it.
+torch = pytest.importorskip("torch", reason="the losses need torch", exc_type=ImportError)
+pytest.importorskip("librosa", reason="rvc.train.losses imports it", exc_type=ImportError)
 
 from rvc.train.losses import (  # noqa: E402
     BandWeightedSpectralLoss,

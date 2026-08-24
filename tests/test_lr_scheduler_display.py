@@ -27,7 +27,14 @@ sys.path.insert(0, str(ROOT))
 # needs.
 sys.path.insert(0, str(ROOT / "rvc" / "train"))
 
-pytest.importorskip("torch", reason="the trainer's utils import torch", exc_type=ImportError)
+# ``rvc.train.utils`` pulls in all four.  Guarded rather than imported bare:
+# an unguarded import fails *collection*, and one collection error aborts the
+# whole session with exit 2 -- so a runner missing any one of these would take
+# the entire suite down rather than skip this module.
+for _dependency in ("torch", "librosa", "matplotlib", "soundfile"):
+    pytest.importorskip(
+        _dependency, reason="the trainer's utils need it", exc_type=ImportError
+    )
 
 from rvc.train.utils import print_init_setup  # noqa: E402
 

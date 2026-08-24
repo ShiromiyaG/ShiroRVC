@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "rvc" / "train"))
 
 torch = pytest.importorskip("torch", reason="the losses need torch", exc_type=ImportError)
+pytest.importorskip("librosa", reason="rvc.train.losses imports it", exc_type=ImportError)
 
 from rvc.train.losses import MultiScaleSTFTLoss  # noqa: E402
 

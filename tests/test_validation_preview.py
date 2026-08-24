@@ -17,6 +17,8 @@ import pytest
 
 torch = pytest.importorskip("torch", reason="the preview path pulls in torch")
 np = pytest.importorskip("numpy")
+pytest.importorskip("librosa", reason="rvc.train.utils imports it", exc_type=ImportError)
+pytest.importorskip("soundfile", reason="rvc.train.utils imports it", exc_type=ImportError)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -25,7 +27,9 @@ sys.path.insert(0, str(ROOT))
 # directory.  Importing it from anywhere else has to reproduce that.
 sys.path.insert(0, str(ROOT / "rvc" / "train"))
 
-import matplotlib  # noqa: E402
+matplotlib = pytest.importorskip(  # noqa: E402
+    "matplotlib", reason="the preview renders with matplotlib", exc_type=ImportError
+)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402

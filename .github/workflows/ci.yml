@@ -67,10 +67,24 @@ jobs:
       # click, psutil and rich are the whole of ``core``'s third-party import
       # list.  They are here so the tests that read the CLI's own defaults and
       # signatures can import it: those compare the backend against the GUI,
-      # and skipping them is the same as not having them.  Nothing here pulls
-      # in torch -- ``core`` imports it lazily, and test_gui_isolation asserts
-      # that it stays that way.
+      # and skipping them is the same as not having them.
       - run: pip install "pytest>=8.2" "PySide6>=6.7,<7" click psutil rich
+
+      # The training-side tests -- the spectral losses, the NSF excitation, the
+      # band-weighted mel distance, the init panel -- are the ones covering the
+      # code most likely to be "corrected" back to a subtly wrong version by
+      # someone reading it later, so a CI that skips them all is not guarding
+      # much.  CPU torch is enough: they run on synthetic tones and small
+      # tensors, a few seconds in total.  librosa and matplotlib come with them
+      # because ``rvc/train/losses.py`` and ``rvc/train/utils.py`` import them.
+      #
+      # This does *not* weaken test_gui_isolation, which spawns a subprocess and
+      # asserts ``'torch' not in sys.modules`` after importing the GUI.  It gets
+      # stronger: without torch installed a stray ``import torch`` in a view
+      # would fail loudly anyway, and with it installed that test is the only
+      # thing that catches it.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install librosa soundfile matplotlib
 
       - name: gui/ stays deletable, one version, one app name, wheel guard holds
         env:

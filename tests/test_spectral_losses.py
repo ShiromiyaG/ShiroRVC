@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 torch = pytest.importorskip("torch", reason="the loss functions need torch")
+pytest.importorskip("librosa", reason="rvc.train.losses imports it", exc_type=ImportError)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
