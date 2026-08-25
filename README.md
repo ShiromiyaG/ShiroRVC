@@ -215,6 +215,7 @@ only signal able to see overtraining.
 
 ## Credits
 
+- **[Applio](https://github.com/IAHispano/Applio)** - The base for this fork.
 - **[codename0og](https://github.com/codename0og/)** — SmartCutter, the learned
   silence-detection model used to trim dataset audio.
 - **[dr87 / spin-for-rvc](https://github.com/dr87/spin-for-rvc)** — the `spin_v1`
