@@ -163,6 +163,28 @@ class ChouwaPeriodDiscriminator(nn.Module):
 #: amplitude (1e-5 is -100 dBFS).  See `ChouwaSpectrogramDiscriminator`.
 MAGNITUDE_FLOOR = 1e-5
 
+#: The periods the multi-period block folds the waveform by.
+#:
+#: Three, not the five this shipped with. The five agreed with each other to a
+#: Spearman rho of 0.86-0.98 *after* partialling out clip RMS -- the redundancy
+#: is real and not an artefact of loud clips being easy to judge -- while all
+#: three STFT branches scored -0.62 to -0.04 against the period block, i.e.
+#: independent. Five near-copies of one opinion and three of another means the
+#: mean the losses take is 5/9 one opinion; the branch count *is* a weight.
+#:
+#: So the cut is not a saving, it is a reweighting: with `normalize=True` on
+#: every ChouwaGAN loss, dropping two period branches leaves `loss_adv` and
+#: `loss_fm` at the same scale but moves the independent branches from 44% to
+#: 57% of the adversarial mean, and from 35% to 47% of the feature-matching
+#: mean. That the freed 834 k parameters and 2 of 9 kernel launches come along
+#: is incidental -- see [[chouwagan-step-is-launch-bound]] for why the launches
+#: are the part that could show up in wall clock.
+#:
+#: 2, 5 and 11 keep the range and stay pairwise coprime, so no branch's folding
+#: grid is a sub-multiple of another's; 3 and 7 go because 2 and 5 already
+#: bracket the low end and 11 holds the top.
+PERIODS = (2, 5, 11)
+
 #: Default: a single full-band stack.
 FULL_BAND = ((0.0, 1.0),)
 
@@ -172,6 +194,44 @@ FULL_BAND = ((0.0, 1.0),)
 #: launch-bound rather than FLOP-bound: measured ~2x slower end to end on an
 #: RTX 5060 even at batch 8.  Opt in only with GPU headroom to spare.
 SPECTROGRAM_BAND_EDGES = ((0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
+
+#: The STFT branches, as ``n_fft``/``hop_length`` plus whatever each one needs to
+#: override.  Anything omitted falls back to the discriminator-wide default.
+#:
+#: The three branches are *not* three resolutions of one design.
+#:
+#: `stft_512` and `stft_1024` cannot resolve a harmonic comb at all -- at 86 Hz
+#: per bin, harmonics of a 120 Hz f0 sit 1.4 bins apart -- so their response
+#: collapses onto the low band and they are best read as *transient* branches:
+#: hop 128 is 2.9 ms, the finest time resolution in the set, and `stft_512`
+#: carries the most independent signal anywhere in the discriminator.  Do not
+#: widen them in frequency; there is nothing there for a wider kernel to see.
+#:
+#: `stft_2048` is the only branch that can resolve the comb (5.57 bins between
+#: harmonics at f0=120) and the only one carrying real high-frequency signal, so
+#: it is the one that gets the resolution budget:
+#:
+#: * A ``(9, 5)`` first kernel spans 194 Hz = 1.6 harmonic periods, against the
+#:   0.54 of a period a ``(3, 5)`` kernel saw.  Below one period a layer cannot
+#:   see a comb at all -- only local slope -- which is what "cannot resolve"
+#:   meant here.  It is also the cheapest layer to widen (2 -> 64 channels).
+#: * The third stage keeps its frequency axis (stride ``(1, 2)``) so the output
+#:   grid stops sampling the comb below its own Nyquist and aliasing away the
+#:   structure the first kernel just made visible.
+#: * ``(64, 128, 192)`` channels take it from ~200 parameters per logit position
+#:   to ~450, in line with the ~1900 the period and sub-band branches have.  At
+#:   (32, 64, 96) there was almost nothing with which to judge spectral texture.
+SPECTROGRAM_SPECS = (
+    {"n_fft": 512, "hop_length": 128},
+    {"n_fft": 1024, "hop_length": 256},
+    {
+        "n_fft": 2048,
+        "hop_length": 512,
+        "channels": (64, 128, 192),
+        "kernels": ((9, 5), (3, 5), (3, 5)),
+        "strides": ((2, 2), (2, 2), (1, 2)),
+    },
+)
 
 
 class ChouwaSpectrogramDiscriminator(nn.Module):
@@ -203,6 +263,8 @@ class ChouwaSpectrogramDiscriminator(nn.Module):
         channels: tuple[int, ...] = (32, 64, 96),
         compression: float = 0.3,
         band_edges: tuple[tuple[float, float], ...] = FULL_BAND,
+        kernels: tuple[tuple[int, int], ...] | None = None,
+        strides: tuple[tuple[int, int], ...] | None = None,
     ):
         super().__init__()
         norm = _norm_layer
@@ -228,19 +290,46 @@ class ChouwaSpectrogramDiscriminator(nn.Module):
 
         # Real and imaginary parts enter as two channels.
         stack_channels = (2,) + tuple(channels)
+        self.depth = len(stack_channels) - 1
+        # A per-stage schedule, so one branch can be given the resolution it can
+        # actually use without changing the two that cannot.  ``None`` keeps the
+        # uniform ``(3, 5)`` kernel and ``(2, 2)`` stride every branch shipped
+        # with; see `SPECTROGRAM_SPECS` for which branch deviates and why.
+        kernels = self._per_stage(kernels, (3, 5))
+        strides = self._per_stage(strides, (2, 2))
         self.band_convs = nn.ModuleList(
             nn.ModuleList(
-                ChouwaSeparableConv2d(in_ch, out_ch, (2, 2), norm)
-                for in_ch, out_ch in zip(
-                    stack_channels[:-1], stack_channels[1:], strict=True
+                ChouwaSpectrogramConv2d(in_ch, out_ch, stride, norm, kernel=kernel)
+                for in_ch, out_ch, kernel, stride in zip(
+                    stack_channels[:-1],
+                    stack_channels[1:],
+                    kernels,
+                    strides,
+                    strict=True,
                 )
             )
             for _ in self.bands
         )
-        self.depth = len(stack_channels) - 1
         self.conv_post = SANConv2d(channels[-1], 1, (3, 3), padding=(1, 1)) if self.use_san else norm(
             nn.Conv2d(channels[-1], 1, (3, 3), padding=(1, 1))
         )
+
+    def _per_stage(self, values, default: tuple[int, int]):
+        """Broadcast one ``(freq, time)`` pair over the stack, or check a list.
+
+        A wrong-length schedule is a configuration error that would otherwise
+        surface as a shape mismatch several layers down, or -- worse -- as a
+        silently shortened stack.
+        """
+        if values is None:
+            return (tuple(default),) * self.depth
+        values = tuple(tuple(int(axis) for axis in value) for value in values)
+        if len(values) != self.depth:
+            raise ValueError(
+                f"Expected {self.depth} entries for a {self.depth}-stage "
+                f"spectrogram stack, received {len(values)}."
+            )
+        return values
 
     def forward(self, x: Tensor, san_training=False):
         return self.forward_spectrogram(self.spectrogram(x), san_training=san_training)
@@ -262,12 +351,15 @@ class ChouwaSpectrogramDiscriminator(nn.Module):
         # both parts of the complex value.
         #
         # The floor is a gradient guard, not a numerical one.  d|X|**0.3/d|X|
-        # diverges as the magnitude goes to zero, and the R1 penalty
-        # differentiates the branch with respect to the *waveform*, straight
-        # through this transform -- with a 1e-7 floor the near-silent bins drove
-        # the R1 gradient norm to 20-5000 against an adversarial norm of ~2.
-        # 1e-5 is -100 dBFS, below the noise floor of any real recording, and
-        # brings R1 back in line with the period branches.
+        # diverges as the magnitude goes to zero, so near-silent bins hand the
+        # backward pass an unbounded gain.  1e-5 is -100 dBFS, below the noise
+        # floor of any real recording.
+        #
+        # The value is inherited from an earlier constraint -- containing the R1
+        # penalty, back when it differentiated this transform -- and no floor was
+        # ever enough for that; see ``r1_penalty``.  It stays because the
+        # ordinary discriminative backward runs through here too, but do not
+        # read 1e-5 as tuned for that.
         magnitude = spec.abs().clamp_min(MAGNITUDE_FLOOR)
         gain = magnitude.pow(self.compression - 1.0)
         return torch.stack((spec.real * gain, spec.imag * gain), dim=1)
@@ -292,24 +384,32 @@ class ChouwaSpectrogramDiscriminator(nn.Module):
         return torch.flatten(x, 1, -1), fmap
 
 
-class ChouwaSeparableConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, stride, norm):
+class ChouwaSpectrogramConv2d(nn.Module):
+    """One dense convolution per stage of the spectrogram stack.
+
+    Dense rather than the depthwise-separable pair it looks like it should be.
+    Depthwise convolution is memory-bound and gets a poor kernel, so the FLOPs
+    it saves here do not become time -- measured, the dense form is faster while
+    computing *more* arithmetic.  Do not "optimise" it back on a FLOP count.
+
+    Capacity comes along for free, which matters for a second reason: these
+    branches are the only place the discriminator can judge spectral texture,
+    which is the one thing the adversarial term is uniquely able to teach.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride, norm, kernel=(3, 5)):
         super().__init__()
-        self.depthwise = norm(
-            nn.Conv2d(
-                in_channels,
-                in_channels,
-                (3, 5),
-                stride,
-                padding=(1, 2),
-                groups=in_channels,
-            )
+        kernel = tuple(int(axis) for axis in kernel)
+        # 'same' padding for the odd kernels this stack uses, so widening a
+        # kernel changes what a layer *sees* and not the shape it produces.
+        padding = tuple(axis // 2 for axis in kernel)
+        self.conv = norm(
+            nn.Conv2d(in_channels, out_channels, kernel, stride, padding=padding)
         )
-        self.pointwise = norm(nn.Conv2d(in_channels, out_channels, 1))
         self.activation = nn.LeakyReLU(0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.activation(self.pointwise(self.activation(self.depthwise(x))))
+        return self.activation(self.conv(x))
 
 
 def _pqmf_filters(num_bands: int, taps: int = 62) -> Tensor:
@@ -333,6 +433,174 @@ def _pqmf_filters(num_bands: int, taps: int = 62) -> Tensor:
         for band in range(num_bands)
     ]
     return torch.stack(filters).unsqueeze(1)
+
+
+class ChouwaCQTDiscriminator(nn.Module):
+    """Discriminator on a log-frequency (constant-Q) projection of the STFT.
+
+    What this buys that no linear-frequency branch can: **a harmonic stack is
+    translation-invariant in pitch.**  On a log axis, changing f0 slides the
+    whole pattern rigidly without changing its shape, so one kernel learns "this
+    is a harmonic series" once and detects it at every pitch.  On the linear
+    axis the comb spacing *is* f0, so a fixed kernel is tuned to one pitch and
+    mis-sized at every other -- `stft_2048`'s ``(9, 5)`` spans 1.6 harmonic
+    periods at f0=120 and 0.6 at f0=320.  That is the gap this fills, and it is
+    a different gap from the one `SPECTROGRAM_BAND_EDGES` fills.
+
+    It is a *pseudo*-CQT: a log-spaced triangular filterbank applied to the
+    linear STFT rather than a bank of per-bin kernels at their own hop sizes.
+    That is the cheap construction and its cost is the bottom octaves, where a
+    log bin is narrower than a linear one and the projection degrades to
+    nearest-bin interpolation.  Measured, bins that read a single STFT bin:
+
+        n_fft 2048   44 of 128, everything under 386 Hz
+        n_fft 4096   28 of 128, under 193 Hz
+        n_fft 8192   12 of 128, under  97 Hz
+
+    ``n_fft`` is close to free here -- the conv stack always sees ``n_bins`` rows
+    whatever the transform, so only the matmul and the STFT itself grow, and the
+    branch measured 4.94 / 4.76 / 4.78 ms across those three.  4096 rather than
+    8192 is a *time*-resolution choice, not a cost one: 8192 is a 186 ms window,
+    longer than a vibrato period, so the harmonic stack it reports is averaged
+    across the modulation the discriminator ought to be judging.  4096 is 93 ms.
+
+    The degenerate rows are not wasted so much as oversampled, and they sit
+    below f0 for most voices anyway: the branch exists for the *shape* of the
+    stack, which lives in the octaves above the fundamental.
+
+    **A true CQT does not escape this, it only hides it.**  A constant-Q bin at
+    ``f`` needs ``Q * sr / f`` samples of support, and at 16 bins per octave Q is
+    22.6, so a 55 Hz bin needs 413 ms -- longer than the 400 ms training segment.
+    nnAudio's ``CQT1992v2`` reports that bin anyway by zero-padding its kernel to
+    32768 samples (743 ms), which fabricates resolution the segment cannot carry,
+    and charges **6x** this front end to do it: 2.76 ms against 0.46 ms at batch
+    8, with the "efficient" ``CQT2010v2`` still 4x at 1.88 ms.  The honest
+    response is to put ``f_min`` where the data supports it rather than to buy a
+    dearer transform, which is why the default is 80 Hz and not 55: 20 of 128
+    rows interpolated instead of 28, and the bank reaches 20.5 kHz instead of
+    14.1.
+
+    The filterbank is applied to the real and imaginary parts separately, which
+    is linear and therefore keeps phase, in the same spirit as
+    `ChouwaSpectrogramDiscriminator`.  Compression is applied after projection,
+    so the gain law sees the log-band magnitude rather than the raw bin.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 44100,
+        n_fft: int = 4096,
+        hop_length: int = 512,
+        f_min: float = 80.0,
+        bins_per_octave: int = 16,
+        n_bins: int = 128,
+        use_san: bool = True,
+        channels: tuple[int, ...] = (64, 128, 192),
+        compression: float = 0.3,
+        kernels: tuple[tuple[int, int], ...] = ((9, 5), (3, 5), (3, 5)),
+        strides: tuple[tuple[int, int], ...] = ((2, 2), (2, 2), (1, 2)),
+    ):
+        super().__init__()
+        norm = _norm_layer
+        self.use_san = bool(use_san)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.bins_per_octave = int(bins_per_octave)
+        self.n_bins = int(n_bins)
+        self.compression = float(compression)
+        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+        self.register_buffer(
+            "filterbank",
+            _log_filterbank(
+                sample_rate, self.n_fft, float(f_min), self.bins_per_octave, self.n_bins
+            ),
+            persistent=True,
+        )
+        stack_channels = (2,) + tuple(channels)
+        self.depth = len(stack_channels) - 1
+        self.convs = nn.ModuleList(
+            ChouwaSpectrogramConv2d(in_ch, out_ch, stride, norm, kernel=kernel)
+            for in_ch, out_ch, kernel, stride in zip(
+                stack_channels[:-1], stack_channels[1:], kernels, strides, strict=True
+            )
+        )
+        self.conv_post = SANConv2d(channels[-1], 1, (3, 3), padding=(1, 1)) if self.use_san else norm(
+            nn.Conv2d(channels[-1], 1, (3, 3), padding=(1, 1))
+        )
+
+    def forward(self, x: Tensor, san_training=False):
+        return self.forward_spectrogram(self.spectrogram(x), san_training=san_training)
+
+    def spectrogram(self, x: Tensor) -> Tensor:
+        waveform = x.squeeze(1).float()
+        window = self.window.to(device=waveform.device, dtype=waveform.dtype)
+        spec = torch.stft(
+            waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        bank = self.filterbank.to(dtype=spec.real.dtype, device=spec.real.device)
+        # Projected before compression, so the power law sees the energy of a
+        # log band rather than of one linear bin.  Real and imaginary go through
+        # the same real-valued bank, which is what keeps this linear in the
+        # complex value and therefore phase-preserving.
+        real = torch.matmul(bank, spec.real)
+        imag = torch.matmul(bank, spec.imag)
+        magnitude = torch.sqrt(real * real + imag * imag).clamp_min(MAGNITUDE_FLOOR)
+        gain = magnitude.pow(self.compression - 1.0)
+        return torch.stack((real * gain, imag * gain), dim=1)
+
+    def forward_spectrogram(self, x: Tensor, san_training=False):
+        fmap = []
+        for conv in self.convs:
+            x = conv(x)
+            fmap.append(x)
+        x = self.conv_post(x, san_training=san_training) if self.use_san else self.conv_post(x)
+        if san_training and self.use_san:
+            function_output, direction_output = x
+            fmap.append(function_output)
+            return [torch.flatten(function_output, 1, -1), torch.flatten(direction_output, 1, -1)], fmap
+        fmap.append(x)
+        return torch.flatten(x, 1, -1), fmap
+
+
+def _log_filterbank(
+    sample_rate: int, n_fft: int, f_min: float, bins_per_octave: int, n_bins: int
+) -> Tensor:
+    """Triangular filters on log-spaced centres, each normalised to unit sum.
+
+    Unit sum rather than unit energy: the bank is applied to a *complex* value,
+    so the natural reading of each output is a weighted average of neighbouring
+    bins rather than a power accumulation, and unit sum keeps a flat-magnitude
+    input flat across the axis instead of tilting it by bandwidth.
+    """
+    bins = n_fft // 2 + 1
+    frequencies = torch.linspace(0.0, sample_rate / 2.0, bins)
+    centres = f_min * (2.0 ** (torch.arange(n_bins, dtype=torch.float32) / bins_per_octave))
+    bank = torch.zeros(n_bins, bins)
+    ratio = 2.0 ** (1.0 / bins_per_octave)
+    for index, centre in enumerate(centres.tolist()):
+        low, high = centre / ratio, centre * ratio
+        if low >= sample_rate / 2.0:
+            break
+        rising = (frequencies - low) / max(centre - low, 1e-6)
+        falling = (high - frequencies) / max(high - centre, 1e-6)
+        weights = torch.minimum(rising, falling).clamp_min(0.0)
+        total = weights.sum()
+        if total <= 0:
+            # Narrower than one STFT bin -- the bottom-octave case the docstring
+            # names.  Fall back to the nearest bin so the row is never all zero,
+            # which would hand the stack a dead input channel.
+            nearest = int(torch.argmin((frequencies - centre).abs()))
+            weights = torch.zeros(bins)
+            weights[nearest] = 1.0
+            total = 1.0
+        bank[index] = weights / total
+    return bank
 
 
 class ChouwaSubBandDiscriminator(nn.Module):
@@ -416,12 +684,18 @@ class ChouwaGANDiscriminator(nn.Module):
         use_checkpointing: bool = False,
         sample_rate: int = 44100,
         use_san: bool = True,
-        periods: tuple[int, ...] = (2, 3, 5, 7, 11),
+        periods: tuple[int, ...] = PERIODS,
         spectrogram_channels: tuple[int, ...] = (32, 64, 96),
         spectrogram_compression: float = 0.3,
+        spectrogram_specs: tuple[dict, ...] = SPECTROGRAM_SPECS,
         use_subband: bool = False,
         subband_bands: int = 8,
         subband_channels: tuple[int, ...] = (64, 128, 192),
+        use_cqt: bool = False,
+        cqt_bins_per_octave: int = 16,
+        cqt_bins: int = 128,
+        cqt_f_min: float = 55.0,
+        cqt_channels: tuple[int, ...] = (64, 128, 192),
         **_: object,
     ):
         super().__init__()
@@ -440,20 +714,37 @@ class ChouwaGANDiscriminator(nn.Module):
         ]
         spectrogram_branches = [
             ChouwaSpectrogramDiscriminator(
-                n_fft,
-                hop_length,
-                n_fft,
+                int(spec["n_fft"]),
+                int(spec["hop_length"]),
+                int(spec["n_fft"]),
                 use_spectral_norm=False,
                 use_san=self.use_san,
-                channels=tuple(spectrogram_channels),
-                compression=spectrogram_compression,
+                channels=tuple(spec.get("channels") or spectrogram_channels),
+                compression=float(spec.get("compression", spectrogram_compression)),
+                band_edges=tuple(spec.get("band_edges") or FULL_BAND),
+                kernels=spec.get("kernels"),
+                strides=spec.get("strides"),
             )
-            for n_fft, hop_length in (
-                (512, 128),
-                (1024, 256),
-                (2048, 512),
-            )
+            for spec in spectrogram_specs
         ]
+        # Appended to the spectrogram family rather than kept apart, because it
+        # is one: it owns a fixed unlearned transform, so it wants the same
+        # precomputed-input sharing and the same R1 treatment (differentiate the
+        # branch, hold the transform outside the graph).  ``_spectrogram_index``
+        # covers a contiguous range, which is why this sits here and not after
+        # the sub-band branch.
+        if use_cqt:
+            spectrogram_branches.append(
+                ChouwaCQTDiscriminator(
+                    sample_rate=int(sample_rate),
+                    f_min=float(cqt_f_min),
+                    bins_per_octave=int(cqt_bins_per_octave),
+                    n_bins=int(cqt_bins),
+                    use_san=self.use_san,
+                    channels=tuple(cqt_channels),
+                    compression=float(spectrogram_compression),
+                )
+            )
         subband_branches = (
             [
                 ChouwaSubBandDiscriminator(
@@ -469,6 +760,20 @@ class ChouwaGANDiscriminator(nn.Module):
         self.spectrogram_count = len(spectrogram_branches)
         self.discriminators = nn.ModuleList(
             period_branches + spectrogram_branches + subband_branches
+        )
+        # Built from what was actually constructed, not from a literal list, so
+        # a changed `periods` or a disabled sub-band branch cannot silently
+        # mislabel a series in TensorBoard.  Index order matches
+        # `self.discriminators`, which is what every per-branch caller uses.
+        self.branch_names = tuple(
+            [f"period_{branch.period}" for branch in period_branches]
+            + [
+                f"cqt_{branch.n_bins}"
+                if isinstance(branch, ChouwaCQTDiscriminator)
+                else f"stft_{branch.n_fft}"
+                for branch in spectrogram_branches
+            ]
+            + [f"subband_{branch.num_bands}" for branch in subband_branches]
         )
 
     @property
@@ -595,13 +900,100 @@ class ChouwaGANDiscriminator(nn.Module):
         ]
         return real_logits, fake_logits, real_features, fake_features
 
+    def enable_compile(self, mode: str = "default") -> bool:
+        """Compile the paired real/fake path without wrapping the module.
+
+        Only :meth:`forward` is compiled, and that is deliberate rather than
+        incidental.  The R1 penalty reaches its branch through
+        :meth:`forward_branch` and differentiates it twice with
+        ``create_graph=True``; double-backward through a compiled region is the
+        part of this loop most likely to break, and it runs on one branch every
+        ``r1_interval`` steps, so there is nothing to win by including it.
+        Leaving it out of the compiled callable keeps it eager for free.
+
+        Shapes here are static -- the discriminator only ever sees
+        ``segment_size`` samples -- which is why ``dynamic=False`` holds and why
+        this succeeds where compiling the variable-length frontend does not.
+
+        Measured on an RTX 5060 at batch 8, forward and backward: 53.65 ms
+        eager against 41.99 ms compiled, a 1.28x speedup, with no CUDA graphs
+        involved.  That distinction is the point -- ``reduce-overhead`` records
+        CUDA graphs and needs a static memory pool this 8 GiB card cannot
+        spare, while plain fusion cuts kernel launches without it.
+        """
+        if getattr(self, "_compile_enabled", False):
+            return True
+
+        eager_forward = self.forward
+        try:
+            compiled_forward = torch.compile(eager_forward, dynamic=False, mode=mode)
+        except Exception as error:
+            from rvc.train.messages import DISCRIMINATOR_COMPILE_ENABLE_FAILED
+
+            print(DISCRIMINATOR_COMPILE_ENABLE_FAILED, str(error))
+            return False
+        compile_failed = False
+
+        def training_forward(*args, **kwargs):
+            nonlocal compile_failed
+            # ``branch_index`` is the R1 path; keep it on the eager callable.
+            if not self.training or compile_failed or kwargs.get("branch_index") is not None:
+                return eager_forward(*args, **kwargs)
+            try:
+                return compiled_forward(*args, **kwargs)
+            except Exception as error:
+                compile_failed = True
+                from rvc.train.messages import DISCRIMINATOR_COMPILE_RUNTIME_FAILED
+
+                print(DISCRIMINATOR_COMPILE_RUNTIME_FAILED, str(error))
+                return eager_forward(*args, **kwargs)
+
+        self.forward = training_forward
+        self._compile_enabled = True
+        self._compile_mode = mode
+        return True
+
     def r1_penalty(self, real_audio: Tensor, branch_index: int) -> Tensor:
-        real_audio = real_audio.detach().requires_grad_(True)
-        real_logits, _ = self.forward_branch(real_audio, branch_index)
+        """Gradient penalty on the input the branch actually judges.
+
+        For every branch but the spectrogram ones that is the waveform. For a
+        spectrogram branch it is the **compressed spectrogram**, and the
+        difference is not cosmetic: taking the gradient with respect to the
+        waveform instead puts the STFT branches eight orders of magnitude above
+        the period branches, while their *discriminative* gradients sit within a
+        factor of 1.4 of each other.
+
+        The cause is `d|X|**0.3/d|X|`, which diverges as the magnitude goes to
+        zero, and real audio has near-silent bins by the thousand.
+        `MAGNITUDE_FLOOR` cannot contain it at any usable value.  But that term
+        belongs to a **fixed, unlearned transform**: R1
+        exists to keep the *discriminator* from getting too sharp, and there is
+        nothing the branch can do about the conditioning of its own front end
+        except shrink its weights toward zero -- which is precisely what the
+        branches that "read as near-constant" had done.
+
+        Differentiating the branch proper, with the transform held outside the
+        graph, restores what R1 is for. The units change -- per spectrogram bin
+        rather than per sample -- and that is harmless because the per-branch
+        controller normalises against each branch's own discriminative
+        gradient, so an absolute scale is never compared across branches. It is
+        also cheaper: the double backward no longer runs through `torch.stft`.
+        """
+        slot = self._spectrogram_index(int(branch_index))
+        discriminator = self.discriminators[int(branch_index)]
+        if slot is not None:
+            source = discriminator.spectrogram(real_audio)
+            source = source.detach().requires_grad_(True)
+            real_logits, _ = self._forward_one(
+                discriminator, real_audio, spectrogram=source
+            )
+        else:
+            source = real_audio.detach().requires_grad_(True)
+            real_logits, _ = self._forward_one(discriminator, source)
         score = real_logits.float().mean()
         gradient = torch.autograd.grad(
             outputs=score,
-            inputs=real_audio,
+            inputs=source,
             create_graph=True,
             only_inputs=True,
         )[0]

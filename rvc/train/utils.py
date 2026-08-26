@@ -203,12 +203,16 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
         optimizer,
         checkpoint_dict.get("learning_rate", 0),
         checkpoint_dict["iteration"],
-        # Retained so existing FP16-era checkpoints keep unpacking; training is
-        # FP32 only now, so nothing consumes it.
-        {},
+        # This slot held FP16 scaler state, which nothing has consumed since
+        # training went FP32-only.  It now carries ``save_checkpoint``'s
+        # ``extra`` -- an empty dict when absent, which is what every existing
+        # checkpoint and every caller that ignores the slot already saw.
+        checkpoint_dict.get("extra") or {},
     )
 
-def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, ema=None):
+def save_checkpoint(
+    model, optimizer, learning_rate, iteration, checkpoint_path, ema=None, extra=None
+):
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
     model_instance = model.module if hasattr(model, "module") else model
 
@@ -226,6 +230,12 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path,
     # extractor, the blender -- keeps seeing exactly what it saw before.
     if ema is not None:
         checkpoint_data["ema"] = ema.state_dict()
+    # Same additive contract: plain Python scalars for training-loop controllers
+    # whose state is expensive to re-earn on a resume.  Nothing that reads these
+    # checkpoints without knowing the key is affected, and ``weights_only=True``
+    # unpickles them, so the loader stays hardened.
+    if extra:
+        checkpoint_data["extra"] = dict(extra)
 
     torch.save(checkpoint_data, checkpoint_path)
     info(f"Saved '{os.path.basename(checkpoint_path)}'.", tag="[SAVE]")

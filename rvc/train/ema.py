@@ -37,13 +37,10 @@ class WeightEMA:
     #: rather than "longer is smoother".  Averaging only helps up to the point
     #: where it has cancelled the oscillation; past that it is pure lag, and
     #: lag is what the overtrain detector pays for, because a lagging average
-    #: reaches its own minimum well after the model did.  Simulated against a
-    #: known turn, with the wobble on its own axis and the drift on another:
-    #: horizons of 200-1000 steps deliver 0.72-0.93x the regret of picking a
-    #: live step, 2000 is roughly break-even, and 10000 (decay 0.9999) is
-    #: **10-14x worse** -- its minimum lands some 13k steps late.  1000 steps
-    #: sits at the wide end of the range that wins at every oscillation level
-    #: tested, so 0.999 it is.
+    #: reaches its own minimum well after the model did.  A 1000-step horizon
+    #: wins at every oscillation level tested; 10000 (decay 0.9999) is an order
+    #: of magnitude worse, with its minimum landing thousands of steps late.
+    #: Do not raise it on the intuition that longer is smoother.
     DEFAULT_DECAY = 0.999
 
     def __init__(self, model, decay: float = DEFAULT_DECAY, warmup: bool = True):

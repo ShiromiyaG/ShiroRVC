@@ -32,6 +32,7 @@ def discriminator_loss(
     disc_generated_outputs,
     san_direction_weight=1.0,
     normalize=False,
+    per_branch=False,
 ):
     """
     Compute the discriminator loss for real and generated outputs.
@@ -39,10 +40,20 @@ def discriminator_loss(
     Returns:
         Tuple of (total_loss, real_loss_sum, fake_loss_sum) aggregated across
         all MPD/MSD discriminator heads.
+
+    With ``per_branch``, a fourth element is appended: a detached ``(heads, 2)``
+    tensor holding each head's ``(real, fake)`` contribution before the
+    ``normalize`` division.  The aggregate hides which head is failing -- heads
+    of very different capacity are summed into one number, so a period
+    branch collapsing and a spectrogram branch collapsing look identical.  The
+    per-head values are computed either way; this only keeps them, and keeping
+    them as one stacked tensor means the caller pays a single device transfer
+    rather than one per head.
     """
     loss = 0
     loss_real = 0
     loss_fake = 0
+    branch_losses = [] if per_branch else None
     branch_count = 0
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
         branch_count += 1
@@ -76,11 +87,17 @@ def discriminator_loss(
         loss += r_loss + g_loss
         loss_real += r_loss
         loss_fake += g_loss
+        if branch_losses is not None:
+            branch_losses.append(
+                torch.stack((r_loss.detach(), g_loss.detach()))
+            )
 
     if normalize and branch_count:
         loss = loss / branch_count
         loss_real = loss_real / branch_count
         loss_fake = loss_fake / branch_count
+    if branch_losses is not None:
+        return loss, loss_real, loss_fake, torch.stack(branch_losses)
     return loss, loss_real, loss_fake
 
 
@@ -238,12 +255,9 @@ def mel_low_frequency_weights(
 
     The mel distance reduces with a mean, so every bin pulls with the same
     authority, and past the Huber knee the pull no longer even scales with how
-    wrong the bin is.  On a 44.1 kHz ChouwaGAN pretrain measured at step 104k
-    that arithmetic bit: bins 0-32 (31 Hz to 992 Hz) held **46% of the mel
-    error and received 32% of the gradient**, and the lowest 16 bins were worse
-    still at 31% against 17%.  A region can be 3x more wrong than the rest of
-    the spectrum and still be a minority of the vote, so it never gets fixed --
-    the 96 nearly-right bins above 1 kHz outnumber it.
+    wrong the bin is.  A region can therefore be several times more wrong than
+    the rest of the spectrum and still be a minority of the vote, so it never
+    gets fixed -- the many nearly-right bins above 1 kHz outnumber it.
 
     Weighting by frequency restores the proportionality the reduction threw
     away.  The weights are normalised to a mean of 1, which matters more than it

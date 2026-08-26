@@ -162,7 +162,7 @@ class Synthesizer(torch.nn.Module):
                     chouwagan_options.get("chouwagan_svae_slow_latent_channels", 32)
                 ),
                 fast_latent_channels=int(
-                    chouwagan_options.get("chouwagan_svae_fast_latent_channels", 64)
+                    chouwagan_options.get("chouwagan_svae_fast_latent_channels", 32)
                 ),
                 prior_blocks=int(
                     chouwagan_options.get("chouwagan_svae_prior_blocks", 4)
@@ -292,6 +292,11 @@ class Synthesizer(torch.nn.Module):
                 ),
                 prior_replacement_start=int(
                     chouwagan_options.get("chouwagan_prior_replacement_start", 5000)
+                ),
+                prior_replacement_mean_share=float(
+                    chouwagan_options.get(
+                        "chouwagan_prior_replacement_mean_share", 0.5
+                    )
                 ),
                 prior_replacement_ramp=int(
                     chouwagan_options.get("chouwagan_prior_replacement_ramp", 20000)

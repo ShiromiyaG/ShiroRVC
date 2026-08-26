@@ -22,7 +22,12 @@ from torch.nn import functional as F
 # non-strictly, so a v1 checkpoint would otherwise load with both feed-forward
 # sublayers left at their init instead of failing.  The id is the only thing
 # standing between that and a silently half-random generator.
-ARCHITECTURE_ID = "shiro_vits_svae_v2"
+#
+# v3 halves ``fast_latent_channels`` (64 -> 32) and makes the KL rate
+# multipliers per dimension, so ``kl_log_beta_*`` and ``kl_rate_ema_*`` change
+# from scalars to vectors.  Every latent-facing tensor changes shape; the same
+# non-strict load would leave them at init.
+ARCHITECTURE_ID = "shiro_vits_svae_v3"
 SUPPORTED_ARCHITECTURE_IDS = frozenset((ARCHITECTURE_ID,))
 
 # Bounds on the predicted log standard deviations.  These exist to stop a bad
@@ -189,7 +194,7 @@ class ChouwaContinuousLatent(nn.Module):
         posterior_channels: int = 192,
         prior_hidden_channels: int = 192,
         slow_latent_channels: int = 32,
-        fast_latent_channels: int = 64,
+        fast_latent_channels: int = 32,
         prior_blocks: int = 4,
         prior_heads: int = 4,
         prior_kernel_size: int = 31,
@@ -209,6 +214,7 @@ class ChouwaContinuousLatent(nn.Module):
         prior_replacement_max: float = 0.0,
         prior_replacement_start: int = 5000,
         prior_replacement_ramp: int = 20000,
+        prior_replacement_mean_share: float = 0.5,
         **_: object,
     ):
         super().__init__()
@@ -232,15 +238,14 @@ class ChouwaContinuousLatent(nn.Module):
         # is low enough.  Targets are expressed in nats per dimension per
         # frame, which is the unit the per-dim diagnostics already report.
         #
-        # The floor stays on underneath it.  Dropping it here used to look
-        # right -- free bits zero the gradient below the floor, and a latent
-        # that is not being trained is not being kept honest either -- but the
-        # constraint the controller enforces is on the *mean*, and a mean is
-        # satisfied just as exactly by four live dimensions and sixty dead
-        # ones.  Measured on the 44.1 kHz pretrain, that is what happened.  The
-        # zeroed gradient is the point rather than the cost: it is what stops a
-        # dimension already at the floor from being pushed further into the
-        # prior.  See ``prior_losses`` for how the two interact.
+        # The floor stays on underneath it.  Dropping it looks right -- free
+        # bits zero the gradient below the floor, and a latent that is not being
+        # trained is not being kept honest either -- but the constraint the
+        # controller enforces is on the *mean*, and a mean is satisfied just as
+        # exactly by four live dimensions and sixty dead ones.  The zeroed
+        # gradient is the point rather than the cost: it stops a dimension
+        # already at the floor from being pushed further into the prior.  See
+        # ``prior_losses`` for how the two interact.
         self.kl_target_slow = max(0.0, float(kl_target_slow))
         self.kl_target_fast = max(0.0, float(kl_target_fast))
         self.kl_beta_lr = max(0.0, float(kl_beta_lr))
@@ -254,39 +259,56 @@ class ChouwaContinuousLatent(nn.Module):
         # leaves it exactly unchanged.  The decoder's first layer is linear and
         # the blocks behind it are layer-normalised, so scaling the latent up
         # and the projection down is very nearly a symmetry of the whole
-        # objective -- a flat direction the optimiser is free to wander along.
-        # It does: an earlier run drifted from sigma ~= 0.5 to the old clamp at
-        # e^1 and pinned there for 90k steps, taking the decoder feature RMS
-        # from 1 to 100 with it, while the KL sat on target the whole time.
+        # objective -- a flat direction the optimiser is free to wander along,
+        # and it does, carrying the decoder's feature RMS with it while the KL
+        # sits on target the whole time.
         # Penalising the *mean* log scale toward zero removes that one degree
         # of freedom and nothing else: per-dimension structure is untouched,
         # since only the average is constrained.
         self.kl_scale_anchor = max(0.0, float(kl_scale_anchor))
 
         # ---- Decoder-facing feature anchor -------------------------------
-        # ``kl_scale_anchor`` holds sigma at 1 and it does: the observed
-        # posterior/prior std sit at 1.02-1.07 for an entire run.  The drift
-        # simply moved.  The KL is a function of ``mu_q - mu_p`` measured in
-        # units of ``sigma_p``, so inflating *both* means together is invisible
-        # to it in exactly the way inflating both scales was, and the
-        # ``*_to_content`` / ``*_to_detail`` projection gains are outside every
-        # term in the objective.  The last run rode that second flat direction
-        # from a decoder feature RMS of 0.9 to 12 and was still climbing.
+        # ``kl_scale_anchor`` holds sigma at 1 successfully, and the drift simply
+        # moves.  The KL is a function of ``mu_q - mu_p`` measured in units of
+        # ``sigma_p``, so inflating *both* means together is invisible to it in
+        # exactly the way inflating both scales was, and the ``*_to_content`` /
+        # ``*_to_detail`` projection gains are outside every term in the
+        # objective.  Anchor a cause and the drift finds the next flat
+        # direction; anchor the observable and it has nowhere to go.
         # Anchoring the log RMS of what the decoder actually receives closes
         # both leaks at once, and closes them wherever the next one opens: it
         # constrains the observable rather than one of its causes.  Log-space
         # and mean-only for the same reasons as above -- 2x too large costs the
         # same as 2x too small, and per-channel structure stays free.
         self.feature_scale_anchor = max(0.0, float(feature_scale_anchor))
-        for branch, target in (
-            ("slow", self.kl_target_slow),
-            ("fast", self.kl_target_fast),
+        # One multiplier *per dimension*, not one per branch.  A single beta
+        # applies the same marginal pressure to a dimension carrying 1.5 nats
+        # and one carrying 0.04, because the penalty is a plain sum and its
+        # gradient with respect to each dimension is 1 either way.  Nothing in
+        # that objective resists concentration -- it rewards it, since the model
+        # is free to spend the whole budget wherever reconstruction pays best
+        # and the constraint is still satisfied on average.  A mean sitting
+        # exactly on target is compatible with most of the dimensions being
+        # dead, so the mean cannot detect the failure it permits.
+        #
+        # Per dimension the error signal is per dimension too: a dimension over
+        # target gets its own rising beta and a starved one falls to
+        # ``kl_beta_min`` and is left alone for reconstruction to claim.  Total
+        # budget is unchanged -- the target is still 0.15 per dimension -- so
+        # this redistributes rather than adds rate.  The free-bits floor stays
+        # underneath as the lower guard; it is not the lever here, and raising
+        # it only parks dimensions on it (see the note above).
+        for branch, target, width in (
+            ("slow", self.kl_target_slow, self.slow_latent_channels),
+            ("fast", self.kl_target_fast, self.fast_latent_channels),
         ):
             self.register_buffer(
-                f"kl_log_beta_{branch}", torch.zeros(()), persistent=True
+                f"kl_log_beta_{branch}", torch.zeros(width), persistent=True
             )
             self.register_buffer(
-                f"kl_rate_ema_{branch}", torch.full((), float(target)), persistent=True
+                f"kl_rate_ema_{branch}",
+                torch.full((width,), float(target)),
+                persistent=True,
             )
 
         self.training_step = 0
@@ -301,11 +323,18 @@ class ChouwaContinuousLatent(nn.Module):
         # controller deliberately keeps small.  Inference runs entirely through
         # ``enc_p -> prior -> dec``, so that path is the one that has to be good.
         # Swapping a scheduled fraction of the batch onto prior samples gives
-        # both modules real reconstruction gradient and closes the train/infer
-        # mismatch, at no extra forward cost.
+        # both modules real reconstruction gradient, at no extra forward cost.
+        #
+        # It closes only half of the train/infer mismatch on its own -- the
+        # module half.  ``prior_replacement_mean_share`` closes the other half,
+        # the operating point; see ``_replacement_scales`` for the measurement
+        # that sized it.
         self.prior_replacement_max = min(1.0, max(0.0, float(prior_replacement_max)))
         self.prior_replacement_start = max(0, int(prior_replacement_start))
         self.prior_replacement_ramp = max(1, int(prior_replacement_ramp))
+        self.prior_replacement_mean_share = min(
+            1.0, max(0.0, float(prior_replacement_mean_share))
+        )
 
         # ``enc_p`` emits a full Gaussian but the ChouwaGAN path historically
         # forwarded only its mean, leaving half of the projection untrained and
@@ -360,8 +389,12 @@ class ChouwaContinuousLatent(nn.Module):
         return mean, logs.clamp(LOGS_MIN, LOGS_MAX)
 
     @staticmethod
-    def _sample(mean: Tensor, logs: Tensor, scale: float = 1.0) -> Tensor:
-        return mean + torch.randn_like(mean) * logs.exp() * float(scale)
+    def _sample(mean: Tensor, logs: Tensor, scale=1.0) -> Tensor:
+        # ``scale`` may be a per-item tensor broadcast over (B, 1, 1); the draw
+        # happens either way so that the RNG stream does not depend on it.
+        if not torch.is_tensor(scale):
+            scale = float(scale)
+        return mean + torch.randn_like(mean) * logs.exp() * scale
 
     def _prior_features(self, content_stats: Tensor, g: Optional[Tensor], mask: Optional[Tensor], pitchf: Optional[Tensor]):
         value = self.prior_input(content_stats)
@@ -434,6 +467,43 @@ class ChouwaContinuousLatent(nn.Module):
         selector[chosen] = 1.0
         return selector
 
+    def _replacement_scales(self, selector: Tensor) -> Tensor:
+        """Per-item prior sampling scale for the replaced batch items.
+
+        Replacement fixes *which module* gets reconstruction gradient, but on
+        its own it leaves the operating point mismatched: it feeds the decoder
+        prior samples at scale 1, while ``infer`` runs ``deterministic=True`` and
+        hands it the prior *mean*.  The mean is not a mild case of the sample --
+        it is systematically less energetic, which is what ``prior_detail_rms``
+        against ``posterior_detail_rms`` reports -- so a decoder trained only on
+        samples pays a large penalty purely for being evaluated somewhere it was
+        never trained.
+
+        So the replaced items are split across both operating points rather than
+        moved to either one.  Scale 0 is what deterministic inference uses and
+        has to be in distribution; scale 1 keeps the sampling regulariser and is
+        the only thing that puts reconstruction gradient on the prior's
+        ``logs``, which would otherwise be left to the KL alone.  Same
+        stochastically rounded count as the selector above, and for the same
+        reason: a Bernoulli draw at batch 8 too often yields none of one kind.
+        """
+        if self.prior_replacement_mean_share <= 0.0:
+            return selector
+        chosen = selector.reshape(-1).nonzero(as_tuple=True)[0]
+        count = chosen.numel()
+        if count < 1:
+            return selector
+        expected = count * self.prior_replacement_mean_share
+        mean_count = int(expected)
+        if torch.rand((), device=selector.device).item() < (expected - mean_count):
+            mean_count += 1
+        if mean_count < 1:
+            return selector
+        scales = selector.clone()
+        order = chosen[torch.randperm(count, device=selector.device)]
+        scales[order[:mean_count]] = 0.0
+        return scales
+
     def forward_train(self, content_stats, spec, g, mask, pitchf=None):
         # Gaussian statistics and their reparameterized samples are especially
         # sensitive to FP16's narrow exponent range.  Keep the complete SVAE
@@ -480,11 +550,16 @@ class ChouwaContinuousLatent(nn.Module):
                 fast.shape[0], replacement_fraction, fast.device, fast.dtype
             )
             if selector is not None:
-                fast = torch.lerp(fast, self._sample(*prior_fast), selector)
-                slow = torch.lerp(slow, self._sample(*prior_slow), selector)
+                scales = self._replacement_scales(selector)
+                fast = torch.lerp(fast, self._sample(*prior_fast, scale=scales), selector)
+                slow = torch.lerp(slow, self._sample(*prior_slow, scale=scales), selector)
                 prior_replacement = selector.mean().detach()
+                prior_replacement_mean = (
+                    (selector - scales).mean().detach() / selector.mean().clamp_min(1e-6)
+                )
             else:
                 prior_replacement = fast.new_zeros(())
+                prior_replacement_mean = fast.new_zeros(())
 
             content, detail, slow_detail, fast_detail = self._latent_to_decoder(
                 slow, fast, content_stats.shape[-1]
@@ -506,6 +581,7 @@ class ChouwaContinuousLatent(nn.Module):
             "posterior_slow_values": slow,
             "posterior_fast_values": fast,
             "prior_replacement": prior_replacement,
+            "prior_replacement_mean": prior_replacement_mean,
             "coarse_spectral_loss": content.new_zeros(()),
         }
 
@@ -523,23 +599,23 @@ class ChouwaContinuousLatent(nn.Module):
         else:
             valid = _resize_mask(mask, value.shape[-1]).float()
             dimensions = (value.float() * valid).sum(dim=(0, 2)) / valid.sum().clamp_min(1.0)
-        return (
-            dimensions.clamp_min(float(free_bits)).sum(),
-            dimensions.sum(),
-            dimensions.detach(),
-        )
+        # Per dimension and still differentiable: the per-branch multiplier is
+        # now a vector, so the caller weights these before summing.
+        return dimensions.clamp_min(float(free_bits)), dimensions.detach()
 
     @property
     def kl_rate_control_active(self) -> bool:
         return self.kl_target_slow > 0.0 or self.kl_target_fast > 0.0
 
     def _kl_beta(self, branch: str, rate: Tensor, target: float) -> Tensor:
-        """Advance the Lagrange multiplier for one branch and return it.
+        """Advance the Lagrange multipliers for one branch and return them.
 
-        ``rate`` is the detached KL in nats per dimension per frame.  The
-        multiplicative update on ``log beta`` keeps the multiplier positive and
-        makes the response symmetric in relative error, so overshooting by 2x
-        costs the same as undershooting by 2x.
+        ``rate`` is the detached per-dimension KL vector in nats per dimension
+        per frame, and everything below is elementwise: each dimension carries
+        its own multiplier and sees only its own error.  The multiplicative
+        update on ``log beta`` keeps the multipliers positive and makes the
+        response symmetric in relative error, so overshooting by 2x costs the
+        same as undershooting by 2x.
         """
         log_beta = getattr(self, f"kl_log_beta_{branch}")
         if target <= 0.0:
@@ -557,15 +633,16 @@ class ChouwaContinuousLatent(nn.Module):
         return log_beta.exp()
 
     def prior_losses(self, parts: Dict[str, Tensor], mask: Optional[Tensor]):
-        # ``_raw_*`` is the unclamped sum; both paths below now use the clamped
-        # one, and the controller reads the per-dim tensor rather than the sum.
-        clamped_slow, _raw_slow, slow_dims = self._kl(
+        # ``*_dims`` is the raw per-dimension rate the controller reads;
+        # ``clamped_*`` is the same vector under the free-bits floor and is what
+        # the loss is built from.
+        clamped_slow, slow_dims = self._kl(
             parts["posterior_slow_distribution"],
             parts["prior_slow_distribution"],
             self.kl_free_bits_slow,
             mask,
         )
-        clamped_fast, _raw_fast, fast_dims = self._kl(
+        clamped_fast, fast_dims = self._kl(
             parts["posterior_fast_distribution"],
             parts["prior_fast_distribution"],
             self.kl_free_bits_fast,
@@ -579,32 +656,34 @@ class ChouwaContinuousLatent(nn.Module):
         if not self.kl_rate_control_active:
             parts["kl_beta_slow"] = slow_dims.new_ones(())
             parts["kl_beta_fast"] = fast_dims.new_ones(())
-            return clamped_slow, clamped_fast, clamped_slow + clamped_fast + anchor
+            total_slow = clamped_slow.sum()
+            total_fast = clamped_fast.sum()
+            return total_slow, total_fast, total_slow + total_fast + anchor
 
         # Rate control and the free-bits floor compose; they are not
-        # alternatives.  The controller targets ``dims.mean()``, and a mean is
-        # blind to how the KL is distributed: 64 dimensions at 0.15 and four
-        # dimensions holding everything while sixty sit at 0.05 produce the
-        # same mean, so a collapsed latent satisfies the constraint exactly and
-        # the multiplier stops moving.  The 44.1 kHz pretrain did precisely
-        # that -- fast mean 0.1542 against a target of 0.15 (error under 3%)
-        # with a median of 0.0699, four of 64 dimensions carrying 56% of the
-        # divergence and 48 of 64 below 0.1.
+        # alternatives, and neither is the lever the other one is.
         #
-        # So the floor supplies what the mean cannot: it is per dimension.
-        # Clamping stops the KL gradient on dimensions already below the floor,
-        # which is what lets reconstruction claim them -- on the raw KL those
-        # sixty dead dimensions were still being actively pushed at the prior.
-        # The controller is unharmed because it reads the *raw* per-dim mean
-        # below: if the floor lets dead dimensions come back, the mean rises
-        # past target, beta rises, and the pressure lands on the live
-        # dimensions.  That redistributes rather than merely adding rate.
-        beta_slow = self._kl_beta("slow", slow_dims.mean(), self.kl_target_slow)
-        beta_fast = self._kl_beta("fast", fast_dims.mean(), self.kl_target_fast)
-        parts["kl_beta_slow"] = beta_slow.detach()
-        parts["kl_beta_fast"] = beta_fast.detach()
-        loss_slow = clamped_slow * beta_slow.detach()
-        loss_fast = clamped_fast * beta_fast.detach()
+        # The controller targets each dimension, not ``dims.mean()``.  A mean is
+        # blind to how the KL is distributed -- every dimension at the target and
+        # a handful holding everything produce the same mean -- so a concentrated
+        # latent satisfies the constraint exactly and the multiplier stops
+        # moving.  Per dimension (see ``_kl_beta``) removes that blind spot at
+        # the source rather than asking the floor to cover for it.
+        #
+        # The floor still does its own job underneath: clamping stops the KL
+        # gradient on dimensions already below it, which is what lets
+        # reconstruction claim them -- on the raw KL those dead dimensions were
+        # still being actively pushed at the prior.  The controller is unharmed
+        # because it reads the *raw* per-dim rate below, so a dimension the
+        # floor has released still reports its true rate.
+        beta_slow = self._kl_beta("slow", slow_dims, self.kl_target_slow).detach()
+        beta_fast = self._kl_beta("fast", fast_dims, self.kl_target_fast).detach()
+        # Reported as the branch mean so the series keeps the scale it had when
+        # there was one multiplier per branch.
+        parts["kl_beta_slow"] = beta_slow.mean()
+        parts["kl_beta_fast"] = beta_fast.mean()
+        loss_slow = (clamped_slow * beta_slow).sum()
+        loss_fast = (clamped_fast * beta_fast).sum()
         # The anchor rides on the total only: ``loss_slow``/``loss_fast`` are
         # reported as the per-branch divergences and should keep meaning that.
         return loss_slow, loss_fast, loss_slow + loss_fast + anchor
@@ -689,6 +768,11 @@ class ChouwaContinuousLatent(nn.Module):
                 "posterior_std_fast": parts["posterior_fast_distribution"][1].exp().mean(),
                 "scale_anchor": parts.get("scale_anchor", slow_kl.new_zeros(())),
                 "prior_replacement": parts["prior_replacement"],
+                # Share of the replaced items decoded from the prior *mean*,
+                # i.e. from the exact input deterministic inference supplies.
+                "prior_replacement_mean": parts.get(
+                    "prior_replacement_mean", slow_kl.new_zeros(())
+                ),
                 "kl_beta_slow": parts.get(
                     "kl_beta_slow", slow_kl.new_ones(())
                 ),

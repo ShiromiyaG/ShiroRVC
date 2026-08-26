@@ -96,6 +96,35 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     if not os.path.exists(config_save_path):
         shutil.copyfile(config_path, config_save_path)
         info(f"Config saved at {config_save_path}", tag="[EXTRACT]")
+        return
+
+    # Keeping the experiment's own config is the point -- it carries whatever
+    # was tuned for this run -- but it must not outlive the architecture it was
+    # written for.  ``train.py`` forces the architecture id to the current one
+    # and fills in only the keys that are *absent*, so a stale config survives
+    # every shape-defining value it happens to name: an id saying v3 over a
+    # latent still built to v2's width, with no error anywhere.  That is the
+    # silent half-migration this guard exists to prevent.
+    def _architecture(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle).get("model", {}).get(
+                    "chouwagan_architecture_id"
+                )
+        except (OSError, ValueError):
+            return None
+
+    existing = _architecture(config_save_path)
+    shipped = _architecture(config_path)
+    if shipped is not None and existing is not None and existing != shipped:
+        backup = f"{config_save_path}.{existing}.bak"
+        shutil.copyfile(config_save_path, backup)
+        shutil.copyfile(config_path, config_save_path)
+        info(
+            f"Config was written for '{existing}' and this build is '{shipped}'; "
+            f"replaced it and kept the old one at {backup}",
+            tag="[EXTRACT]",
+        )
     else:
         info(f"Config already exists at {config_save_path}", tag="[EXTRACT]")
 

@@ -16,6 +16,24 @@ VOCODER_COMPILE_RUNTIME_FAILED = (
     "continuing in eager mode:"
 )
 
+DISCRIMINATOR_COMPILE_NOT_SUPPORTED = (
+    "[INIT] Discriminator compilation ignored: the selected vocoder does not "
+    "support it."
+)
+DISCRIMINATOR_COMPILE_NO_CUDA = (
+    "[INIT] Discriminator compilation ignored: CUDA is unavailable."
+)
+DISCRIMINATOR_COMPILE_ENABLED = (
+    "[INIT] Discriminator compilation enabled with mode '{mode}'. "
+    "The first training batch builds the graph."
+)
+DISCRIMINATOR_COMPILE_ENABLE_FAILED = (
+    "[WARNING] Discriminator compilation could not be enabled:"
+)
+DISCRIMINATOR_COMPILE_RUNTIME_FAILED = (
+    "[WARNING] Discriminator compilation failed; continuing in eager mode:"
+)
+
 VOCODER_COMPILE_CLI_HELP = "Compile the selected vocoder decoder during training."
 TORCH_COMPILE_MODE_CLI_HELP = "Torch compile mode used for the vocoder decoder."
 
