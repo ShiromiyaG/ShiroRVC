@@ -157,6 +157,23 @@ def frame_conditioning(
     return torch.cat(channels, dim=1)
 
 
+def template_amplitude(energy: Tensor, wave_amp: float = 0.1) -> Tensor:
+    """Turn relative log frame energy into RefineGAN's intensity envelope.
+
+    The paper drives the pitch template's amplitude from a frame-level intensity
+    measurement, which is what gives the vocoder its intensity response: the
+    excitation is already at the right loudness before the refinement network
+    sees it.  ``frame_energy`` is a *log power* relative to the utterance mean,
+    so amplitude is ``exp(energy * scale / 2)``, and ``wave_amp`` places the
+    utterance mean at the template's nominal level.
+
+    Computed in FP32: the exponential of a +/- 3 sigma log energy overflows the
+    FP16 range for loud frames well before the clamp could catch it.
+    """
+    energy = energy.float()
+    return (float(wave_amp) * torch.exp(0.5 * ENERGY_LOG_SCALE * energy)).clamp(0.0, 1.0)
+
+
 def conditioning_channels(use_periodicity: bool, use_energy: bool) -> int:
     return int(bool(use_periodicity)) + int(bool(use_energy))
 

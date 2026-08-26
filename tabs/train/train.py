@@ -1317,6 +1317,9 @@ def train_tab():
                     (
                         settings[component.key]
                         if component.key in settings
+                        # Historical preset key, kept only so a preset saved
+                        # before the option was renamed still restores the
+                        # toggle.  Nothing writes it any more.
                         else settings.get("compile_chouwagan", gr.skip())
                         if component.key == "compile_vocoder"
                         else gr.skip()

@@ -1,10 +1,10 @@
-"""The flow frontend must be a drop-in for the SVAE.
+"""The contract ``train.py`` and ``synthesizers.py`` hold the frontend to.
 
-``train.py`` reaches into the frontend by name in a dozen places -- parameter
-grouping, the ablation sampler, the KL weighting branch, the rolling
-diagnostics -- and ``net_g`` loads ChouwaGAN checkpoints non-strictly, so a
-missing attribute surfaces as a crash mid-epoch and a wrong architecture id
-surfaces as a silently half-initialised generator.  Both are pinned here.
+Both reach into it by name in a dozen places -- parameter grouping, the ablation
+sampler, the KL weighting branch, the rolling diagnostics -- and ``net_g`` loads
+checkpoints non-strictly, so a missing attribute surfaces as a crash mid-epoch
+and a wrong architecture id surfaces as a silently half-initialised generator.
+Both are pinned here.
 """
 
 import inspect
@@ -12,13 +12,9 @@ import inspect
 import pytest
 import torch
 
-from rvc.lib.algorithm.chouwagan_svae import (
-    ARCHITECTURE_ID as SVAE_ARCHITECTURE_ID,
-    ChouwaContinuousLatent,
-)
 from rvc.lib.algorithm.chouwagan_vits import (
     ARCHITECTURE_ID as VITS_ARCHITECTURE_ID,
-    ChouwaVitsLatent,
+    RefineVitsLatent,
 )
 
 # Everything train.py or synthesizers.py touches on the frontend.
@@ -26,7 +22,6 @@ REQUIRED_METHODS = (
     "forward_train",
     "prior_losses",
     "diagnostics",
-    "usage_regularization",
     "ablate_dimension",
     "infer",
     "set_training_step",
@@ -40,9 +35,6 @@ REQUIRED_ATTRIBUTES = (
     "kl_target_slow",
     "kl_target_fast",
     "kl_rate_control_active",
-    "coarse_spectral_loss_weight",
-    "usage_loss_weight",
-    "content_path_dropout",
     "posterior_available",
 )
 
@@ -71,7 +63,7 @@ def _build(latent_channels=64, **overrides):
         prior_replacement_ramp=1,
     )
     kwargs.update(overrides)
-    return ChouwaVitsLatent(**kwargs)
+    return RefineVitsLatent(**kwargs)
 
 
 def _inputs(model, batch=2, frames=24):
@@ -86,15 +78,14 @@ def _inputs(model, batch=2, frames=24):
     )
 
 
-def test_architecture_ids_are_distinct():
-    """A checkpoint from one frontend must not load into the other."""
-    assert VITS_ARCHITECTURE_ID != SVAE_ARCHITECTURE_ID
+def test_the_architecture_id_marks_the_decoder_it_was_trained_against():
+    """A checkpoint from an older decoder must fail the guard, not load."""
+    assert VITS_ARCHITECTURE_ID.endswith("refinegan_v1")
 
 
-def test_interface_parity_with_the_svae():
+def test_every_attribute_the_trainer_reaches_for_exists():
     for name in REQUIRED_METHODS:
-        assert callable(getattr(ChouwaVitsLatent, name, None)), name
-        assert callable(getattr(ChouwaContinuousLatent, name, None)), name
+        assert callable(getattr(RefineVitsLatent, name, None)), name
     model = _build()
     for name in REQUIRED_ATTRIBUTES:
         assert hasattr(model, name), name
@@ -111,7 +102,6 @@ def test_forward_train_emits_every_key_the_decoder_and_trainer_read():
         "detail_fast",
         "prior_replacement",
         "prior_replacement_mean",
-        "coarse_spectral_loss",
     ):
         assert key in parts, key
     assert parts["content"].shape[1] == 32

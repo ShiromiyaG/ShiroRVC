@@ -1,10 +1,10 @@
-"""VITS-style flow latent frontend, as a drop-in alternative to the SVAE.
+"""VITS-style flow latent frontend feeding the RefineGAN decoder.
 
-Same interface as ``ChouwaContinuousLatent`` -- ``forward_train`` /
-``prior_losses`` / ``diagnostics`` / ``infer`` / ``remove_posterior`` -- so the
-ChouwaGAN decoder, the discriminator, the balance controllers and every metric
-series work unchanged with either frontend.  Selected by
-``chouwagan_frontend: "vits"``.
+It exposes ``forward_train`` / ``prior_losses`` / ``diagnostics`` / ``infer`` /
+``remove_posterior``, which is the contract the decoder, the discriminator, the
+balance controllers and every metric series are written against.  ``content``
+and ``detail`` are concatenated into the conditioning sequence RefineGAN
+refines its pitch template against.
 
 This is RVC's VITS posterior-plus-flow, with the four modifications that the
 measurements in this repo argued for:
@@ -29,7 +29,7 @@ measurements in this repo argued for:
 4. **Rate-targeted KL.**  ``c_kl = 1.0`` with no floor and no target lets the
    latent carry unlimited information about the target, which is exactly what
    the decoder learns to lean on and then does not find at inference.  The
-   per-dimension controller from the SVAE is reused verbatim; set
+   per-dimension rate controller below holds it at a target instead; set
    ``kl_target = 0`` for plain VITS behaviour.
 
 The single latent branch is called "fast" throughout -- ``fast_to_content``,
@@ -47,25 +47,175 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from rvc.lib.algorithm.chouwagan_svae import (
-    LOGS_MAX,
-    LOGS_MIN,
-    SpectrogramFrequencyStem,
-    _resize_mask,
-    _resize_sequence,
-)
 from rvc.lib.algorithm.normalizing_flow import ResidualCouplingBlock
 from rvc.lib.algorithm.wavenet import WaveNet
 
-# A flow latent shares no tensor shapes with the SVAE, and ``net_g`` loads
-# ChouwaGAN checkpoints non-strictly, so without a distinct id an SVAE
-# checkpoint would load here with every latent module left at its init.
-ARCHITECTURE_ID = "shiro_vits_flow_v1"
+# ``net_g`` loads checkpoints non-strictly, so the architecture id is the only
+# thing standing between an incompatible checkpoint and a silently half-random
+# model.  ``refinegan_v1`` marks the decoder swap: the previous ids belonged to
+# latents whose decoder consumed a different conditioning contract entirely.
+ARCHITECTURE_ID = "shiro_vits_flow_refinegan_v1"
 SUPPORTED_ARCHITECTURE_IDS = frozenset((ARCHITECTURE_ID,))
 
+# Bounds on the predicted log standard deviations.  These exist to stop a bad
+# init from producing inf/nan, not to shape the solution -- a run that *sits* on
+# either bound has lost the gradient on its variance head, because ``clamp``
+# passes nothing through outside its range.  The real defence against drift is
+# ``kl_scale_anchor``; this is only the guard rail.
+LOGS_MIN = -6.0
+LOGS_MAX = 2.0
 
-class ChouwaVitsLatent(nn.Module):
-    """Posterior + normalizing flow latent frontend for the Chouwa decoder."""
+
+def _resize_mask(mask: Optional[Tensor], length: int) -> Optional[Tensor]:
+    if mask is None:
+        return None
+    if mask.shape[-1] == int(length):
+        return mask
+    return F.interpolate(mask.float(), size=int(length), mode="nearest").to(mask.dtype)
+
+
+def _resize_sequence(value: Tensor, length: int) -> Tensor:
+    if value.shape[-1] == int(length):
+        return value
+    return F.interpolate(value, size=int(length), mode="linear", align_corners=False)
+
+
+class ChannelLayerNorm(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(channels))
+
+    def forward(self, value: Tensor) -> Tensor:
+        return self.norm(value.transpose(1, 2)).transpose(1, 2)
+
+
+class EBranchformerBlock(nn.Module):
+    """Compact local/global branchformer block for the 100 Hz prior stream."""
+
+    def __init__(self, channels: int, heads: int = 4, kernel_size: int = 31):
+        super().__init__()
+        channels = int(channels)
+        heads = max(1, min(int(heads), channels))
+        while channels % heads:
+            heads -= 1
+        self.heads = heads
+        self.head_dim = channels // heads
+        # Macaron feed-forward pair.  These were previously a single ``ffn`` /
+        # ``ffn_norm`` pair *applied twice*, once before the branches and once
+        # after the merge.  Tying them forces one set of weights to serve two
+        # different roles and hands it the sum of two unrelated gradients; the
+        # half-step residual only makes sense with independent sublayers.
+        self.ffn_norm_in = ChannelLayerNorm(channels)
+        self.ffn_in = self._feed_forward(channels)
+        self.ffn_norm_out = ChannelLayerNorm(channels)
+        self.ffn_out = self._feed_forward(channels)
+        self.local_norm = ChannelLayerNorm(channels)
+        self.local = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels),
+            nn.Conv1d(channels, channels * 2, 1),
+            nn.GLU(dim=1),
+            nn.Conv1d(channels, channels, 1),
+        )
+        self.global_norm = ChannelLayerNorm(channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, 1)
+        self.global_out = nn.Conv1d(channels, channels, 1)
+        self.merge = nn.Conv1d(channels * 2, channels, 1)
+        self.final_norm = ChannelLayerNorm(channels)
+
+    @staticmethod
+    def _feed_forward(channels: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv1d(channels, channels * 2, 1),
+            nn.SiLU(),
+            nn.Conv1d(channels * 2, channels, 1),
+        )
+
+    @staticmethod
+    def _normalize(norm: ChannelLayerNorm, value: Tensor, mask: Optional[Tensor]) -> Tensor:
+        """Layer-norm, then re-zero padding.
+
+        ``LayerNorm`` maps an all-zero padded frame onto its own bias, so a
+        block that only masks its output still feeds a nonzero constant into
+        every sublayer input.  The conv branch spreads that a kernel radius;
+        attention is worse, because it becomes a key at every padded position
+        that all the real frames then attend to.
+        """
+        value = norm(value)
+        return value if mask is None else value * mask
+
+    def forward(self, value: Tensor, mask: Optional[Tensor]) -> Tensor:
+        mask = _resize_mask(mask, value.shape[-1])
+        # ``(batch, 1, 1, key)`` broadcasts over heads and query positions.  The
+        # key set always retains at least one real frame, so no query row is
+        # fully masked and the softmax cannot produce NaN.
+        attention_mask = None if mask is None else mask.bool().unsqueeze(1)
+        value = value + 0.5 * self.ffn_in(self._normalize(self.ffn_norm_in, value, mask))
+        local = self.local(self._normalize(self.local_norm, value, mask))
+        normalized = self._normalize(self.global_norm, value, mask)
+        batch, channels, length = normalized.shape
+        q, k, v = self.qkv(normalized).reshape(
+            batch, 3, self.heads, self.head_dim, length
+        ).unbind(1)
+        q = q.permute(0, 1, 3, 2)
+        k = k.permute(0, 1, 3, 2)
+        v = v.permute(0, 1, 3, 2)
+        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+        attended = attended.permute(0, 1, 3, 2).reshape(batch, channels, length)
+        global_branch = self.global_out(attended)
+        value = value + self.merge(torch.cat((local, global_branch), dim=1))
+        value = value + 0.5 * self.ffn_out(self._normalize(self.ffn_norm_out, value, mask))
+        value = self.final_norm(value)
+        return value if mask is None else value * mask
+
+
+class SpectrogramFrequencyStem(nn.Module):
+    """Read a log-magnitude spectrogram along frequency before flattening it.
+
+    The posterior used to enter through a single ``Conv1d(spec_channels,
+    posterior_channels, 1)``: one matrix collapsing all 1025 bins into 192
+    channels before anything looked at them.  A kernel of width 1 over the
+    channel axis has no notion that bin *k* and bin *k+1* are neighbours, so a
+    harmonic comb -- the one structure the posterior most needs to describe --
+    arrives as an arbitrary permutation of coordinates and has to be relearned
+    as one.
+
+    Striding down the frequency axis with a real kernel keeps that adjacency.
+    The stack is deliberately cheap (1 -> 16 -> 32 -> 32 channels, frequency
+    quartered twice then halved) because it runs on every training step and is
+    then thrown away: ``remove_posterior`` deletes it before export, so none of
+    this cost or capacity reaches inference.
+    """
+
+    def __init__(self, spec_channels: int, out_channels: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                nn.Conv2d(1, 16, (7, 3), stride=(4, 1), padding=(3, 1)),
+                nn.Conv2d(16, 32, (5, 3), stride=(4, 1), padding=(2, 1)),
+                nn.Conv2d(32, 32, (5, 3), stride=(2, 1), padding=(2, 1)),
+            ]
+        )
+        bins = int(spec_channels)
+        for stride in (4, 4, 2):
+            bins = (bins + stride - 1) // stride
+        self.flattened_channels = 32 * bins
+        self.project = nn.Conv1d(self.flattened_channels, int(out_channels), 1)
+
+    def forward(self, spectrogram: Tensor, mask: Optional[Tensor]) -> Tensor:
+        # ``(batch, 1, freq, time)``; the mask is over time only and broadcasts
+        # across every remaining frequency row.
+        value = spectrogram.unsqueeze(1)
+        frame_mask = None if mask is None else mask.unsqueeze(1)
+        for layer in self.layers:
+            value = F.silu(layer(value))
+            if frame_mask is not None:
+                value = value * frame_mask
+        batch, channels, bins, length = value.shape
+        return self.project(value.reshape(batch, channels * bins, length))
+
+
+class RefineVitsLatent(nn.Module):
+    """Posterior + normalizing flow latent frontend for the RefineGAN decoder."""
 
     architecture_id = ARCHITECTURE_ID
 
@@ -142,9 +292,6 @@ class ChouwaVitsLatent(nn.Module):
 
         self.training_step = 0
         self.current_prior_replacement = 0.0
-        self.coarse_spectral_loss_weight = 0.0
-        self.usage_loss_weight = 0.0
-        self.content_path_dropout = 0.0
 
         self.prior_replacement_max = min(1.0, max(0.0, float(prior_replacement_max)))
         self.prior_replacement_start = max(0, int(prior_replacement_start))
@@ -172,8 +319,6 @@ class ChouwaVitsLatent(nn.Module):
         )
         self.prior_f0 = nn.Conv1d(2, int(prior_hidden_channels), 1)
         self.prior_speaker = nn.Conv1d(int(gin_channels), int(prior_hidden_channels), 1)
-
-        from rvc.lib.algorithm.chouwagan_svae import EBranchformerBlock
 
         self.prior_blocks = nn.ModuleList(
             [
@@ -445,7 +590,6 @@ class ChouwaVitsLatent(nn.Module):
             "posterior_fast_values": z,
             "prior_replacement": prior_replacement,
             "prior_replacement_mean": prior_replacement_mean,
-            "coarse_spectral_loss": content_out.new_zeros(()),
         }
 
     # -- losses --------------------------------------------------------------
@@ -530,15 +674,6 @@ class ChouwaVitsLatent(nn.Module):
         parts["kl_beta_fast"] = beta.mean()
         loss_fast = (clamped * beta).sum()
         return zero, loss_fast, loss_fast + anchor
-
-    def usage_regularization(self, parts, mask):
-        zero = parts["content"].new_zeros(())
-        return zero, {
-            "usage_variance_floor": zero,
-            "usage_entropy_floor": zero,
-            "usage_covariance": zero,
-            "usage_gate_fraction": zero,
-        }
 
     @staticmethod
     def _kl_effective_dims(per_dim: Tensor) -> Tensor:

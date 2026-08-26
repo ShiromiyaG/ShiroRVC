@@ -10,5 +10,5 @@
     "flask_server": false,
     "version": "4.3.0",
     "model_author": "None",
-    "use_fp16": false
+    "use_fp16": true
 }

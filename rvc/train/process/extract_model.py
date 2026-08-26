@@ -8,7 +8,7 @@ from collections import OrderedDict
 import torch
 
 from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
-from rvc.lib.algorithm.chouwagan_svae import ARCHITECTURE_ID
+from rvc.lib.algorithm.chouwagan_vits import ARCHITECTURE_ID
 from rvc.lib.terminal import error as print_error, success
 
 now_dir = os.getcwd()
@@ -73,9 +73,8 @@ def extract_model(
         def is_training_only_key(key):
             return (
                 "enc_q" in key
-                or key.startswith("chouwagan_discrete.posterior")
-                or key.startswith("chouwagan_discrete.coarse_spectral")
-                or key.startswith("chouwagan_discrete.usage_ema")
+                or key.startswith("refinegan_latent.posterior")
+
             )
 
         opt = OrderedDict(
@@ -114,7 +113,7 @@ def extract_model(
         vocoder_config = {
             key: value
             for key, value in hps.model.items()
-            if key.startswith("chouwagan_")
+            if key.startswith("refinegan_")
         }
 
 
@@ -138,10 +137,10 @@ def extract_model(
         opt["vocoder_config"] = vocoder_config
         opt["architecture_id"] = (
             vocoder_config.get(
-                "chouwagan_architecture_id",
+                "refinegan_architecture_id",
                 ARCHITECTURE_ID,
             )
-            if vocoder_id == "chouwagan"
+            if vocoder_id == "refinegan"
             else "hifi_gan_nsf_v1"
         )
 

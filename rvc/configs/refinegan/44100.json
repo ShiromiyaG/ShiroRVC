@@ -1,0 +1,230 @@
+{
+  "train": {
+    "spectral_loss": "L1 Mel Loss",
+    "seed": 1234,
+    "learning_rate_g": 0.0001,
+    "learning_rate_d": 0.0004,
+    "betas": [
+      0.8,
+      0.99
+    ],
+    "eps": 1e-09,
+    "lr_decay": 0.999875,
+    "lr_final_ratio": 0.25,
+    "rolling_loss_steps": 50,
+    "validation_preview_dpi": 67,
+    "validation_preview_width": 24.0,
+    "validation_preview_height": 5.8,
+    "segment_size": 17640,
+    "c_mel": 45,
+    "r1_interval": 16,
+    "r1_gamma": 0.25,
+    "r1_segment_size": 6144,
+    "refinegan_r1_target_ratio": 1.0,
+    "refinegan_r1_max_scale": 10000.0,
+    "refinegan_r1_min_scale": 0.0001,
+    "refinegan_global_clip_norm_g": 500.0,
+    "refinegan_compile_discriminator": false,
+    "refinegan_adaptive_adv_interval": 8,
+    "adv_warmup_steps": 2000,
+    "refinegan_adv_balance_target": 0.8,
+    "refinegan_adaptive_adv_min": 0.01,
+    "refinegan_adaptive_adv_max": 3.0,
+    "refinegan_adaptive_adv_ramp_start": 16000,
+    "refinegan_adaptive_adv_ramp_steps": 64000,
+    "refinegan_adaptive_adv_ramp_steps_finetune": 2000,
+    "refinegan_fm_weight": 2.0,
+    "refinegan_fm_balance_target": 0.33,
+    "refinegan_fm_balance_min": 0.1,
+    "refinegan_ms_stft_weight": 5.0,
+    "refinegan_prior_loss_weight": 1.0,
+    "refinegan_prior_warmup_steps": 10000,
+    "refinegan_ablation_interval": 128,
+    "refinegan_ablation_loss_weight": 0.0,
+    "refinegan_ablation_margin": 0.01,
+    "refinegan_diagnostics_interval": 64,
+    "refinegan_mel_distance": "huber",
+    "refinegan_mel_huber_beta": 0.3,
+    "refinegan_mel_low_emphasis": 1.3,
+    "refinegan_mel_low_emphasis_hz": 1000.0,
+    "refinegan_envelope_loss_weight": 3.0,
+    "refinegan_envelope_kernel": 100,
+    "refinegan_envelope_stride": 50,
+    "refinegan_envelope_floor": 0.001,
+    "refinegan_rms_loss_weight": 5.0,
+    "refinegan_rms_window": 1024,
+    "refinegan_rms_hop": 256,
+    "refinegan_peak_headroom_weight": 0.0,
+    "refinegan_peak_headroom_threshold": 0.85,
+    "holdout_fraction": 0.02,
+    "holdout_min_slices": 16,
+    "holdout_max_slices": 96,
+    "holdout_max_seconds": 120.0,
+    "holdout_interval": 0,
+    "overtrain_patience": 8,
+    "overtrain_min_delta": 0.001,
+    "ema_decay": 0.999
+  },
+  "data": {
+    "max_wav_value": 32768.0,
+    "sample_rate": 44100,
+    "filter_length": 2048,
+    "hop_length": 441,
+    "win_length": 2048,
+    "n_mel_channels": 128,
+    "mel_fmin": 0.0,
+    "mel_fmax": null
+  },
+  "model": {
+    "inter_channels": 192,
+    "hidden_channels": 192,
+    "filter_channels": 768,
+    "text_enc_hidden_dim": 768,
+    "n_heads": 2,
+    "n_layers": 6,
+    "kernel_size": 3,
+    "p_dropout": 0,
+    "resblock": "refinegan",
+    "resblock_kernel_sizes": [
+      3,
+      7,
+      11
+    ],
+    "resblock_dilation_sizes": [
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ]
+    ],
+    "upsample_rates": [
+      3,
+      3,
+      7,
+      7
+    ],
+    "upsample_initial_channel": 512,
+    "upsample_kernel_sizes": [
+      6,
+      6,
+      14,
+      14
+    ],
+    "use_spectral_norm": false,
+    "gin_channels": 256,
+    "spk_embed_dim": 109,
+    "refinegan_architecture_id": "shiro_vits_flow_refinegan_v1",
+    "refinegan_start_channels": 16,
+    "refinegan_leaky_relu_slope": 0.2,
+    "refinegan_decoder_channels": [
+      256,
+      128,
+      96,
+      64
+    ],
+    "refinegan_resblock_kernel_sizes": [
+      [
+        3,
+        7,
+        11
+      ],
+      [
+        3,
+        7,
+        11
+      ],
+      [
+        11
+      ],
+      [
+        11
+      ]
+    ],
+    "refinegan_resblock_dilations": [
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3
+      ],
+      [
+        1,
+        3
+      ]
+    ],
+    "refinegan_encoder_kernel_size": 7,
+    "refinegan_wave_amp": 0.1,
+    "refinegan_use_spectral_norm": false,
+    "refinegan_d_periods": [
+      2,
+      3,
+      5,
+      7,
+      11
+    ],
+    "refinegan_d_resolutions": [
+      [
+        1024,
+        120,
+        600
+      ],
+      [
+        2048,
+        240,
+        1200
+      ],
+      [
+        512,
+        50,
+        240
+      ]
+    ],
+    "refinegan_d_resolution_channels": 32,
+    "refinegan_content_channels": 128,
+    "refinegan_detail_channels": 64,
+    "refinegan_posterior_channels": 192,
+    "refinegan_prior_hidden_channels": 192,
+    "refinegan_vits_latent_channels": 192,
+    "refinegan_vits_posterior_layers": 16,
+    "refinegan_vits_flow_blocks": 4,
+    "refinegan_vits_flow_layers": 4,
+    "refinegan_vits_free_bits": 0.03,
+    "refinegan_vits_kl_target": 0.15,
+    "refinegan_prior_blocks": 4,
+    "refinegan_prior_heads": 4,
+    "refinegan_prior_kernel_size": 31,
+    "refinegan_kl_beta_lr": 0.01,
+    "refinegan_kl_beta_min": 0.0001,
+    "refinegan_kl_beta_max": 10.0,
+    "refinegan_kl_rate_momentum": 0.01,
+    "refinegan_kl_scale_anchor": 1.0,
+    "refinegan_feature_scale_anchor": 1.0,
+    "refinegan_prior_uses_logs": true,
+    "refinegan_prior_direct_content": true,
+    "refinegan_prior_replacement_max": 0.7,
+    "refinegan_prior_replacement_start": 2000,
+    "refinegan_prior_replacement_ramp": 12000,
+    "refinegan_prior_replacement_mean_share": 0.5,
+    "refinegan_use_periodicity": true,
+    "refinegan_use_frame_energy": true,
+    "refinegan_segment_energy_floor": 0.05
+  }
+}

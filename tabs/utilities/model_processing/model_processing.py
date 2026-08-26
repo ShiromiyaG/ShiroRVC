@@ -51,9 +51,8 @@ def extract_small_model(
                 key: value.half()
                 for key, value in ckpt.items()
                 if "enc_q" not in key
-                and not key.startswith("chouwagan_discrete.posterior")
-                and not key.startswith("chouwagan_discrete.coarse_spectral")
-                and not key.startswith("chouwagan_discrete.usage_ema")
+                and not key.startswith("refinegan_latent.posterior")
+
             }
         )
 
@@ -106,12 +105,12 @@ def extract_small_model(
                 "vocoder_config": {
                     key: value
                     for key, value in model_config.items()
-                    if key.startswith("chouwagan_")
+                    if key.startswith("refinegan_")
                 },
                 "architecture_id": model_config.get(
-                    "chouwagan_architecture_id"
+                    "refinegan_architecture_id"
                 )
-                if vocoder_id == "chouwagan"
+                if vocoder_id == "refinegan"
                 else "hifi_gan_nsf_v1",
             }
         )

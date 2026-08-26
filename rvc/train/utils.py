@@ -896,6 +896,7 @@ def print_init_setup(
     exp_decay_gamma,
     spectral_loss,
     lr_final_ratio=None,
+    amp_dtype=None,
 ):
     if rank != 0:
         return
@@ -904,9 +905,32 @@ def print_init_setup(
         torch.backends.cuda.matmul.allow_tf32
         and torch.backends.cudnn.allow_tf32
     )
-    # FP32 master weights throughout; TF32 only changes how cuDNN/cuBLAS run
-    # the convolutions internally (11-bit mantissa, no autocast, no scaler).
-    precision = "FP32 (TF32 matmul/conv)" if tf32_enabled else "FP32"
+    # TF32 is orthogonal to autocast: it only changes how cuDNN/cuBLAS run the
+    # convolutions internally (11-bit mantissa), and it applies to the FP32 ops
+    # that remain under autocast just as much as it does without it.  So it is
+    # reported as a qualifier on either line rather than as a precision of its
+    # own.
+    #
+    # ``amp_dtype`` has to be passed in rather than inferred here.  This row read
+    # the TF32 flags alone until 2026-08-26, so it printed "FP32 (TF32
+    # matmul/conv)" on every run -- including FP16 ones, where autocast and the
+    # GradScaler were both live.  The banner prints well before the "AMP enabled"
+    # line, so it was the only precision statement most runs ever saw.
+    #
+    # Master weights stay FP32 in every case, so the row names only what
+    # changes: the autocast dtype, whether a GradScaler is live, and TF32.  The
+    # panel's value column is narrow enough that a longer string is silently
+    # truncated, which is how this row came to be misleading in the first place.
+    if amp_dtype is None:
+        precision = "FP32 (TF32 matmul/conv)" if tf32_enabled else "FP32"
+    else:
+        name = {torch.float16: "FP16", torch.bfloat16: "BF16"}.get(
+            amp_dtype, str(amp_dtype).rsplit(".", 1)[-1].upper()
+        )
+        # BF16 carries FP32's exponent range, so it needs no loss scaling.
+        scaler = " + GradScaler" if amp_dtype == torch.float16 else ""
+        tf32_note = " (TF32 conv)" if tf32_enabled else ""
+        precision = f"{name} autocast{scaler}{tf32_note}"
 
     rows = [
         ("PRECISION", precision),

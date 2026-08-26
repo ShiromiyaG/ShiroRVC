@@ -13,16 +13,16 @@
         "generator": "hifi_nsf",
         "discriminator": "mpd_msd"
     },
-    "chouwagan": {
-        "label": "ChouwaGAN",
-        "architecture": "chouwagan",
-        "config_dir": "chouwagan",
+    "refinegan": {
+        "label": "RefineGAN",
+        "architecture": "refinegan",
+        "config_dir": "refinegan",
         "sample_rates": [
             44100
         ],
-        "pretrained_dir": "chouwagan",
+        "pretrained_dir": "refinegan",
         "supports_smartcutter": false,
-        "generator": "chouwagan",
-        "discriminator": "chouwagan"
+        "generator": "refinegan",
+        "discriminator": "refinegan"
     }
 }

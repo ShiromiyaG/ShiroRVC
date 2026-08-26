@@ -1,9 +1,9 @@
 from .mpd_msd_combined import MPD_MSD_Combined
-from .chouwagan import PERIODS, SPECTROGRAM_SPECS, ChouwaGANDiscriminator
+from .refinegan import PERIODS, RESOLUTIONS, RefineGANDiscriminator
 
 __all__ = [
     "MPD_MSD_Combined",
-    "ChouwaGANDiscriminator",
+    "RefineGANDiscriminator",
     "PERIODS",
-    "SPECTROGRAM_SPECS",
+    "RESOLUTIONS",
 ]

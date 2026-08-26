@@ -174,24 +174,28 @@ catalog falls back to English silently rather than raising.
 ShiroRVC ships two vocoders — the part that turns the model's internal
 representation back into sound.
 
-| | **HiFi-GAN** | **ChouwaGAN** |
+| | **HiFi-GAN** | **RefineGAN** |
 |---|---|---|
 | Sample rates | 32 / 40 / 48 kHz | 44.1 kHz |
-| Frontend | Original VITS (flow + posterior) | Sequential VAE, slow + fast latents |
-| Generator | NSF HiFi-GAN | Anti-aliased harmonic decoder with excitation U-Net |
-| Discriminator | MPD + MSD | 5 period + 3 band-split complex STFT + PQMF sub-band |
+| Frontend | Original VITS (flow + posterior) | VITS flow + posterior, rate-targeted KL |
+| Generator | NSF HiFi-GAN | Pitch-template U-Net (RefineGAN paper) |
+| Discriminator | MPD + MSD | MPD (5 periods) + multi-resolution STFT |
 
 **HiFi-GAN** is the well-tested option inherited from the original RVC, and the
 right choice if you want results that behave predictably.
 
-**ChouwaGAN** is what this fork exists for, aimed at singing at 44.1 kHz. Its
-frontend splits the latent into a *slow* stream carrying timbre and a *fast*
-stream carrying detail, each held at a target divergence by a KL rate controller
-rather than being allowed to collapse. Its discriminator judges the compressed
-**complex** STFT — real and imaginary parts, split into frequency sub-bands — so
-the adversarial signal carries phase, which mel reconstruction losses cannot
-supply. A PQMF sub-band branch watches inter-band consistency, where upsampling
-aliasing shows up. Every branch uses a SAN head with lazy R1 regularisation.
+**RefineGAN** is what this fork exists for, aimed at singing at 44.1 kHz. It
+follows the [RefineGAN paper](https://arxiv.org/abs/2111.00962) rather than the
+widely copied Applio port: the decoder refines a **pitch template** — a
+one-sample pulse at every pitch period, uniform noise where the signal is
+unvoiced, scaled by the measured frame intensity — instead of a band-limited
+sine bank. Pitch and loudness are therefore exact before the network does
+anything, and the U-Net only has to supply timbre. Its latent frontend is VITS's
+posterior-plus-flow with a per-dimension KL rate controller, so the latent
+cannot quietly collapse, and a scheduled fraction of every batch is decoded from
+the *prior* so the inference path receives reconstruction gradient. The
+discriminator is the paper's MPD plus a multi-resolution STFT branch, with lazy
+R1 regularisation whose strength is controlled per branch.
 
 </details>
 

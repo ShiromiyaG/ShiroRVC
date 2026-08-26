@@ -104,11 +104,8 @@ from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
 from rvc.lib.algorithm.frame_features import spectrogram_for_features
 from rvc.configs.vocoders import normalize_vocoder
-from rvc.lib.algorithm.chouwagan_svae import (
-    ARCHITECTURE_ID as CHOUWAGAN_ARCHITECTURE_ID,
-)
 from rvc.lib.algorithm.chouwagan_vits import (
-    ARCHITECTURE_ID as CHOUWAGAN_VITS_ARCHITECTURE_ID,
+    ARCHITECTURE_ID as REFINEGAN_ARCHITECTURE_ID,
 )
 from rvc.train.run_spec import TrainRunSpec
 
@@ -192,7 +189,7 @@ config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
 exp_decay_gamma = float(getattr(config.train, "lr_decay", 0.999875))
 # Which reconstruction term the run uses.  This belongs to the vocoder, not to
 # the run: a 128-band mel cannot resolve a harmonic comb above ~2 kHz (at 8 kHz
-# a bin spans four harmonics at f0=120), so ChouwaGAN needs the linear-frequency
+# a bin spans four harmonics at f0=120), so RefineGAN needs the linear-frequency
 # MS-STFT term beside it and ships "Hybrid L1", while HiFi-GAN ships the plain
 # mel it was designed around.  Leaving it on the UI meant every run re-answered
 # a question the vocoder had already answered, and answered it wrong by default.
@@ -220,9 +217,9 @@ validation_preview_figsize = (
     max(1.0, float(getattr(config.train, "validation_preview_height", 5.8))),
 )
 
-chouwagan_active = vocoder == "chouwagan"
-if chouwagan_active and sample_rate != 44100:
-    raise ValueError("ChouwaGAN requires the 44.1 kHz configuration.")
+refinegan_active = vocoder == "refinegan"
+if refinegan_active and sample_rate != 44100:
+    raise ValueError("RefineGAN requires the 44.1 kHz configuration.")
 
 # AMP precision / dtype init
 # Default: FP32 + TF32 tensor cores, no autocast, no scaler.
@@ -296,7 +293,7 @@ swap_start_step = 0  # Filled at resume: global_step when the swap was enabled
 swap_completed = False
 
 # Freezes the whole frontend: everything outside `dec.` and `emb_g.`
-# ( ChouwaGAN: enc_p + chouwagan_discrete / legacy VITS: enc_p + enc_q + flow )
+# ( RefineGAN: enc_p + refinegan_latent / legacy VITS: enc_p + enc_q + flow )
 freeze_vae = False # If true, lets only vocoder ( dec ), spk embedding and discriminator learn
 
 # ----  Global LR scales  ----
@@ -529,81 +526,59 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
 
 def get_g_model(config, sample_rate, vocoder, use_checkpointing):
     from rvc.lib.algorithm.synthesizers import Synthesizer
-    if vocoder == "chouwagan":
-        chouwagan_defaults = {
-            "chouwagan_hierarchical": True,
-            "chouwagan_architecture_id": CHOUWAGAN_ARCHITECTURE_ID,
-            "chouwagan_content_channels": 128,
-            "chouwagan_detail_channels": 64,
-            "chouwagan_detail_gate_init": 0.0,
-            "chouwagan_late_detail_fusion": True,
-            "chouwagan_posterior_channels": 160,
-            "chouwagan_prior_hidden_channels": 128,
-            "chouwagan_shared_prior_trunk": True,
-            "chouwagan_content_speaker_conditioning": False,
-            "chouwagan_content_path_dropout": 0.05,
-            "chouwagan_svae_slow_latent_channels": 32,
-            # The rate target is per dimension, so width sets the size of the
-            # gap inference has to guess across: KL(q||p) is what the posterior
-            # holds and the prior does not, and the controller pins it at the
-            # target rather than letting it fall.  Extra width buys gap, not
-            # detail.
-            "chouwagan_svae_fast_latent_channels": 32,
-            "chouwagan_svae_prior_blocks": 4,
-            "chouwagan_svae_prior_heads": 4,
-            "chouwagan_svae_prior_kernel_size": 31,
-            "chouwagan_svae_posterior_blocks": 4,
-            "chouwagan_svae_posterior_slow_blocks": 2,
+    if vocoder == "refinegan":
+        refinegan_defaults = {
+            "refinegan_content_channels": 128,
+            "refinegan_detail_channels": 64,
+            "refinegan_posterior_channels": 192,
+            "refinegan_prior_hidden_channels": 192,
+            "refinegan_prior_blocks": 4,
+            "refinegan_prior_heads": 4,
+            "refinegan_prior_kernel_size": 31,
             # A fraction of the 0.15 rate target, not most of it.  The
             # controller pins the per-dim *mean* at the target, so the floor
             # does not add rate -- it only decides how much of a fixed budget is
             # spent before allocation starts.  Push it near the target and
             # latent collapse becomes the optimum, which the mean cannot see.
             # Do not "fix" a collapse by raising these.
-            "chouwagan_svae_free_bits_slow": 0.05,
-            "chouwagan_svae_free_bits_fast": 0.03,
-            "chouwagan_svae_kl_scale_anchor": 1.0,
-            "chouwagan_svae_feature_scale_anchor": 1.0,
+            "refinegan_vits_free_bits": 0.03,
+            "refinegan_vits_kl_target": 0.15,
+            "refinegan_kl_scale_anchor": 1.0,
+            "refinegan_feature_scale_anchor": 1.0,
             # The decoder only learns to make good audio from prior latents on
             # the replaced fraction of the batch, and inference is 100% prior.
             # The start and ramp are early on purpose: the reconstruction
             # gradient is the only pressure that makes the prior *informative*
             # rather than merely cheap to match, and it has to arrive before the
             # window in which the latent can collapse has closed.
-            "chouwagan_prior_replacement_max": 0.7,
-            "chouwagan_prior_replacement_start": 2000,
-            "chouwagan_prior_replacement_ramp": 12000,
+            "refinegan_prior_replacement_max": 0.7,
+            "refinegan_prior_replacement_start": 2000,
+            "refinegan_prior_replacement_ramp": 12000,
             # Half the replaced items decode from the prior mean, which is what
             # ``infer`` supplies, and half from a prior sample.  Training only
             # on samples leaves the decoder unpractised at the operating point
-            # inference uses; see ``ChouwaContinuousLatent._replacement_scales``.
-            "chouwagan_prior_replacement_mean_share": 0.5,
-            "chouwagan_prior_uses_logs": True,
-            "chouwagan_excitation_unet": True,
-            "chouwagan_excitation_kernel": 7,
-            "chouwagan_noise_injection": False,
-            "chouwagan_output_head_threshold": 0.85,
-            "chouwagan_output_head_ceiling": 1.0,
-            "chouwagan_remove_output_dc": True,
+            # inference uses; see ``RefineVitsLatent._replacement_scales``.
+            "refinegan_prior_replacement_mean_share": 0.5,
+            "refinegan_prior_uses_logs": True,
+            "refinegan_start_channels": 16,
+            "refinegan_wave_amp": 0.1,
+            # One wide branch at the high-rate stages instead of three narrow
+            # ones.  The paper halves channels to 32 at the output rate, where a
+            # conv1d reaches 26% of this card's throughput; stopping the halving
+            # at 64 and spending the budget on width measured 33% more
+            # arithmetic in 24% less wall time, 17% less activation memory and
+            # 1.76x the achieved TFLOP/s.  See ``_decoder_channels``.  Setting
+            # all three back to their flat defaults restores the paper exactly.
+            "refinegan_decoder_channels": [256, 128, 96, 64],
+            "refinegan_resblock_kernel_sizes": [[3, 7, 11], [3, 7, 11], [11], [11]],
+            "refinegan_resblock_dilations": [[1, 3, 5], [1, 3, 5], [1, 3], [1, 3]],
         }
-        # The Chouwa frontend is intentionally replaced by the continuous
-        # SVAE architecture; old FSQ identifiers must not select the legacy
-        # implementation for a new run.  The id follows whichever frontend is
-        # selected: the two share no tensor shapes, and ``net_g`` loads
-        # ChouwaGAN checkpoints non-strictly, so pinning the wrong one here
-        # would let a checkpoint from the other frontend load with every latent
-        # module silently left at its initialisation.
-        selected_frontend = str(
-            config.model.get("chouwagan_frontend", "svae")
-            if hasattr(config.model, "get")
-            else getattr(config.model, "chouwagan_frontend", "svae")
-        ).lower()
-        config.model["chouwagan_architecture_id"] = (
-            CHOUWAGAN_VITS_ARCHITECTURE_ID
-            if selected_frontend == "vits"
-            else CHOUWAGAN_ARCHITECTURE_ID
-        )
-        for key, value in chouwagan_defaults.items():
+        # The id is pinned rather than read from the config: ``net_g`` loads
+        # non-strictly, so a checkpoint whose latent or decoder layout differs
+        # would otherwise load with the mismatched modules left at their init
+        # instead of failing the guard.
+        config.model["refinegan_architecture_id"] = REFINEGAN_ARCHITECTURE_ID
+        for key, value in refinegan_defaults.items():
             if key not in config.model:
                 config.model[key] = value
     model_config = config.model.__dict__.copy()
@@ -619,49 +594,30 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
 
 def get_d_model(config, vocoder, use_checkpointing):
     vocoder = normalize_vocoder(vocoder)
-    if vocoder == "chouwagan":
+    if vocoder == "refinegan":
         from rvc.lib.algorithm.discriminators.multi import (
             PERIODS,
-            SPECTROGRAM_SPECS,
-            ChouwaGANDiscriminator,
+            RESOLUTIONS,
+            RefineGANDiscriminator,
         )
 
         # JSON has no tuples, so a configured schedule arrives as nested lists.
         # The discriminator normalises them itself; passing them through
         # untouched keeps this function free of the branch layout.
-        spectrogram_specs = getattr(
-            config.model, "chouwagan_d_spectrogram_specs", None
-        )
-        spectrogram_specs = tuple(
-            dict(spec) for spec in (spectrogram_specs or SPECTROGRAM_SPECS)
-        )
+        resolutions = getattr(config.model, "refinegan_d_resolutions", None)
 
-        return ChouwaGANDiscriminator(
-            use_spectral_norm=False,
-            use_san=bool(getattr(config.model, "chouwagan_use_san", True)),
+        return RefineGANDiscriminator(
+            use_spectral_norm=bool(
+                getattr(config.model, "refinegan_use_spectral_norm", False)
+            ),
             use_checkpointing=use_checkpointing,
             sample_rate=config.data.sample_rate,
-            periods=tuple(getattr(config.model, "chouwagan_d_periods", None) or PERIODS),
-            spectrogram_channels=tuple(
-                getattr(config.model, "chouwagan_d_spectrogram_channels", (32, 64, 96))
+            periods=tuple(getattr(config.model, "refinegan_d_periods", None) or PERIODS),
+            resolutions=tuple(
+                tuple(value) for value in (resolutions or RESOLUTIONS)
             ),
-            spectrogram_compression=float(
-                getattr(config.model, "chouwagan_d_spectrogram_compression", 0.3)
-            ),
-            spectrogram_specs=spectrogram_specs,
-            use_subband=bool(getattr(config.model, "chouwagan_d_use_subband", False)),
-            subband_bands=int(getattr(config.model, "chouwagan_d_subband_bands", 8)),
-            subband_channels=tuple(
-                getattr(config.model, "chouwagan_d_subband_channels", (64, 128, 192))
-            ),
-            use_cqt=bool(getattr(config.model, "chouwagan_d_use_cqt", False)),
-            cqt_bins_per_octave=int(
-                getattr(config.model, "chouwagan_d_cqt_bins_per_octave", 16)
-            ),
-            cqt_bins=int(getattr(config.model, "chouwagan_d_cqt_bins", 128)),
-            cqt_f_min=float(getattr(config.model, "chouwagan_d_cqt_f_min", 55.0)),
-            cqt_channels=tuple(
-                getattr(config.model, "chouwagan_d_cqt_channels", (64, 128, 192))
+            resolution_channels=int(
+                getattr(config.model, "refinegan_d_resolution_channels", 32)
             ),
         )
 
@@ -714,7 +670,7 @@ def _lazy_r1_penalty(
     return real_grad.square().reshape(real_grad.shape[0], -1).sum(dim=1).mean()
 
 
-def _chouwagan_ablation_margin(
+def _refinegan_ablation_margin(
     model,
     discrete_model,
     discrete_parts,
@@ -761,7 +717,7 @@ def _chouwagan_ablation_margin(
     be dense enough to steer.
     """
     with torch.no_grad():
-        ablated_detail, slow_detail, fast_detail = discrete_model.ablate_dimension(
+        ablated_detail, _, _ = discrete_model.ablate_dimension(
             discrete_parts,
             branch,
             dimension,
@@ -773,12 +729,6 @@ def _chouwagan_ablation_margin(
     detail_slice = commons.slice_segments(
         ablated_detail, ids_slice, segment_size, dim=3
     )
-    slow_slice = commons.slice_segments(
-        slow_detail, ids_slice, segment_size, dim=3
-    )
-    fast_slice = commons.slice_segments(
-        fast_detail, ids_slice, segment_size, dim=3
-    )
     pitchf_slice = commons.slice_segments(pitchf, ids_slice, segment_size, dim=2)
     speaker = model.emb_g(sid).unsqueeze(-1)
 
@@ -787,10 +737,6 @@ def _chouwagan_ablation_margin(
             torch.cat((content_slice, detail_slice), dim=1),
             pitchf_slice,
             g=speaker,
-            content_latent=content_slice,
-            detail_latent=detail_slice,
-            slow_detail_latent=slow_slice,
-            fast_detail_latent=fast_slice,
         )
 
     target_mel = wave_to_mel(config, target)
@@ -1027,23 +973,15 @@ def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int
     return max(1, min(configured, wanted)) if wanted else configured
 
 
-def _constant_discriminator_loss(san_direction_weight: float, san_active: bool) -> float:
-    """``loss_disc`` for a discriminator that emits one constant for real and fake.
-
-    This is the operational definition of a dead discriminator: it has stopped
-    being a function of its input.  It is a fixed number for a given loss form,
-    so the distance to it is an absolute health measure that needs no baseline
-    and no reference run.  Both sides are symmetric about the midpoint of the
-    real and fake targets, so the best constant is always 0.5.
-
-    Mirrors the two branches of :func:`~rvc.train.losses.discriminator_loss`:
-    SAN heads use a squared-softplus surrogate and carry a direction term at
-    ``san_direction_weight``; everything else is plain LSGAN.
-    """
-    if not san_active:
-        return 0.5
-    per_side = math.log1p(math.exp(0.5)) ** 2
-    return (1.0 + max(0.0, float(san_direction_weight))) * 2.0 * per_side
+#: ``loss_disc`` for a discriminator that emits one constant for real and fake.
+#:
+#: This is the operational definition of a dead discriminator: it has stopped
+#: being a function of its input.  Under the LSGAN objective RefineGAN uses,
+#: both sides are symmetric about the midpoint of the real and fake targets, so
+#: the best constant is always 0.5 and the loss it produces is exactly 0.5.
+#: That makes the distance to it an absolute health measure needing no baseline
+#: and no reference run.
+CONSTANT_DISCRIMINATOR_LOSS = 0.5
 
 
 class _AdversarialCeilingGovernor:
@@ -1292,7 +1230,7 @@ def _holdout_spectral_loss(net_g, batches, config, device):
     """Mel distance between the *inference* path and ground truth, held out.
 
     Deliberately the inference path (``infer``) and not the training forward.
-    On ChouwaGAN the training path samples the posterior, which has seen the
+    On RefineGAN the training path samples the posterior, which has seen the
     target spectrogram, and a model that is memorising scores well there long
     after it has stopped generalising.  ``infer`` runs prior-only, which is
     what inference actually does, and the same call works for the HiFi-GAN
@@ -1311,7 +1249,7 @@ def _holdout_spectral_loss(net_g, batches, config, device):
     count = 0
 
     # The metric has to be a pure function of the weights, and ``infer`` draws
-    # noise on both paths: the ChouwaGAN branch consumes RNG even when
+    # noise on both paths: the RefineGAN branch consumes RNG even when
     # ``deterministic`` zeroes the scale, and the VITS/HiFi-GAN branch ignores
     # the flag entirely and always samples at 0.66666 (see
     # ``Synthesizer.infer``).  Left alone that would put fresh sampling noise
@@ -1461,7 +1399,7 @@ def _deliverable_weights(overtrain_monitor, ema, model_g):
     return _cpu_state_dict(model_g), "live weights"
 
 
-def _checkpoint_extra(r1_controller, grad_scaler):
+def _checkpoint_extra(r1_controller, grad_scaler, r1_grad_scaler=None):
     """Training-loop state that a resume cannot re-derive, for the D checkpoint.
 
     Everything here is plain scalars and plain dicts on purpose: ``extra`` is
@@ -1476,6 +1414,8 @@ def _checkpoint_extra(r1_controller, grad_scaler):
     if grad_scaler is not None:
         extra["grad_scaler"] = grad_scaler.state_dict()
         extra["amp_skipped_steps"] = int(amp_skipped_steps)
+    if r1_grad_scaler is not None:
+        extra["r1_grad_scaler"] = r1_grad_scaler.state_dict()
     return extra or None
 
 
@@ -1499,7 +1439,7 @@ class _R1StrengthController:
     Targeting the ratio directly makes the stabilisation constant in the units
     that matter and removes the constant that has to be re-picked per run.  The
     update is multiplicative on ``log scale`` and symmetric in relative error,
-    matching ``ChouwaGANSVAE._kl_beta`` -- the same controller shape for the same
+    matching ``RefineGANSVAE._kl_beta`` -- the same controller shape for the same
     reason, and overshooting by 2x costs what undershooting by 2x costs.
 
     The scale applied to an R1 event is the one earned by the events before it:
@@ -1874,10 +1814,10 @@ def _adaptive_feature_match_weight(
 
     ``balance_target`` is the fm-to-reconstruction gradient ratio to hold at the
     last decoder layer, so it is directly comparable to
-    ``chouwagan_adv_balance_target``.  Its default is where a healthy run sat.
+    ``refinegan_adv_balance_target``.  Its default is where a healthy run sat.
 
     ``maximum`` is 1.0 on purpose, and it means this can only ever *reduce*
-    ``chouwagan_fm_weight``, never amplify it.  The configured weight stays the
+    ``refinegan_fm_weight``, never amplify it.  The configured weight stays the
     ceiling because the observed failure is overgrowth; letting a controller
     push feature matching above what the config asked for would be a second,
     unproven change riding along with this one.
@@ -1909,10 +1849,8 @@ def _generator_gradient_metrics(net_g):
     model = net_g.module if hasattr(net_g, "module") else net_g
     groups = {
         "content_encoder": [],
-        "frontend_content": [],
-        "coarse_spectral": [],
         "posterior": [],
-            "latent": [],
+        "latent": [],
         "prior": [],
         "decoder": [],
         "speaker": [],
@@ -1923,20 +1861,14 @@ def _generator_gradient_metrics(net_g):
             continue
         if name.startswith("enc_p."):
             group = "content_encoder"
-        elif name.startswith("chouwagan_discrete.content"):
-            group = "frontend_content"
-        elif name.startswith("chouwagan_discrete.coarse_spectral"):
-            group = "coarse_spectral"
         elif (
-            name.startswith("chouwagan_discrete.posterior_slow_head")
-            or name.startswith("chouwagan_discrete.posterior_fast_head")
-            or name.startswith("chouwagan_discrete.fast_to_")
-            or name.startswith("chouwagan_discrete.slow_to_")
+            name.startswith("refinegan_latent.posterior_fast_head")
+            or name.startswith("refinegan_latent.fast_to_")
         ):
             group = "latent"
-        elif name.startswith("chouwagan_discrete.posterior"):
+        elif name.startswith("refinegan_latent.posterior"):
             group = "posterior"
-        elif name.startswith("chouwagan_discrete.prior"):
+        elif name.startswith("refinegan_latent.prior"):
             group = "prior"
         elif name.startswith("dec."):
             group = "decoder"
@@ -2022,7 +1954,7 @@ def get_optimizers(
 
     optim_g = _make_optimizer(net_g, optimizer_choice_g, lr_g, num_epochs=total_epoch_count, num_batches=num_batches, param_groups=g_param_groups)
     lazy_reg_interval = None
-    if vocoder == "chouwagan" and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
+    if vocoder == "refinegan" and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
         lazy_reg_interval = int(getattr(config.train, "r1_interval", 16))
     optim_d = _make_optimizer(
         net_d,
@@ -2040,8 +1972,8 @@ def apply_frontend_freeze(net_g, rank):
     """
     Freeze the frontend for fine-tuning, driven by the `freeze_vae` flag.
 
-    Everything outside `dec.` and `emb_g.` is frozen, which on ChouwaGAN means
-    `enc_p` plus the SVAE prior/posterior under `chouwagan_discrete`.
+    Everything outside `dec.` and `emb_g.` is frozen, which on RefineGAN means
+    `enc_p` plus the SVAE prior/posterior under `refinegan_latent`.
     """
     if not freeze_vae:
         if rank == 0:
@@ -2060,32 +1992,23 @@ def apply_frontend_freeze(net_g, rank):
 
 
 def apply_finetune_freezes(net_g, rank):
-    """Keep the learned content/code distribution stable during Chouwa fine-tuning."""
+    """Keep the learned content/code distribution stable during Refine fine-tuning."""
     if not finetune_phase:
         return
 
     model = net_g.module if hasattr(net_g, "module") else net_g
-    discrete = getattr(model, "chouwagan_discrete", None)
+    discrete = getattr(model, "refinegan_latent", None)
     if discrete is None:
         return
 
     frozen_modules = [
         getattr(model, "enc_p", None),
-        getattr(discrete, "content_input", None),
-        getattr(discrete, "content_blocks", None),
-        getattr(discrete, "content_attention", None),
         getattr(discrete, "posterior_input", None),
-        getattr(discrete, "posterior_content", None),
-        getattr(discrete, "posterior_speaker", None),
-        getattr(discrete, "posterior_blocks", None),
-        getattr(discrete, "posterior_slow_head", None),
+        getattr(discrete, "posterior_condition", None),
+        getattr(discrete, "posterior_enc", None),
         getattr(discrete, "posterior_fast_head", None),
-        getattr(discrete, "posterior_slow_precondition", None),
-        getattr(discrete, "posterior_fast_precondition", None),
-        getattr(discrete, "coarse_spectral_head", None),
     ]
     frozen_params = 0
-    discrete.content_path_dropout = 0.0
     for module in frozen_modules:
         if module is None:
             continue
@@ -2096,7 +2019,7 @@ def apply_finetune_freezes(net_g, rank):
 
     if rank == 0:
         print(
-            f"[INIT] Chouwa fine-tune frontend frozen: {frozen_params:,} params; "
+            f"[INIT] Refine fine-tune frontend frozen: {frozen_params:,} params; "
             "decoder, speaker embedding, prior and continuous latent adapters remain trainable."
         )
 
@@ -2173,8 +2096,8 @@ def enable_vocoder_compile(net_g, device, rank):
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
 
     mode = torch_compile_mode
-    if chouwagan_active:
-        # The ChouwaGAN loop backwards through the decoder graph more than once
+    if refinegan_active:
+        # The RefineGAN loop backwards through the decoder graph more than once
         # per step: `loss_core.backward(retain_graph=True)` is followed by the
         # decoder-only `autograd.grad` for the GAN term, plus the adaptive-adv
         # and Grad_Source probes.  AOTAutograd's donated-buffer optimisation
@@ -2183,7 +2106,7 @@ def enable_vocoder_compile(net_g, device, rank):
         import torch._functorch.config as functorch_config
 
         functorch_config.donated_buffer = False
-    if chouwagan_active and mode == "reduce-overhead":
+    if refinegan_active and mode == "reduce-overhead":
         # `reduce-overhead` records CUDA graphs, which cannot survive the extra
         # backward passes above: the Grad_Source probes fire on step 50 and trip
         # "graph recording observed an input tensor deallocate during graph
@@ -2194,7 +2117,7 @@ def enable_vocoder_compile(net_g, device, rank):
         mode = "default"
         if rank == 0:
             print(
-                "[INIT] 'reduce-overhead' is incompatible with the ChouwaGAN "
+                "[INIT] 'reduce-overhead' is incompatible with the RefineGAN "
                 "multi-backward loop (CUDA graphs); using "
                 f"'{mode}' instead."
             )
@@ -2209,10 +2132,10 @@ def enable_vocoder_compile(net_g, device, rank):
 
 
 def enable_discriminator_compile(net_d, config, device, rank):
-    """Compile the discriminator, driven by ``chouwagan_compile_discriminator``.
+    """Compile the discriminator, driven by ``refinegan_compile_discriminator``.
 
     Config-driven rather than a run-spec flag: it is a property of the
-    ChouwaGAN discriminator's shape contract, not a choice a user makes per
+    RefineGAN discriminator's shape contract, not a choice a user makes per
     run.  It travels with the architecture that makes it valid.
 
     ``torch_compile_mode`` is deliberately not consulted.  That option exists
@@ -2221,9 +2144,9 @@ def enable_discriminator_compile(net_d, config, device, rank):
     (see :func:`enable_vocoder_compile`) and which an 8 GiB card has no room
     for besides.  Plain fusion is the whole benefit here, so the mode is fixed.
     """
-    if not chouwagan_active:
+    if not refinegan_active:
         return False
-    if not bool(getattr(config.train, "chouwagan_compile_discriminator", False)):
+    if not bool(getattr(config.train, "refinegan_compile_discriminator", False)):
         return False
     if device.type != "cuda":
         if rank == 0:
@@ -2248,7 +2171,7 @@ def enable_discriminator_compile(net_d, config, device, rank):
 
 @torch.no_grad()
 def collect_source_path_metrics(net_g):
-    """How hard the NSF excitation is pushed into each decoder stage.
+    """How hard the pitch template is pushed into each decoder stage.
 
     Read off the weights, not the activations, so it costs nothing and can be
     sampled at the rolling-log cadence.
@@ -2258,48 +2181,35 @@ def collect_source_path_metrics(net_g):
     was the *strength of the source injection at the high-rate stages*.  Their
     `noise_convs` sit at 1.4-2.0x of init on the first (lowest-rate) stage and at
     0.4-8% of init on the rest -- the harmonic source enters once, heavily
-    filtered, and the network synthesises the rest.  A fresh model injects a
-    full-band harmonic comb at every stage, which is where RVC's mirroring comes
-    from.  ChouwaGAN cannot alias the same way (every stage renders the source
-    band-limited to its own rate), but *how much* excitation each stage leans on
-    is still the same maturity signal, and nothing was watching it.
+    filtered, and the network synthesises the rest.
 
-    Two decoder layouts, one meaning.  With `chouwagan_excitation_unet` the
-    excitation arrives as a concatenated skip and `fusion_proj` decides the mix,
-    so the ratio is the excitation half of that 1x1 against its main-path half.
-    On the legacy path the source is added through a gate, so it is the gated
-    projection against the stage's upsample conv.  Both answer "how much of this
-    stage's output is excitation rather than latent".
+    RefineGAN's U-Net makes the same quantity directly readable.  Every decoder
+    stage opens by concatenating its upsampled activation with the encoder skip
+    taken at that resolution, and that skip is a pure function of the template:
+    the encoder sees nothing else.  ``ParallelResBlock.input_conv`` is the 1x1
+    that decides the mix, so the ratio of its skip-half column norms to its
+    main-half column norms answers "how much of this stage's output is
+    excitation rather than latent".
     """
     model = net_g.module if hasattr(net_g, "module") else net_g
     decoder = getattr(model, "dec", None)
-    stages = getattr(decoder, "ups", None)
-    if stages is None or not hasattr(decoder, "channels"):
+    stages = getattr(decoder, "upsample_conv_blocks", None)
+    skip_widths = getattr(decoder, "skip_channels", None)
+    if stages is None or not skip_widths:
         return {}
 
     metrics = {}
-    unet = bool(getattr(decoder, "excitation_unet", False))
-    if unet:
-        gate = getattr(decoder, "exc_bottleneck_gate", None)
-        if gate is not None:
-            metrics["Source/bottleneck_gate"] = torch.sigmoid(gate).item()
-
     ratios = []
-    for index, channels in enumerate(decoder.channels):
-        if unet:
-            fusion = decoder.fusion_proj[index].weight
-            # cat order is (x, skip), so the main path owns the first columns.
-            main = fusion[:, :channels].norm()
-            excitation = fusion[:, channels:].norm()
-        else:
-            main = stages[index][1].weight.norm()
-            excitation = (
-                torch.sigmoid(decoder.source_gates[index])
-                * decoder.source_projections[index].weight.norm()
-            )
-            metrics[f"Source/gate_stage_{index}"] = torch.sigmoid(
-                decoder.source_gates[index]
-            ).item()
+    for index, stage in enumerate(stages):
+        weight = stage.input_conv.weight
+        # cat order is (upsampled, skip), so the main path owns the leading
+        # columns.  The split is read from the decoder rather than inferred:
+        # it is only ``in_channels // 3`` under the paper's halving, and the
+        # shipped schedule does not halve, so inferring it would silently
+        # attribute part of the main path to the excitation.
+        skip = int(skip_widths[index])
+        main = weight[:, :-skip].norm()
+        excitation = weight[:, -skip:].norm()
         ratio = (excitation / main.clamp_min(1e-8)).item()
         metrics[f"Source/inject_ratio_stage_{index}"] = ratio
         ratios.append(ratio)
@@ -2357,7 +2267,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
 
             # Load the model and optim states
-            generator_strict_load = strict_load and not chouwagan_active
+            generator_strict_load = strict_load and not refinegan_active
             _, _, _, epoch_str, _ = load_checkpoint(
                 g_checkpoint_path,
                 net_g,
@@ -2419,7 +2329,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
 
             net_g.load_state_dict(
                 state_dict,
-                strict=not chouwagan_active,
+                strict=not refinegan_active,
             )
 
         # Loading the pretrained Discriminator model
@@ -2693,8 +2603,8 @@ def get_reference_sample(train_loader, device, config):
             int(config.data.filter_length),
             int(config.data.hop_length),
         )
-    elif getattr(config.model, "chouwagan_use_periodicity", False) or getattr(
-        config.model, "chouwagan_use_frame_energy", False
+    elif getattr(config.model, "refinegan_use_periodicity", False) or getattr(
+        config.model, "refinegan_use_frame_energy", False
     ):
         print(
             "[REFERENCE] Custom reference has no audio, so the preview runs "
@@ -2843,6 +2753,9 @@ def run(
         exp_decay_gamma,
         spectral_loss,
         lr_final_ratio,
+        # Passed from the same variable that drives every ``autocast`` call, so
+        # the banner cannot disagree with what the loop actually runs.
+        amp_dtype=amp_dtype if use_amp else None,
     )
 
     # Initial setup
@@ -2863,31 +2776,31 @@ def run(
     fn_spectral_loss2 = None
     fn_spectral_loss_ms = None
 
-    # ChouwaGAN's compressed-mel distance.  A plain L1 has a gradient of
+    # RefineGAN's compressed-mel distance.  A plain L1 has a gradient of
     # constant magnitude no matter how close the reconstruction gets, so the
     # generator settles into a noise-limited equilibrium where the loss creeps
     # down but the gradient norm never anneals.  Huber is L2 below ``beta``
     # (self-annealing as the residual shrinks) and L1 above it (robust to the
     # onset/silence bins that a plain MSE would over-weight).
     mel_distance = str(
-        getattr(config.train, "chouwagan_mel_distance", "huber")
+        getattr(config.train, "refinegan_mel_distance", "huber")
     ).lower()
-    mel_huber_beta = float(getattr(config.train, "chouwagan_mel_huber_beta", 0.3))
+    mel_huber_beta = float(getattr(config.train, "refinegan_mel_huber_beta", 0.3))
     # Frequency weighting for that distance.  A mean over bins gives every bin
     # the same vote, and past the Huber knee the vote stops scaling with the
     # error, so a badly wrong minority of bins stays wrong: measured at 46% of
     # the mel error against 32% of the gradient below 1 kHz.  1.0 is off, which
     # is what a config that predates this key gets.
     mel_low_emphasis = float(
-        getattr(config.train, "chouwagan_mel_low_emphasis", 1.0)
+        getattr(config.train, "refinegan_mel_low_emphasis", 1.0)
     )
     mel_low_emphasis_hz = float(
-        getattr(config.train, "chouwagan_mel_low_emphasis_hz", 1000.0)
+        getattr(config.train, "refinegan_mel_low_emphasis_hz", 1000.0)
     )
 
     def _make_mel_distance():
-        if not chouwagan_active or mel_distance in ("l1", "mae"):
-            base, weighted = torch.nn.L1Loss, chouwagan_active
+        if not refinegan_active or mel_distance in ("l1", "mae"):
+            base, weighted = torch.nn.L1Loss, refinegan_active
         elif mel_distance == "huber":
             base, weighted = (
                 lambda **kw: torch.nn.SmoothL1Loss(beta=mel_huber_beta, **kw)
@@ -2896,7 +2809,7 @@ def run(
             base, weighted = torch.nn.MSELoss, True
         else:
             raise ValueError(
-                f"Unknown chouwagan_mel_distance {mel_distance!r}: "
+                f"Unknown refinegan_mel_distance {mel_distance!r}: "
                 "expected 'huber', 'l1' or 'mse'."
             )
         if not weighted or mel_low_emphasis == 1.0:
@@ -2927,7 +2840,7 @@ def run(
 
     if spectral_loss == "L1 Mel Loss":
         fn_spectral_loss = _make_mel_distance()
-        if rank == 0 and chouwagan_active:
+        if rank == 0 and refinegan_active:
             print(
                 f"[INIT] Mel distance: {mel_distance}"
                 + (f" (beta={mel_huber_beta})" if mel_distance == "huber" else "")
@@ -2935,24 +2848,24 @@ def run(
         if swap_l1_to_ms:
             fn_spectral_loss_ms = MultiScaleMelSpectrogramLoss(
                 sample_rate=sample_rate,
-                safe_log=chouwagan_active,
+                safe_log=refinegan_active,
                 loss_fn=_make_mel_distance(),
             )
     elif spectral_loss == "Multi-Scale Mel Loss":
         # Uses the same configured distance as the single-scale mel loss.  It
-        # used to hardcode L1, which silently ignored ``chouwagan_mel_distance``
+        # used to hardcode L1, which silently ignored ``refinegan_mel_distance``
         # -- selecting this mode quietly discarded the Huber setting.
         #
-        # One caveat worth knowing: ``chouwagan_mel_huber_beta`` was tuned
+        # One caveat worth knowing: ``refinegan_mel_huber_beta`` was tuned
         # against ``wave_to_mel(for_loss=True)``, while this operates on
         # ``log1p(mel * log_scale)``.  The two scales are similar but not
         # identical, so beta is a slightly different L2/L1 crossover here.
         fn_spectral_loss = MultiScaleMelSpectrogramLoss(
             sample_rate=sample_rate,
-            safe_log=chouwagan_active,
+            safe_log=refinegan_active,
             loss_fn=_make_mel_distance(),
         )
-        if rank == 0 and chouwagan_active:
+        if rank == 0 and refinegan_active:
             print(
                 f"[INIT] Multi-scale mel distance: {mel_distance}"
                 + (f" (beta={mel_huber_beta})" if mel_distance == "huber" else "")
@@ -2999,6 +2912,22 @@ def run(
         if use_amp
         else None
     )
+    # The lazy R1 step is a *second* optimizer iteration on ``optim_d`` inside
+    # the same training step, and a GradScaler tracks its state per optimizer
+    # per iteration: once ``step(optim_d)`` has been called, a further
+    # ``unscale_(optim_d)`` before ``update()`` raises "unscale_() is being
+    # called after step()".  It did, on the first R1 step of every FP16 run.
+    #
+    # A second scaler is the fix rather than an extra ``update()`` because the
+    # two backwards genuinely want different loss scales: R1 is a double
+    # backward of a squared gradient norm, so its magnitude has no relation to
+    # the discriminative loss's, and forcing them to share one scale means
+    # whichever overflows first drags the other down with it.
+    r1_grad_scaler = (
+        torch.amp.GradScaler("cuda", init_scale=2.0 ** 10, growth_interval=2000)
+        if use_amp
+        else None
+    )
     # The scaler carries real state: the current scale and how far it is into the
     # growth interval.  Restarting it at ``init_scale`` on every resume replays
     # the initial overflow-and-back-off search, which throws away a handful of
@@ -3015,24 +2944,16 @@ def run(
                     f"({amp_skipped_steps} steps skipped so far).",
                     tag="[RESUME]",
                 )
+    if r1_grad_scaler is not None:
+        r1_scaler_state = resumed_extra_d.get("r1_grad_scaler")
+        if r1_scaler_state:
+            r1_grad_scaler.load_state_dict(r1_scaler_state)
     if use_amp and rank == 0:
         info(f"AMP enabled: dtype={amp_dtype}, GradScaler active.", tag="[INIT]")
 
     phase_start_step = global_step
     phase_step = 0
     phase_limit_reached = False
-    if finetune_phase and vocoder == "chouwagan":
-        model_g = net_g.module if hasattr(net_g, "module") else net_g
-        discrete = getattr(model_g, "chouwagan_discrete", None)
-        if discrete is not None:
-            discrete.usage_loss_weight *= max(
-                0.0,
-                float(getattr(config.train, "chouwagan_finetune_usage_scale", 0.25)),
-            )
-            discrete.coarse_spectral_loss_weight *= max(
-                0.0,
-                float(getattr(config.train, "chouwagan_finetune_coarse_scale", 0.5)),
-            )
     if finetune_phase:
         epoch_str = 1
 
@@ -3131,7 +3052,7 @@ def run(
     adv_ramp_start = fit_schedule(
         0
         if finetune_phase
-        else max(0, int(getattr(config.train, "chouwagan_adaptive_adv_ramp_start", 20000))),
+        else max(0, int(getattr(config.train, "refinegan_adaptive_adv_ramp_start", 20000))),
         planned_steps,
         0.2,
     )
@@ -3139,9 +3060,9 @@ def run(
         max(
             0,
             int(
-                getattr(config.train, "chouwagan_adaptive_adv_ramp_steps_finetune", 2000)
+                getattr(config.train, "refinegan_adaptive_adv_ramp_steps_finetune", 2000)
                 if finetune_phase
-                else getattr(config.train, "chouwagan_adaptive_adv_ramp_steps", 80000)
+                else getattr(config.train, "refinegan_adaptive_adv_ramp_steps", 80000)
             ),
         ),
         planned_steps,
@@ -3152,15 +3073,12 @@ def run(
         ramp_steps=adv_ramp_steps,
         ceiling_start=1.0,
         ceiling_end=max(
-            max(0.0, float(getattr(config.train, "chouwagan_adaptive_adv_min", 0.01))),
-            float(getattr(config.train, "chouwagan_adaptive_adv_max", 8.0)),
+            max(0.0, float(getattr(config.train, "refinegan_adaptive_adv_min", 0.01))),
+            float(getattr(config.train, "refinegan_adaptive_adv_max", 8.0)),
         ),
-        floor_loss=_constant_discriminator_loss(
-            max(0.0, min(1.0, float(getattr(config.train, "chouwagan_san_direction_weight", 0.25)))),
-            bool(getattr(config.model, "chouwagan_use_san", True)),
-        ),
+        floor_loss=CONSTANT_DISCRIMINATOR_LOSS,
         collapse_ceiling=max(
-            0.0, float(getattr(config.train, "chouwagan_adaptive_adv_min", 0.01))
+            0.0, float(getattr(config.train, "refinegan_adaptive_adv_min", 0.01))
         ),
     )
 
@@ -3171,9 +3089,9 @@ def run(
         branch_names=getattr(
             net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ()
         ),
-        target_ratio=float(getattr(config.train, "chouwagan_r1_target_ratio", 1.0)),
-        maximum=float(getattr(config.train, "chouwagan_r1_max_scale", 10000.0)),
-        minimum=float(getattr(config.train, "chouwagan_r1_min_scale", 1e-4)),
+        target_ratio=float(getattr(config.train, "refinegan_r1_target_ratio", 1.0)),
+        maximum=float(getattr(config.train, "refinegan_r1_max_scale", 10000.0)),
+        minimum=float(getattr(config.train, "refinegan_r1_min_scale", 1e-4)),
     )
     if r1_controller.load_state_dict(resumed_extra_d.get("r1_controller")):
         info(
@@ -3247,6 +3165,7 @@ def run(
             adversarial_ceiling_governor=adversarial_ceiling_governor,
             r1_controller=r1_controller,
             grad_scaler=grad_scaler,
+            r1_grad_scaler=r1_grad_scaler,
         )
         if use_lr_scheduler and (not warmup_active() or warmup_completed):
             if lr_scheduler in ["exp decay epoch", "cosine annealing", "cosine annealing epoch"]:
@@ -3325,6 +3244,7 @@ def training_loop(
     adversarial_ceiling_governor=None,
     r1_controller=None,
     grad_scaler=None,
+    r1_grad_scaler=None,
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -3420,13 +3340,13 @@ def training_loop(
         "posterior_detail_rms": deque(maxlen=rolling_loss_steps),
         "prior_detail_rms": deque(maxlen=rolling_loss_steps),
     }
-    if chouwagan_active:
+    if refinegan_active:
         # Waveform-domain reconstruction terms, logged unweighted so the series
         # stay readable when their weights change.
         for key in ("loss_envelope", "loss_rms", "loss_peak", "loss_waveform"):
             avg_rolling_cache[key] = deque(maxlen=rolling_loss_steps)
     else:
-        # ``loss_kl`` is the Gaussian VITS ELBO term; the ChouwaGAN frontend
+        # ``loss_kl`` is the Gaussian VITS ELBO term; the RefineGAN frontend
         # reports its divergence through ``loss_prior_*`` instead and leaves
         # this at a constant zero.
         avg_rolling_cache["loss_kl"] = deque(maxlen=rolling_loss_steps)
@@ -3462,24 +3382,24 @@ def training_loop(
     # would dominate forever.
     amp_skip_cache = deque(maxlen=rolling_loss_steps)
     disc_branch_names = ()
-    if chouwagan_active:
+    if refinegan_active:
         disc_branch_names = tuple(
             getattr(net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ())
         )
 
-    chouwagan_diagnostics_interval = max(
+    refinegan_diagnostics_interval = max(
         1,
-        int(getattr(config.train, "chouwagan_diagnostics_interval", 256)),
+        int(getattr(config.train, "refinegan_diagnostics_interval", 256)),
     )
 
     # Same correction for everything sourced from ``discrete_diagnostics``.
-    # Those are produced once every ``chouwagan_diagnostics_interval`` steps, so
+    # Those are produced once every ``refinegan_diagnostics_interval`` steps, so
     # a deque sized in *steps* holds `maxlen * interval` steps of history: at the
     # defaults that is 50 x 256 = 12800 steps, which made the KL/prior series a
     # near-cumulative average of the whole run rather than a recent one. They
     # read low for thousands of steps after the underlying value had moved.
     diagnostic_window = max(
-        2, rolling_loss_steps // max(1, chouwagan_diagnostics_interval)
+        2, rolling_loss_steps // max(1, refinegan_diagnostics_interval)
     )
     for key in (
         "prior_kl_slow",
@@ -3519,30 +3439,26 @@ def training_loop(
     # output conv that sums the waveform-domain loss gradient over B*T samples),
     # so its natural operating point sits in the hundreds.  The clip is a spike
     # guard, not a per-step rescaler -- keep the ceiling well above that range.
-    chouwagan_global_clip_g = max(
+    refinegan_global_clip_g = max(
         0.0,
-        float(getattr(config.train, "chouwagan_global_clip_norm_g", 500.0)),
-    )
-    chouwagan_san_direction_weight = max(
-        0.0,
-        min(1.0, float(getattr(config.train, "chouwagan_san_direction_weight", 0.25))),
+        float(getattr(config.train, "refinegan_global_clip_norm_g", 500.0)),
     )
     adv_warmup_steps = 0 if finetune_phase else max(
         0, int(getattr(config.train, "adv_warmup_steps", 2000))
     )
-    chouwagan_discrete = None
-    if chouwagan_active:
+    refinegan_latent = None
+    if refinegan_active:
         model_g = net_g.module if hasattr(net_g, "module") else net_g
-        chouwagan_discrete = getattr(model_g, "chouwagan_discrete", None)
-    chouwagan_prior_loss_weight = max(
+        refinegan_latent = getattr(model_g, "refinegan_latent", None)
+    refinegan_prior_loss_weight = max(
         0.0,
-        float(getattr(config.train, "chouwagan_prior_loss_weight", PRIOR_LOSS_WEIGHT_DEFAULT)),
+        float(getattr(config.train, "refinegan_prior_loss_weight", PRIOR_LOSS_WEIGHT_DEFAULT)),
     )
-    chouwagan_prior_warmup_steps = 0 if finetune_phase else max(
+    refinegan_prior_warmup_steps = 0 if finetune_phase else max(
         0,
-        int(getattr(config.train, "chouwagan_prior_warmup_steps", PRIOR_WARMUP_STEPS_DEFAULT)),
+        int(getattr(config.train, "refinegan_prior_warmup_steps", PRIOR_WARMUP_STEPS_DEFAULT)),
     )
-    # When ``chouwagan_svae_kl_target_*`` is set, the rate controller owns the
+    # When ``refinegan_kl_target_*`` is set, the rate controller owns the
     # KL weight and discards both settings above (see the
     # ``kl_rate_control_active`` test at the loss site).  Silently ignored
     # config is worse than no config: a run tuned by turning these knobs would
@@ -3551,47 +3467,43 @@ def training_loop(
     #
     # Only when they differ from their defaults, though.  The shipped config
     # carries both keys at their default values, so testing for the key's
-    # presence fired this on every ChouwaGAN run and warned about a choice
+    # presence fired this on every RefineGAN run and warned about a choice
     # nobody made -- which is how a warning becomes something people scroll
     # past.  A value equal to the default says nothing about intent.
     if (
         rank == 0
-        and chouwagan_discrete is not None
-        and chouwagan_discrete.kl_rate_control_active
+        and refinegan_latent is not None
+        and refinegan_latent.kl_rate_control_active
     ):
         overridden = []
-        if chouwagan_prior_loss_weight != PRIOR_LOSS_WEIGHT_DEFAULT:
-            overridden.append(f"chouwagan_prior_loss_weight={chouwagan_prior_loss_weight}")
+        if refinegan_prior_loss_weight != PRIOR_LOSS_WEIGHT_DEFAULT:
+            overridden.append(f"refinegan_prior_loss_weight={refinegan_prior_loss_weight}")
         if (
             not finetune_phase
-            and chouwagan_prior_warmup_steps != PRIOR_WARMUP_STEPS_DEFAULT
+            and refinegan_prior_warmup_steps != PRIOR_WARMUP_STEPS_DEFAULT
         ):
-            overridden.append(f"chouwagan_prior_warmup_steps={chouwagan_prior_warmup_steps}")
+            overridden.append(f"refinegan_prior_warmup_steps={refinegan_prior_warmup_steps}")
         if overridden:
             warning(
                 f"KL rate control is active (targets slow="
-                f"{chouwagan_discrete.kl_target_slow}, fast="
-                f"{chouwagan_discrete.kl_target_fast}), so it sets the KL weight "
+                f"{refinegan_latent.kl_target_slow}, fast="
+                f"{refinegan_latent.kl_target_fast}), so it sets the KL weight "
                 f"itself and ignores {', '.join(overridden)}. Change "
-                "chouwagan_svae_kl_target_slow/_fast to move the "
+                "refinegan_kl_target_slow/_fast to move the "
                 "prior/posterior balance.",
                 tag="[INIT]",
             )
-    chouwagan_ablation_interval = 0 if finetune_phase else max(
+    refinegan_ablation_interval = 0 if finetune_phase else max(
         0,
-        int(getattr(config.train, "chouwagan_ablation_interval", 0)),
+        int(getattr(config.train, "refinegan_ablation_interval", 0)),
     )
-    chouwagan_ablation_weight = max(
+    refinegan_ablation_weight = max(
         0.0,
-        float(getattr(config.train, "chouwagan_ablation_loss_weight", 0.0)),
+        float(getattr(config.train, "refinegan_ablation_loss_weight", 0.0)),
     )
-    chouwagan_ablation_margin = max(
+    refinegan_ablation_margin = max(
         0.0,
-        float(getattr(config.train, "chouwagan_ablation_margin", 0.01)),
-    )
-    chouwagan_usage_loss_interval = max(
-        1,
-        int(getattr(config.train, "chouwagan_usage_loss_interval", 16)),
+        float(getattr(config.train, "refinegan_ablation_margin", 0.01)),
     )
     kl_active_threshold = max(
         0.0,
@@ -3599,7 +3511,7 @@ def training_loop(
     )
     adaptive_adv_interval = max(
         1,
-        int(getattr(config.train, "chouwagan_adaptive_adv_interval", 8)),
+        int(getattr(config.train, "refinegan_adaptive_adv_interval", 8)),
     )
 
     # ---- Adversarial balance --------------------------------------------
@@ -3613,22 +3525,22 @@ def training_loop(
     # capping it there caps the ceiling on final quality.
     adaptive_adv_balance = max(
         0.0,
-        float(getattr(config.train, "chouwagan_adv_balance_target", 0.5)),
+        float(getattr(config.train, "refinegan_adv_balance_target", 0.5)),
     )
     adaptive_adv_min = max(
         0.0,
-        float(getattr(config.train, "chouwagan_adaptive_adv_min", 0.01)),
+        float(getattr(config.train, "refinegan_adaptive_adv_min", 0.01)),
     )
     # The same rule for the other discriminator-derived loss -- see
     # ``_adaptive_feature_match_weight`` for the measurements that motivate it.
-    # 0.0 disables the governor and restores the fixed ``chouwagan_fm_weight``.
+    # 0.0 disables the governor and restores the fixed ``refinegan_fm_weight``.
     adaptive_fm_balance = max(
         0.0,
-        float(getattr(config.train, "chouwagan_fm_balance_target", 0.33)),
+        float(getattr(config.train, "refinegan_fm_balance_target", 0.33)),
     )
     adaptive_fm_min = max(
         0.0,
-        float(getattr(config.train, "chouwagan_fm_balance_min", 0.1)),
+        float(getattr(config.train, "refinegan_fm_balance_min", 0.1)),
     )
     # 8.0 is a judgement call, not a derived constant: it is roughly a quarter
     # of the balance the rule currently requests, an ~8x increase on the old
@@ -3637,15 +3549,15 @@ def training_loop(
     # finished; lower it if loss_disc_real starts falling well below 1.0.
     adaptive_adv_max = max(
         adaptive_adv_min,
-        float(getattr(config.train, "chouwagan_adaptive_adv_max", 8.0)),
+        float(getattr(config.train, "refinegan_adaptive_adv_max", 8.0)),
     )
     adaptive_adv_ramp_start = max(
         0,
-        int(getattr(config.train, "chouwagan_adaptive_adv_ramp_start", 20000)),
+        int(getattr(config.train, "refinegan_adaptive_adv_ramp_start", 20000)),
     )
     adaptive_adv_ramp_steps = max(
         0,
-        int(getattr(config.train, "chouwagan_adaptive_adv_ramp_steps", 80000)),
+        int(getattr(config.train, "refinegan_adaptive_adv_ramp_steps", 80000)),
     )
     # A fine-tune never reaches the pretraining ramp's horizon -- a few thousand
     # steps is typical -- so it gets its own, short one.  It still gets a ramp
@@ -3654,23 +3566,23 @@ def training_loop(
     # on the first batch is how a fine-tune picks up artefacts it never had.
     adaptive_adv_ramp_steps_finetune = max(
         0,
-        int(getattr(config.train, "chouwagan_adaptive_adv_ramp_steps_finetune", 2000)),
+        int(getattr(config.train, "refinegan_adaptive_adv_ramp_steps_finetune", 2000)),
     )
 
     # Feature matching is the other channel that carries texture, and it was
     # hardcoded to 1.0 while being normalised by branch count -- roughly half
     # of HiFi-GAN's convention of 2.0 unnormalised, on a term already three
     # orders of magnitude below the spectral loss.
-    chouwagan_fm_weight = max(
+    refinegan_fm_weight = max(
         0.0,
-        float(getattr(config.train, "chouwagan_fm_weight", 2.0)),
+        float(getattr(config.train, "refinegan_fm_weight", 2.0)),
     )
 
     # Only read by the "Hybrid L1" spectral loss.  Left at 1.0 so the option
     # behaves exactly as before unless it is raised deliberately.
     ms_stft_weight = max(
         0.0,
-        float(getattr(config.train, "chouwagan_ms_stft_weight", 1.0)),
+        float(getattr(config.train, "refinegan_ms_stft_weight", 1.0)),
     )
 
     # ---- Waveform-domain reconstruction terms ---------------------------
@@ -3679,33 +3591,33 @@ def training_loop(
     # tends to drift.  Both terms below are relative (log ratios / max-pool
     # differences), so neither assumes a particular dataset normalisation.
     envelope_loss_weight = max(
-        0.0, float(getattr(config.train, "chouwagan_envelope_loss_weight", 3.0))
+        0.0, float(getattr(config.train, "refinegan_envelope_loss_weight", 3.0))
     )
     envelope_kernel = max(
-        2, int(getattr(config.train, "chouwagan_envelope_kernel", 100))
+        2, int(getattr(config.train, "refinegan_envelope_kernel", 100))
     )
     envelope_stride = max(
-        1, int(getattr(config.train, "chouwagan_envelope_stride", 50))
+        1, int(getattr(config.train, "refinegan_envelope_stride", 50))
     )
     # Amplitude below which the companded envelope stops resolving detail.
     # 1e-3 is about -60 dBFS, under any decay tail worth reproducing.
     envelope_floor = max(
-        1e-8, float(getattr(config.train, "chouwagan_envelope_floor", 1e-3))
+        1e-8, float(getattr(config.train, "refinegan_envelope_floor", 1e-3))
     )
     rms_loss_weight = max(
-        0.0, float(getattr(config.train, "chouwagan_rms_loss_weight", 5.0))
+        0.0, float(getattr(config.train, "refinegan_rms_loss_weight", 5.0))
     )
     rms_window_size = max(
-        16, int(getattr(config.train, "chouwagan_rms_window", 1024))
+        16, int(getattr(config.train, "refinegan_rms_window", 1024))
     )
-    rms_hop_size = max(1, int(getattr(config.train, "chouwagan_rms_hop", 256)))
+    rms_hop_size = max(1, int(getattr(config.train, "refinegan_rms_hop", 256)))
     # One-sided and absolute: only useful when the dataset is peak-normalised
     # below the head's threshold.  Off by default.
     peak_headroom_weight = max(
-        0.0, float(getattr(config.train, "chouwagan_peak_headroom_weight", 0.0))
+        0.0, float(getattr(config.train, "refinegan_peak_headroom_weight", 0.0))
     )
     peak_headroom_threshold = float(
-        getattr(config.train, "chouwagan_peak_headroom_threshold", 0.85)
+        getattr(config.train, "refinegan_peak_headroom_threshold", 0.85)
     )
 
     cached_adaptive_adv = None
@@ -3737,7 +3649,7 @@ def training_loop(
                 apply_linear_warmup(optim_g, optim_d, global_step, effective_warmup_steps(train_loader), rank)
 
             # Gradient clipping.  The step-scheduled variant (clip hard early,
-            # loosen later) was removed: with ChouwaGAN the global norm below
+            # loosen later) was removed: with RefineGAN the global norm below
             # already bounds both nets, and it never bound anything in practice
             # -- ``grad_clip_hit_rate_g`` sat at 0 with grad norms 4x under the
             # cap.  What remains is the manual override and that global bound.
@@ -3747,9 +3659,9 @@ def training_loop(
             else:
                 grad_clip_value_g = grad_clip_value_d = float("inf")
 
-            if chouwagan_active and chouwagan_global_clip_g > 0:
-                grad_clip_value_g = min(grad_clip_value_g, chouwagan_global_clip_g)
-                grad_clip_value_d = min(grad_clip_value_d, chouwagan_global_clip_g)
+            if refinegan_active and refinegan_global_clip_g > 0:
+                grad_clip_value_g = min(grad_clip_value_g, refinegan_global_clip_g)
+                grad_clip_value_d = min(grad_clip_value_d, refinegan_global_clip_g)
 
 
             # Device handling
@@ -3772,7 +3684,7 @@ def training_loop(
                 y_hat, ids_slice, x_mask, z_mask, vae_parts = model_output
 
                 discrete_parts = None
-                if chouwagan_discrete is not None:
+                if refinegan_latent is not None:
                     discrete_parts = vae_parts
                     z = z_p = m_q = logs_q = None
                     m_p = None
@@ -3788,7 +3700,7 @@ def training_loop(
 
             # Discriminator update
             main_real_spectrograms = None
-            if chouwagan_active:
+            if refinegan_active:
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
                 )
@@ -3809,13 +3721,12 @@ def training_loop(
 
             for y_d_real, y_d_fake, real_spectrograms in d_updates:
                 with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    if chouwagan_active:
+                    if refinegan_active:
                         y_d_hat_r, y_d_hat_g, _, _ = net_d(
                             y_d_real,
                             y_d_fake,
                             real_spectrograms=real_spectrograms,
                             pair_batches=True,
-                            san_training=True,
                         )
                     else:
                         y_d_hat_r, y_d_hat_g, _, _ = net_d(
@@ -3826,10 +3737,7 @@ def training_loop(
                     disc_loss_parts = discriminator_loss(
                         y_d_hat_r,
                         y_d_hat_g,
-                        san_direction_weight=chouwagan_san_direction_weight
-                        if chouwagan_active
-                        else 1.0,
-                        normalize=chouwagan_active,
+                        normalize=refinegan_active,
                         per_branch=bool(disc_branch_names),
                     )
                     loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
@@ -3878,7 +3786,7 @@ def training_loop(
                         r1_controller.observe_discriminator(name, norm)
 
             if (
-                chouwagan_active
+                refinegan_active
                 and r1_gamma > 0
                 and global_step % r1_interval == 0
             ):
@@ -3900,9 +3808,9 @@ def training_loop(
                     )
 
                 optim_d.zero_grad(set_to_none=True)
-                if grad_scaler is not None:
-                    grad_scaler.scale(loss_r1).backward()
-                    grad_scaler.unscale_(optim_d)
+                if r1_grad_scaler is not None:
+                    r1_grad_scaler.scale(loss_r1).backward()
+                    r1_grad_scaler.unscale_(optim_d)
                 else:
                     loss_r1.backward()
                 grad_norm_d_r1 = _clip_or_sample_grad_norm(
@@ -3913,8 +3821,12 @@ def training_loop(
                 )
                 if grad_norm_d_r1 is not None:
                     r1_controller.observe_r1(r1_branch, float(grad_norm_d_r1))
-                if grad_scaler is not None:
-                    grad_scaler.step(optim_d)
+                if r1_grad_scaler is not None:
+                    r1_grad_scaler.step(optim_d)
+                    # Closed here rather than with the main scaler at the end of
+                    # the step: this is a complete iteration of its own, and it
+                    # only runs every ``r1_interval`` steps.
+                    r1_grad_scaler.update()
                 else:
                     optim_d.step()
                 _normalize_san_weights(net_d)
@@ -3935,7 +3847,7 @@ def training_loop(
 
             # Run discriminator on generated output
             discriminator_parameter_states = None
-            if chouwagan_active:
+            if refinegan_active:
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
                 )
@@ -3972,11 +3884,11 @@ def training_loop(
                 if spectral_loss == "L1 Mel Loss":
                     y_mel = wave_to_mel(
                         config, y, num_mels=None,
-                        for_loss=chouwagan_active,
+                        for_loss=refinegan_active,
                     )
                     y_hat_mel = wave_to_mel(
                         config, y_hat, num_mels=None,
-                        for_loss=chouwagan_active,
+                        for_loss=refinegan_active,
                     )
                     if swap_l1_to_ms and fn_spectral_loss_ms is not None:
                         # Loss swap: L1 mel fades out, Multi-Scale mel fades in over swap_duration_steps
@@ -4000,11 +3912,11 @@ def training_loop(
                     # L1 Mel
                     y_mel = wave_to_mel(
                         config, y, num_mels=None,
-                        for_loss=chouwagan_active,
+                        for_loss=refinegan_active,
                     )
                     y_hat_mel = wave_to_mel(
                         config, y_hat, num_mels=None,
-                        for_loss=chouwagan_active,
+                        for_loss=refinegan_active,
                     )
                     loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel # * 45
                     # MS-STFT.  Weighted, because the mel term it sits beside
@@ -4019,7 +3931,7 @@ def training_loop(
                     loss_spectral = loss_l1_mel + loss_ms_stft
                     # Logged post-weight, which is what the sum above actually
                     # sees: the point of these two series is to show whether
-                    # ``chouwagan_ms_stft_weight`` is high enough for the
+                    # ``refinegan_ms_stft_weight`` is high enough for the
                     # MS-STFT term to matter beside a mel term carrying c_mel.
                     loss_spectral_parts = {
                         "loss_spectral_l1_mel": loss_l1_mel,
@@ -4029,7 +3941,7 @@ def training_loop(
                 loss_envelope = torch.zeros((), device=y.device)
                 loss_rms = torch.zeros((), device=y.device)
                 loss_peak = torch.zeros((), device=y.device)
-                if chouwagan_active:
+                if refinegan_active:
                     if envelope_loss_weight > 0.0:
                         loss_envelope = envelope_loss(
                             y.float(),
@@ -4057,18 +3969,18 @@ def training_loop(
 
                 # The probe is instrumentation first and a loss second, so it
                 # is gated on the interval alone.  It used to also require
-                # ``chouwagan_ablation_weight > 0``, which meant the only way to
+                # ``refinegan_ablation_weight > 0``, which meant the only way to
                 # stop paying for a term that does nothing was to also go blind
                 # to the one measurement that says whether a latent dimension is
                 # load-bearing.  ``loss_ablation`` is still scaled by the weight
                 # below, so a weight of zero costs exactly the forward pass.
                 if (
-                    chouwagan_discrete is not None
-                    and chouwagan_ablation_interval > 0
-                    and global_step % chouwagan_ablation_interval == 0
+                    refinegan_latent is not None
+                    and refinegan_ablation_interval > 0
+                    and global_step % refinegan_ablation_interval == 0
                 ):
-                    slow_dimension_count = len(chouwagan_discrete.slow_levels)
-                    fast_dimension_count = len(chouwagan_discrete.fast_levels)
+                    slow_dimension_count = len(refinegan_latent.slow_levels)
+                    fast_dimension_count = len(refinegan_latent.fast_levels)
                     total_dimension_count = slow_dimension_count + fast_dimension_count
                     selected_dimension = int(
                         torch.randint(
@@ -4083,9 +3995,9 @@ def training_loop(
                     else:
                         ablation_branch = "fast"
                         ablation_dimension = selected_dimension - slow_dimension_count
-                    ablation_raw, ablation_delta, _ = _chouwagan_ablation_margin(
+                    ablation_raw, ablation_delta, _ = _refinegan_ablation_margin(
                         model_g,
-                        chouwagan_discrete,
+                        refinegan_latent,
                         discrete_parts,
                         ids_slice,
                         config.train.segment_size // config.data.hop_length,
@@ -4095,63 +4007,44 @@ def training_loop(
                         y_hat,
                         ablation_branch,
                         ablation_dimension,
-                        chouwagan_ablation_margin,
+                        refinegan_ablation_margin,
                     )
-                    loss_ablation = ablation_raw * chouwagan_ablation_weight
+                    loss_ablation = ablation_raw * refinegan_ablation_weight
 
                 # Feature Matching loss
                 loss_fm = feature_loss(
                     fmap_r,
                     fmap_g,
-                    normalize=chouwagan_active,
-                ) * (chouwagan_fm_weight if chouwagan_active else 2.0)
+                    normalize=refinegan_active,
+                ) * (refinegan_fm_weight if refinegan_active else 2.0)
 
                 # Generator loss
                 loss_adv = generator_loss(
                     y_d_hat_g,
-                    normalize=chouwagan_active,
-                    san_direction_weight=(
-                        chouwagan_san_direction_weight if chouwagan_active else 1.0
-                    ),
-                    use_softplus=chouwagan_active,
+                    normalize=refinegan_active,
                 )
 
                 loss_prior_slow = torch.zeros((), device=y.device)
                 loss_prior_fast = torch.zeros((), device=y.device)
                 loss_prior = torch.zeros((), device=y.device)
-                loss_coarse_spectral = torch.zeros((), device=y.device)
-                loss_usage = torch.zeros((), device=y.device)
-                usage_diagnostics = {}
                 discrete_diagnostics = {}
-                if chouwagan_discrete is not None:
+                if refinegan_latent is not None:
                     loss_prior_slow, loss_prior_fast, raw_prior_loss = (
-                        chouwagan_discrete.prior_losses(discrete_parts, x_mask)
+                        refinegan_latent.prior_losses(discrete_parts, x_mask)
                     )
-                    if chouwagan_discrete.kl_rate_control_active:
+                    if refinegan_latent.kl_rate_control_active:
                         # The rate controller owns the KL weight: applying the
                         # fixed weight and warmup on top would fight its own
                         # feedback loop.
                         loss_prior = raw_prior_loss
                     else:
-                        if chouwagan_prior_warmup_steps:
-                            prior_progress = min(1.0, global_step / chouwagan_prior_warmup_steps)
+                        if refinegan_prior_warmup_steps:
+                            prior_progress = min(1.0, global_step / refinegan_prior_warmup_steps)
                         else:
                             prior_progress = 1.0
-                        loss_prior = raw_prior_loss * chouwagan_prior_loss_weight * prior_progress
-                    loss_coarse_spectral = (
-                        discrete_parts["coarse_spectral_loss"]
-                        * chouwagan_discrete.coarse_spectral_loss_weight
-                    )
-                    if (
-                        chouwagan_discrete.usage_loss_weight > 0.0
-                        and global_step % chouwagan_usage_loss_interval == 0
-                    ):
-                        loss_usage, usage_diagnostics = chouwagan_discrete.usage_regularization(
-                            discrete_parts,
-                            x_mask,
-                        )
-                    if global_step % chouwagan_diagnostics_interval == 0:
-                        discrete_diagnostics = chouwagan_discrete.diagnostics(
+                        loss_prior = raw_prior_loss * refinegan_prior_loss_weight * prior_progress
+                    if global_step % refinegan_diagnostics_interval == 0:
+                        discrete_diagnostics = refinegan_latent.diagnostics(
                             discrete_parts,
                             x_mask,
                         )
@@ -4166,7 +4059,7 @@ def training_loop(
                     ) * config.train.c_kl
 
                     # KL diagnostic: per-dimension raw divergence for the
-                    # Gaussian VITS path.  The discrete Chouwa path does not
+                    # Gaussian VITS path.  The discrete Refine path does not
                     # enter this branch.
                     with torch.no_grad():
                         raw_kl = logs_p - logs_q - 0.5 + 0.5 * (
@@ -4198,9 +4091,9 @@ def training_loop(
                 # is this step's, since the discriminator update ran above.
                 adaptive_adv_ceiling = adversarial_ceiling_governor.update(
                     phase_step if finetune_phase else global_step,
-                    loss_disc.item() if chouwagan_active else None,
+                    loss_disc.item() if refinegan_active else None,
                 )
-                if chouwagan_active:
+                if refinegan_active:
                     # Each refresh costs two extra autograd traversals (one of
                     # them through the whole discriminator), measured at +16% of
                     # step time.  The weight is a slowly-varying scalar that is
@@ -4267,8 +4160,6 @@ def training_loop(
                     + loss_waveform
                     + loss_kl
                     + loss_prior
-                    + loss_coarse_spectral
-                    + loss_usage
                     + loss_ablation
                 )
                 loss_gan = (
@@ -4286,7 +4177,7 @@ def training_loop(
             optim_g.zero_grad(set_to_none=True)
             module_grad_metrics = {}
             if (
-                chouwagan_active
+                refinegan_active
                 and rank == 0
                 and global_step % grad_source_probe_interval == 0
             ):
@@ -4312,7 +4203,7 @@ def training_loop(
                         _tensor_gradient_norm(source_loss, y_hat).item(),
                         global_step,
                     )
-            if chouwagan_active:
+            if refinegan_active:
                 if grad_scaler is not None:
                     grad_scaler.scale(loss_core).backward(retain_graph=True)
                     _add_decoder_only_gradients(
@@ -4347,7 +4238,7 @@ def training_loop(
                     # the difference visible -- when `requested` sits far above
                     # `ceiling`, the balance rule is being overruled, and
                     # `saturation` is the fraction of it that survives.
-                    if chouwagan_active:
+                    if refinegan_active:
                         writer.add_scalar(
                             "GAN/adaptive_adv_requested",
                             adaptive_adv_requested.item(),
@@ -4403,7 +4294,7 @@ def training_loop(
                                 f"{_share:.3f} against a target of "
                                 f"{r1_controller.target_ratio:.2f}. The controller "
                                 f"has no authority left over this branch; raise "
-                                f"chouwagan_r1_max_scale.",
+                                f"refinegan_r1_max_scale.",
                                 tag="[R1]",
                             )
                         for _name, _share in r1_controller.newly_floored():
@@ -4413,7 +4304,7 @@ def training_loop(
                                 f"{_share:.3f} against a target of "
                                 f"{r1_controller.target_ratio:.2f}. The branch is "
                                 f"over-regularised and the controller cannot ease "
-                                f"it further; lower chouwagan_r1_min_scale.",
+                                f"it further; lower refinegan_r1_min_scale.",
                                 tag="[R1]",
                             )
                     writer.add_scalar(
@@ -4426,7 +4317,7 @@ def training_loop(
                         last_layer_adv_grad.item(),
                         global_step,
                     )
-                    # The quantity being held at ``chouwagan_adv_balance_target``,
+                    # The quantity being held at ``refinegan_adv_balance_target``,
                     # on the same terms as ``GAN/fm_to_rec_ratio`` below: *after*
                     # the adaptive weight, so it is what the optimizer receives
                     # rather than what the adversarial term asked for.  The two
@@ -4462,7 +4353,7 @@ def training_loop(
                             last_layer_fm_grad.item(),
                             global_step,
                         )
-                        # The quantity being held at ``chouwagan_fm_balance_target``.
+                        # The quantity being held at ``refinegan_fm_balance_target``.
                         # Reported *after* the weight, so it is what the optimizer
                         # actually receives rather than what fm asked for.
                         writer.add_scalar(
@@ -4652,7 +4543,7 @@ def training_loop(
             avg_rolling_cache["loss_prior"].append(loss_prior.detach())
             avg_rolling_cache["loss_prior_slow"].append(loss_prior_slow.detach())
             avg_rolling_cache["loss_prior_fast"].append(loss_prior_fast.detach())
-            if chouwagan_active:
+            if refinegan_active:
                 avg_rolling_cache["loss_envelope"].append(loss_envelope.detach())
                 avg_rolling_cache["loss_rms"].append(loss_rms.detach())
                 avg_rolling_cache["loss_peak"].append(loss_peak.detach())
@@ -4814,7 +4705,7 @@ def training_loop(
 
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
 
-                if chouwagan_active:
+                if refinegan_active:
                     source_scalars = collect_source_path_metrics(net_g)
                     if source_scalars:
                         summarize(
@@ -5091,7 +4982,7 @@ def training_loop(
                         config.train.learning_rate_d,
                         epoch,
                         d_path,
-                        extra=_checkpoint_extra(r1_controller, grad_scaler),
+                        extra=_checkpoint_extra(r1_controller, grad_scaler, r1_grad_scaler),
                     )
 
 

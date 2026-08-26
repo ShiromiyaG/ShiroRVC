@@ -338,12 +338,6 @@ msgstr "Escolha o método de normalização de volume."
 msgid "Choose which GPUs to train on, and enable multi-GPU training."
 msgstr "Escolha em quais GPUs treinar e ative o treinamento multi-GPU."
 
-msgid "ChouwaGAN is 44.1 kHz only."
-msgstr "ChouwaGAN funciona apenas em 44,1 kHz."
-
-msgid "ChouwaGAN only. Above 1 adds variation, below 1 flattens it."
-msgstr "Somente ChouwaGAN. Acima de 1 adiciona variação, abaixo de 1 achata."
-
 msgid "Chunk length (s)"
 msgstr "Duração do bloco (s)"
 
@@ -1429,6 +1423,12 @@ msgstr "Reduz o uso de VRAM em troca de velocidade."
 
 msgid "Reduce detected noise in speech."
 msgstr "Reduz o ruído detectado na fala."
+
+msgid "RefineGAN is 44.1 kHz only."
+msgstr "RefineGAN funciona apenas em 44,1 kHz."
+
+msgid "RefineGAN only. Above 1 adds variation, below 1 flattens it."
+msgstr "Somente RefineGAN. Acima de 1 adiciona variação, abaixo de 1 achata."
 
 msgid "Refresh"
 msgstr "Atualizar"

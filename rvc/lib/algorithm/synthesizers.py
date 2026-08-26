@@ -8,13 +8,14 @@ from rvc.lib.algorithm import generators
 from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
 from rvc.lib.algorithm.chouwagan_vits import (
-    ARCHITECTURE_ID as CHOUWAGAN_VITS_ARCHITECTURE_ID,
-    ChouwaVitsLatent,
+    ARCHITECTURE_ID as REFINEGAN_VITS_ARCHITECTURE_ID,
+    RefineVitsLatent,
 )
 from rvc.lib.algorithm.frame_features import (
     conditioning_channels,
     frame_conditioning,
     frame_periodicity,
+    template_amplitude,
 )
 from rvc.lib.terminal import get_console, info, warning
 from rvc.train.messages import (
@@ -28,10 +29,6 @@ from rvc.lib.algorithm.normalizing_flow import ResidualCouplingBlock
 from rvc.lib.algorithm.text_encoder import TextEncoder
 # Posterior Encoder
 from rvc.lib.algorithm.posterior_encoder import PosteriorEncoder
-from rvc.lib.algorithm.chouwagan_svae import (
-    ARCHITECTURE_ID as CHOUWAGAN_ARCHITECTURE_ID,
-    ChouwaContinuousLatent,
-)
 
 
 debug_shapes = False
@@ -77,36 +74,38 @@ class Synthesizer(torch.nn.Module):
         self.sr = sr
         self.architecture_id = "vits_gaussian_v1"
 
-        chouwagan_options = {}
+        refinegan_options = {}
         if vocoder_config:
-            chouwagan_options.update(vocoder_config)
-        chouwagan_options.update(
+            refinegan_options.update(vocoder_config)
+        refinegan_options.update(
             {
                 key: value
                 for key, value in kwargs.items()
-                if key.startswith("chouwagan_")
+                if key.startswith("refinegan_")
             }
         )
 
         # ---- Measured frame conditioning and segment sampling -------------
         # All three default to off, so a config that predates them builds the
         # previous model exactly.
-        self.use_periodicity = vocoder_id == "chouwagan" and bool(
-            chouwagan_options.get("chouwagan_use_periodicity", False)
+        self.use_periodicity = vocoder_id == "refinegan" and bool(
+            refinegan_options.get("refinegan_use_periodicity", False)
         )
-        self.use_frame_energy = vocoder_id == "chouwagan" and bool(
-            chouwagan_options.get("chouwagan_use_frame_energy", False)
+        self.use_frame_energy = vocoder_id == "refinegan" and bool(
+            refinegan_options.get("refinegan_use_frame_energy", False)
         )
         self.segment_energy_floor = (
-            float(chouwagan_options.get("chouwagan_segment_energy_floor", 0.0))
-            if vocoder_id == "chouwagan"
+            float(refinegan_options.get("refinegan_segment_energy_floor", 0.0))
+            if vocoder_id == "refinegan"
             else 0.0
         )
         # ``spec_channels`` is ``filter_length // 2 + 1``; the frame features
         # need the FFT size back to turn bin indices into frequencies.
         self.spec_n_fft = 2 * (int(spec_channels) - 1)
-        self.chouwagan_hierarchical = bool(
-            chouwagan_options.get("chouwagan_hierarchical", False)
+        # Must match the decoder's own nominal template amplitude, since it is
+        # what the measured envelope is expressed relative to.
+        self.template_wave_amp = float(
+            refinegan_options.get("refinegan_wave_amp", 0.1)
         )
 
 
@@ -127,100 +126,97 @@ class Synthesizer(torch.nn.Module):
             dec_kwargs.update(vocoder_config)
         if vocoder_id == "hifi":
             self.dec = generators.HiFiGANNSFGenerator(**dec_kwargs)
-        elif vocoder_id == "chouwagan":
+        elif vocoder_id == "refinegan":
             if int(sr) != 44100:
-                raise ValueError("ChouwaGAN only supports 44.1 kHz configurations.")
-            chouwagan_decoder_config = {
+                raise ValueError("RefineGAN only supports 44.1 kHz configurations.")
+            refinegan_decoder_config = {
                 key: dec_kwargs.pop(key)
                 for key in list(dec_kwargs)
-                if key.startswith("chouwagan_")
+                if key.startswith("refinegan_")
             }
-            chouwagan_decoder_config.update(
+            refinegan_decoder_config.update(
                 {
                     key: value
                     for key, value in kwargs.items()
-                    if key.startswith("chouwagan_")
+                    if key.startswith("refinegan_")
                 }
             )
-            self.dec = generators.ChouwaGANGenerator(
+            self.dec = generators.RefineGANGenerator(
                 **dec_kwargs,
-                **chouwagan_decoder_config,
+                **refinegan_decoder_config,
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
 
-        self.chouwagan_discrete = None
-        self.chouwagan_frontend = str(
-            chouwagan_options.get("chouwagan_frontend", "svae")
-        ).lower()
-        if vocoder_id == "chouwagan" and self.chouwagan_frontend == "vits":
-            # The flow frontend: same interface, different latent.  Its shapes
-            # share nothing with the SVAE, so it carries its own architecture id
-            # and a checkpoint from the other frontend fails the guard instead
-            # of loading non-strictly with every latent module at its init.
+        self.refinegan_latent = None
+        if vocoder_id == "refinegan":
+            # The architecture id travels with the checkpoint and is checked
+            # before loading.  ``net_g`` loads non-strictly, so without it a
+            # checkpoint from a different latent layout would load with every
+            # latent module silently left at its init.
             self.architecture_id = str(
-                chouwagan_options.get(
-                    "chouwagan_architecture_id",
-                    CHOUWAGAN_VITS_ARCHITECTURE_ID,
+                refinegan_options.get(
+                    "refinegan_architecture_id",
+                    REFINEGAN_VITS_ARCHITECTURE_ID,
                 )
             )
-            self.chouwagan_discrete = ChouwaVitsLatent(
+            self.refinegan_latent = RefineVitsLatent(
                 input_channels=inter_channels,
                 spec_channels=spec_channels,
                 content_channels=int(
-                    chouwagan_options.get("chouwagan_content_channels", 128)
+                    refinegan_options.get("refinegan_content_channels", 128)
                 ),
                 detail_channels=int(
-                    chouwagan_options.get("chouwagan_detail_channels", 64)
+                    refinegan_options.get("refinegan_detail_channels", 64)
                 ),
                 gin_channels=gin_channels,
                 posterior_channels=int(
-                    chouwagan_options.get("chouwagan_posterior_channels", 192)
+                    refinegan_options.get("refinegan_posterior_channels", 192)
                 ),
                 prior_hidden_channels=int(
-                    chouwagan_options.get("chouwagan_prior_hidden_channels", 192)
+                    refinegan_options.get("refinegan_prior_hidden_channels", 192)
                 ),
                 latent_channels=int(
-                    chouwagan_options.get("chouwagan_vits_latent_channels", 192)
+                    refinegan_options.get("refinegan_vits_latent_channels", 192)
                 ),
                 posterior_layers=int(
-                    chouwagan_options.get("chouwagan_vits_posterior_layers", 16)
+                    refinegan_options.get("refinegan_vits_posterior_layers", 16)
                 ),
-                flow_blocks=int(chouwagan_options.get("chouwagan_vits_flow_blocks", 4)),
-                flow_layers=int(chouwagan_options.get("chouwagan_vits_flow_layers", 4)),
+                flow_blocks=int(refinegan_options.get("refinegan_vits_flow_blocks", 4)),
+                flow_layers=int(refinegan_options.get("refinegan_vits_flow_layers", 4)),
                 prior_blocks=int(
-                    chouwagan_options.get("chouwagan_svae_prior_blocks", 4)
+                    refinegan_options.get("refinegan_prior_blocks", 4)
                 ),
-                prior_heads=int(chouwagan_options.get("chouwagan_svae_prior_heads", 4)),
+                prior_heads=int(refinegan_options.get("refinegan_prior_heads", 4)),
                 prior_kernel_size=int(
-                    chouwagan_options.get("chouwagan_svae_prior_kernel_size", 31)
+                    refinegan_options.get("refinegan_prior_kernel_size", 31)
                 ),
                 kl_free_bits=float(
-                    chouwagan_options.get("chouwagan_vits_free_bits", 0.03)
+                    refinegan_options.get("refinegan_vits_free_bits", 0.03)
                 ),
-                kl_target=float(chouwagan_options.get("chouwagan_vits_kl_target", 0.15)),
+                kl_target=float(refinegan_options.get("refinegan_vits_kl_target", 0.15)),
                 kl_beta_lr=float(
-                    chouwagan_options.get("chouwagan_svae_kl_beta_lr", 0.01)
+                    refinegan_options.get("refinegan_kl_beta_lr", 0.01)
                 ),
                 kl_beta_min=float(
-                    chouwagan_options.get("chouwagan_svae_kl_beta_min", 1e-4)
+                    refinegan_options.get("refinegan_kl_beta_min", 1e-4)
                 ),
                 kl_beta_max=float(
-                    chouwagan_options.get("chouwagan_svae_kl_beta_max", 10.0)
+                    refinegan_options.get("refinegan_kl_beta_max", 10.0)
                 ),
                 kl_rate_momentum=float(
-                    chouwagan_options.get("chouwagan_svae_kl_rate_momentum", 0.01)
+                    refinegan_options.get("refinegan_kl_rate_momentum", 0.01)
                 ),
                 kl_scale_anchor=float(
-                    chouwagan_options.get("chouwagan_svae_kl_scale_anchor", 1.0)
+                    refinegan_options.get("refinegan_kl_scale_anchor", 1.0)
                 ),
                 feature_scale_anchor=float(
-                    chouwagan_options.get("chouwagan_svae_feature_scale_anchor", 1.0)
+                    refinegan_options.get("refinegan_feature_scale_anchor", 1.0)
                 ),
                 content_feature_channels=(
                     int(text_enc_hidden_dim)
                     if bool(
-                        chouwagan_options.get("chouwagan_prior_direct_content", True)
+                        refinegan_options.get("refinegan_prior_direct_content", True)
                     )
                     else 0
                 ),
@@ -228,215 +224,23 @@ class Synthesizer(torch.nn.Module):
                     self.use_periodicity, self.use_frame_energy
                 ),
                 prior_uses_logs=bool(
-                    chouwagan_options.get("chouwagan_prior_uses_logs", False)
+                    refinegan_options.get("refinegan_prior_uses_logs", False)
                 ),
                 prior_replacement_max=float(
-                    chouwagan_options.get("chouwagan_prior_replacement_max", 0.0)
+                    refinegan_options.get("refinegan_prior_replacement_max", 0.0)
                 ),
                 prior_replacement_start=int(
-                    chouwagan_options.get("chouwagan_prior_replacement_start", 5000)
+                    refinegan_options.get("refinegan_prior_replacement_start", 5000)
                 ),
                 prior_replacement_ramp=int(
-                    chouwagan_options.get("chouwagan_prior_replacement_ramp", 20000)
+                    refinegan_options.get("refinegan_prior_replacement_ramp", 20000)
                 ),
                 prior_replacement_mean_share=float(
-                    chouwagan_options.get(
-                        "chouwagan_prior_replacement_mean_share", 0.5
+                    refinegan_options.get(
+                        "refinegan_prior_replacement_mean_share", 0.5
                     )
                 ),
             )
-        elif vocoder_id == "chouwagan":
-            self.architecture_id = str(
-                chouwagan_options.get(
-                    "chouwagan_architecture_id",
-                    CHOUWAGAN_ARCHITECTURE_ID,
-                )
-            )
-            self.chouwagan_discrete = ChouwaContinuousLatent(
-                input_channels=inter_channels,
-                spec_channels=spec_channels,
-                content_channels=int(
-                    chouwagan_options.get("chouwagan_content_channels", 128)
-                ),
-                detail_channels=int(
-                    chouwagan_options.get("chouwagan_detail_channels", 64)
-                ),
-                gin_channels=gin_channels,
-                posterior_channels=int(
-                    chouwagan_options.get("chouwagan_posterior_channels", 160)
-                ),
-                prior_hidden_channels=int(
-                    chouwagan_options.get("chouwagan_prior_hidden_channels", 128)
-                ),
-                slow_levels=chouwagan_options.get(
-                    "chouwagan_fsq_slow_levels", (8, 8, 5, 5)
-                ),
-                fast_levels=chouwagan_options.get(
-                    "chouwagan_fsq_fast_levels", (8, 8, 8, 5, 5, 5)
-                ),
-                slow_output_channels=int(
-                    chouwagan_options.get("chouwagan_fsq_slow_output_channels", 32)
-                ),
-                fast_output_channels=int(
-                    chouwagan_options.get("chouwagan_fsq_fast_output_channels", 64)
-                ),
-                slow_latent_channels=int(
-                    chouwagan_options.get("chouwagan_svae_slow_latent_channels", 32)
-                ),
-                fast_latent_channels=int(
-                    chouwagan_options.get("chouwagan_svae_fast_latent_channels", 32)
-                ),
-                prior_blocks=int(
-                    chouwagan_options.get("chouwagan_svae_prior_blocks", 4)
-                ),
-                prior_heads=int(
-                    chouwagan_options.get("chouwagan_svae_prior_heads", 4)
-                ),
-                prior_kernel_size=int(
-                    chouwagan_options.get("chouwagan_svae_prior_kernel_size", 31)
-                ),
-                posterior_blocks=int(
-                    chouwagan_options.get("chouwagan_svae_posterior_blocks", 4)
-                ),
-                posterior_slow_blocks=int(
-                    chouwagan_options.get("chouwagan_svae_posterior_slow_blocks", 2)
-                ),
-                kl_free_bits_slow=float(
-                    chouwagan_options.get("chouwagan_svae_free_bits_slow", 0.05)
-                ),
-                kl_free_bits_fast=float(
-                    chouwagan_options.get("chouwagan_svae_free_bits_fast", 0.05)
-                ),
-                kl_target_slow=float(
-                    chouwagan_options.get("chouwagan_svae_kl_target_slow", 0.0)
-                ),
-                kl_target_fast=float(
-                    chouwagan_options.get("chouwagan_svae_kl_target_fast", 0.0)
-                ),
-                kl_beta_lr=float(
-                    chouwagan_options.get("chouwagan_svae_kl_beta_lr", 0.01)
-                ),
-                kl_beta_min=float(
-                    chouwagan_options.get("chouwagan_svae_kl_beta_min", 1e-4)
-                ),
-                kl_beta_max=float(
-                    chouwagan_options.get("chouwagan_svae_kl_beta_max", 10.0)
-                ),
-                kl_rate_momentum=float(
-                    chouwagan_options.get("chouwagan_svae_kl_rate_momentum", 0.01)
-                ),
-                kl_scale_anchor=float(
-                    chouwagan_options.get("chouwagan_svae_kl_scale_anchor", 1.0)
-                ),
-                feature_scale_anchor=float(
-                    chouwagan_options.get("chouwagan_svae_feature_scale_anchor", 1.0)
-                ),
-                prior_uses_logs=bool(
-                    chouwagan_options.get("chouwagan_prior_uses_logs", False)
-                ),
-                # The prior reads the ContentVec features directly, alongside
-                # ``enc_p``'s summary of them; see ``prior_content``.
-                content_feature_channels=(
-                    int(text_enc_hidden_dim)
-                    if bool(
-                        chouwagan_options.get("chouwagan_prior_direct_content", True)
-                    )
-                    else 0
-                ),
-                frame_conditioning_channels=conditioning_channels(
-                    self.use_periodicity, self.use_frame_energy
-                ),
-                architecture_id=str(
-                    chouwagan_options.get(
-                        "chouwagan_architecture_id",
-                        CHOUWAGAN_ARCHITECTURE_ID,
-                    )
-                ),
-                fsq_bound_mode=str(
-                    chouwagan_options.get("chouwagan_fsq_bound_mode", "ifsq")
-                ),
-                fsq_ifsq_alpha=float(
-                    chouwagan_options.get("chouwagan_fsq_ifsq_alpha", 1.6)
-                ),
-                fsq_precondition_mode=str(
-                    chouwagan_options.get(
-                        "chouwagan_fsq_precondition_mode", "rms_affine"
-                    )
-                ),
-                fsq_precondition_eps=float(
-                    chouwagan_options.get("chouwagan_fsq_precondition_eps", 1e-5)
-                ),
-                dimensionwise_adapters=bool(
-                    chouwagan_options.get("chouwagan_dimensionwise_adapters", True)
-                ),
-                posterior_residual=bool(
-                    chouwagan_options.get("chouwagan_posterior_residual", True)
-                ),
-                posterior_residual_start=int(
-                    chouwagan_options.get("chouwagan_posterior_residual_start", 10000)
-                ),
-                posterior_residual_ramp=int(
-                    chouwagan_options.get("chouwagan_posterior_residual_ramp", 10000)
-                ),
-                coarse_spectral_loss_weight=float(
-                    chouwagan_options.get(
-                        "chouwagan_coarse_spectral_loss_weight", 0.05
-                    )
-                ),
-                usage_loss_weight=float(
-                    chouwagan_options.get("chouwagan_usage_loss_weight", 0.01)
-                ),
-                usage_start_steps=int(
-                    chouwagan_options.get("chouwagan_usage_start_steps", 15000)
-                ),
-                usage_update_interval=int(
-                    chouwagan_options.get("chouwagan_usage_update_interval", 16)
-                ),
-                usage_ema_decay=float(
-                    chouwagan_options.get("chouwagan_usage_ema_decay", 0.99)
-                ),
-                usage_entropy_gate=float(
-                    chouwagan_options.get("chouwagan_usage_entropy_gate", 0.35)
-                ),
-                usage_entropy_floor=float(
-                    chouwagan_options.get("chouwagan_usage_entropy_floor", 0.45)
-                ),
-                usage_variance_floor=float(
-                    chouwagan_options.get("chouwagan_usage_variance_floor", 0.05)
-                ),
-                usage_covariance_weight=float(
-                    chouwagan_options.get("chouwagan_usage_covariance_weight", 0.01)
-                ),
-                usage_soft_temperature=float(
-                    chouwagan_options.get("chouwagan_usage_soft_temperature", 0.15)
-                ),
-                shared_prior_trunk=bool(
-                    chouwagan_options.get("chouwagan_shared_prior_trunk", True)
-                ),
-                content_speaker_conditioning=bool(
-                    chouwagan_options.get(
-                        "chouwagan_content_speaker_conditioning", True
-                    )
-                ),
-                content_path_dropout=float(
-                    chouwagan_options.get("chouwagan_content_path_dropout", 0.0)
-                ),
-                prior_replacement_max=float(
-                    chouwagan_options.get("chouwagan_prior_replacement_max", 0.3)
-                ),
-                prior_replacement_start=int(
-                    chouwagan_options.get("chouwagan_prior_replacement_start", 5000)
-                ),
-                prior_replacement_mean_share=float(
-                    chouwagan_options.get(
-                        "chouwagan_prior_replacement_mean_share", 0.5
-                    )
-                ),
-                prior_replacement_ramp=int(
-                    chouwagan_options.get("chouwagan_prior_replacement_ramp", 20000)
-                ),
-            )
-
         info(f"Vocoder: {vocoder_spec['label']}", tag="[INIT]")
 
 
@@ -455,7 +259,7 @@ class Synthesizer(torch.nn.Module):
 
 
         # ------   [ Posterior Encoder ] Extracts latents (z) from target audio (training only)   -----------------------------------
-        if self.chouwagan_discrete is None:
+        if self.refinegan_latent is None:
             self.enc_q = PosteriorEncoder(
                 in_channels=spec_channels,
                 out_channels=inter_channels,
@@ -477,7 +281,7 @@ class Synthesizer(torch.nn.Module):
                 gin_channels=gin_channels,
             )
         else:
-            # The discrete ChouwaGAN frontend owns its training-only posterior
+            # The discrete RefineGAN frontend owns its training-only posterior
             # and intentionally has no Gaussian posterior or normalizing flow.
             self.enc_q = None
             self.flow = None
@@ -502,40 +306,56 @@ class Synthesizer(torch.nn.Module):
 
     def remove_weight_norm(self):
         """Removes weight normalization from the model."""
-        for module in [self.dec, self.flow, self.enc_q, self.chouwagan_discrete]:
+        for module in [self.dec, self.flow, self.enc_q, self.refinegan_latent]:
             if module is not None:
                 self._remove_weight_norm_from(module)
 
     def _prior_content_stats(
         self, m_p: torch.Tensor, logs_p: torch.Tensor
     ) -> torch.Tensor:
-        """Assemble the tensor the ChouwaGAN prior consumes from ``enc_p``.
+        """Assemble the tensor the RefineGAN prior consumes from ``enc_p``.
 
-        ``enc_p`` projects to ``2 * inter_channels`` and the ChouwaGAN path used
+        ``enc_p`` projects to ``2 * inter_channels`` and the RefineGAN path used
         to discard the ``logs_p`` half entirely, leaving those weights untrained
         and throwing away the encoder's uncertainty estimate.
         """
-        if self.chouwagan_discrete is not None and getattr(
-            self.chouwagan_discrete, "prior_uses_logs", False
+        if self.refinegan_latent is not None and getattr(
+            self.refinegan_latent, "prior_uses_logs", False
         ):
             return torch.cat((m_p, logs_p), dim=1)
         return m_p
 
+    def _template_amplitude(
+        self, conditioning: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Extract RefineGAN's intensity envelope from the frame conditioning.
+
+        Returns ``None`` when frame energy is not measured, which makes the
+        template fall back to its constant nominal amplitude -- the vocoder then
+        has to infer loudness from the latent, which is the behaviour of every
+        implementation that has no intensity input at all.
+        """
+        if conditioning is None or not self.use_frame_energy:
+            return None
+        # ``frame_conditioning`` stacks periodicity first when it is enabled, so
+        # energy is always the last channel.
+        return template_amplitude(conditioning[:, -1:], self.template_wave_amp)
+
     def set_training_step(self, step: int) -> None:
         """Update the discrete prior replacement schedule for the next batch."""
-        if self.chouwagan_discrete is not None:
-            self.chouwagan_discrete.set_training_step(step)
+        if self.refinegan_latent is not None:
+            self.refinegan_latent.set_training_step(step)
 
     def remove_training_modules(self) -> None:
         """Drop training-only posterior modules before exporting/inference."""
-        if self.chouwagan_discrete is not None:
-            self.chouwagan_discrete.remove_posterior()
+        if self.refinegan_latent is not None:
+            self.refinegan_latent.remove_posterior()
         self.enc_q = None
         self.flow = None
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "chouwagan"}:
+        if self.vocoder not in {"hifi", "refinegan"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode
@@ -611,7 +431,7 @@ class Synthesizer(torch.nn.Module):
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
         if spec is not None:
-            if self.chouwagan_discrete is not None:
+            if self.refinegan_latent is not None:
                 conditioning = frame_conditioning(
                     spec,
                     pitchf,
@@ -621,7 +441,7 @@ class Synthesizer(torch.nn.Module):
                     self.use_frame_energy,
                     x_mask,
                 )
-                discrete_parts = self.chouwagan_discrete.forward_train(
+                discrete_parts = self.refinegan_latent.forward_train(
                     self._prior_content_stats(m_p, logs_p),
                     spec,
                     g,
@@ -652,30 +472,16 @@ class Synthesizer(torch.nn.Module):
                 if self.use_f0:
                     pitchf_slice = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                 z_slice = torch.cat((content_slice, detail_slice), dim=1)
-                periodicity_slice = None
-                if self.use_periodicity and conditioning is not None:
-                    periodicity_slice = slice_segments(
-                        conditioning[:, :1], ids_slice, self.segment_size, dim=3
+                amplitude = self._template_amplitude(conditioning)
+                if amplitude is not None:
+                    amplitude = slice_segments(
+                        amplitude, ids_slice, self.segment_size, dim=3
                     )
                 o = self.dec(
                     z_slice,
                     pitchf_slice,
                     g=g,
-                    periodicity=periodicity_slice,
-                    content_latent=content_slice,
-                    detail_latent=detail_slice,
-                    slow_detail_latent=slice_segments(
-                        discrete_parts["detail_slow"],
-                        ids_slice,
-                        self.segment_size,
-                        dim=3,
-                    ),
-                    fast_detail_latent=slice_segments(
-                        discrete_parts["detail_fast"],
-                        ids_slice,
-                        self.segment_size,
-                        dim=3,
-                    ),
+                    template_amplitude=amplitude,
                 )
                 return o, ids_slice, x_mask, x_mask, discrete_parts
 
@@ -739,7 +545,7 @@ class Synthesizer(torch.nn.Module):
         # TextEncoder
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
-        if self.chouwagan_discrete is not None:
+        if self.refinegan_latent is not None:
             temperature = max(1e-3, float(temperature))
             # Measured from the *source* spectrogram, by the same code the
             # trainer uses.  ``frame_conditioning`` returns None when the
@@ -754,7 +560,7 @@ class Synthesizer(torch.nn.Module):
                 self.use_frame_energy,
                 x_mask,
             )
-            content, detail, _, _, slow_detail, fast_detail = self.chouwagan_discrete.infer(
+            content, detail, _, _, slow_detail, fast_detail = self.refinegan_latent.infer(
                 self._prior_content_stats(m_p, logs_p),
                 g,
                 x_mask,
@@ -764,21 +570,11 @@ class Synthesizer(torch.nn.Module):
                 content=phone.transpose(1, 2),
                 frame_conditioning=conditioning,
             )
-            if hasattr(self.dec, "source"):
-                self.dec.source.deterministic = deterministic
             o = self.dec(
                 torch.cat((content, detail), dim=1),
                 nsff0,
                 g,
-                periodicity=(
-                    conditioning[:, :1]
-                    if (self.use_periodicity and conditioning is not None)
-                    else None
-                ),
-                content_latent=content,
-                detail_latent=detail,
-                slow_detail_latent=slow_detail,
-                fast_detail_latent=fast_detail,
+                template_amplitude=self._template_amplitude(conditioning),
             )
             return o, x_mask, (content, detail, m_p, logs_p)
         else:

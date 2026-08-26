@@ -154,7 +154,7 @@ def envelope_loss(
 
     ``kernel_size``/``stride`` set the timescale the envelope is measured on.
     The 5/3 default is roughly a 100 us window at 44.1 kHz, which is tight
-    enough to act like a waveform loss.  ChouwaGAN randomises the phase of the
+    enough to act like a waveform loss.  RefineGAN randomises the phase of the
     NSF overtones every step, so a sample-exact waveform is not a reachable
     target: pass a millisecond-scale window (e.g. 100/50) to constrain the
     amplitude envelope without fighting the excitation's phase.
@@ -393,7 +393,7 @@ class MultiScaleSTFTLoss(nn.Module):
         #: are above 7.1 while the median is 0.013, so the term is in practice a
         #: "match the loudest bins" loss.  That is the low end, which the mel
         #: term beside it already covers and already emphasises
-        #: (``chouwagan_mel_low_emphasis``).  The reason to reach for MS-STFT at
+        #: (``refinegan_mel_low_emphasis``).  The reason to reach for MS-STFT at
         #: all is the *linear* frequency resolution it brings to the top of the
         #: band; spending half the term on the bottom of it works against that.
         self.spectral_convergence = bool(spectral_convergence)

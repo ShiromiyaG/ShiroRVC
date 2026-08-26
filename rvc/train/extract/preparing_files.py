@@ -105,18 +105,27 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     # every shape-defining value it happens to name: an id saying v3 over a
     # latent still built to v2's width, with no error anywhere.  That is the
     # silent half-migration this guard exists to prevent.
-    def _architecture(path):
+    #
+    # A *missing* id counts as stale, not as "nothing to check".  The guard used
+    # to require both sides to name an id, which made it blind to exactly the
+    # case that motivates it: the 2026-08-26 ChouwaGAN -> RefineGAN change
+    # renamed the key itself, so every config written before it reads ``None``
+    # here.  Such a config would have been kept, and since ``train.py`` only
+    # fills in *absent* keys, the run would have silently lost every option
+    # whose name changed -- frame conditioning among them -- while looking
+    # perfectly ordinary in the log.
+    def _architecture(path, default=None):
         try:
             with open(path, encoding="utf-8") as handle:
                 return json.load(handle).get("model", {}).get(
-                    "chouwagan_architecture_id"
+                    "refinegan_architecture_id", default
                 )
         except (OSError, ValueError):
-            return None
+            return default
 
-    existing = _architecture(config_save_path)
+    existing = _architecture(config_save_path, default="unknown")
     shipped = _architecture(config_path)
-    if shipped is not None and existing is not None and existing != shipped:
+    if shipped is not None and existing != shipped:
         backup = f"{config_save_path}.{existing}.bak"
         shutil.copyfile(config_save_path, backup)
         shutil.copyfile(config_path, config_save_path)

@@ -80,7 +80,7 @@ class SineGenerator(torch.nn.Module):
         # in here would silently drop the running phase to an 11-bit mantissa,
         # and the failure mode is a detuned harmonic source rather than a NaN,
         # so neither the GradScaler nor any loss would flag it.  The fence and
-        # the explicit cast make the FP32 guarantee structural; ChouwaGAN's
+        # the explicit cast make the FP32 guarantee structural; RefineGAN's
         # ``BandLimitedNSFSource.prepare`` states it the same way with its own
         # ``f0.float()``.
         with torch.autocast(device_type=f0.device.type, enabled=False), torch.no_grad():

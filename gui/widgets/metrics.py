@@ -39,7 +39,7 @@ from ..i18n import _
 #: which silently turns a three-line preset into a five-line one.
 #:
 #: Only tags the run actually wrote are offered, so a HiFi-GAN run never sees
-#: the ChouwaGAN-only prior metrics.
+#: the RefineGAN-only prior metrics.
 PRESETS: dict[str, list[str]] = {
     "Health": ["loss_spectral", "loss_gen_total", "loss_disc"],
     "Adversarial": ["loss_disc_real", "loss_disc_fake", "loss_adv", "loss_fm"],

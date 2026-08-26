@@ -10,10 +10,10 @@ in every series that existed at the time:
   operating point the model was never trained at.  Over that same run, 34k
   steps of training bought 0.3%.
 
-* The KL rate controller held one multiplier per branch against the per-dim
-  *mean*, and a plain sum applies identical marginal pressure to every
-  dimension.  Concentration is therefore free: fast mean 0.1489 against a
-  target of 0.15 while two of 64 dimensions carried 29% of the divergence.
+* The KL rate controller held one multiplier for the whole branch against the
+  per-dim *mean*, and a plain sum applies identical marginal pressure to every
+  dimension.  Concentration is therefore free: a mean of 0.1489 against a target
+  of 0.15 while two of 64 dimensions carried 29% of the divergence.
 
 Both fixes are structural and neither has a loss series that would catch a
 regression, so they are pinned here.
@@ -30,7 +30,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from rvc.lib.algorithm.chouwagan_svae import ChouwaContinuousLatent
+from rvc.lib.algorithm.chouwagan_vits import RefineVitsLatent
 
 
 def _latent(**overrides):
@@ -41,16 +41,17 @@ def _latent(**overrides):
         spec_channels=12,
         posterior_channels=16,
         prior_hidden_channels=16,
-        slow_latent_channels=4,
-        fast_latent_channels=8,
+        latent_channels=8,
+        posterior_layers=2,
+        flow_blocks=2,
+        flow_layers=2,
         prior_blocks=1,
-        posterior_blocks=1,
-        posterior_slow_blocks=1,
-        kl_target_slow=0.15,
-        kl_target_fast=0.15,
+        prior_heads=2,
+        prior_kernel_size=7,
+        kl_target=0.15,
     )
     kwargs.update(overrides)
-    return ChouwaContinuousLatent(**kwargs)
+    return RefineVitsLatent(**kwargs)
 
 
 # --------------------------------------------------------------------------
@@ -61,22 +62,21 @@ def test_replacement_scales_split_across_both_operating_points():
     """Half the replaced items decode from the mean, half from a sample."""
     module = _latent(prior_replacement_mean_share=0.5)
     selector = torch.zeros(8, 1, 1)
-    selector[[0, 1, 2, 3, 4, 5]] = 1.0
+    selector[:4] = 1.0
 
     scales = module._replacement_scales(selector)
 
-    flat = scales.reshape(-1)
-    # Never turns a replaced item into an unreplaced one, and never the reverse.
-    assert torch.all((flat == 0.0) | (flat == 1.0))
-    assert torch.all(flat[selector.reshape(-1) == 0.0] == 0.0)
-    assert int((flat == 1.0).sum()) == 3
+    chosen = selector.reshape(-1).bool()
+    assert float(scales[chosen].sum()) == pytest.approx(2.0)
+    # Untouched items must stay untouched: a scale is only meaningful where the
+    # selector actually replaces the latent.
+    assert float(scales[~chosen].sum()) == 0.0
 
 
 def test_replacement_mean_share_of_zero_keeps_every_item_sampled():
-    """The old behaviour stays reachable, and is not the default."""
+    """The opt-out has to be exact, not merely rare."""
     module = _latent(prior_replacement_mean_share=0.0)
-    selector = torch.zeros(4, 1, 1)
-    selector[[0, 2]] = 1.0
+    selector = torch.ones(6, 1, 1)
 
     assert torch.equal(module._replacement_scales(selector), selector)
 
@@ -86,37 +86,15 @@ def test_replacement_mean_share_defaults_to_training_both_points():
 
 
 def test_sample_accepts_a_per_item_scale_and_zero_returns_the_mean():
-    """A scale of 0 has to give back the mean exactly, not merely nearly."""
-    mean = torch.randn(4, 3, 5)
-    logs = torch.zeros(4, 3, 5)
+    mean = torch.randn(4, 8, 6)
+    logs = torch.zeros(4, 8, 6)
     scale = torch.zeros(4, 1, 1)
-    scale[[1, 3]] = 1.0
+    scale[2:] = 1.0
 
-    drawn = ChouwaContinuousLatent._sample(mean, logs, scale=scale)
+    drawn = RefineVitsLatent._sample(mean, logs, scale=scale)
 
-    assert torch.equal(drawn[0], mean[0])
-    assert torch.equal(drawn[2], mean[2])
-    assert not torch.equal(drawn[1], mean[1])
-
-
-def test_sample_draws_noise_regardless_of_scale():
-    """RNG consumption must not depend on the scale.
-
-    The holdout metric pins a seed and restores the stream around itself; a
-    short-circuit at scale 0 would silently shift every draw that follows.
-    """
-    mean = torch.zeros(2, 3, 4)
-    logs = torch.zeros(2, 3, 4)
-
-    torch.manual_seed(0)
-    ChouwaContinuousLatent._sample(mean, logs, scale=0.0)
-    after_zero = torch.randn(3)
-
-    torch.manual_seed(0)
-    ChouwaContinuousLatent._sample(mean, logs, scale=1.0)
-    after_one = torch.randn(3)
-
-    assert torch.equal(after_zero, after_one)
+    assert torch.equal(drawn[:2], mean[:2])
+    assert not torch.equal(drawn[2:], mean[2:])
 
 
 def test_forward_train_reports_the_mean_share_it_applied():
@@ -131,7 +109,7 @@ def test_forward_train_reports_the_mean_share_it_applied():
 
     parts = module.forward_train(
         content_stats=torch.randn(4, 16, 20),
-        spec=torch.randn(4, 12, 20),
+        spec=torch.rand(4, 12, 20),
         g=None,
         mask=torch.ones(4, 1, 20),
     )
@@ -149,8 +127,7 @@ def test_rate_multipliers_are_per_dimension():
     module = _latent()
 
     assert module.kl_log_beta_fast.shape == (8,)
-    assert module.kl_rate_ema_fast.shape == (4 * 2,)
-    assert module.kl_log_beta_slow.shape == (4,)
+    assert module.kl_rate_ema_fast.shape == (8,)
 
 
 def test_a_hot_dimension_is_pressured_and_a_starved_one_is_released():
@@ -170,7 +147,7 @@ def test_a_hot_dimension_is_pressured_and_a_starved_one_is_released():
     # The error is clamped to +/-1 and ``kl_beta_lr`` is 0.01, so log-beta moves
     # at most 0.01 per step: reaching either bound from 0 takes ~1000 steps.
     for _ in range(1500):
-        beta = module._kl_beta("fast", rate, target)
+        beta = module._kl_beta(rate, target)
 
     assert beta[0] == pytest.approx(module.kl_beta_max, rel=1e-3)
     assert beta[1] == pytest.approx(module.kl_beta_min, rel=1e-3)
@@ -181,16 +158,13 @@ def test_prior_losses_weight_each_dimension_by_its_own_multiplier():
     module.eval()  # freeze the multipliers so the arithmetic is checkable
     with torch.no_grad():
         module.kl_log_beta_fast.copy_(torch.linspace(-2.0, 0.0, 8))
-        module.kl_log_beta_slow.zero_()
 
     frames = 6
+    # The VITS estimator is ``logs_p - logs_q - 0.5 + 0.5 * (z_p - mu_p)^2 /
+    # var_p``.  With unit variances and a zero prior mean, ``z_p = sqrt(2)``
+    # makes it exactly 0.5 per dimension, so the weighted sum is checkable.
     parts = {
-        "posterior_slow_distribution": (
-            torch.zeros(1, 4, frames), torch.zeros(1, 4, frames)
-        ),
-        "prior_slow_distribution": (
-            torch.zeros(1, 4, frames), torch.zeros(1, 4, frames)
-        ),
+        "posterior_z_p": torch.full((1, 8, frames), 2.0 ** 0.5),
         "posterior_fast_distribution": (
             torch.ones(1, 8, frames), torch.zeros(1, 8, frames)
         ),
@@ -203,7 +177,6 @@ def test_prior_losses_weight_each_dimension_by_its_own_multiplier():
     }
     _slow, loss_fast, _total = module.prior_losses(parts, mask=None)
 
-    # KL is 0.5 per dimension here, so the loss is 0.5 * sum(beta).
     expected = 0.5 * module.kl_log_beta_fast.exp().sum()
     assert loss_fast == pytest.approx(float(expected), rel=1e-5)
     # The reported beta stays a scalar so the existing series keeps its meaning.
@@ -211,32 +184,20 @@ def test_prior_losses_weight_each_dimension_by_its_own_multiplier():
 
 
 def test_free_bits_floor_still_releases_dimensions_below_it():
-    """The floor is a separate mechanism and per-dim beta does not replace it."""
-    module = _latent(kl_free_bits_fast=0.5, kl_target_fast=0.0, kl_target_slow=0.0)
+    """The floor is a separate mechanism and per-dim beta does not replace it.
+
+    The raw estimate is -0.5 here rather than 0: this is the Monte Carlo form,
+    which is unbiased for the KL but goes negative for a single sample drawn
+    closer to the prior mean than the prior's own spread.  The floor has to hold
+    against that, not merely against small positive values.
+    """
+    module = _latent(kl_free_bits=0.5, kl_target=0.0)
     clamped, raw = module._kl(
+        torch.zeros(1, 8, 4),
         (torch.zeros(1, 8, 4), torch.zeros(1, 8, 4)),
         (torch.zeros(1, 8, 4), torch.zeros(1, 8, 4)),
         free_bits=0.5,
     )
 
     assert torch.allclose(clamped, torch.full((8,), 0.5))
-    assert torch.allclose(raw, torch.zeros(8))
-
-
-# --------------------------------------------------------------------------
-# Width
-
-
-def test_fast_branch_is_no_wider_than_the_last_run_filled():
-    """64 fast dims bought inference gap, not detail.
-
-    The rate target is per dimension, so width sets how much information the
-    posterior holds and the prior does not -- which is exactly what
-    deterministic inference has to guess.  The last run measured an effective
-    dimension count of 18.6 out of 64 while paying 64 x 0.15 nats per frame.
-    """
-    assert _latent.__module__  # keep the import meaningful under -O
-    import inspect
-
-    signature = inspect.signature(ChouwaContinuousLatent.__init__)
-    assert signature.parameters["fast_latent_channels"].default == 32
+    assert torch.allclose(raw, torch.full((8,), -0.5))

@@ -4,12 +4,12 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ShiroRVC\n"
-"POT-Creation-Date: 2026-08-26 11:46+0000\n"
+"POT-Creation-Date: 2026-08-26 21:08+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: tabs/utilities/model_processing/model_processing.py:130
+#: tabs/utilities/model_processing/model_processing.py:129
 msgid ""
 "\n"
 "            # Checkpoint Extractor ⚙️\n"
@@ -77,7 +77,7 @@ msgstr ""
 msgid "1 · Model"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:137
+#: tabs/utilities/model_processing/model_processing.py:136
 msgid "1. Generator network checkpoint (.pth)"
 msgstr ""
 
@@ -430,14 +430,6 @@ msgstr ""
 
 #: tabs/train/train.py:1043
 msgid "Choose which GPUs to train on, and enable multi-GPU training."
-msgstr ""
-
-#: gui/views/training.py:156
-msgid "ChouwaGAN is 44.1 kHz only."
-msgstr ""
-
-#: gui/views/inference.py:313
-msgid "ChouwaGAN only. Above 1 adds variation, below 1 flattens it."
 msgstr ""
 
 #: gui/views/training.py:179
@@ -913,7 +905,7 @@ msgstr ""
 msgid "Extract Features"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:201
+#: tabs/utilities/model_processing/model_processing.py:200
 msgid "Extract Small Model"
 msgstr ""
 
@@ -938,7 +930,7 @@ msgstr ""
 msgid "F0 curve file"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:176
+#: tabs/utilities/model_processing/model_processing.py:175
 msgid "F0-guided model"
 msgstr ""
 
@@ -1698,7 +1690,7 @@ msgstr ""
 msgid "Output"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:151
+#: tabs/utilities/model_processing/model_processing.py:150
 msgid "Output Directory"
 msgstr ""
 
@@ -1718,13 +1710,13 @@ msgstr ""
 #: tabs/tts/tts.py:326
 #: tabs/utilities/analyzer/analyzer.py:16
 #: tabs/utilities/model_information.py:15
-#: tabs/utilities/model_processing/model_processing.py:204
+#: tabs/utilities/model_processing/model_processing.py:203
 #: tabs/utilities/processing/processing.py:22
 #: tabs/voice_blender/voice_blender.py:65
 msgid "Output Information"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:144
+#: tabs/utilities/model_processing/model_processing.py:143
 msgid "Output Model Name"
 msgstr ""
 
@@ -2003,6 +1995,14 @@ msgstr ""
 msgid "Reduce detected noise in speech."
 msgstr ""
 
+#: gui/views/training.py:156
+msgid "RefineGAN is 44.1 kHz only."
+msgstr ""
+
+#: gui/views/inference.py:313
+msgid "RefineGAN only. Above 1 adds variation, below 1 flattens it."
+msgstr ""
+
 #: tabs/train/train.py:516
 #: tabs/train/train.py:1223
 #: tabs/tts/tts.py:69
@@ -2091,7 +2091,7 @@ msgstr ""
 msgid "Run preprocessing"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:160
+#: tabs/utilities/model_processing/model_processing.py:159
 msgid "Sample Rate of the model (sr)"
 msgstr ""
 
@@ -2209,7 +2209,7 @@ msgstr ""
 msgid "Select file to import"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:184
+#: tabs/utilities/model_processing/model_processing.py:183
 msgid "Select one that corresponds to your training."
 msgstr ""
 
@@ -2441,7 +2441,7 @@ msgstr ""
 msgid "Starting the trainer… (loading models and dataset)"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:205
+#: tabs/utilities/model_processing/model_processing.py:204
 msgid "Status messages and final file path will be displayed here."
 msgstr ""
 
@@ -2585,7 +2585,7 @@ msgstr ""
 msgid "The dataset folder does not exist."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:152
+#: tabs/utilities/model_processing/model_processing.py:151
 msgid "The directory where the final .pth file will be saved."
 msgstr ""
 
@@ -2624,7 +2624,7 @@ msgstr ""
 msgid "The name that will appear in the model information."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:145
+#: tabs/utilities/model_processing/model_processing.py:144
 msgid "The output file will be saved as `<name>.pth`."
 msgstr ""
 
@@ -2647,7 +2647,7 @@ msgstr ""
 msgid "The pre-overtrain model is exported either way; this only ends the run."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:178
+#: tabs/utilities/model_processing/model_processing.py:177
 msgid "The selected vocoder requires F0 guidance."
 msgstr ""
 
@@ -2818,7 +2818,7 @@ msgstr ""
 msgid "Validation sample"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:183
+#: tabs/utilities/model_processing/model_processing.py:182
 msgid "Version"
 msgstr ""
 
@@ -2828,7 +2828,7 @@ msgstr ""
 
 #: gui/views/training.py:156
 #: tabs/train/train.py:466
-#: tabs/utilities/model_processing/model_processing.py:168
+#: tabs/utilities/model_processing/model_processing.py:167
 msgid "Vocoder"
 msgstr ""
 

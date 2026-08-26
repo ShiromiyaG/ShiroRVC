@@ -6,7 +6,7 @@ from one the prior simply predicts well.  Per-dimension KL cannot: it measures
 predicts it" at least as often as it means "nothing is there" -- measured over
 the 44.1 kHz pretrain the two rank-correlate at 0.24.
 
-The probe used to be gated on ``chouwagan_ablation_loss_weight > 0``, so
+The probe used to be gated on ``refinegan_ablation_loss_weight > 0``, so
 switching off a loss term that provably does nothing also switched off the
 measurement.  Those are separate decisions and this pins them apart.
 """
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 TRAIN_PY = ROOT / "rvc" / "train" / "train.py"
-CONFIGS = sorted((ROOT / "rvc" / "configs" / "chouwagan").glob("*.json"))
+CONFIGS = sorted((ROOT / "rvc" / "configs" / "refinegan").glob("*.json"))
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +40,7 @@ def _probe_guard(source: str) -> ast.If:
         names = {
             n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
         }
-        if "chouwagan_ablation_interval" in names:
+        if "refinegan_ablation_interval" in names:
             return node
     raise AssertionError("could not find the ablation probe guard in train.py")
 
@@ -48,7 +48,7 @@ def _probe_guard(source: str) -> ast.If:
 def test_the_probe_does_not_depend_on_the_loss_weight(source):
     guard = _probe_guard(source)
     names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
-    assert "chouwagan_ablation_weight" not in names, (
+    assert "refinegan_ablation_weight" not in names, (
         "gating the measurement on the loss weight means the only way to stop "
         "paying for an inert loss term is to go blind to latent usage"
     )
@@ -57,23 +57,23 @@ def test_the_probe_does_not_depend_on_the_loss_weight(source):
 def test_the_probe_still_respects_its_interval(source):
     guard = _probe_guard(source)
     names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
-    assert "chouwagan_ablation_interval" in names
-    assert "chouwagan_discrete" in names
+    assert "refinegan_ablation_interval" in names
+    assert "refinegan_latent" in names
 
 
 def test_the_loss_is_still_scaled_by_its_weight(source):
     """Decoupling the probe must not make the loss unconditional."""
-    assert "loss_ablation = ablation_raw * chouwagan_ablation_weight" in source
+    assert "loss_ablation = ablation_raw * refinegan_ablation_weight" in source
 
 
 @pytest.mark.parametrize("config_path", CONFIGS, ids=lambda p: p.name)
 def test_shipped_configs_measure_but_do_not_weight(config_path):
     train = json.loads(config_path.read_text(encoding="utf-8"))["train"]
-    assert train["chouwagan_ablation_loss_weight"] == 0.0, (
+    assert train["refinegan_ablation_loss_weight"] == 0.0, (
         "the term has no gradient toward its stated purpose: ablated_error is "
         "detached, so it only adds generic reconstruction pressure"
     )
-    interval = train["chouwagan_ablation_interval"]
+    interval = train["refinegan_ablation_interval"]
     assert interval > 0, "a weight of zero must not turn the measurement off"
     # 96 latent dimensions drawn uniformly, one per interval.  Each dimension is
     # therefore sampled about once per ``96 * interval`` steps, and a histogram

@@ -27,7 +27,7 @@ Two things make this implementation safe to drop into this repository:
 Caveat worth stating plainly: Muon is established on transformer-style dense
 stacks.  Applied to a weight-normalised convolutional vocoder it is reasonable
 but not something the literature has validated -- the E-Branchformer prior in
-the ChouwaGAN SVAE is the part of this model closest to where Muon is known to
+the RefineGAN SVAE is the part of this model closest to where Muon is known to
 help.
 """
 
