@@ -25,6 +25,10 @@ install_rich_print()
 
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE
 from rvc.lib.utils import extract_features
+from rvc.lib.algorithm.frame_features import (
+    matched_n_fft,
+    spectrogram_for_features,
+)
 from rvc.infer.retrieval import IndexRetriever, RetrievalConfig
 from rvc.lib.terminal import get_console
 
@@ -400,6 +404,20 @@ class Pipeline:
                 pitch, pitchf = None, None
             p_len = torch.tensor([p_len], device=self.device).long()
 
+            # Periodicity and loudness are measured from the *source* here,
+            # with the same code and the same Hz-per-bin the trainer used on
+            # the target.  A model built without those features ignores it.
+            source_spec = None
+            if getattr(net_g, "use_periodicity", False) or getattr(
+                net_g, "use_frame_energy", False
+            ):
+                n_fft = matched_n_fft(self.sample_rate)
+                source_spec = spectrogram_for_features(
+                    torch.from_numpy(audio0).float().to(self.device),
+                    n_fft,
+                    self.window,
+                )
+
             # Inference
             audio1 = (
                 net_g.infer(
@@ -409,6 +427,7 @@ class Pipeline:
                     nsff0=pitchf.float(),       # float f0 curve
                     sid=sid,                    # speaker id
                     seed=seed,                  # inference seed
+                    spec=source_spec,           # source spectrogram for frame features
                     deterministic=deterministic,
                     temperature=latent_temperature,
                 )[0][0, 0]

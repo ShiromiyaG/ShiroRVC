@@ -203,10 +203,11 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
         optimizer,
         checkpoint_dict.get("learning_rate", 0),
         checkpoint_dict["iteration"],
-        # This slot held FP16 scaler state, which nothing has consumed since
-        # training went FP32-only.  It now carries ``save_checkpoint``'s
-        # ``extra`` -- an empty dict when absent, which is what every existing
-        # checkpoint and every caller that ignores the slot already saw.
+        # ``save_checkpoint``'s ``extra``: an empty dict when absent, which is
+        # what every checkpoint written before the key existed returns.  The
+        # slot originally held FP16 scaler state directly; now the scaler state
+        # is one key *inside* ``extra`` alongside the R1 controller, so a
+        # checkpoint from either era loads without a version check.
         checkpoint_dict.get("extra") or {},
     )
 

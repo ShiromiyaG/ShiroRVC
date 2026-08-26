@@ -179,6 +179,52 @@ class ConvNeXtBlock1d(nn.Module):
         return value if mask is None else value * mask
 
 
+class SpectrogramFrequencyStem(nn.Module):
+    """Read a log-magnitude spectrogram along frequency before flattening it.
+
+    The posterior used to enter through a single ``Conv1d(spec_channels,
+    posterior_channels, 1)``: one matrix collapsing all 1025 bins into 192
+    channels before anything looked at them.  A kernel of width 1 over the
+    channel axis has no notion that bin *k* and bin *k+1* are neighbours, so a
+    harmonic comb -- the one structure the posterior most needs to describe --
+    arrives as an arbitrary permutation of coordinates and has to be relearned
+    as one.
+
+    Striding down the frequency axis with a real kernel keeps that adjacency.
+    The stack is deliberately cheap (1 -> 16 -> 32 -> 32 channels, frequency
+    quartered twice then halved) because it runs on every training step and is
+    then thrown away: ``remove_posterior`` deletes it before export, so none of
+    this cost or capacity reaches inference.
+    """
+
+    def __init__(self, spec_channels: int, out_channels: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                nn.Conv2d(1, 16, (7, 3), stride=(4, 1), padding=(3, 1)),
+                nn.Conv2d(16, 32, (5, 3), stride=(4, 1), padding=(2, 1)),
+                nn.Conv2d(32, 32, (5, 3), stride=(2, 1), padding=(2, 1)),
+            ]
+        )
+        bins = int(spec_channels)
+        for stride in (4, 4, 2):
+            bins = (bins + stride - 1) // stride
+        self.flattened_channels = 32 * bins
+        self.project = nn.Conv1d(self.flattened_channels, int(out_channels), 1)
+
+    def forward(self, spectrogram: Tensor, mask: Optional[Tensor]) -> Tensor:
+        # ``(batch, 1, freq, time)``; the mask is over time only and broadcasts
+        # across every remaining frequency row.
+        value = spectrogram.unsqueeze(1)
+        frame_mask = None if mask is None else mask.unsqueeze(1)
+        for layer in self.layers:
+            value = F.silu(layer(value))
+            if frame_mask is not None:
+                value = value * frame_mask
+        batch, channels, bins, length = value.shape
+        return self.project(value.reshape(batch, channels * bins, length))
+
+
 class ChouwaContinuousLatent(nn.Module):
     """Two-rate continuous stochastic VAE frontend for the Chouwa decoder."""
 
@@ -210,6 +256,8 @@ class ChouwaContinuousLatent(nn.Module):
         kl_rate_momentum: float = 0.01,
         kl_scale_anchor: float = 1.0,
         feature_scale_anchor: float = 1.0,
+        content_feature_channels: int = 0,
+        frame_conditioning_channels: int = 0,
         prior_uses_logs: bool = False,
         prior_replacement_max: float = 0.0,
         prior_replacement_start: int = 5000,
@@ -343,6 +391,35 @@ class ChouwaContinuousLatent(nn.Module):
         prior_input_channels = self.input_channels * (2 if self.prior_uses_logs else 1)
         self.prior_input = nn.Conv1d(prior_input_channels, int(prior_hidden_channels), 1)
         self.prior_feature_channels = int(prior_hidden_channels)
+        # ---- Direct content path ----------------------------------------
+        # ``content_stats`` is ``enc_p``'s output, and ``enc_p`` opens with a
+        # single ``Linear(768, 192)`` applied before any nonlinearity -- a
+        # rank-192 projection of the ContentVec features.  Measured on this
+        # dataset's own extracted features, the best possible rank-192 map
+        # retains 88.7% of their variance, so ~11% is gone before any module
+        # sees it, and no amount of depth downstream recovers it: capacity
+        # after a bottleneck cannot undo the bottleneck.
+        #
+        # The prior is the only module whose output inference consumes, so it
+        # is the one that should not be reading a lossy summary.  A 1x1 conv
+        # from the raw features costs ~0.2M parameters and leaves ``enc_p``
+        # untouched for every other consumer.
+        self.content_feature_channels = max(0, int(content_feature_channels))
+        self.prior_content = (
+            nn.Conv1d(self.content_feature_channels, int(prior_hidden_channels), 1)
+            if self.content_feature_channels
+            else None
+        )
+        # ---- Measured frame conditioning ---------------------------------
+        # Periodicity and the loudness envelope; see ``frame_features``.  Both
+        # are properties of the audio that the prior has to guess today, and
+        # both are supplied by the source at inference.
+        self.frame_conditioning_channels = max(0, int(frame_conditioning_channels))
+        self.prior_frame = (
+            nn.Conv1d(self.frame_conditioning_channels, int(prior_hidden_channels), 1)
+            if self.frame_conditioning_channels
+            else None
+        )
         self.prior_f0 = nn.Conv1d(2, int(prior_hidden_channels), 1)
         self.prior_speaker = nn.Conv1d(int(gin_channels), int(prior_hidden_channels), 1)
         self.prior_blocks = nn.ModuleList(
@@ -357,7 +434,9 @@ class ChouwaContinuousLatent(nn.Module):
             nn.SiLU(),
         )
 
-        self.posterior_input = nn.Conv1d(self.spec_channels, int(posterior_channels), 1)
+        self.posterior_input = SpectrogramFrequencyStem(
+            self.spec_channels, int(posterior_channels)
+        )
         self.posterior_condition = nn.Conv1d(
             self.prior_feature_channels,
             int(posterior_channels),
@@ -396,8 +475,24 @@ class ChouwaContinuousLatent(nn.Module):
             scale = float(scale)
         return mean + torch.randn_like(mean) * logs.exp() * scale
 
-    def _prior_features(self, content_stats: Tensor, g: Optional[Tensor], mask: Optional[Tensor], pitchf: Optional[Tensor]):
+    def _prior_features(
+        self,
+        content_stats: Tensor,
+        g: Optional[Tensor],
+        mask: Optional[Tensor],
+        pitchf: Optional[Tensor],
+        content: Optional[Tensor] = None,
+        frame_conditioning: Optional[Tensor] = None,
+    ):
         value = self.prior_input(content_stats)
+        if self.prior_content is not None and content is not None:
+            value = value + self.prior_content(
+                _resize_sequence(content.float(), value.shape[-1])
+            )
+        if self.prior_frame is not None and frame_conditioning is not None:
+            value = value + self.prior_frame(
+                _resize_sequence(frame_conditioning.float(), value.shape[-1])
+            )
         if pitchf is None:
             pitchf = content_stats.new_zeros(content_stats.shape[0], content_stats.shape[-1])
         if pitchf.ndim == 3:
@@ -414,7 +509,9 @@ class ChouwaContinuousLatent(nn.Module):
     def _posterior_features(self, spec: Tensor, condition: Tensor, mask: Optional[Tensor]):
         target = torch.log1p(spec.float().clamp_min(0.0))
         target_mask = _resize_mask(mask, target.shape[-1])
-        value = self.posterior_input(target) + self.posterior_condition(_resize_sequence(condition.detach(), target.shape[-1]))
+        value = self.posterior_input(target, target_mask) + self.posterior_condition(
+            _resize_sequence(condition.detach(), target.shape[-1])
+        )
         for block in self.posterior_blocks:
             value = block(value, target_mask)
         return value if target_mask is None else value * target_mask, target_mask
@@ -504,38 +601,42 @@ class ChouwaContinuousLatent(nn.Module):
         scales[order[:mean_count]] = 0.0
         return scales
 
-    def forward_train(self, content_stats, spec, g, mask, pitchf=None):
-        # Gaussian statistics and their reparameterized samples are especially
-        # sensitive to FP16's narrow exponent range.  Keep the complete SVAE
-        # frontend in FP32; the surrounding decoder autocast still provides the
-        # bulk of AMP's memory and throughput savings.
-        device_type = content_stats.device.type
-        with torch.autocast(device_type=device_type, enabled=False):
-            content_stats = content_stats.float()
-            spec = spec.float()
-            g = None if g is None else g.float()
-            mask = None if mask is None else mask.float()
-            pitchf = None if pitchf is None else pitchf.float()
-
-            prior_features = self._prior_features(content_stats, g, mask, pitchf)
-            prior_fast = self._distribution(self.prior_fast(prior_features))
+    def forward_train(
+        self,
+        content_stats,
+        spec,
+        g,
+        mask,
+        pitchf=None,
+        content=None,
+        frame_conditioning=None,
+    ):
+        prior_features = self._prior_features(
+            content_stats, g, mask, pitchf, content, frame_conditioning
+        )
+        # Distribution statistics (exp, log, sampling) need FP32 precision;
+        # the conv blocks above and the projections below stay in whatever
+        # dtype the caller's autocast context provides.
+        with torch.autocast(device_type=content_stats.device.type, enabled=False):
+            prior_fast = self._distribution(self.prior_fast(prior_features.float()))
             prior_slow_features = self.prior_slow_down(prior_features)
-            prior_slow = self._distribution(self.prior_slow(prior_slow_features))
-            if not self.posterior_available:
-                raise RuntimeError("The training-only SVAE posterior is unavailable.")
-            posterior_features, posterior_mask = self._posterior_features(spec, prior_features, mask)
+            prior_slow = self._distribution(self.prior_slow(prior_slow_features.float()))
+        if not self.posterior_available:
+            raise RuntimeError("The training-only SVAE posterior is unavailable.")
+        posterior_features, posterior_mask = self._posterior_features(spec, prior_features, mask)
+        posterior_slow_features = self.posterior_slow_down(posterior_features)
+        for block in self.posterior_slow_blocks:
+            posterior_slow_features = block(
+                posterior_slow_features,
+                _resize_mask(posterior_mask, posterior_slow_features.shape[-1]),
+            )
+        with torch.autocast(device_type=content_stats.device.type, enabled=False):
             posterior_fast = self._resize_distribution(
-                self._distribution(self.posterior_fast(posterior_features)),
+                self._distribution(self.posterior_fast(posterior_features.float())),
                 prior_fast[0].shape[-1],
             )
-            posterior_slow_features = self.posterior_slow_down(posterior_features)
-            for block in self.posterior_slow_blocks:
-                posterior_slow_features = block(
-                    posterior_slow_features,
-                    _resize_mask(posterior_mask, posterior_slow_features.shape[-1]),
-                )
             posterior_slow = self._resize_distribution(
-                self._distribution(self.posterior_slow(posterior_slow_features)),
+                self._distribution(self.posterior_slow(posterior_slow_features.float())),
                 prior_slow[0].shape[-1],
             )
             fast = self._sample(*posterior_fast)
@@ -561,13 +662,13 @@ class ChouwaContinuousLatent(nn.Module):
                 prior_replacement = fast.new_zeros(())
                 prior_replacement_mean = fast.new_zeros(())
 
-            content, detail, slow_detail, fast_detail = self._latent_to_decoder(
-                slow, fast, content_stats.shape[-1]
+        content, detail, slow_detail, fast_detail = self._latent_to_decoder(
+            slow, fast, content_stats.shape[-1]
+        )
+        with torch.no_grad():
+            _, prior_detail, _, _ = self._latent_to_decoder(
+                prior_slow[0], prior_fast[0], content_stats.shape[-1]
             )
-            with torch.no_grad():
-                _, prior_detail, _, _ = self._latent_to_decoder(
-                    prior_slow[0], prior_fast[0], content_stats.shape[-1]
-                )
         return {
             "content": content,
             "detail": detail,
@@ -800,8 +901,20 @@ class ChouwaContinuousLatent(nn.Module):
         content, detail, slow_detail, fast_detail = self._latent_to_decoder(slow, fast, target_length)
         return detail, slow_detail, fast_detail
 
-    def infer(self, content_stats, g, mask, pitchf=None, deterministic=True, temperature=1.0):
-        prior_features = self._prior_features(content_stats, g, mask, pitchf)
+    def infer(
+        self,
+        content_stats,
+        g,
+        mask,
+        pitchf=None,
+        deterministic=True,
+        temperature=1.0,
+        content=None,
+        frame_conditioning=None,
+    ):
+        prior_features = self._prior_features(
+            content_stats, g, mask, pitchf, content, frame_conditioning
+        )
         prior_fast = self._distribution(self.prior_fast(prior_features))
         prior_slow = self._distribution(self.prior_slow(self.prior_slow_down(prior_features)))
         scale = 0.0 if deterministic else max(0.0, float(temperature))

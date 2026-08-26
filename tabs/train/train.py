@@ -20,7 +20,13 @@ from core import (
     run_train_script,
     stop_train_script,
 )
-from rvc.configs.config import get_gpu_info, get_number_of_gpus, max_vram_gpu, microarchitecture_capability_checker
+from rvc.configs.config import (
+    get_gpu_info,
+    get_number_of_gpus,
+    get_use_fp16,
+    max_vram_gpu,
+    microarchitecture_capability_checker,
+)
 from rvc.configs.vocoders import (
     get_vocoder_choices,
     get_vocoder_sample_rates,
@@ -294,6 +300,84 @@ def auto_enable_checkpointing():
         return max_vram_gpu(0) < 6
     except:
         return False
+
+def start_train_from_ui(
+    model_name,
+    epoch_save_frequency,
+    save_only_latest_net_models,
+    save_weight_models,
+    total_epoch_count,
+    sample_rate,
+    batch_size,
+    gpu,
+    use_warmup,
+    warmup_duration,
+    pretrained,
+    cleanup,
+    index_algorithm,
+    custom_pretrained,
+    g_pretrained_path,
+    d_pretrained_path,
+    vocoder,
+    optimizer_choice,
+    use_checkpointing,
+    use_tf32,
+    use_benchmark,
+    lr_scheduler,
+    use_custom_lr,
+    custom_lr_g,
+    custom_lr_d,
+    compile_vocoder,
+    torch_compile_mode,
+    overtrain_detector,
+    stop_on_overtrain,
+    use_ema,
+):
+    """Launch a run from this tab's controls.
+
+    Gradio binds ``inputs`` to parameters *by position*, so calling
+    ``run_train_script`` directly makes the order of that list part of the
+    launcher's signature -- inserting one argument in ``core.py`` silently
+    shifts every later flag.  Naming the parameters here and calling with
+    keywords confines the positional coupling to this one function.
+
+    ``use_fp16`` is not among the controls: it is a machine-level setting under
+    Settings -> Precision, read at launch so it still lands in the run spec.
+    """
+    return run_train_script(
+        model_name=model_name,
+        epoch_save_frequency=epoch_save_frequency,
+        save_only_latest_net_models=save_only_latest_net_models,
+        save_weight_models=save_weight_models,
+        total_epoch_count=total_epoch_count,
+        sample_rate=sample_rate,
+        batch_size=batch_size,
+        gpu=gpu,
+        use_warmup=use_warmup,
+        warmup_duration=warmup_duration,
+        pretrained=pretrained,
+        cleanup=cleanup,
+        index_algorithm=index_algorithm,
+        custom_pretrained=custom_pretrained,
+        g_pretrained_path=g_pretrained_path,
+        d_pretrained_path=d_pretrained_path,
+        vocoder=vocoder,
+        optimizer_choice=optimizer_choice,
+        use_checkpointing=use_checkpointing,
+        use_tf32=use_tf32,
+        use_fp16=get_use_fp16(),
+        use_benchmark=use_benchmark,
+        lr_scheduler=lr_scheduler,
+        use_custom_lr=use_custom_lr,
+        custom_lr_g=custom_lr_g,
+        custom_lr_d=custom_lr_d,
+        compile_vocoder=compile_vocoder,
+        torch_compile_mode=torch_compile_mode,
+        overtrain_detector=overtrain_detector,
+        stop_on_overtrain=stop_on_overtrain,
+        use_ema=use_ema,
+    )
+
 
 # Init state for certain options.
 initial_sample_rate_choices = [
@@ -1038,7 +1122,7 @@ def train_tab():
                 outputs=[train_output_info],
                 show_progress="hidden",
             ).then(
-                fn=run_train_script,
+                fn=start_train_from_ui,
                 inputs=[
                     model_name,
                     epoch_save_frequency,

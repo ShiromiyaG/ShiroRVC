@@ -115,6 +115,44 @@ def test_the_weight_reaches_the_loss_the_optimizer_sees():
     )
 
 
+def _reported_ratio(tag: str) -> str:
+    """The expression ``writer.add_scalar(tag, ...)`` reports, as source text."""
+    source = TRAIN_PY.read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
+            continue
+        name = getattr(node.func, "attr", None)
+        first = node.args[0]
+        if name == "add_scalar" and isinstance(first, ast.Constant) and first.value == tag:
+            return ast.get_source_segment(source, node.args[1]) or ""
+    pytest.fail(f"train.py no longer reports {tag}")
+
+
+def test_both_halves_report_the_ratio_the_optimizer_receives():
+    """The two series sit side by side and are read as comparable.
+
+    They were not: ``adv_to_rec_ratio`` was the raw gradient ratio while
+    ``fm_to_rec_ratio`` was reported after its weight, so a balance rule sitting
+    exactly on target read as tens against the other's fractions.  Measured on
+    the pretrain at step 14.5k, ``adv_to_rec_ratio`` showed 29.1 with an
+    adaptive weight of 0.0172 -- a product of 0.50, which *is*
+    ``chouwagan_adv_balance_target``.
+
+    Each series has to carry its own weight, and neither may carry the other's.
+    """
+    adversarial = _reported_ratio("GAN/adv_to_rec_ratio")
+    feature_match = _reported_ratio("GAN/fm_to_rec_ratio")
+
+    assert "adaptive_adv" in adversarial and "last_layer_adv_grad" in adversarial
+    assert "adaptive_fm" in feature_match and "last_layer_fm_grad" in feature_match
+    assert "adaptive_fm" not in adversarial
+    assert "adaptive_adv" not in feature_match
+    # Both divide by the reconstruction gradient, which is what makes them
+    # comparable to each other rather than only to their own targets.
+    for expression in (adversarial, feature_match):
+        assert "last_layer_rec_grad" in expression
+
+
 def test_the_config_ships_the_knobs():
     import json
 

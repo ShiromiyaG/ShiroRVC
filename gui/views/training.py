@@ -419,6 +419,15 @@ class TrainingPage(Page):
         # does nothing and read as though it were doing something.
         self.tf32 = Toggle(_("TF32 matmuls"), _("Faster on Ampere and newer, marginally less precise."))
         self.tf32.setEnabled(False)
+        # FP16 autocast with a GradScaler, on top of FP32 master weights.  Same
+        # 11-bit mantissa as TF32, narrower exponent range -- which is what the
+        # scaler is for.  Off by default and disabled until a CUDA device is
+        # reported, for the same reason as TF32 above.
+        self.fp16 = Toggle(
+            _("FP16 autocast"),
+            _("Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."),
+        )
+        self.fp16.setEnabled(False)
         self.benchmark = Toggle(_("cuDNN benchmark"), _("Faster once shapes settle."), checked=True)
         self.compile_vocoder = Toggle(
             _("torch.compile the vocoder"), _("Slow first epoch, faster afterwards.")
@@ -437,7 +446,7 @@ class TrainingPage(Page):
         self.compile_vocoder.toggled.connect(self.torch_compile_mode_field.setVisible)
 
         advanced.add(
-            self.checkpointing, self.tf32, self.benchmark,
+            self.checkpointing, self.tf32, self.fp16, self.benchmark,
             self.compile_vocoder, self.torch_compile_mode_field,
         )
 
@@ -782,6 +791,7 @@ class TrainingPage(Page):
             "optimizer_choice": self.optimizer.text(),
             "use_checkpointing": self.checkpointing.isChecked(),
             "use_tf32": self.tf32.isChecked(),
+            "use_fp16": self.fp16.isChecked(),
             "use_benchmark": self.benchmark.isChecked(),
             "lr_scheduler": self.lr_scheduler.text(),
             "use_custom_lr": self.use_custom_lr.isChecked(),
@@ -953,6 +963,19 @@ class TrainingPage(Page):
             _("Faster on Ampere and newer, marginally less precise.")
             if supported
             else _("This GPU has no TF32 units, so the setting would do nothing.")
+        )
+
+        # FP16 needs a CUDA device but not Ampere, so it follows the device list
+        # rather than the capability check.  Left unticked: unlike TF32 it
+        # changes the numerics of the forward pass, so it is opt-in.
+        has_cuda = bool(devices)
+        self.fp16.setEnabled(has_cuda)
+        if not has_cuda:
+            self.fp16.setChecked(False)
+        self.fp16.setToolTip(
+            _("Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow.")
+            if has_cuda
+            else _("Autocast needs a CUDA GPU, so the setting would do nothing.")
         )
 
     def refresh_suggestions(self) -> None:

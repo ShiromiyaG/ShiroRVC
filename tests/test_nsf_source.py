@@ -138,3 +138,55 @@ def test_a_speech_f0_is_unaffected():
     """Nothing below Nyquist should be touched by the mask at all."""
     # 32 harmonics of 120 Hz reach 3840 Hz -- nowhere near the transition.
     assert _top_band_share(_source(32), 120.0) < 1e-4
+
+
+# -- FP16: the phase must not follow the autocast dtype ----------------------
+#
+# Under ``autocast(fp16)`` the HiFi-GAN source used to stay FP32 only because
+# none of ``cumsum``/``fmod``/``sin`` are on autocast's op list and ``pitchf``
+# happens to arrive as FP32.  That is an accident of the op list, and the
+# failure mode if it ever stops holding is a detuned excitation, not a NaN --
+# so no loss, and not the GradScaler, would report it.  These pin the fence.
+
+
+def _sine_generator():
+    from rvc.lib.algorithm.generators.hifigan_nsf import SineGenerator
+
+    # harmonic_num=0 is what HiFiGANNSFGenerator builds.
+    return SineGenerator(SR, num_harmonics=0)
+
+
+@pytest.mark.parametrize("f0_dtype", [torch.float32, torch.float16])
+def test_hifigan_source_stays_fp32_under_autocast(f0_dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("autocast(fp16) is a CUDA path")
+    generator = _sine_generator().cuda()
+    f0 = (torch.rand(2, 64, device="cuda") * 300 + 80).to(f0_dtype)
+
+    with torch.autocast(device_type="cuda", enabled=True, dtype=torch.float16):
+        waves, _voiced, _noise = generator(f0, 480)
+
+    assert waves.dtype is torch.float32, (
+        f"the excitation came back {waves.dtype}: the phase accumulation is "
+        "running in reduced precision"
+    )
+    assert torch.isfinite(waves).all()
+
+
+def test_autocast_does_not_change_the_excitation():
+    """Same seed, autocast on and off: the samples must be identical."""
+    if not torch.cuda.is_available():
+        pytest.skip("autocast(fp16) is a CUDA path")
+    generator = _sine_generator().cuda()
+    f0 = torch.rand(2, 64, device="cuda") * 300 + 80
+
+    # The generator draws a fresh noise term per call, so the seed has to be
+    # reset or this measures the noise rather than the phase.
+    torch.manual_seed(7)
+    with torch.autocast(device_type="cuda", enabled=True, dtype=torch.float16):
+        under_autocast, _v, _n = generator(f0, 480)
+    torch.manual_seed(7)
+    with torch.autocast(device_type="cuda", enabled=False):
+        plain, _v, _n = generator(f0, 480)
+
+    assert torch.equal(under_autocast, plain)

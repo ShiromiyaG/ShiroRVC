@@ -7,6 +7,15 @@ from torch.nn.utils.parametrize import remove_parametrizations
 from rvc.lib.algorithm import generators
 from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
+from rvc.lib.algorithm.chouwagan_vits import (
+    ARCHITECTURE_ID as CHOUWAGAN_VITS_ARCHITECTURE_ID,
+    ChouwaVitsLatent,
+)
+from rvc.lib.algorithm.frame_features import (
+    conditioning_channels,
+    frame_conditioning,
+    frame_periodicity,
+)
 from rvc.lib.terminal import get_console, info, warning
 from rvc.train.messages import (
     VOCODER_COMPILE_ENABLE_FAILED,
@@ -78,6 +87,24 @@ class Synthesizer(torch.nn.Module):
                 if key.startswith("chouwagan_")
             }
         )
+
+        # ---- Measured frame conditioning and segment sampling -------------
+        # All three default to off, so a config that predates them builds the
+        # previous model exactly.
+        self.use_periodicity = vocoder_id == "chouwagan" and bool(
+            chouwagan_options.get("chouwagan_use_periodicity", False)
+        )
+        self.use_frame_energy = vocoder_id == "chouwagan" and bool(
+            chouwagan_options.get("chouwagan_use_frame_energy", False)
+        )
+        self.segment_energy_floor = (
+            float(chouwagan_options.get("chouwagan_segment_energy_floor", 0.0))
+            if vocoder_id == "chouwagan"
+            else 0.0
+        )
+        # ``spec_channels`` is ``filter_length // 2 + 1``; the frame features
+        # need the FFT size back to turn bin indices into frequencies.
+        self.spec_n_fft = 2 * (int(spec_channels) - 1)
         self.chouwagan_hierarchical = bool(
             chouwagan_options.get("chouwagan_hierarchical", False)
         )
@@ -123,7 +150,102 @@ class Synthesizer(torch.nn.Module):
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
 
         self.chouwagan_discrete = None
-        if vocoder_id == "chouwagan":
+        self.chouwagan_frontend = str(
+            chouwagan_options.get("chouwagan_frontend", "svae")
+        ).lower()
+        if vocoder_id == "chouwagan" and self.chouwagan_frontend == "vits":
+            # The flow frontend: same interface, different latent.  Its shapes
+            # share nothing with the SVAE, so it carries its own architecture id
+            # and a checkpoint from the other frontend fails the guard instead
+            # of loading non-strictly with every latent module at its init.
+            self.architecture_id = str(
+                chouwagan_options.get(
+                    "chouwagan_architecture_id",
+                    CHOUWAGAN_VITS_ARCHITECTURE_ID,
+                )
+            )
+            self.chouwagan_discrete = ChouwaVitsLatent(
+                input_channels=inter_channels,
+                spec_channels=spec_channels,
+                content_channels=int(
+                    chouwagan_options.get("chouwagan_content_channels", 128)
+                ),
+                detail_channels=int(
+                    chouwagan_options.get("chouwagan_detail_channels", 64)
+                ),
+                gin_channels=gin_channels,
+                posterior_channels=int(
+                    chouwagan_options.get("chouwagan_posterior_channels", 192)
+                ),
+                prior_hidden_channels=int(
+                    chouwagan_options.get("chouwagan_prior_hidden_channels", 192)
+                ),
+                latent_channels=int(
+                    chouwagan_options.get("chouwagan_vits_latent_channels", 192)
+                ),
+                posterior_layers=int(
+                    chouwagan_options.get("chouwagan_vits_posterior_layers", 16)
+                ),
+                flow_blocks=int(chouwagan_options.get("chouwagan_vits_flow_blocks", 4)),
+                flow_layers=int(chouwagan_options.get("chouwagan_vits_flow_layers", 4)),
+                prior_blocks=int(
+                    chouwagan_options.get("chouwagan_svae_prior_blocks", 4)
+                ),
+                prior_heads=int(chouwagan_options.get("chouwagan_svae_prior_heads", 4)),
+                prior_kernel_size=int(
+                    chouwagan_options.get("chouwagan_svae_prior_kernel_size", 31)
+                ),
+                kl_free_bits=float(
+                    chouwagan_options.get("chouwagan_vits_free_bits", 0.03)
+                ),
+                kl_target=float(chouwagan_options.get("chouwagan_vits_kl_target", 0.15)),
+                kl_beta_lr=float(
+                    chouwagan_options.get("chouwagan_svae_kl_beta_lr", 0.01)
+                ),
+                kl_beta_min=float(
+                    chouwagan_options.get("chouwagan_svae_kl_beta_min", 1e-4)
+                ),
+                kl_beta_max=float(
+                    chouwagan_options.get("chouwagan_svae_kl_beta_max", 10.0)
+                ),
+                kl_rate_momentum=float(
+                    chouwagan_options.get("chouwagan_svae_kl_rate_momentum", 0.01)
+                ),
+                kl_scale_anchor=float(
+                    chouwagan_options.get("chouwagan_svae_kl_scale_anchor", 1.0)
+                ),
+                feature_scale_anchor=float(
+                    chouwagan_options.get("chouwagan_svae_feature_scale_anchor", 1.0)
+                ),
+                content_feature_channels=(
+                    int(text_enc_hidden_dim)
+                    if bool(
+                        chouwagan_options.get("chouwagan_prior_direct_content", True)
+                    )
+                    else 0
+                ),
+                frame_conditioning_channels=conditioning_channels(
+                    self.use_periodicity, self.use_frame_energy
+                ),
+                prior_uses_logs=bool(
+                    chouwagan_options.get("chouwagan_prior_uses_logs", False)
+                ),
+                prior_replacement_max=float(
+                    chouwagan_options.get("chouwagan_prior_replacement_max", 0.0)
+                ),
+                prior_replacement_start=int(
+                    chouwagan_options.get("chouwagan_prior_replacement_start", 5000)
+                ),
+                prior_replacement_ramp=int(
+                    chouwagan_options.get("chouwagan_prior_replacement_ramp", 20000)
+                ),
+                prior_replacement_mean_share=float(
+                    chouwagan_options.get(
+                        "chouwagan_prior_replacement_mean_share", 0.5
+                    )
+                ),
+            )
+        elif vocoder_id == "chouwagan":
             self.architecture_id = str(
                 chouwagan_options.get(
                     "chouwagan_architecture_id",
@@ -211,6 +333,18 @@ class Synthesizer(torch.nn.Module):
                 ),
                 prior_uses_logs=bool(
                     chouwagan_options.get("chouwagan_prior_uses_logs", False)
+                ),
+                # The prior reads the ContentVec features directly, alongside
+                # ``enc_p``'s summary of them; see ``prior_content``.
+                content_feature_channels=(
+                    int(text_enc_hidden_dim)
+                    if bool(
+                        chouwagan_options.get("chouwagan_prior_direct_content", True)
+                    )
+                    else 0
+                ),
+                frame_conditioning_channels=conditioning_channels(
+                    self.use_periodicity, self.use_frame_energy
                 ),
                 architecture_id=str(
                     chouwagan_options.get(
@@ -478,12 +612,23 @@ class Synthesizer(torch.nn.Module):
 
         if spec is not None:
             if self.chouwagan_discrete is not None:
+                conditioning = frame_conditioning(
+                    spec,
+                    pitchf,
+                    self.sr,
+                    self.spec_n_fft,
+                    self.use_periodicity,
+                    self.use_frame_energy,
+                    x_mask,
+                )
                 discrete_parts = self.chouwagan_discrete.forward_train(
                     self._prior_content_stats(m_p, logs_p),
                     spec,
                     g,
                     x_mask,
                     pitchf=pitchf,
+                    content=phone.transpose(1, 2),
+                    frame_conditioning=conditioning,
                 )
                 content = discrete_parts["content"]
                 detail = discrete_parts["detail"]
@@ -491,6 +636,12 @@ class Synthesizer(torch.nn.Module):
                     content,
                     spec_lengths,
                     self.segment_size,
+                    frame_energy=(
+                        spec.detach().float().square().mean(dim=1)
+                        if self.segment_energy_floor > 0.0
+                        else None
+                    ),
+                    energy_floor=self.segment_energy_floor,
                 )
                 detail_slice = slice_segments(
                     detail,
@@ -501,10 +652,16 @@ class Synthesizer(torch.nn.Module):
                 if self.use_f0:
                     pitchf_slice = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                 z_slice = torch.cat((content_slice, detail_slice), dim=1)
+                periodicity_slice = None
+                if self.use_periodicity and conditioning is not None:
+                    periodicity_slice = slice_segments(
+                        conditioning[:, :1], ids_slice, self.segment_size, dim=3
+                    )
                 o = self.dec(
                     z_slice,
                     pitchf_slice,
                     g=g,
+                    periodicity=periodicity_slice,
                     content_latent=content_slice,
                     detail_latent=detail_slice,
                     slow_detail_latent=slice_segments(
@@ -584,6 +741,19 @@ class Synthesizer(torch.nn.Module):
 
         if self.chouwagan_discrete is not None:
             temperature = max(1e-3, float(temperature))
+            # Measured from the *source* spectrogram, by the same code the
+            # trainer uses.  ``frame_conditioning`` returns None when the
+            # caller supplies no spectrogram, and every consumer then falls
+            # back to its pre-feature behaviour rather than to zeros.
+            conditioning = frame_conditioning(
+                spec,
+                nsff0,
+                self.sr,
+                self.spec_n_fft,
+                self.use_periodicity,
+                self.use_frame_energy,
+                x_mask,
+            )
             content, detail, _, _, slow_detail, fast_detail = self.chouwagan_discrete.infer(
                 self._prior_content_stats(m_p, logs_p),
                 g,
@@ -591,6 +761,8 @@ class Synthesizer(torch.nn.Module):
                 pitchf=nsff0,
                 deterministic=deterministic,
                 temperature=temperature,
+                content=phone.transpose(1, 2),
+                frame_conditioning=conditioning,
             )
             if hasattr(self.dec, "source"):
                 self.dec.source.deterministic = deterministic
@@ -598,6 +770,11 @@ class Synthesizer(torch.nn.Module):
                 torch.cat((content, detail), dim=1),
                 nsff0,
                 g,
+                periodicity=(
+                    conditioning[:, :1]
+                    if (self.use_periodicity and conditioning is not None)
+                    else None
+                ),
                 content_latent=content,
                 detail_latent=detail,
                 slow_detail_latent=slow_detail,

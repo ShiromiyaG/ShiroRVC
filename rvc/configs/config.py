@@ -8,12 +8,29 @@ from rvc.lib.terminal import get_console
 
 arch_config_paths = get_vocoder_config_paths()
 
-# Training is FP32-only.  FP16 needed a GradScaler and was the source of the
-# AMP instability; BF16 has the range but only an 8-bit mantissa, which
-# measured a gradient cosine of 0.77-0.82 against a true-FP32 reference (TF32
-# and FP16, both 11-bit, sit at 0.9997 and 0.99).  TF32 already gives tensor
-# cores at 11 bits with no autocast and no scaler, and it is toggled per run
-# from the training tab rather than here.
+# Training defaults to FP32 master weights with TF32 tensor cores: no autocast,
+# no scaler, toggled per run from the training tab.
+#
+# FP16 is the one autocast mode offered, enabled from Settings -> Precision and
+# carried into the run spec by the launcher.  It has the same 11-bit mantissa as
+# TF32 (gradient cosine 0.99 against a true-FP32 reference) but a narrow
+# exponent range, which is what the GradScaler is there for.  BF16 is not
+# offered: an 8-bit mantissa measured a gradient cosine of only 0.77-0.82 on
+# this model, whose oscillatory NSF source and L1-on-log-mel loss produce
+# heavily cancelling sums.
+
+#: Where the persisted FP16 preference lives.  Read defensively -- a missing or
+#: hand-broken config must not stop the app from starting.
+_APP_CONFIG_PATH = os.path.join("assets", "config.json")
+
+
+def get_use_fp16() -> bool:
+    """The persisted "train under FP16 autocast" preference."""
+    try:
+        with open(_APP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("use_fp16", False))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return False
 
 def singleton(cls):
     instances = {}
@@ -57,20 +74,39 @@ class Config:
 
 
     def get_precision(self):
-        return "fp32"
+        return "fp16 (autocast)" if get_use_fp16() else "fp32"
 
-    def check_precision(self):
+    def check_precision(self, use_fp16=None):
+        """Report the precision the next run would start with.
+
+        ``use_fp16`` comes from the settings checkbox so the report matches what
+        is on screen even before the change handler has written it; falling back
+        to the persisted value keeps the method callable with no arguments.
+        """
+        if use_fp16 is None:
+            use_fp16 = get_use_fp16()
         tf32 = torch.backends.cuda.matmul.allow_tf32
-        return "\n".join(
-            (
-                "Training precision: FP32 (master weights and optimizer in FP32).",
-                f"TF32 matmul/conv currently: {'on' if tf32 else 'off'}"
-                " - toggle it per run in the Training tab.",
-                "No autocast, no GradScaler: FP16 and BF16 training were removed.",
-                "BF16 lost too much mantissa here (gradient cosine 0.77-0.82 vs"
-                " FP32; TF32 is 0.9997).",
+        lines = [
+            "Master weights and optimizer state: FP32 (always).",
+            f"TF32 matmul/conv currently: {'on' if tf32 else 'off'}"
+            " - toggle it per run in the Training tab.",
+        ]
+        if use_fp16:
+            lines.append(
+                "FP16 autocast: ON, with a GradScaler. Distribution math and the"
+                " NSF source stay in FP32."
             )
+            if not torch.cuda.is_available():
+                lines.append(
+                    "No CUDA device visible, so the setting will do nothing here."
+                )
+        else:
+            lines.append("FP16 autocast: off - no autocast, no GradScaler.")
+        lines.append(
+            "BF16 is not offered: it lost too much mantissa here (gradient cosine"
+            " 0.77-0.82 vs FP32; TF32 is 0.9997 and FP16 is 0.99)."
         )
+        return "\n".join(lines)
 
     def device_config(self):
         if self.device.startswith("cuda"):

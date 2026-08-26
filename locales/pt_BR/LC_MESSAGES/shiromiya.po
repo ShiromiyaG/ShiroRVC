@@ -48,18 +48,18 @@ msgstr "### Idioma"
 
 msgid ""
 "### Precision\n"
-"Training runs in **FP32** end to end - there is no autocast and no GradScaler.\n"
+"The default is **FP32** master weights with **TF32** tensor cores - no autocast, no loss scaler. TF32 is toggled per run in the Training tab.\n"
 "\n"
-"FP16 was removed because it needs a loss scaler and was the source of the AMP instability. BF16 was removed because its 8-bit mantissa measured a gradient cosine of only **0.77-0.82** against a true-FP32 reference, while TF32 and FP16 (11-bit mantissa) sit at 0.9997 and 0.99. This model is unusually sensitive: the oscillatory NSF source and the L1-on-log-mel loss produce heavily cancelling sums.\n"
+"**FP16** adds `torch.autocast` plus a `GradScaler` on top. It keeps the same 11-bit mantissa as TF32 (gradient cosine 0.99 against a true-FP32 reference, where BF16's 8-bit mantissa measured only 0.77-0.82), but its narrow exponent range can overflow, which is what the scaler is for. Distribution math and the NSF source stay in FP32; the convolutional backbone - the dominant cost - runs in FP16.\n"
 "\n"
-"The precision knob that remains is **TF32**, which gives tensor cores at 11-bit mantissa with no autocast and no scaler. Toggle it per run with `use 'TF32' precision` in the Training tab."
+"Turn it on for the memory and speed, turn it off if a run shows the scaler backing off repeatedly or losses going non-finite. BF16 is not offered: it loses too much mantissa for this model, whose oscillatory NSF source and L1-on-log-mel loss produce heavily cancelling sums."
 msgstr ""
 "### Precisão\n"
-"O treinamento roda em **FP32** de ponta a ponta - não há autocast nem GradScaler.\n"
+"O padrão são pesos mestres em **FP32** com tensor cores **TF32** - sem autocast e sem loss scaler. O TF32 é ligado por execução na aba de treinamento.\n"
 "\n"
-"FP16 foi removido porque precisa de um escalonador de perda e era a origem da instabilidade do AMP. BF16 foi removido porque sua mantissa de 8 bits mediu um cosseno de gradiente de apenas **0,77-0,82** contra uma referência FP32 real, enquanto TF32 e FP16 (mantissa de 11 bits) ficam em 0,9997 e 0,99. Este modelo é excepcionalmente sensível: a fonte NSF oscilatória e a perda L1 sobre log-mel produzem somas com forte cancelamento.\n"
+"O **FP16** acrescenta `torch.autocast` e um `GradScaler` por cima. Ele mantém a mesma mantissa de 11 bits do TF32 (cosseno de gradiente de 0,99 contra uma referência FP32 real, enquanto a mantissa de 8 bits do BF16 mediu apenas 0,77-0,82), mas sua faixa de expoente estreita pode estourar, e é para isso que serve o scaler. A matemática das distribuições e a fonte NSF permanecem em FP32; o backbone convolucional - o custo dominante - roda em FP16.\n"
 "\n"
-"O ajuste de precisão que resta é o **TF32**, que usa os tensor cores com mantissa de 11 bits, sem autocast e sem escalonador. Ative-o por execução com `usar precisão 'TF32'` na aba de Treinamento."
+"Ligue para ganhar memória e velocidade; desligue se uma execução mostrar o scaler recuando repetidamente ou perdas ficando não finitas. BF16 não é oferecido: perde mantissa demais neste modelo, cuja fonte NSF oscilatória e perda L1 sobre log-mel produzem somas com forte cancelamento."
 
 msgid "0 is all of model A, 1 is all of model B."
 msgstr "0 é todo o modelo A, 1 é todo o modelo B."
@@ -154,6 +154,9 @@ msgstr "E selecione a taxa de amostragem."
 msgid "Applied on the next start. Takes effect immediately when launched with --language, which overrides this setting."
 msgstr "Aplicado na próxima inicialização. Tem efeito imediato quando iniciado com --language, que sobrepõe esta configuração."
 
+msgid "Applies to runs started after this is saved. Needs a CUDA GPU."
+msgstr "Vale para as execuções iniciadas depois de salvar. Requer uma GPU CUDA."
+
 msgid "Apply a soft autotune to your inferences, recommended for singing conversions."
 msgstr "Aplica um autotune suave às inferências; recomendado para conversões de canto."
 
@@ -198,6 +201,9 @@ msgstr "Áudio a converter."
 
 msgid "Auto picks by dataset size."
 msgstr "Automático escolhe pelo tamanho do dataset."
+
+msgid "Autocast needs a CUDA GPU, so the setting would do nothing."
+msgstr "O autocast precisa de uma GPU CUDA, então a opção não faria nada."
 
 msgid "Automatic detects silence; Simple cuts on a fixed grid."
 msgstr "Automático detecta silêncio; Simples corta em uma grade fixa."
@@ -692,6 +698,18 @@ msgstr "Arquivo da curva de F0"
 msgid "F0-guided model"
 msgstr "Modelo guiado por F0"
 
+msgid "FP16 autocast"
+msgstr "Autocast em FP16"
+
+msgid "FP16 training (autocast + GradScaler)"
+msgstr "Treinamento em FP16 (autocast + GradScaler)"
+
+msgid "FP16 training disabled. Runs start from now on in FP32 with TF32 tensor cores."
+msgstr "Treinamento em FP16 desativado. As execuções a partir de agora começam em FP32 com tensor cores TF32."
+
+msgid "FP16 training enabled. Runs started from now on use autocast with a GradScaler."
+msgstr "Treinamento em FP16 ativado. As execuções iniciadas a partir de agora usam autocast com um GradScaler."
+
 msgid "Faiss index. Picked automatically when there is only one next to the model."
 msgstr "Index Faiss. Escolhido automaticamente quando há apenas um ao lado do modelo."
 
@@ -1033,6 +1051,9 @@ msgstr "Taxa de aprendizado do gerador"
 
 msgid "Length of each KL annealing cycle, in epochs."
 msgstr "Duração de cada ciclo de annealing KL, em epochs."
+
+msgid "Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."
+msgstr "Menos VRAM e steps mais rápidos. Os pesos mestres continuam em FP32; um GradScaler cuida do estouro."
 
 msgid "Light theme"
 msgstr "Tema claro"

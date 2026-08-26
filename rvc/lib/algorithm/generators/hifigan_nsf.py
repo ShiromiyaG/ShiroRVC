@@ -72,9 +72,20 @@ class SineGenerator(torch.nn.Module):
         return sine_waves
 
     def forward(self, f0: torch.Tensor, upsampling_factor: int):
-        with torch.no_grad():
+        # Phase accumulation must not run in a reduced precision.  Under
+        # ``autocast(fp16)`` this block happens to stay FP32 today only because
+        # none of ``cumsum``/``fmod``/``sin``/``interpolate`` are on autocast's
+        # op list and ``f0`` arrives as FP32 -- an incidental property, not a
+        # guarantee.  Adding any autocast-listed op (a conv, a matmul) anywhere
+        # in here would silently drop the running phase to an 11-bit mantissa,
+        # and the failure mode is a detuned harmonic source rather than a NaN,
+        # so neither the GradScaler nor any loss would flag it.  The fence and
+        # the explicit cast make the FP32 guarantee structural; ChouwaGAN's
+        # ``BandLimitedNSFSource.prepare`` states it the same way with its own
+        # ``f0.float()``.
+        with torch.autocast(device_type=f0.device.type, enabled=False), torch.no_grad():
             # Expand `f0` to include waveform dimensions
-            f0 = f0.unsqueeze(-1)
+            f0 = f0.float().unsqueeze(-1)
 
             # Generate sine waves
             sine_waves = (

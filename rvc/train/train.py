@@ -102,9 +102,13 @@ from mel_processing import MultiScaleMelSpectrogramLoss
 
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
+from rvc.lib.algorithm.frame_features import spectrogram_for_features
 from rvc.configs.vocoders import normalize_vocoder
 from rvc.lib.algorithm.chouwagan_svae import (
     ARCHITECTURE_ID as CHOUWAGAN_ARCHITECTURE_ID,
+)
+from rvc.lib.algorithm.chouwagan_vits import (
+    ARCHITECTURE_ID as CHOUWAGAN_VITS_ARCHITECTURE_ID,
 )
 from rvc.train.run_spec import TrainRunSpec
 
@@ -144,6 +148,7 @@ architecture = "RVC"
 optimizer_choice_g = optimizer_choice_d = spec.optimizer_choice
 use_checkpointing = spec.use_checkpointing
 use_tf32 = spec.use_tf32
+use_fp16 = spec.use_fp16
 use_benchmark = spec.use_benchmark
 lr_scheduler = spec.lr_scheduler
 
@@ -220,18 +225,24 @@ if chouwagan_active and sample_rate != 44100:
     raise ValueError("ChouwaGAN requires the 44.1 kHz configuration.")
 
 # AMP precision / dtype init
+# Default: FP32 + TF32 tensor cores, no autocast, no scaler.
+#
+# ``use_fp16`` enables ``torch.autocast`` at FP16 with ``GradScaler``.  The
+# generator, frontend and discriminator autocast-disable wrappers have been
+# narrowed to protect only distribution math and the NSF source, so the
+# convolutional backbone (the dominant cost) runs in FP16 without inserting
+# cast nodes that break Inductor fusions.
+#
 # BF16 carries FP32's exponent range, so it needs no GradScaler and cannot
 # overflow the way FP16 does in the periodic activations, the anti-aliased
-# resampling or the Gaussian latent statistics.  It takes precedence when both
-# flags are set.
-# Training runs in FP32 throughout.  BF16's 8-bit mantissa was measured to
-# cost far too much gradient fidelity for this model: against a true-FP32
-# reference the gradient cosine was 0.77 at init and 0.82 after training,
-# versus 0.9997 for TF32 and 0.99 for FP16 (both 11-bit mantissa).  The
-# oscillatory NSF source and the L1-on-log-mel loss produce heavily cancelling
-# sums, which amplify BF16 rounding: `m_source.l_linear.weight` even flipped
-# sign (+94.13 -> -3.30).  TF32 already provides tensor cores at 11 bits with
-# no autocast and no scaler, so it is the mixed-precision path here.
+# resampling or the Gaussian latent statistics.
+#
+# History: an earlier measurement with blanket ``autocast(enabled=False)``
+# wrapping the entire forward showed FP16 at 0.93x of TF32.  That was cast
+# overhead; with the fencing narrowed to distribution math only, the compiled
+# decoder graph stays in one dtype end-to-end.
+use_amp = bool(use_fp16)
+amp_dtype = torch.float16 if use_amp else None
 
 # Globals ( Do not alter these )
 global_step = 0
@@ -245,6 +256,12 @@ overtrain_flagged = False
 overtrain_exported = False
 reset_optimizer_for_run = finetune_phase
 use_lr_scheduler = lr_scheduler != "none"
+# How many optimizer steps the GradScaler has thrown away because the gradients
+# came back non-finite.  Under FP16 a skipped step is the *expected* response to
+# an overflow, but a run that skips them in series is not training at all -- and
+# without this counter that looks exactly like a loss that stopped improving.
+# Cumulative across resumes: it rides in the D checkpoint's ``extra``.
+amp_skipped_steps = 0
 
 
 
@@ -571,8 +588,21 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
         }
         # The Chouwa frontend is intentionally replaced by the continuous
         # SVAE architecture; old FSQ identifiers must not select the legacy
-        # implementation for a new run.
-        config.model["chouwagan_architecture_id"] = CHOUWAGAN_ARCHITECTURE_ID
+        # implementation for a new run.  The id follows whichever frontend is
+        # selected: the two share no tensor shapes, and ``net_g`` loads
+        # ChouwaGAN checkpoints non-strictly, so pinning the wrong one here
+        # would let a checkpoint from the other frontend load with every latent
+        # module silently left at its initialisation.
+        selected_frontend = str(
+            config.model.get("chouwagan_frontend", "svae")
+            if hasattr(config.model, "get")
+            else getattr(config.model, "chouwagan_frontend", "svae")
+        ).lower()
+        config.model["chouwagan_architecture_id"] = (
+            CHOUWAGAN_VITS_ARCHITECTURE_ID
+            if selected_frontend == "vits"
+            else CHOUWAGAN_ARCHITECTURE_ID
+        )
         for key, value in chouwagan_defaults.items():
             if key not in config.model:
                 config.model[key] = value
@@ -1300,7 +1330,10 @@ def _holdout_spectral_loss(net_g, batches, config, device):
     try:
         with torch.no_grad():
             for batch in batches:
-                phone, phone_lengths, pitch, pitchf, _spec, _spec_lengths, wave, wave_lengths, sid = batch
+                # Not named ``spec``: ``test_run_spec`` audits every
+                # ``spec.<field>`` in this file against the run spec, and a
+                # local of that name collides with the check.
+                phone, phone_lengths, pitch, pitchf, holdout_spec, _spec_lengths, wave, wave_lengths, sid = batch
                 phone = phone.to(device, non_blocking=True)
                 phone_lengths = phone_lengths.to(device, non_blocking=True)
                 pitch = pitch.to(device, non_blocking=True)
@@ -1308,7 +1341,15 @@ def _holdout_spectral_loss(net_g, batches, config, device):
                 sid = sid.to(device, non_blocking=True)
                 wave = wave.to(device, non_blocking=True)
 
-                generated, *_ = model.infer(phone, phone_lengths, pitch, pitchf, sid, 0)
+                # The held-out spectrogram, not a placeholder: a model trained
+                # with the measured frame features has to be *scored* with them
+                # too.  Left out, this evaluates a path the weights were never
+                # trained for and reports the mismatch as a quality regression.
+                holdout_spec = holdout_spec.to(device, non_blocking=True)
+
+                generated, *_ = model.infer(
+                    phone, phone_lengths, pitch, pitchf, sid, 0, holdout_spec
+                )
                 # ``infer`` rebuilds the waveform from frame-rate features, so
                 # its length lands within a hop of the target rather than on it.
                 length = min(generated.shape[-1], wave.shape[-1], int(wave_lengths.min()))
@@ -1418,6 +1459,24 @@ def _deliverable_weights(overtrain_monitor, ema, model_g):
     # for one -- would change what has already been chosen.  The other two
     # branches already return CPU copies.
     return _cpu_state_dict(model_g), "live weights"
+
+
+def _checkpoint_extra(r1_controller, grad_scaler):
+    """Training-loop state that a resume cannot re-derive, for the D checkpoint.
+
+    Everything here is plain scalars and plain dicts on purpose: ``extra`` is
+    unpickled under ``weights_only=True``, and the ``GradScaler``'s own
+    ``state_dict`` is five floats and ints, so it stays inside that contract.
+    Returns ``None`` when there is nothing to carry, which is what
+    ``save_checkpoint`` already treats as "omit the key".
+    """
+    extra = {}
+    if r1_controller is not None:
+        extra["r1_controller"] = r1_controller.state_dict
+    if grad_scaler is not None:
+        extra["grad_scaler"] = grad_scaler.state_dict()
+        extra["amp_skipped_steps"] = int(amp_skipped_steps)
+    return extra or None
 
 
 class _R1StrengthController:
@@ -2621,8 +2680,29 @@ def get_reference_sample(train_loader, device, config):
         print(f"[REFERENCE] Origin of the ref: {file_name}")
         reference_source = file_name
 
+    # The preview must run the same path the holdout scores and the pipeline
+    # ships, which means supplying the spectrogram the frame features are
+    # measured from.  A custom reference in ``logs/reference`` carries only
+    # features and f0, so there is no audio to measure and the model falls back
+    # to its pre-feature behaviour -- correct, but worth saying out loud,
+    # because the preview then stops matching the holdout.
+    reference_spec = None
+    if reference_audio is not None:
+        reference_spec = spectrogram_for_features(
+            reference_audio.reshape(1, -1),
+            int(config.data.filter_length),
+            int(config.data.hop_length),
+        )
+    elif getattr(config.model, "chouwagan_use_periodicity", False) or getattr(
+        config.model, "chouwagan_use_frame_energy", False
+    ):
+        print(
+            "[REFERENCE] Custom reference has no audio, so the preview runs "
+            "without the measured frame features. The holdout still uses them."
+        )
+
     return (
-        (phone, phone_lengths, pitch, pitchf, sid, config.train.seed),
+        (phone, phone_lengths, pitch, pitchf, sid, config.train.seed, reference_spec),
         reference_audio,
         reference_source,
     )
@@ -2909,6 +2989,35 @@ def run(
     enable_vocoder_compile(net_g, device, rank)
     enable_discriminator_compile(net_d, config, device, rank)
 
+    # GradScaler for FP16 AMP.  The init_scale is set high to avoid an early
+    # underflow that zeros a whole batch of gradients, but not so high that
+    # FP16-range overflows on the first step.  The ceiling is well above any
+    # healthy operating range; the scaler's own backoff handles overflows, so
+    # this is a guard, not a per-step rescaler.
+    grad_scaler = (
+        torch.amp.GradScaler("cuda", init_scale=2.0 ** 10, growth_interval=2000)
+        if use_amp
+        else None
+    )
+    # The scaler carries real state: the current scale and how far it is into the
+    # growth interval.  Restarting it at ``init_scale`` on every resume replays
+    # the initial overflow-and-back-off search, which throws away a handful of
+    # steps each time -- and hides a run that had settled at a much lower scale.
+    global amp_skipped_steps
+    amp_skipped_steps = int(resumed_extra_d.get("amp_skipped_steps") or 0)
+    if grad_scaler is not None:
+        scaler_state = resumed_extra_d.get("grad_scaler")
+        if scaler_state:
+            grad_scaler.load_state_dict(scaler_state)
+            if rank == 0:
+                info(
+                    f"Restored the GradScaler at scale {grad_scaler.get_scale():.0f} "
+                    f"({amp_skipped_steps} steps skipped so far).",
+                    tag="[RESUME]",
+                )
+    if use_amp and rank == 0:
+        info(f"AMP enabled: dtype={amp_dtype}, GradScaler active.", tag="[INIT]")
+
     phase_start_step = global_step
     phase_step = 0
     phase_limit_reached = False
@@ -3137,6 +3246,7 @@ def run(
             ema=ema,
             adversarial_ceiling_governor=adversarial_ceiling_governor,
             r1_controller=r1_controller,
+            grad_scaler=grad_scaler,
         )
         if use_lr_scheduler and (not warmup_active() or warmup_completed):
             if lr_scheduler in ["exp decay epoch", "cosine annealing", "cosine annealing epoch"]:
@@ -3214,6 +3324,7 @@ def training_loop(
     ema=None,
     adversarial_ceiling_governor=None,
     r1_controller=None,
+    grad_scaler=None,
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -3239,6 +3350,7 @@ def training_loop(
     """
     global global_step, warmup_completed, use_lr_scheduler, lr_scheduler, use_warmup, swap_completed
     global phase_step, phase_limit_reached, overtrain_flagged, overtrain_exported
+    global amp_skipped_steps
 
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -3345,6 +3457,10 @@ def training_loop(
     # 50-step window costs a single mean and a single device transfer instead
     # of 2 * heads of each.
     disc_branch_cache = deque(maxlen=rolling_loss_steps)
+    # One 0/1 per step, so the logged rate is "how much of the recent window did
+    # FP16 throw away" rather than a lifetime average that a bad first epoch
+    # would dominate forever.
+    amp_skip_cache = deque(maxlen=rolling_loss_steps)
     disc_branch_names = ()
     if chouwagan_active:
         disc_branch_names = tuple(
@@ -3650,7 +3766,7 @@ def training_loop(
                 model_g.set_training_step(global_step)
 
             # Generator main forward pass:
-            with autocast(device_type="cuda", enabled=False):
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 model_output = net_g(spec, spec_lengths, sid, phone, phone_lengths, pitchf, pitch)
 
                 y_hat, ids_slice, x_mask, z_mask, vae_parts = model_output
@@ -3676,7 +3792,7 @@ def training_loop(
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
                 )
-                with torch.no_grad(), autocast(device_type="cuda", enabled=False):
+                with torch.no_grad(), autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     main_real_spectrograms = (
                         discriminator_model.prepare_spectrograms(y)
                     )
@@ -3692,7 +3808,7 @@ def training_loop(
             grad_norm_d_r1 = None
 
             for y_d_real, y_d_fake, real_spectrograms in d_updates:
-                with autocast(device_type="cuda", enabled=False):
+                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     if chouwagan_active:
                         y_d_hat_r, y_d_hat_g, _, _ = net_d(
                             y_d_real,
@@ -3706,7 +3822,7 @@ def training_loop(
                             y_d_real, y_d_fake
                         )
 
-                with autocast(device_type="cuda", enabled=False):
+                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     disc_loss_parts = discriminator_loss(
                         y_d_hat_r,
                         y_d_hat_g,
@@ -3721,14 +3837,21 @@ def training_loop(
                         _disc_branch_acc.append(disc_loss_parts[3])
 
                 optim_d.zero_grad(set_to_none=True)
-                loss_disc.backward()
+                if grad_scaler is not None:
+                    grad_scaler.scale(loss_disc).backward()
+                    grad_scaler.unscale_(optim_d)
+                else:
+                    loss_disc.backward()
                 grad_norm_d = _clip_or_sample_grad_norm(
                     net_d.parameters(),
                     grad_clip_value_d,
                     global_step,
                     metrics_update_interval,
                 )
-                optim_d.step()
+                if grad_scaler is not None:
+                    grad_scaler.step(optim_d)
+                else:
+                    optim_d.step()
                 _normalize_san_weights(net_d)
 
                 # Temp accumulation
@@ -3764,7 +3887,7 @@ def training_loop(
                 )
                 r1_event = max(0, global_step // r1_interval - 1)
                 r1_branch = r1_event % discriminator_model.num_branches
-                with autocast(device_type="cuda", enabled=False):
+                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     r1_penalty = _lazy_r1_penalty(
                         net_d,
                         y,
@@ -3777,20 +3900,23 @@ def training_loop(
                     )
 
                 optim_d.zero_grad(set_to_none=True)
-                loss_r1.backward()
+                if grad_scaler is not None:
+                    grad_scaler.scale(loss_r1).backward()
+                    grad_scaler.unscale_(optim_d)
+                else:
+                    loss_r1.backward()
                 grad_norm_d_r1 = _clip_or_sample_grad_norm(
                     net_d.parameters(),
                     grad_clip_value_d,
                     global_step,
                     metrics_update_interval,
                 )
-                # Already this branch's own norm, not the ensemble's:
-                # ``_lazy_r1_penalty`` goes through ``forward_branch``, so only
-                # ``discriminators[r1_branch]`` has gradients and every other
-                # parameter is skipped as ``None``.
                 if grad_norm_d_r1 is not None:
                     r1_controller.observe_r1(r1_branch, float(grad_norm_d_r1))
-                optim_d.step()
+                if grad_scaler is not None:
+                    grad_scaler.step(optim_d)
+                else:
+                    optim_d.step()
                 _normalize_san_weights(net_d)
 
             # Stack + mean
@@ -3820,14 +3946,14 @@ def training_loop(
                 for parameter in discriminator_model.parameters():
                     parameter.requires_grad_(False)
 
-                with autocast(device_type="cuda", enabled=False):
+                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     with torch.no_grad():
                         _, fmap_r = discriminator_model._forward_audio(
                             y, main_real_spectrograms
                         )
                     y_d_hat_g, fmap_g = discriminator_model._forward_audio(y_hat)
             else:
-                with autocast(device_type="cuda", enabled=False):
+                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
 
 
@@ -3836,7 +3962,7 @@ def training_loop(
             ablation_delta = None
             ablation_branch = None
             ablation_dimension = None
-            with autocast(device_type="cuda", enabled=False):
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
 
                 # Spectral loss.  The component terms are logged separately
                 # where a mode has more than one, because the combined series
@@ -4187,8 +4313,15 @@ def training_loop(
                         global_step,
                     )
             if chouwagan_active:
-                loss_core.backward(retain_graph=True)
-                _add_decoder_only_gradients(loss_gan, net_g)
+                if grad_scaler is not None:
+                    grad_scaler.scale(loss_core).backward(retain_graph=True)
+                    _add_decoder_only_gradients(
+                        grad_scaler.scale(loss_gan), net_g
+                    )
+                    grad_scaler.unscale_(optim_g)
+                else:
+                    loss_core.backward(retain_graph=True)
+                    _add_decoder_only_gradients(loss_gan, net_g)
                 if global_step % metrics_update_interval == 0:
                     module_grad_metrics = _generator_gradient_metrics(net_g)
                 grad_norm_g = _clip_or_sample_grad_norm(
@@ -4197,7 +4330,10 @@ def training_loop(
                     global_step,
                     metrics_update_interval,
                 )
-                optim_g.step()
+                if grad_scaler is not None:
+                    grad_scaler.step(optim_g)
+                else:
+                    optim_g.step()
 
                 if rank == 0 and global_step % 50 == 0:
                     writer.add_scalar(
@@ -4290,10 +4426,24 @@ def training_loop(
                         last_layer_adv_grad.item(),
                         global_step,
                     )
+                    # The quantity being held at ``chouwagan_adv_balance_target``,
+                    # on the same terms as ``GAN/fm_to_rec_ratio`` below: *after*
+                    # the adaptive weight, so it is what the optimizer receives
+                    # rather than what the adversarial term asked for.  The two
+                    # sit side by side and are read as comparable, and until now
+                    # they were not -- this one was the raw gradient ratio, which
+                    # reads as tens against the other's fractions and makes a
+                    # balance rule sitting exactly on target look broken.
+                    #
+                    # Nothing is lost by weighting it: the raw ratio is
+                    # ``last_layer_adv_grad / last_layer_rec_grad``, and both are
+                    # logged above.  A run that spans this change has a step
+                    # discontinuity in the series at the resume.
                     writer.add_scalar(
                         "GAN/adv_to_rec_ratio",
                         (
-                            last_layer_adv_grad
+                            adaptive_adv
+                            * last_layer_adv_grad
                             / (last_layer_rec_grad + 1e-6)
                         ).item(),
                         global_step,
@@ -4347,7 +4497,11 @@ def training_loop(
                         global_step,
                     )
             else:
-                loss_gen_total.backward() # Loss backward
+                if grad_scaler is not None:
+                    grad_scaler.scale(loss_gen_total).backward()
+                    grad_scaler.unscale_(optim_g)
+                else:
+                    loss_gen_total.backward()
                 if global_step % metrics_update_interval == 0:
                     module_grad_metrics = _generator_gradient_metrics(net_g)
                 grad_norm_g = _clip_or_sample_grad_norm(
@@ -4356,7 +4510,10 @@ def training_loop(
                     global_step,
                     metrics_update_interval,
                 )
-                optim_g.step() # Optim step
+                if grad_scaler is not None:
+                    grad_scaler.step(optim_g)
+                else:
+                    optim_g.step()
 
             if discriminator_parameter_states is not None:
                 for parameter, requires_grad in zip(
@@ -4366,6 +4523,19 @@ def training_loop(
                 ):
                     parameter.requires_grad_(requires_grad)
 
+
+            if grad_scaler is not None:
+                # ``update`` is the only place that reports an overflow, and it
+                # reports it by *lowering the scale*: there is no "was the step
+                # taken" flag on the scaler.  Reading the scale either side of
+                # the call is the sanctioned way to detect it.
+                scale_before_update = grad_scaler.get_scale()
+                grad_scaler.update()
+                if grad_scaler.get_scale() < scale_before_update:
+                    amp_skipped_steps += 1
+                    amp_skip_cache.append(1.0)
+                else:
+                    amp_skip_cache.append(0.0)
 
             # After both optimizer branches, so it always sees post-step
             # weights, and before any of the preview/holdout weight swaps, so
@@ -4567,6 +4737,22 @@ def training_loop(
                         "learning_rate/lr_d": optim_d.param_groups[0]["lr"],
                         "learning_rate/lr_g": optim_g.param_groups[0]["lr"],
                     })
+
+                # AMP health.  ``scale`` is the diagnostic: a healthy FP16 run
+                # settles at a scale and grows it back after the occasional
+                # overflow, so a scale walking down decade by decade, or a
+                # ``skip_rate`` that stops returning to zero, is the run telling
+                # you the gradients are overflowing faster than the scaler can
+                # back off.  Without these two series that state is invisible --
+                # the losses simply stop moving, because the steps are not
+                # being applied.
+                if grad_scaler is not None:
+                    scalar_dict_rolling["AMP/grad_scaler_scale"] = grad_scaler.get_scale()
+                    scalar_dict_rolling["AMP/skipped_steps_total"] = amp_skipped_steps
+                    if amp_skip_cache:
+                        scalar_dict_rolling[
+                            f"AMP/skip_rate_{rolling_loss_steps}"
+                        ] = sum(amp_skip_cache) / len(amp_skip_cache)
 
                 # logging rolling averages
                 for key, queue in avg_rolling_cache.items():
@@ -4905,11 +5091,7 @@ def training_loop(
                         config.train.learning_rate_d,
                         epoch,
                         d_path,
-                        extra=(
-                            {"r1_controller": r1_controller.state_dict}
-                            if r1_controller is not None
-                            else None
-                        ),
+                        extra=_checkpoint_extra(r1_controller, grad_scaler),
                     )
 
 

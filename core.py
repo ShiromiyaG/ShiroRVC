@@ -467,6 +467,7 @@ def run_train_script(
     optimizer_choice: str = "AdamW",
     use_checkpointing: bool = False,
     use_tf32: bool = False,
+    use_fp16: bool = False,
     use_benchmark: bool = True,
     lr_scheduler: str = "exp decay step",
     use_custom_lr: bool = False,
@@ -522,6 +523,7 @@ def run_train_script(
         custom_lr_d=float(custom_lr_d if custom_lr_d is not None else 1e-4),
         use_checkpointing=bool(use_checkpointing),
         use_tf32=bool(use_tf32),
+        use_fp16=bool(use_fp16),
         use_benchmark=bool(use_benchmark),
         compile_vocoder=bool(compile_vocoder),
         torch_compile_mode=str(torch_compile_mode),
@@ -1400,6 +1402,17 @@ TRAIN_OWN = [
         default=False,
         show_default=True,
         help="Lets you choose between FP32 and TF32 precision used in training.",
+    ),
+    click.option(
+        "--use_fp16",
+        type=click.BOOL,
+        default=False,
+        show_default=True,
+        help=(
+            "Run the forward pass under FP16 autocast with a GradScaler. Master "
+            "weights stay FP32; distribution math and the NSF source stay FP32. "
+            "Off means plain FP32 (with TF32 tensor cores if --use_tf32)."
+        ),
     ),
     click.option(
         "--use_benchmark",

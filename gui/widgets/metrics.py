@@ -46,9 +46,15 @@ PRESETS: dict[str, list[str]] = {
     # Whether the adaptive weight is actually being applied. `saturation` below
     # 1 means the ceiling is overruling the balance rule, which is invisible in
     # `adaptive_adv_weight` alone -- it just reads as a flat line.
+    # ``adv_to_rec_ratio`` and ``fm_to_rec_ratio`` are both reported after their
+    # adaptive weight, so they are directly comparable to each other and each to
+    # its own balance target. Both halves of the GAN objective belong on the same
+    # chart: the failure this preset exists to show is one of them being held on
+    # target while the other grows.
     "Balance": [
         "adaptive_adv_saturation", "adaptive_adv_weight",
         "adaptive_adv_requested", "adaptive_adv_ceiling", "adv_to_rec_ratio",
+        "adaptive_fm_weight", "fm_to_rec_ratio",
     ],
     "Gradients": [
         "grad_norm_g", "grad_norm_d", "grad_norm_d_r1", "grad_clip_hit_rate_g",

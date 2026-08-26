@@ -43,9 +43,28 @@ class FixedLowPass1d(nn.Module):
             "kernel", _lowpass_kernel(factor, width, rolloff), persistent=False
         )
 
+    def _grouped_kernel(self, x: Tensor) -> Tensor:
+        """The per-channel kernel, cached across calls.
+
+        ``.to()`` plus ``.expand()`` ran on every forward of every instance.
+        Each is cheap on its own and neither shows up in the GPU trace, but at
+        26 instances called several times per step they are pure dispatch on a
+        step that is already CPU-bound.  The cache is keyed by the only three
+        things that can change it.
+        """
+        channels = int(x.shape[1])
+        key = (channels, x.dtype, x.device)
+        if getattr(self, "_kernel_key", None) != key:
+            self._kernel_cache = (
+                self.kernel.to(device=x.device, dtype=x.dtype)
+                .expand(channels, -1, -1)
+                .contiguous()
+            )
+            self._kernel_key = key
+        return self._kernel_cache
+
     def forward(self, x: Tensor) -> Tensor:
-        kernel = self.kernel.to(device=x.device, dtype=x.dtype)
-        kernel = kernel.expand(x.shape[1], -1, -1)
+        kernel = self._grouped_kernel(x)
         padding = (kernel.shape[-1] - 1) // 2
         return F.conv1d(
             _safe_pad(x, padding),
@@ -71,20 +90,42 @@ class AntiAliasedUpsample1d(nn.Module):
             self.pad * self.factor + (kernel_size - self.factor + 1) // 2
         )
 
+    def _grouped_kernel(self, x: Tensor) -> Tensor:
+        channels = int(x.shape[1])
+        key = (channels, x.dtype, x.device)
+        if getattr(self, "_kernel_key", None) != key:
+            self._kernel_cache = (
+                self.kernel.to(device=x.device, dtype=x.dtype)
+                .expand(channels, -1, -1)
+                .contiguous()
+            )
+            self._kernel_key = key
+        return self._kernel_cache
+
     def forward(self, x: Tensor) -> Tensor:
         if self.factor == 1:
             return x
         channels = x.shape[1]
-        kernel = self.kernel.to(device=x.device, dtype=x.dtype)
-        kernel = kernel.expand(channels, -1, -1)
+        kernel = self._grouped_kernel(x)
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
+        # ``padding`` crops the transposed convolution's own output instead of
+        # computing 43 samples per call and then throwing them away.  It is
+        # symmetric, and ``pad_left``/``pad_right`` differ by one whenever
+        # ``kernel_size - factor`` is odd -- which it always is here, since the
+        # kernel length is odd and the factor even.  So the symmetric part goes
+        # to the convolution and only the remaining single sample is trimmed;
+        # using ``output_padding`` to absorb it instead would shift the whole
+        # signal by one sample at 2x rate, which is a phase change in the
+        # anti-aliasing path, not an optimisation.
         x = self.factor * F.conv_transpose1d(
             x,
             kernel,
             stride=self.factor,
+            padding=self.pad_left,
             groups=channels,
         )
-        return x[..., self.pad_left : -self.pad_right]
+        trim = self.pad_right - self.pad_left
+        return x if trim == 0 else x[..., :-trim]
 
 
 def soft_clip(
@@ -120,11 +161,9 @@ class DCBlocker(nn.Module):
     """
 
     def forward(self, waveform: Tensor) -> Tensor:
-        output_dtype = waveform.dtype
-        waveform = waveform.float()
         centered = waveform - waveform.mean(dim=-1, keepdim=True)
         peak = centered.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
-        return (centered / peak).to(output_dtype)
+        return centered / peak
 
 
 class NoiseInjection(nn.Module):
@@ -232,7 +271,7 @@ class BandLimitedNSFSource(nn.Module):
     # them out of the graph costs no fusion and restores compilation of the
     # convolutional trunk, which is where the time actually goes.
     @torch.compiler.disable
-    def prepare(self, f0: Tensor, length: int):
+    def prepare(self, f0: Tensor, length: int, periodicity: Optional[Tensor] = None):
         if f0 is None:
             raise ValueError("ChouwaGAN requires an F0 sequence.")
         if f0.ndim == 3:
@@ -258,6 +297,22 @@ class BandLimitedNSFSource(nn.Module):
         # milliseconds of crossfade removes it without smearing the boundary
         # (one frame is 10 ms at 44.1 kHz).
         voiced_envelope = self._smooth_mask(voiced)
+
+        # Measured harmonicity, if the caller supplied it.  Without it the mix
+        # falls back to the binary voicing flag, which is what this model did
+        # before -- the fallback is the old behaviour, never a zeroed signal.
+        if periodicity is None:
+            harmonicity = voiced_envelope
+        else:
+            harmonicity = periodicity.float()
+            if harmonicity.ndim == 3:
+                harmonicity = harmonicity.squeeze(1)
+            harmonicity = F.interpolate(
+                harmonicity.unsqueeze(1), size=length, mode="linear", align_corners=False
+            ).squeeze(1)
+            # Still gated by voicing: a frame with no f0 has no comb to sit on,
+            # whatever the measurement says.
+            harmonicity = harmonicity.clamp(0.0, 1.0) * voiced_envelope
 
         phase = torch.cumsum(
             2.0 * math.pi * f0 / self.sample_rate,
@@ -313,7 +368,7 @@ class BandLimitedNSFSource(nn.Module):
             noise = torch.randn(
                 f0.shape, generator=generator, device=f0.device, dtype=f0.dtype
             )
-        return f0, voiced, voiced_envelope, harmonic_wave, noise
+        return f0, voiced, voiced_envelope, harmonic_wave, noise, harmonicity
 
     @torch.compiler.disable
     def render(
@@ -322,7 +377,7 @@ class BandLimitedNSFSource(nn.Module):
         length: int,
         sample_rate: float,
     ) -> Tensor:
-        f0, voiced, voiced_envelope, harmonic_wave, noise = state
+        f0, voiced, voiced_envelope, harmonic_wave, noise, harmonicity = state
         full_length = int(f0.shape[-1])
         if full_length % int(length):
             raise ValueError
@@ -341,6 +396,7 @@ class BandLimitedNSFSource(nn.Module):
             voiced_envelope = voiced_envelope.index_select(-1, indices)
             harmonic_wave = harmonic_wave.index_select(1, indices)
             noise = noise.index_select(-1, indices)
+            harmonicity = harmonicity.index_select(-1, indices)
 
         harmonics = torch.arange(
             1,
@@ -369,10 +425,14 @@ class BandLimitedNSFSource(nn.Module):
         harmonic_wave = harmonic_wave / normalizer.clamp_min(1e-4)
 
         # Both terms ride the crossfaded envelope so neither steps at the edge.
-        noise_level = self.noise_std * (
-            0.25 * voiced_envelope + 1.0 - voiced_envelope
-        )
-        source = harmonic_wave * voiced_envelope + noise * noise_level
+        #
+        # ``harmonicity`` is the measured harmonic share where one was supplied
+        # and the voicing envelope otherwise, so with the feature off this is
+        # bit-identical to the two-constant mix it replaces.  With it on, a
+        # breathy frame moves continuously toward the noise term instead of
+        # having to be either fully voiced or fully unvoiced.
+        noise_level = self.noise_std * (1.0 - 0.75 * harmonicity)
+        source = harmonic_wave * harmonicity + noise * noise_level
         return source.unsqueeze(1)
 
     def forward(
@@ -380,8 +440,9 @@ class BandLimitedNSFSource(nn.Module):
         f0: Tensor,
         length: int,
         sample_rate: float,
+        periodicity: Optional[Tensor] = None,
     ) -> Tensor:
-        state = self.prepare(f0, length)
+        state = self.prepare(f0, length, periodicity)
         return self.render(state, length, sample_rate)
 
 
@@ -859,24 +920,17 @@ class ChouwaGANGenerator(nn.Module):
         detail_latent: Optional[Tensor] = None,
         slow_detail_latent: Optional[Tensor] = None,
         fast_detail_latent: Optional[Tensor] = None,
+        periodicity: Optional[Tensor] = None,
     ) -> Tensor:
-        # The waveform decoder contains periodic activations, anti-aliased
-        # resampling and NSF source mixing.  Keep this complete path in FP32
-        # during training instead of allowing autocast to place its sensitive
-        # signal operations in FP16.
-        if self.training and x.is_cuda:
-            with torch.autocast(device_type="cuda", enabled=False):
-                return self._forward_impl(
-                    x.float(),
-                    f0.float(),
-                    None if g is None else g.float(),
-                    None if content_latent is None else content_latent.float(),
-                    None if detail_latent is None else detail_latent.float(),
-                    None if slow_detail_latent is None else slow_detail_latent.float(),
-                    None if fast_detail_latent is None else fast_detail_latent.float(),
-                )
         return self._forward_impl(
-            x, f0, g, content_latent, detail_latent, slow_detail_latent, fast_detail_latent
+            x,
+            f0,
+            g,
+            content_latent,
+            detail_latent,
+            slow_detail_latent,
+            fast_detail_latent,
+            periodicity,
         )
 
     def _forward_impl(
@@ -888,6 +942,7 @@ class ChouwaGANGenerator(nn.Module):
         detail_latent: Optional[Tensor] = None,
         slow_detail_latent: Optional[Tensor] = None,
         fast_detail_latent: Optional[Tensor] = None,
+        periodicity: Optional[Tensor] = None,
     ) -> Tensor:
         use_hierarchical_latent = (
             self.hierarchical
@@ -927,7 +982,7 @@ class ChouwaGANGenerator(nn.Module):
 
         output_length = x.shape[-1] * self.total_upsample
         with torch.no_grad():
-            source_state = self.source.prepare(f0, output_length)
+            source_state = self.source.prepare(f0, output_length, periodicity)
 
         excitation_skips = None
         if self.excitation_unet:

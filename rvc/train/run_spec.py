@@ -86,6 +86,7 @@ class TrainRunSpec:
     # -- performance ------------------------------------------------------
     use_checkpointing: bool = False
     use_tf32: bool = False
+    use_fp16: bool = False
     use_benchmark: bool = True
     compile_vocoder: bool = False
     torch_compile_mode: str = "default"

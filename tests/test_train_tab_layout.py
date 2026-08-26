@@ -62,15 +62,29 @@ def _section_order() -> list[str]:
     return [text for _line, text in sorted(headers)]
 
 
+#: The tab does not call ``core.run_train_script`` directly: Gradio binds
+#: ``inputs`` positionally, so a named wrapper keeps that coupling in one place
+#: and lets settings-level flags (FP16) be filled in at launch.
+LAUNCHER = "start_train_from_ui"
+
+
 def _train_inputs() -> list[str]:
     for node in ast.walk(_train_tab()):
         if not isinstance(node, ast.Call):
             continue
         keywords = {k.arg: k.value for k in node.keywords}
         target = keywords.get("fn")
-        if isinstance(target, ast.Name) and target.id == "run_train_script":
+        if isinstance(target, ast.Name) and target.id == LAUNCHER:
             return [e.id for e in keywords["inputs"].elts if isinstance(e, ast.Name)]
-    raise AssertionError("the run_train_script click went missing")
+    raise AssertionError(f"the {LAUNCHER} click went missing")
+
+
+def _launcher() -> ast.FunctionDef:
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    return next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == LAUNCHER
+    )
 
 
 # -- the wiring, which the reorder must not have touched --------------------
@@ -89,18 +103,63 @@ def test_every_input_is_a_component_that_exists():
     assert not missing, f"inputs reference undefined components: {missing}"
 
 
-def test_the_input_list_matches_the_backend_signature():
+def test_the_input_list_fills_every_launcher_parameter():
+    """One component per wrapper parameter, since Gradio binds by position."""
+    inputs = _train_inputs()
+    params = [arg.arg for arg in _launcher().args.args]
+    assert len(inputs) == len(params), (
+        f"{len(inputs)} inputs for {len(params)} launcher parameters: "
+        f"{inputs} vs {params}"
+    )
+
+
+def test_the_launcher_calls_the_backend_by_keyword():
+    """Positional forwarding is what made an inserted flag shift every later one.
+
+    ``use_fp16`` is the reason this test exists: it sits between ``use_tf32``
+    and ``use_benchmark`` in ``run_train_script``, so a positional call here
+    would have sent ``use_benchmark`` as the FP16 flag.
+    """
     import inspect
 
     core = pytest.importorskip(
         "core", reason="the CLI carries its own dependencies"
     )
 
-    inputs = _train_inputs()
-    params = list(inspect.signature(core.run_train_script).parameters)
-    assert len(inputs) <= len(params), (
-        f"{len(inputs)} inputs for {len(params)} parameters"
+    call = next(
+        node for node in ast.walk(_launcher())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_train_script"
     )
+    assert not call.args, "run_train_script is being called positionally again"
+
+    sent = {keyword.arg for keyword in call.keywords}
+    accepted = inspect.signature(core.run_train_script).parameters
+    unknown = sent - set(accepted)
+    assert not unknown, f"the launcher sends parameters core does not take: {unknown}"
+
+    required = {
+        name for name, param in accepted.items()
+        if param.default is inspect.Parameter.empty
+    }
+    assert required <= sent, f"the launcher never sets: {sorted(required - sent)}"
+
+
+def test_fp16_reaches_the_backend_from_the_settings_tab():
+    """The FP16 flag has no control here; it is read at launch time."""
+    call = next(
+        node for node in ast.walk(_launcher())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_train_script"
+    )
+    fp16 = next(k for k in call.keywords if k.arg == "use_fp16")
+    assert (
+        isinstance(fp16.value, ast.Call)
+        and isinstance(fp16.value.func, ast.Name)
+        and fp16.value.func.id == "get_use_fp16"
+    ), "use_fp16 no longer comes from the persisted precision setting"
 
 
 def test_no_component_key_was_lost_or_duplicated():
