@@ -61,6 +61,21 @@ msgstr ""
 "\n"
 "Ligue para ganhar memória e velocidade; desligue se uma execução mostrar o scaler recuando repetidamente ou perdas ficando não finitas. BF16 não é oferecido: perde mantissa demais neste modelo, cuja fonte NSF oscilatória e perda L1 sobre log-mel produzem somas com forte cancelamento."
 
+msgid "**Architecture id in config.json:** `{}`"
+msgstr "**Id de arquitetura no config.json:** `{}`"
+
+msgid "**Sample rate:** {} Hz -- fixed by the extracted audio."
+msgstr "**Taxa de amostragem:** {} Hz -- fixada pelo áudio já extraído."
+
+msgid "**Vocoder that stamps it:** {}"
+msgstr "**Vocoder que a carimba:** {}"
+
+msgid "**model_info.json says:** `{}`"
+msgstr "**model_info.json diz:** `{}`"
+
+msgid "**{} checkpoint(s) in this folder.** They belong to the old architecture and cannot be resumed under a different one."
+msgstr "**{} checkpoint(s) nesta pasta.** Eles pertencem à arquitetura antiga e não podem ser retomados sob outra."
+
 msgid "0 is all of model A, 1 is all of model B."
 msgstr "0 é todo o modelo A, 1 é todo o modelo B."
 
@@ -99,6 +114,9 @@ msgstr "5 · Index"
 
 msgid "A GAN generator oscillates against its discriminator; the average is usually better than any single step. Costs one extra copy of it in VRAM."
 msgstr "Um gerador GAN oscila contra o seu discriminador; a média costuma ser melhor do que qualquer passo isolado. Custa uma cópia extra dele na VRAM."
+
+msgid "A folder under logs/ that already has a config.json."
+msgstr "Uma pasta em logs/ que já possui um config.json."
 
 msgid "Accepts Hugging Face, Google Drive, Pixeldrain and direct links."
 msgstr "Aceita Hugging Face, Google Drive, Pixeldrain e links diretos."
@@ -644,6 +662,12 @@ msgstr "Todos os escalares, imagens de preview e amostras de áudio que um trein
 msgid "Everything below has a working default."
 msgstr "Tudo abaixo já tem um padrão que funciona."
 
+msgid "Experiment"
+msgstr "Experimento"
+
+msgid "Experiment Config"
+msgstr "Config do experimento"
+
 msgid "Exponential decay is the default. Cosine annealing and none are alternatives."
 msgstr "O decaimento exponencial é o padrão. Cosine annealing e nenhum são alternativas."
 
@@ -854,6 +878,9 @@ msgstr "A consulta à GPU falhou"
 msgid "GPU query failed: {error}"
 msgstr "A consulta à GPU falhou: {error}"
 
+msgid "G_*.pth / D_*.pth from the old architecture are moved into a subfolder instead of being deleted."
+msgstr "Os G_*.pth / D_*.pth da arquitetura antiga são movidos para uma subpasta em vez de apagados."
+
 msgid "Generate Index"
 msgstr "Gerar index"
 
@@ -1013,11 +1040,17 @@ msgstr "Arquivo pré-treinado inválido."
 msgid "Invalid training preset name: {name}"
 msgstr "Nome de predefinição de treinamento inválido: {name}"
 
+msgid "Keep a backup of the current config"
+msgstr "Manter um backup do config atual"
+
 msgid "Keep only the latest G/D"
 msgstr "Manter apenas o G/D mais recente"
 
 msgid "Keep only the latest generator and discriminator checkpoints."
 msgstr "Mantém apenas os checkpoints mais recentes do gerador e do discriminador."
+
+msgid "Kept the previous config at `{}`."
+msgstr "Config anterior mantido em `{}`."
 
 msgid "LR scheduler"
 msgstr "Agendador de LR"
@@ -1139,8 +1172,14 @@ msgstr "Modelo usado para extrair características de conteúdo independentes do
 msgid "Model-guided slicing. Not available at 44.1 kHz."
 msgstr "Fatiamento guiado por modelo. Indisponível em 44,1 kHz."
 
+msgid "Move existing checkpoints aside"
+msgstr "Mover os checkpoints existentes para o lado"
+
 msgid "Move files to custom embedder"
 msgstr "Mover arquivos para o embedder personalizado"
+
+msgid "Moved {} checkpoint(s) into `{}/`."
+msgstr "{} checkpoint(s) movidos para `{}/`."
 
 msgid "Must match what you will use at inference time."
 msgstr "Precisa coincidir com o que você vai usar na inferência."
@@ -1424,6 +1463,9 @@ msgstr "Lê os metadados armazenados em um checkpoint."
 msgid "Ready"
 msgstr "Pronto"
 
+msgid "Rebuild config"
+msgstr "Regerar config"
+
 msgid "Reduce VRAM use at the cost of speed."
 msgstr "Reduz o uso de VRAM em troca de velocidade."
 
@@ -1481,6 +1523,9 @@ msgstr "Reiniciando o backend."
 msgid "Restarts the run instead of resuming it."
 msgstr "Reinicia a execução em vez de retomá-la."
 
+msgid "Rewrite an extracted experiment's `config.json` for a different vocoder, without re-running preprocessing or feature extraction. The new config is the shipped one for that vocoder at this experiment's sample rate, so anything hand-tuned in the old file is replaced rather than merged."
+msgstr "Reescreve o `config.json` de um experimento já extraído para outro vocoder, sem refazer o preprocessamento nem a extração de features. O novo config é o que acompanha aquele vocoder na taxa de amostragem deste experimento, então qualquer ajuste manual do arquivo antigo é substituído, não mesclado."
+
 msgid "Run"
 msgstr "Treino"
 
@@ -1525,6 +1570,9 @@ msgstr "Salvar em uma predefinição"
 
 msgid "Save weight models"
 msgstr "Salvar modelos de pesos"
+
+msgid "Saved beside it as config.json.<old architecture>.bak."
+msgstr "Salvo ao lado dele como config.json.<arquitetura antiga>.bak."
 
 msgid "Saved to {path}"
 msgstr "Salvo em {path}"
@@ -1571,6 +1619,12 @@ msgstr "Selecionar predefinição personalizada"
 msgid "Select a run to see its validation previews."
 msgstr "Selecione um treino para ver seus previews de validação."
 
+msgid "Select an experiment first."
+msgstr "Selecione um experimento primeiro."
+
+msgid "Select an experiment to see what its config was written for."
+msgstr "Selecione um experimento para ver para que o config dele foi escrito."
+
 msgid "Select file to import"
 msgstr "Selecionar arquivo a importar"
 
@@ -1591,6 +1645,9 @@ msgstr "Selecione o ID de locutor a usar na conversão."
 
 msgid "Select two voice models, set your desired blend percentage, and blend them into an entirely new voice."
 msgstr "Selecione dois modelos de voz, defina a porcentagem de mistura desejada e combine-os em uma voz inteiramente nova."
+
+msgid "Set `vocoder_architecture` to `{}` in model_info.json."
+msgstr "`vocoder_architecture` definido como `{}` no model_info.json."
 
 msgid "Set name"
 msgstr "Definir nome"
@@ -1842,6 +1899,9 @@ msgstr "As cópias de 16 kHz alimentam apenas a extração de pitch e do embedde
 msgid "The Edge TTS voice used before conversion."
 msgstr "A voz do Edge TTS usada antes da conversão."
 
+msgid "The architecture the rebuilt config will be written for."
+msgstr "A arquitetura para a qual o config regerado será escrito."
+
 msgid "The archive is unpacked into logs/."
 msgstr "O arquivo é descompactado em logs/."
 
@@ -1850,6 +1910,9 @@ msgstr "O áudio que você quer converter."
 
 msgid "The dataset folder does not exist."
 msgstr "A pasta do dataset não existe."
+
+msgid "The dataset, filelist and extracted features are untouched: none of them depend on the vocoder."
+msgstr "O dataset, a filelist e as features extraídas ficam intactos: nenhum deles depende do vocoder."
 
 msgid "The directory where the final .pth file will be saved."
 msgstr "O diretório onde o arquivo .pth final será salvo."
@@ -1901,6 +1964,12 @@ msgstr "O modelo anterior ao overtraining é exportado de qualquer forma; isto s
 
 msgid "The selected vocoder requires F0 guidance."
 msgstr "O vocoder selecionado exige guia de F0."
+
+msgid "The shipped config is missing: {}"
+msgstr "O config que acompanha o projeto está faltando: {}"
+
+msgid "The two disagree. Rebuilding writes both, which is how that gets resolved."
+msgstr "Os dois discordam. Regerar escreve os dois, que é como isso se resolve."
 
 msgid "There is no converted file to save yet."
 msgstr "Ainda não há arquivo convertido para salvar."
@@ -2028,6 +2097,9 @@ msgstr "Ver"
 msgid "Vocoder"
 msgstr "Vocoder"
 
+msgid "Vocoder / Architecture"
+msgstr "Vocoder / Arquitetura"
+
 msgid "Voice"
 msgstr "Voz"
 
@@ -2094,8 +2166,23 @@ msgstr "Janela"
 msgid "Written to logs/ under this name."
 msgstr "Gravado em logs/ com este nome."
 
+msgid "Wrote `{}` from `{}`."
+msgstr "Escrito `{}` a partir de `{}`."
+
 msgid "You can also use a custom path."
 msgstr "Você também pode usar um caminho personalizado."
+
+msgid "`{}` has a config.json with no data.sample_rate, so there is nothing to match a new one against."
+msgstr "`{}` tem um config.json sem data.sample_rate, então não há contra o que casar um novo."
+
+msgid "`{}` has no config.json to rebuild."
+msgstr "`{}` não tem config.json para regerar."
+
+msgid "`{}` has no readable config.json."
+msgstr "`{}` não tem um config.json legível."
+
+msgid "absent"
+msgstr "ausente"
 
 msgid "checkpoints, schedule, precision, compilation, gradient clipping"
 msgstr "checkpoints, agendamento, precisão, compilação, clipping de gradiente"
@@ -2145,6 +2232,9 @@ msgstr "threads, amostras mudas, precisão, limpeza"
 msgid "torch.compile the vocoder"
 msgstr "compilar o vocoder com torch.compile"
 
+msgid "unrecognised -- this config predates the current registry"
+msgstr "não reconhecida -- este config é anterior ao registro atual"
+
 msgid "use 'TF32' precision"
 msgstr "usar precisão 'TF32'"
 
@@ -2178,3 +2268,9 @@ msgstr "{name} salvo em {folder}"
 
 msgid "{tags} metrics · {points} points"
 msgstr "{tags} métricas · {points} pontos"
+
+msgid "{} checkpoint(s) were left in place. Training will try to resume from them and they are not loadable under the new architecture -- move or delete them before starting a run."
+msgstr "{} checkpoint(s) foram deixados no lugar. O treino vai tentar retomar a partir deles e eles não carregam sob a nova arquitetura -- mova ou apague antes de iniciar um run."
+
+msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
+msgstr "{} não tem configuração para {} Hz (ele suporta {}). O áudio extraído fixa a taxa, então este experimento não pode usar esse vocoder."

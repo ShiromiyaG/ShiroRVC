@@ -48,6 +48,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from rvc.configs.vocoders import (
     get_architecture_id,
@@ -270,10 +271,20 @@ class RefineVitsLatent(nn.Module):
         prior_replacement_start: int = 5000,
         prior_replacement_ramp: int = 20000,
         prior_replacement_mean_share: float = 0.5,
+        checkpointing: bool = False,
         **_: object,
     ):
         super().__init__()
         self.architecture_id = ARCHITECTURE_ID
+        # Recompute the prior stack and the posterior encoder in the backward
+        # pass instead of storing their activations.  Separate from the
+        # decoder's ``checkpointing`` flag on purpose: the two stacks have
+        # different shapes -- the decoder runs at the sample rate, this runs at
+        # 100 Hz over ``segment_size / hop_length`` frames -- so the trade of
+        # one extra forward against the saved activations is not the same
+        # decision, and the profitable one depends on which stack the run is
+        # actually short on.
+        self.checkpointing = bool(checkpointing)
         self.input_channels = int(input_channels)
         self.spec_channels = int(spec_channels or input_channels)
         self.content_channels = int(content_channels)
@@ -386,6 +397,19 @@ class RefineVitsLatent(nn.Module):
 
     # -- shared helpers ------------------------------------------------------
 
+    def _maybe_checkpoint(self, function, *args):
+        """Run ``function`` under activation checkpointing where it pays.
+
+        Only in training and only with grad enabled: ``infer`` and every
+        ``no_grad`` diagnostic store nothing to begin with, so recomputing
+        there would be pure cost.  ``use_reentrant=False`` is required rather
+        than preferred -- the reentrant implementation loses the autocast state
+        and cannot handle the ``None`` mask these callables take.
+        """
+        if not (self.checkpointing and self.training and torch.is_grad_enabled()):
+            return function(*args)
+        return checkpoint(function, *args, use_reentrant=False)
+
     @staticmethod
     def _distribution(value: Tensor) -> Tuple[Tensor, Tensor]:
         mean, logs = value.chunk(2, 1)
@@ -491,13 +515,13 @@ class RefineVitsLatent(nn.Module):
         if g is not None:
             value = value + self.prior_speaker(g).expand(-1, -1, value.shape[-1])
         for block in self.prior_blocks:
-            value = block(value, mask)
+            value = self._maybe_checkpoint(block, value, mask)
         return value if mask is None else value * mask
 
     def _posterior_distribution(self, spec, condition, g, mask):
         target = torch.log1p(spec.float().clamp_min(0.0))
         target_mask = _resize_mask(mask, target.shape[-1])
-        value = self.posterior_input(target, target_mask)
+        value = self._maybe_checkpoint(self.posterior_input, target, target_mask)
         value = value + self.posterior_condition(
             _resize_sequence(condition.detach(), target.shape[-1])
         )
@@ -508,7 +532,10 @@ class RefineVitsLatent(nn.Module):
             if target_mask is None
             else target_mask.to(value.dtype)
         )
-        value = self.posterior_enc(value, ones, g=g)
+        # ``g`` is keyword-only at the call site but positional in the
+        # signature; checkpointing takes positional arguments, and the WaveNet
+        # accepts it there.
+        value = self._maybe_checkpoint(self.posterior_enc, value, ones, g)
         stats = self.posterior_fast_head(value)
         if target_mask is not None:
             stats = stats * target_mask

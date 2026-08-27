@@ -13,6 +13,7 @@ from tabs.utilities.analyzer.analyzer import analyzer_tab
 from tabs.utilities.f0_extractor.f0_extractor import f0_extractor_tab
 from tabs.utilities.model_bundle.model_bundle import model_bundle_tab
 from tabs.utilities.model_processing.model_processing import extract_small_model_tab
+from tabs.utilities.experiment_config.experiment_config import experiment_config_tab
 
 def utilities_tab():
     gr.Markdown(
@@ -34,3 +35,6 @@ def utilities_tab():
 
     with gr.TabItem(_("Model Processing")):
         extract_small_model_tab()
+
+    with gr.TabItem(_("Experiment Config")):
+        experiment_config_tab()

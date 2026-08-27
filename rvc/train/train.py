@@ -543,6 +543,12 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
             "prior_blocks": 4,
             "prior_heads": 4,
             "prior_kernel_size": 31,
+            # Activation checkpointing for the latent frontend only (prior
+            # stack + posterior encoder), independent of the decoder's own
+            # ``use_checkpointing``.  Off by default: it trades a second
+            # forward over those stacks for their activations, which is a win
+            # only on a run that is actually short on memory.
+            "latent_checkpointing": False,
             # A fraction of the 0.15 rate target, not most of it.  The
             # controller pins the per-dim *mean* at the target, so the floor
             # does not add rate -- it only decides how much of a fixed budget is
@@ -874,6 +880,145 @@ def _add_decoder_only_gradients(loss, net_g):
         retain_graph=False,
         allow_unused=True,
     )
+    _accumulate_gradients(decoder_parameters, decoder_gradients)
+
+
+def _add_decoder_only_wave_gradients(y_hat, wave_gradient, net_g):
+    """The same accumulation, entered from the waveform instead of a scalar.
+
+    The branchwise generator step never builds a ``loss_gan`` graph -- each
+    discriminator branch is backwarded into the detached waveform and thrown
+    away -- so what reaches here is ``d loss_gan / d y_hat`` rather than
+    ``loss_gan``.  Every path from the GAN objective to the decoder runs
+    through ``y_hat``, so seeding the generator's backward with that gradient
+    is the chain rule, not an approximation: it produces the same decoder
+    gradients the joint path would have.
+    """
+    decoder_parameters = _decoder_parameters(net_g)
+    if not decoder_parameters or wave_gradient is None:
+        return
+
+    decoder_gradients = torch.autograd.grad(
+        y_hat,
+        decoder_parameters,
+        grad_outputs=wave_gradient,
+        retain_graph=False,
+        allow_unused=True,
+    )
+    _accumulate_gradients(decoder_parameters, decoder_gradients)
+
+
+def _branchwise_generator_terms(
+    discriminator_model,
+    y,
+    y_hat,
+    real_spectrograms,
+    *,
+    use_amp,
+    amp_dtype,
+    loss_scale=1.0,
+    san_direction_weight=1.0,
+    use_softplus=False,
+):
+    """Adversarial and feature-matching terms, one discriminator branch at a time.
+
+    The joint path holds every branch's feature maps and activation graph alive
+    at once, from the forward until the single ``loss_gan`` backward, which is
+    at the far end of the step: one copy of the largest intermediate tensors in
+    the step per branch, held across every reconstruction loss in between.  Here each branch is forwarded on a *detached* copy of the
+    waveform, differentiated immediately, and dropped before the next one
+    starts, so the peak holds one branch instead of all of them.  What survives
+    the loop is two waveform-shaped gradients, which are the same size as
+    ``y_hat``.
+
+    The two terms are differentiated separately because their weights
+    (``adaptive_adv`` and ``adaptive_fm``) are not known yet -- they are decided
+    downstream from these very losses -- and the wave gradient is linear in
+    both, so keeping them apart is what lets the governors stay exact rather
+    than lag a step.
+
+    Normalisation is applied after the loop rather than inside it: ``adv`` is a
+    mean over branches and ``fm`` a mean over *all* layer terms of all branches,
+    and neither denominator is known until every branch has been seen.  Both
+    are single scalars, so scaling the accumulated losses and gradients at the
+    end is identical to having divided each contribution as it arrived.
+
+    ``loss_scale`` is the AMP scaler's factor.  The returned gradients carry it
+    (they are handed to the optimizer, which unscales) while the returned
+    losses do not (they are reported and fed to the controllers).
+    """
+    branches = discriminator_model.discriminators
+    proxy = y_hat.detach().requires_grad_(True)
+    adv_wave_grad = torch.zeros_like(proxy)
+    fm_wave_grad = torch.zeros_like(proxy)
+    adv_total = None
+    fm_total = None
+    term_count = 0
+
+    for index in range(len(branches)):
+        branch = branches[index]
+        slot = discriminator_model._spectrogram_index(index)
+        real_spectrogram = (
+            real_spectrograms[slot]
+            if real_spectrograms is not None and slot is not None
+            else None
+        )
+        with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+            with torch.no_grad():
+                _, real_features = discriminator_model._forward_one(
+                    branch, y, real_spectrogram
+                )
+            fake_logit, fake_features = discriminator_model._forward_one(
+                branch, proxy
+            )
+            # ``normalize=False`` on both: the denominators are applied once,
+            # after the loop.
+            branch_adv = generator_loss(
+                [fake_logit],
+                normalize=False,
+                san_direction_weight=san_direction_weight,
+                use_softplus=use_softplus,
+            )
+            branch_fm = feature_loss([real_features], [fake_features])
+
+        term_count += min(len(real_features), len(fake_features))
+        adv_total = branch_adv.detach() if adv_total is None else adv_total + branch_adv.detach()
+        fm_total = branch_fm.detach() if fm_total is None else fm_total + branch_fm.detach()
+
+        # ``retain_graph`` on the first of the pair only: the second frees this
+        # branch's graph, which is the whole point of the loop.
+        adv_wave_grad += torch.autograd.grad(
+            branch_adv * loss_scale, proxy, retain_graph=True
+        )[0]
+        fm_wave_grad += torch.autograd.grad(branch_fm * loss_scale, proxy)[0]
+        del real_features, fake_features, fake_logit, branch_adv, branch_fm
+
+    branch_count = max(1, len(branches))
+    term_count = max(1, term_count)
+    zero = y_hat.detach().float().new_zeros(())
+    return {
+        "loss_scale": float(loss_scale),
+        "loss_adv": (adv_total / branch_count) if adv_total is not None else zero,
+        "loss_fm": (fm_total / term_count) if fm_total is not None else zero,
+        "adv_wave_grad": adv_wave_grad / branch_count,
+        "fm_wave_grad": fm_wave_grad / term_count,
+    }
+
+
+def _wave_parameter_gradient(y_hat, wave_gradient, parameter):
+    """``d loss / d parameter`` for a loss that reaches it only through ``y_hat``."""
+    if wave_gradient is None:
+        return None
+    return torch.autograd.grad(
+        y_hat,
+        parameter,
+        grad_outputs=wave_gradient,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+
+
+def _accumulate_gradients(parameters, gradients):
     # Accumulate with one multi-tensor kernel rather than one per parameter.
     # The decoder has 332 of them, and the old `parameter.grad + gradient` was
     # also out-of-place, so it allocated 332 tensors it immediately dropped:
@@ -882,7 +1027,7 @@ def _add_decoder_only_gradients(loss, net_g):
     # itself does, so it is safe on grads that `backward()` just populated.
     existing_grads = []
     incoming_grads = []
-    for parameter, gradient in zip(decoder_parameters, decoder_gradients):
+    for parameter, gradient in zip(parameters, gradients):
         if gradient is None:
             continue
         if parameter.grad is None:
@@ -1883,6 +2028,7 @@ def _adaptive_adversarial_weight(
     balance_target: float = 0.5,
     minimum: float = 0.01,
     maximum: float = 1.0,
+    adversarial_gradient=None,
 ):
     """Balance adversarial pressure against reconstruction on one decoder layer.
 
@@ -1899,13 +2045,17 @@ def _adaptive_adversarial_weight(
         create_graph=False,
         allow_unused=True,
     )[0]
-    adversarial_gradient = torch.autograd.grad(
-        loss_adversarial,
-        parameter,
-        retain_graph=True,
-        create_graph=False,
-        allow_unused=True,
-    )[0]
+    if adversarial_gradient is None:
+        # ``None`` where the branchwise step has already produced this by the
+        # chain rule from the waveform: there the adversarial loss is a
+        # detached scalar with no graph left to differentiate.
+        adversarial_gradient = torch.autograd.grad(
+            loss_adversarial,
+            parameter,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )[0]
 
     zero = loss_reconstruction.detach().new_zeros(())
     reconstruction_norm = (
@@ -1932,6 +2082,7 @@ def _adaptive_feature_match_weight(
     balance_target: float,
     minimum: float = 0.1,
     maximum: float = 1.0,
+    feature_gradient=None,
 ):
     """The same balance rule, applied to the other discriminator-derived loss.
 
@@ -1957,16 +2108,21 @@ def _adaptive_feature_match_weight(
     unproven change riding along with this one.
     """
     zero = loss_feature_match.detach().new_zeros(())
-    if not loss_feature_match.requires_grad:
-        return loss_feature_match.detach().new_ones(()), zero, zero
+    feature_match_gradient = feature_gradient
+    if feature_match_gradient is None:
+        # A detached loss with no supplied gradient means feature matching is
+        # not reaching the decoder at all; a detached loss *with* one is the
+        # branchwise step, which computed it from the waveform instead.
+        if not loss_feature_match.requires_grad:
+            return loss_feature_match.detach().new_ones(()), zero, zero
 
-    feature_match_gradient = torch.autograd.grad(
-        loss_feature_match,
-        parameter,
-        retain_graph=True,
-        create_graph=False,
-        allow_unused=True,
-    )[0]
+        feature_match_gradient = torch.autograd.grad(
+            loss_feature_match,
+            parameter,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )[0]
     feature_match_norm = (
         feature_match_gradient.detach().float().norm()
         if feature_match_gradient is not None
@@ -4078,6 +4234,8 @@ def training_loop(
 
             # Run discriminator on generated output
             discriminator_parameter_states = None
+            branchwise_generator = False
+            branch_terms = None
             if refinegan_active:
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
@@ -4089,12 +4247,34 @@ def training_loop(
                 for parameter in discriminator_model.parameters():
                     parameter.requires_grad_(False)
 
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    with torch.no_grad():
-                        _, fmap_r = discriminator_model._forward_audio(
-                            y, main_real_spectrograms
-                        )
-                    y_d_hat_g, fmap_g = discriminator_model._forward_audio(y_hat)
+                # ``d_branchwise`` now governs the generator step as well as
+                # R1.  Off, this is the joint forward it always was.
+                branchwise_generator = bool(
+                    getattr(discriminator_model, "branchwise", False)
+                )
+                if branchwise_generator:
+                    branch_terms = _branchwise_generator_terms(
+                        discriminator_model,
+                        y,
+                        y_hat,
+                        main_real_spectrograms,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        loss_scale=(
+                            grad_scaler.get_scale()
+                            if grad_scaler is not None
+                            else 1.0
+                        ),
+                        san_direction_weight=san_direction_weight,
+                        use_softplus=san_active,
+                    )
+                else:
+                    with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                        with torch.no_grad():
+                            _, fmap_r = discriminator_model._forward_audio(
+                                y, main_real_spectrograms
+                            )
+                        y_d_hat_g, fmap_g = discriminator_model._forward_audio(y_hat)
             else:
                 with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
@@ -4242,12 +4422,18 @@ def training_loop(
                     )
                     loss_ablation = ablation_raw * ablation_weight
 
-                # Feature Matching loss
-                loss_fm = feature_loss(
-                    fmap_r,
-                    fmap_g,
-                    normalize=refinegan_active,
-                ) * (fm_weight if refinegan_active else 2.0)
+                # Feature Matching loss.  Branchwise, both this and the
+                # adversarial term below were already summed over branches
+                # inside the loop that differentiated them; only the configured
+                # weight is still outstanding.
+                if branchwise_generator:
+                    loss_fm = branch_terms["loss_fm"] * fm_weight
+                else:
+                    loss_fm = feature_loss(
+                        fmap_r,
+                        fmap_g,
+                        normalize=refinegan_active,
+                    ) * (fm_weight if refinegan_active else 2.0)
 
                 # Generator loss.  ``y_d_hat_g`` comes from the *generator*
                 # update's forward, which never sets ``san_training``, so these
@@ -4258,12 +4444,15 @@ def training_loop(
                 # LSGAN's ``(1 - d) ** 2`` also punishes the generator for
                 # scoring *above* the real target, which is not a defect worth
                 # a gradient.
-                loss_adv = generator_loss(
-                    y_d_hat_g,
-                    normalize=refinegan_active,
-                    san_direction_weight=san_direction_weight,
-                    use_softplus=san_active,
-                )
+                if branchwise_generator:
+                    loss_adv = branch_terms["loss_adv"]
+                else:
+                    loss_adv = generator_loss(
+                        y_d_hat_g,
+                        normalize=refinegan_active,
+                        san_direction_weight=san_direction_weight,
+                        use_softplus=san_active,
+                    )
 
                 loss_prior_slow = torch.zeros((), device=y.device)
                 loss_prior_fast = torch.zeros((), device=y.device)
@@ -4347,6 +4536,26 @@ def training_loop(
                         last_layer = _last_layer_parameter(
                             _decoder_output_layer(model_g.dec)
                         )
+                        # Branchwise, the GAN losses are detached scalars: their
+                        # gradient at the last layer comes from the waveform
+                        # gradients the branch loop accumulated, unscaled first
+                        # because the balance rule is a *ratio* against a
+                        # reconstruction gradient that was never scaled.
+                        branch_adv_parameter_grad = None
+                        branch_fm_parameter_grad = None
+                        if branchwise_generator:
+                            inverse_scale = 1.0 / branch_terms["loss_scale"]
+                            branch_adv_parameter_grad = _wave_parameter_gradient(
+                                y_hat,
+                                branch_terms["adv_wave_grad"] * inverse_scale,
+                                last_layer,
+                            )
+                            branch_fm_parameter_grad = _wave_parameter_gradient(
+                                y_hat,
+                                branch_terms["fm_wave_grad"]
+                                * (inverse_scale * fm_weight),
+                                last_layer,
+                            )
                         (
                             cached_adaptive_adv,
                             cached_rec_grad,
@@ -4361,6 +4570,7 @@ def training_loop(
                             balance_target=adaptive_adv_balance,
                             minimum=adaptive_adv_min,
                             maximum=adaptive_adv_ceiling,
+                            adversarial_gradient=branch_adv_parameter_grad,
                         )
                         # Shares the reconstruction gradient that call just
                         # measured, so governing the second half of the GAN
@@ -4376,6 +4586,7 @@ def training_loop(
                                 cached_rec_grad,
                                 balance_target=adaptive_fm_balance,
                                 minimum=adaptive_fm_min,
+                                feature_gradient=branch_fm_parameter_grad,
                             )
                     # The cached weight was clamped against the ceiling in force
                     # when it was computed; re-clamp so a ceiling that moved in
@@ -4425,16 +4636,29 @@ def training_loop(
                 and global_step % grad_source_probe_interval == 0
             ):
                 decoder_parameters = _decoder_parameters(net_g)
-                grad_source_losses = {
-                    "spectral": loss_spectral,
-                    "adv": loss_adv * gan_weight,
+                grad_source_losses = {"spectral": loss_spectral}
+                if loss_waveform.requires_grad:
+                    grad_source_losses["waveform"] = loss_waveform
+                # The two GAN terms are probed from a loss graph on the joint
+                # path and from their waveform gradients on the branchwise one.
+                # Both express the same quantity: the wave series *is* the norm
+                # of that gradient, and the decoder series is it propagated one
+                # step further back.
+                grad_source_waves = {}
+                if branchwise_generator:
+                    inverse_scale = 1.0 / branch_terms["loss_scale"]
+                    grad_source_waves["adv"] = (
+                        branch_terms["adv_wave_grad"] * (inverse_scale * gan_weight)
+                    )
+                    grad_source_waves["fm"] = branch_terms["fm_wave_grad"] * (
+                        inverse_scale * fm_weight * float(adaptive_fm) * gan_weight
+                    )
+                else:
+                    grad_source_losses["adv"] = loss_adv * gan_weight
                     # Weighted, unlike ``adv``: the fm weight is now governed,
                     # so the unweighted probe would report a term the optimizer
                     # never sees and hide the correction working.
-                    "fm": adaptive_fm * loss_fm * gan_weight,
-                }
-                if loss_waveform.requires_grad:
-                    grad_source_losses["waveform"] = loss_waveform
+                    grad_source_losses["fm"] = adaptive_fm * loss_fm * gan_weight
                 for name, source_loss in grad_source_losses.items():
                     writer.add_scalar(
                         f"Grad_Source/decoder_{name}",
@@ -4446,16 +4670,59 @@ def training_loop(
                         _tensor_gradient_norm(source_loss, y_hat).item(),
                         global_step,
                     )
+                for name, wave_gradient in grad_source_waves.items():
+                    decoder_gradients = torch.autograd.grad(
+                        y_hat,
+                        decoder_parameters,
+                        grad_outputs=wave_gradient,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    terms = [
+                        gradient.detach().float().square().sum()
+                        for gradient in decoder_gradients
+                        if gradient is not None
+                    ]
+                    writer.add_scalar(
+                        f"Grad_Source/decoder_{name}",
+                        torch.sqrt(torch.stack(terms).sum()).item() if terms else 0.0,
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        f"Grad_Source/wave_{name}",
+                        wave_gradient.detach().float().norm().item(),
+                        global_step,
+                    )
             if refinegan_active:
+                # Branchwise, ``loss_gan`` is a number rather than a graph; the
+                # gradient it stands for was accumulated in wave space and is
+                # already carrying the AMP scale, exactly like the scaled
+                # scalar the joint path hands over.
+                gan_wave_gradient = None
+                if branchwise_generator:
+                    gan_wave_gradient = (
+                        branch_terms["adv_wave_grad"] * float(adaptive_adv)
+                        + branch_terms["fm_wave_grad"] * (float(adaptive_fm) * fm_weight)
+                    ) * gan_weight
                 if grad_scaler is not None:
                     grad_scaler.scale(loss_core).backward(retain_graph=True)
-                    _add_decoder_only_gradients(
-                        grad_scaler.scale(loss_gan), net_g
-                    )
+                    if branchwise_generator:
+                        _add_decoder_only_wave_gradients(
+                            y_hat, gan_wave_gradient, net_g
+                        )
+                    else:
+                        _add_decoder_only_gradients(
+                            grad_scaler.scale(loss_gan), net_g
+                        )
                     grad_scaler.unscale_(optim_g)
                 else:
                     loss_core.backward(retain_graph=True)
-                    _add_decoder_only_gradients(loss_gan, net_g)
+                    if branchwise_generator:
+                        _add_decoder_only_wave_gradients(
+                            y_hat, gan_wave_gradient, net_g
+                        )
+                    else:
+                        _add_decoder_only_gradients(loss_gan, net_g)
                 if global_step % metrics_update_interval == 0:
                     module_grad_metrics = _generator_gradient_metrics(net_g)
                 grad_norm_g = _clip_or_sample_grad_norm(

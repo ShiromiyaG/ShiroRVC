@@ -241,6 +241,7 @@
     "prior_blocks": 4,
     "prior_heads": 4,
     "prior_kernel_size": 31,
+    "latent_checkpointing": false,
     "kl_beta_lr": 0.01,
     "kl_beta_min": 0.0001,
     "kl_beta_max": 10.0,

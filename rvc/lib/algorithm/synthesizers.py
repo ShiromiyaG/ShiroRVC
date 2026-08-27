@@ -184,6 +184,11 @@ class Synthesizer(torch.nn.Module):
             )
             self.refinegan_latent = RefineVitsLatent(
                 input_channels=inter_channels,
+                # Deliberately *not* the decoder's ``checkpointing``: the two
+                # stacks are separately profitable, so each gets its own key.
+                checkpointing=bool(
+                    vocoder_options.get("latent_checkpointing", False)
+                ),
                 spec_channels=spec_channels,
                 content_channels=int(
                     vocoder_options.get("content_channels", 128)
