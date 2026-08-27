@@ -42,7 +42,7 @@ sys.path.insert(0, str(ROOT))
 torch = pytest.importorskip("torch", reason="the rule differentiates", exc_type=ImportError)
 
 TRAIN_PY = ROOT / "rvc" / "train" / "train.py"
-CONFIG = ROOT / "rvc" / "configs" / "refinegan" / "44100.json"
+CONFIG = ROOT / "rvc" / "configs" / "chouwagan" / "44100.json"
 
 
 @pytest.fixture(scope="module")
@@ -74,7 +74,7 @@ def test_the_weight_falls_as_feature_matching_outgrows_reconstruction(rule):
 
     assert weights == sorted(weights, reverse=True), "the correction must be monotone"
     # At the target ratio the governor is a no-op, which is what makes the
-    # configured ``refinegan_fm_weight`` still mean something.
+    # configured ``fm_weight`` still mean something.
     assert weights[0] == pytest.approx(1.0, rel=1e-3)
     # And at the run's measured drift -- fm/rec doubling -- it halves.
     assert weights[1] == pytest.approx(0.5, rel=1e-3)
@@ -136,7 +136,7 @@ def test_both_halves_report_the_ratio_the_optimizer_receives():
     exactly on target read as tens against the other's fractions.  Measured on
     the pretrain at step 14.5k, ``adv_to_rec_ratio`` showed 29.1 with an
     adaptive weight of 0.0172 -- a product of 0.50, which *is*
-    ``refinegan_adv_balance_target``.
+    ``adv_balance_target``.
 
     Each series has to carry its own weight, and neither may carry the other's.
     """
@@ -159,9 +159,9 @@ def test_the_config_ships_the_knobs():
     train = json.loads(CONFIG.read_text(encoding="utf-8"))["train"]
     # 0.33 is where the run sat from 4k to 16k, the stretch over which the
     # holdout improved fastest -- not a round number.
-    assert train["refinegan_fm_balance_target"] == 0.33
-    assert train["refinegan_fm_balance_min"] == 0.1
+    assert train["fm_balance_target"] == 0.33
+    assert train["fm_balance_min"] == 0.1
     # Raised from 20.0, then 100.0, then 400.0 -- ``stft_2048`` pinned on the
     # first two.  Why the bound has to span a 700x spread, and how saturation is
     # detected now rather than found by hand: ``test_r1_saturation.py``.
-    assert train["refinegan_r1_max_scale"] == 10000.0
+    assert train["r1_max_scale"] == 10000.0

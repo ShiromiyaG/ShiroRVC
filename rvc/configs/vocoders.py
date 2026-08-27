@@ -67,6 +67,33 @@ def get_vocoder_sample_rates(vocoder):
     return [int(rate) for rate in get_vocoder_spec(vocoder)["sample_rates"]]
 
 
+def uses_vits_latent(vocoder):
+    """Whether the vocoder is driven by the ``RefineVitsLatent`` frontend.
+
+    Everything the trainer does differently for RefineGAN -- the discrete
+    frontend, the per-branch discriminator, the R1 strength controller, the
+    latent and loss weights -- belongs to that frontend rather than to the
+    decoder that consumes it, so a second decoder over the same latent inherits
+    all of it.  Read the registry rather than comparing ids, so adding a third
+    one is a JSON edit.
+    """
+    return get_vocoder_spec(vocoder).get("latent") == "vits"
+
+
+def get_discriminator_id(vocoder):
+    return get_vocoder_spec(vocoder).get("discriminator", "mpd_msd")
+
+
+def get_architecture_id(vocoder):
+    """The id a checkpoint carries so an incompatible one fails to load.
+
+    ``net_g`` loads non-strictly: without this, a Wavehax checkpoint would load
+    into a RefineGAN synthesizer with every decoder module silently left at its
+    initialisation.
+    """
+    return get_vocoder_spec(vocoder)["architecture_id"]
+
+
 def get_vocoder_config_paths():
     paths = {}
     for vocoder_id, spec in load_vocoder_registry().items():

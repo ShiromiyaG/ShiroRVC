@@ -118,7 +118,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
         try:
             with open(path, encoding="utf-8") as handle:
                 return json.load(handle).get("model", {}).get(
-                    "refinegan_architecture_id", default
+                    "architecture_id", default
                 )
         except (OSError, ValueError):
             return default

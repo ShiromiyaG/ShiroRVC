@@ -2,7 +2,7 @@
 
 ``generate_config`` deliberately keeps an existing ``logs/<model>/config.json``
 so per-run tuning survives re-extraction.  Combined with ``train.py`` -- which
-forces ``refinegan_architecture_id`` to the current build and otherwise fills in
+forces ``architecture_id`` to the current build and otherwise fills in
 only *absent* keys -- that meant a stale config kept every shape-defining value
 it happened to name while advertising the new architecture id.
 
@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from rvc.train.extract.preparing_files import generate_config
 
-SHIPPED = ROOT / "rvc" / "configs" / "refinegan" / "44100.json"
+SHIPPED = ROOT / "rvc" / "configs" / "chouwagan" / "44100.json"
 
 
 @pytest.fixture
@@ -51,29 +51,29 @@ def _write(path: Path, payload):
 
 def test_a_config_from_an_older_architecture_is_replaced(tmp_path, shipped):
     stale = json.loads(json.dumps(shipped))
-    stale["model"]["refinegan_architecture_id"] = "shiro_vits_svae_v2"
-    stale["model"]["refinegan_vits_latent_channels"] = 64
+    stale["model"]["architecture_id"] = "shiro_vits_svae_v2"
+    stale["model"]["vits_latent_channels"] = 64
     _write(tmp_path / "config.json", stale)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(44100, str(tmp_path), "chouwagan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    assert written["model"]["refinegan_architecture_id"] == (
-        shipped["model"]["refinegan_architecture_id"]
+    assert written["model"]["architecture_id"] == (
+        shipped["model"]["architecture_id"]
     )
-    assert written["model"]["refinegan_vits_latent_channels"] == (
-        shipped["model"]["refinegan_vits_latent_channels"]
+    assert written["model"]["vits_latent_channels"] == (
+        shipped["model"]["vits_latent_channels"]
     )
 
 
 def test_the_replaced_config_is_kept(tmp_path, shipped):
     """Never a silent overwrite -- the tuning in it may still be wanted."""
     stale = json.loads(json.dumps(shipped))
-    stale["model"]["refinegan_architecture_id"] = "shiro_vits_svae_v2"
+    stale["model"]["architecture_id"] = "shiro_vits_svae_v2"
     stale["train"]["learning_rate_d"] = 0.0009
     _write(tmp_path / "config.json", stale)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(44100, str(tmp_path), "chouwagan")
 
     backup = tmp_path / "config.json.shiro_vits_svae_v2.bak"
     assert backup.exists()
@@ -85,23 +85,23 @@ def test_the_replaced_config_is_kept(tmp_path, shipped):
 def test_a_config_that_names_no_architecture_at_all_is_replaced(tmp_path, shipped):
     """The case the guard was blind to, and the one that motivates it.
 
-    The 2026-08-26 ChouwaGAN -> RefineGAN change renamed the option keys
+    The 2026-08-26 ChouwaGAN -> ChouwaGAN change renamed the option keys
     themselves, so every config written before it names no architecture id under
     the current name.  Requiring both sides to name one would have kept such a
     config and silently dropped every renamed option -- ``train.py`` fills in
     only *absent* keys, so the old `chouwagan_*` entries would have sat there
-    unread while their `refinegan_*` counterparts took defaults.
+    unread while their `*` counterparts took defaults.
     """
     stale = json.loads(json.dumps(shipped))
-    del stale["model"]["refinegan_architecture_id"]
+    del stale["model"]["architecture_id"]
     stale["model"]["chouwagan_use_frame_energy"] = True
     _write(tmp_path / "config.json", stale)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(44100, str(tmp_path), "chouwagan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    assert written["model"]["refinegan_architecture_id"] == (
-        shipped["model"]["refinegan_architecture_id"]
+    assert written["model"]["architecture_id"] == (
+        shipped["model"]["architecture_id"]
     )
     assert "chouwagan_use_frame_energy" not in written["model"]
     assert (tmp_path / "config.json.unknown.bak").exists()
@@ -129,7 +129,7 @@ def test_a_matching_config_is_left_exactly_alone(tmp_path, shipped):
     tuned["train"]["learning_rate_d"] = 0.0009
     _write(tmp_path / "config.json", tuned)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(44100, str(tmp_path), "chouwagan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert written["train"]["learning_rate_d"] == pytest.approx(0.0009)
@@ -138,9 +138,9 @@ def test_a_matching_config_is_left_exactly_alone(tmp_path, shipped):
 
 def test_a_missing_config_is_created(tmp_path, shipped):
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(44100, str(tmp_path), "chouwagan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    assert written["model"]["refinegan_architecture_id"] == (
-        shipped["model"]["refinegan_architecture_id"]
+    assert written["model"]["architecture_id"] == (
+        shipped["model"]["architecture_id"]
     )

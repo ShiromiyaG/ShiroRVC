@@ -393,7 +393,7 @@ class MultiScaleSTFTLoss(nn.Module):
         #: are above 7.1 while the median is 0.013, so the term is in practice a
         #: "match the loudest bins" loss.  That is the low end, which the mel
         #: term beside it already covers and already emphasises
-        #: (``refinegan_mel_low_emphasis``).  The reason to reach for MS-STFT at
+        #: (``mel_low_emphasis``).  The reason to reach for MS-STFT at
         #: all is the *linear* frequency resolution it brings to the top of the
         #: band; spending half the term on the bottom of it works against that.
         self.spectral_convergence = bool(spectral_convergence)

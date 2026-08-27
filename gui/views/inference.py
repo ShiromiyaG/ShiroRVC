@@ -310,7 +310,7 @@ class ConversionSettings(QWidget):
         )
         self.advanced.add_row(
             Field(_("Seed"), self.seed, _("0 picks a fresh seed each run.")),
-            Field(_("Latent temperature"), self.temperature, _("RefineGAN only. Above 1 adds variation, below 1 flattens it.")),
+            Field(_("Latent temperature"), self.temperature, _("ChouwaGAN and Wavehax only. Above 1 adds variation, below 1 flattens it.")),
         )
         self.advanced.add(self.deterministic)
 

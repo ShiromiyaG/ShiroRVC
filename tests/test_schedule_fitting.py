@@ -329,7 +329,7 @@ def test_the_measured_run_really_did_let_r1_take_over(train):
     assert shares == sorted(shares[:-1]) + [shares[-1]], "and it climbed"
 
 
-#: The nine branches, in ``RefineGANDiscriminator.branch_names`` order.
+#: The nine branches, in ``ChouwaGANDiscriminator.branch_names`` order.
 BRANCHES = (
     "period_2", "period_3", "period_5", "period_7", "period_11",
     "stft_512", "stft_1024", "stft_2048", "subband_8",

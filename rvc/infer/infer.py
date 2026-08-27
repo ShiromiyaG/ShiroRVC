@@ -35,9 +35,11 @@ from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.algorithm.commons import strip_parametrizations
 from rvc.lib.model_bundle import get_bundle_models, is_model_bundle, load_model_bundle
 from rvc.configs.config import Config
-from rvc.configs.vocoders import normalize_vocoder
-from rvc.lib.algorithm.chouwagan_vits import (
-    ARCHITECTURE_ID as REFINEGAN_ARCHITECTURE_ID,
+from rvc.configs.vocoders import (
+    get_architecture_id,
+    get_vocoder_spec,
+    normalize_vocoder,
+    uses_vits_latent,
 )
 from rvc.infer.messages import (
     INFER_MODE_DETERMINISTIC,
@@ -545,11 +547,12 @@ class VoiceConverter:
                     self.active_cpt.get("vocoder_architecture", self.active_cpt.get("vocoder", "hifi")),
                 )
             )
-            if self.vocoder == "refinegan":
+            if uses_vits_latent(self.vocoder):
                 architecture_id = self.active_cpt.get("architecture_id")
-                if architecture_id != REFINEGAN_ARCHITECTURE_ID:
+                if architecture_id != get_architecture_id(self.vocoder):
                     raise ValueError(
-                        f"Unsupported RefineGAN architecture: {architecture_id or 'unknown'}."
+                        f"Unsupported {get_vocoder_spec(self.vocoder)['label']} "
+                        f"architecture: {architecture_id or 'unknown'}."
                     )
 
             synth_kwargs = {
@@ -563,7 +566,7 @@ class VoiceConverter:
             self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
 
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
-            if self.vocoder == "refinegan":
+            if uses_vits_latent(self.vocoder):
                 self.net_g.remove_training_modules()
             else:
                 del self.net_g.enc_q # Posterior encoder is training-only

@@ -7,7 +7,7 @@ real tensors and check the gradient actually flows.
 
 The other thing pinned here is that ``MultiScaleMelSpectrogramLoss`` honours a
 configured distance.  It used to hardcode ``L1Loss``, which meant selecting
-"Multi-Scale Mel Loss" silently discarded ``refinegan_mel_distance``.
+"Multi-Scale Mel Loss" silently discarded ``mel_distance``.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from rvc.train.losses import MultiScaleSTFTLoss  # noqa: E402
 from rvc.train.mel_processing import MultiScaleMelSpectrogramLoss  # noqa: E402
 
 SAMPLE_RATE = 44100
-SEGMENT = 17640  # what config.train.segment_size is for RefineGAN
+SEGMENT = 17640  # what config.train.segment_size is for ChouwaGAN
 
 
 @pytest.fixture

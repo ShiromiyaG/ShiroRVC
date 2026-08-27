@@ -103,9 +103,12 @@ from mel_processing import MultiScaleMelSpectrogramLoss
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
 from rvc.lib.algorithm.frame_features import spectrogram_for_features
-from rvc.configs.vocoders import normalize_vocoder
-from rvc.lib.algorithm.chouwagan_vits import (
-    ARCHITECTURE_ID as REFINEGAN_ARCHITECTURE_ID,
+from rvc.configs.vocoders import (
+    get_architecture_id,
+    get_discriminator_id,
+    get_vocoder_spec,
+    normalize_vocoder,
+    uses_vits_latent,
 )
 from rvc.train.run_spec import TrainRunSpec
 
@@ -217,9 +220,14 @@ validation_preview_figsize = (
     max(1.0, float(getattr(config.train, "validation_preview_height", 5.8))),
 )
 
-refinegan_active = vocoder == "refinegan"
+# Named for the machinery rather than for the decoder: RefineGAN and Wavehax
+# share the VITS latent frontend, the per-branch discriminator and every
+# ``*`` loss below, and differ only in ``net_g.dec``.
+refinegan_active = uses_vits_latent(vocoder)
 if refinegan_active and sample_rate != 44100:
-    raise ValueError("RefineGAN requires the 44.1 kHz configuration.")
+    raise ValueError(
+        f"{get_vocoder_spec(vocoder)['label']} requires the 44.1 kHz configuration."
+    )
 
 # AMP precision / dtype init
 # Default: FP32 + TF32 tensor cores, no autocast, no scaler.
@@ -526,58 +534,82 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
 
 def get_g_model(config, sample_rate, vocoder, use_checkpointing):
     from rvc.lib.algorithm.synthesizers import Synthesizer
-    if vocoder == "refinegan":
+    if uses_vits_latent(vocoder):
         refinegan_defaults = {
-            "refinegan_content_channels": 128,
-            "refinegan_detail_channels": 64,
-            "refinegan_posterior_channels": 192,
-            "refinegan_prior_hidden_channels": 192,
-            "refinegan_prior_blocks": 4,
-            "refinegan_prior_heads": 4,
-            "refinegan_prior_kernel_size": 31,
+            "content_channels": 128,
+            "detail_channels": 64,
+            "posterior_channels": 192,
+            "prior_hidden_channels": 192,
+            "prior_blocks": 4,
+            "prior_heads": 4,
+            "prior_kernel_size": 31,
             # A fraction of the 0.15 rate target, not most of it.  The
             # controller pins the per-dim *mean* at the target, so the floor
             # does not add rate -- it only decides how much of a fixed budget is
             # spent before allocation starts.  Push it near the target and
             # latent collapse becomes the optimum, which the mean cannot see.
             # Do not "fix" a collapse by raising these.
-            "refinegan_vits_free_bits": 0.03,
-            "refinegan_vits_kl_target": 0.15,
-            "refinegan_kl_scale_anchor": 1.0,
-            "refinegan_feature_scale_anchor": 1.0,
+            "vits_free_bits": 0.03,
+            "vits_kl_target": 0.15,
+            "kl_scale_anchor": 1.0,
+            "feature_scale_anchor": 1.0,
             # The decoder only learns to make good audio from prior latents on
             # the replaced fraction of the batch, and inference is 100% prior.
             # The start and ramp are early on purpose: the reconstruction
             # gradient is the only pressure that makes the prior *informative*
             # rather than merely cheap to match, and it has to arrive before the
             # window in which the latent can collapse has closed.
-            "refinegan_prior_replacement_max": 0.7,
-            "refinegan_prior_replacement_start": 2000,
-            "refinegan_prior_replacement_ramp": 12000,
+            "prior_replacement_max": 0.7,
+            "prior_replacement_start": 2000,
+            "prior_replacement_ramp": 12000,
             # Half the replaced items decode from the prior mean, which is what
             # ``infer`` supplies, and half from a prior sample.  Training only
             # on samples leaves the decoder unpractised at the operating point
             # inference uses; see ``RefineVitsLatent._replacement_scales``.
-            "refinegan_prior_replacement_mean_share": 0.5,
-            "refinegan_prior_uses_logs": True,
-            "refinegan_start_channels": 16,
-            "refinegan_wave_amp": 0.1,
-            # One wide branch at the high-rate stages instead of three narrow
-            # ones.  The paper halves channels to 32 at the output rate, where a
-            # conv1d reaches 26% of this card's throughput; stopping the halving
-            # at 64 and spending the budget on width measured 33% more
-            # arithmetic in 24% less wall time, 17% less activation memory and
-            # 1.76x the achieved TFLOP/s.  See ``_decoder_channels``.  Setting
-            # all three back to their flat defaults restores the paper exactly.
-            "refinegan_decoder_channels": [256, 128, 96, 64],
-            "refinegan_resblock_kernel_sizes": [[3, 7, 11], [3, 7, 11], [11], [11]],
-            "refinegan_resblock_dilations": [[1, 3, 5], [1, 3, 5], [1, 3], [1, 3]],
+            "prior_replacement_mean_share": 0.5,
+            "prior_uses_logs": True,
         }
+        # Decoder-specific defaults.  Only the selected decoder's are applied,
+        # so a Wavehax run does not carry RefineGAN's channel schedule in its
+        # config and vice versa.
+        decoder_defaults = {
+            # The decoder is depthwise-separable and its blocks narrow as the
+            # rate climbs, which is affordable because the excitation U-Net --
+            # not the trunk -- carries pitch phase up to the output rate.  The
+            # excitation is rendered once at full rate and band-limited down, so
+            # every stage sees one phase-consistent source rather than four
+            # independently re-rendered harmonic banks.
+            "chouwagan": {
+                "chouwagan_channels": [256, 160, 80, 40],
+                "chouwagan_block_kernels": [[3, 7], [3, 7], [7], [7]],
+                "chouwagan_dilations": [1, 3, 5],
+                "chouwagan_expansion": [2, 2, 1, 1],
+                "chouwagan_harmonics": 128,
+                "chouwagan_excitation_unet": True,
+                "chouwagan_remove_output_dc": True,
+            },
+            # ``wavehax.v2.yaml``, with n_fft left to default to twice the
+            # 441-sample hop.  The kernel is wider across frequency than across
+            # time because the structure being modelled is a harmonic comb.
+            "wavehax": {
+                "channels": 16,
+                "mult_channels": 3,
+                "kernel_size": [13, 7],
+                "num_blocks": 8,
+                "prior_type": "pcph_closed_form",
+                "drop_prob": 0.0,
+                "framewise_norm": False,
+                "use_logmag_phase": False,
+            },
+        }
+        refinegan_defaults.update(
+            decoder_defaults.get(get_vocoder_spec(vocoder)["generator"], {})
+        )
         # The id is pinned rather than read from the config: ``net_g`` loads
         # non-strictly, so a checkpoint whose latent or decoder layout differs
         # would otherwise load with the mismatched modules left at their init
         # instead of failing the guard.
-        config.model["refinegan_architecture_id"] = REFINEGAN_ARCHITECTURE_ID
+        config.model["architecture_id"] = get_architecture_id(vocoder)
         for key, value in refinegan_defaults.items():
             if key not in config.model:
                 config.model[key] = value
@@ -594,30 +626,94 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
 
 def get_d_model(config, vocoder, use_checkpointing):
     vocoder = normalize_vocoder(vocoder)
-    if vocoder == "refinegan":
-        from rvc.lib.algorithm.discriminators.multi import (
-            PERIODS,
-            RESOLUTIONS,
-            RefineGANDiscriminator,
-        )
+    discriminator_id = get_discriminator_id(vocoder)
+    # JSON has no tuples, so a configured schedule arrives as nested lists.  The
+    # discriminators normalise them themselves; passing them through untouched
+    # keeps this function free of the branch layout.
+    def setting(name, default=None):
+        return getattr(config.model, name, None) or default
 
-        # JSON has no tuples, so a configured schedule arrives as nested lists.
-        # The discriminator normalises them itself; passing them through
-        # untouched keeps this function free of the branch layout.
-        resolutions = getattr(config.model, "refinegan_d_resolutions", None)
+    if discriminator_id == "chouwagan":
+        from rvc.lib.algorithm.discriminators.multi import chouwagan as chouwagan_d
 
-        return RefineGANDiscriminator(
+        return chouwagan_d.ChouwaGANDiscriminator(
             use_spectral_norm=bool(
-                getattr(config.model, "refinegan_use_spectral_norm", False)
+                getattr(config.model, "use_spectral_norm", False)
             ),
             use_checkpointing=use_checkpointing,
             sample_rate=config.data.sample_rate,
-            periods=tuple(getattr(config.model, "refinegan_d_periods", None) or PERIODS),
-            resolutions=tuple(
-                tuple(value) for value in (resolutions or RESOLUTIONS)
+            # Per-branch driving: R1 rotated one branch at a time under its own
+            # strength controller, plus a ``loss_disc`` series per branch.  Off
+            # collapses all of that onto one branch; see ``branchwise.py``.
+            branchwise=bool(getattr(config.model, "d_branchwise", True)),
+            # Sliced-adversarial heads.  Off falls back to plain LSGAN logits,
+            # and ``_constant_discriminator_loss`` moves the governor's floor
+            # with it -- the two loss forms have different floors.
+            use_san=bool(getattr(config.model, "d_use_san", True)),
+            periods=tuple(setting("d_periods", chouwagan_d.PERIODS)),
+            spectrogram_channels=tuple(
+                setting("d_spectrogram_channels", chouwagan_d.SPECTROGRAM_CHANNELS)
             ),
-            resolution_channels=int(
-                getattr(config.model, "refinegan_d_resolution_channels", 32)
+            spectrogram_compression=float(
+                getattr(config.model, "d_spectrogram_compression", 0.3)
+            ),
+            spectrogram_specs=tuple(
+                setting("d_spectrogram_specs", chouwagan_d.SPECTROGRAM_SPECS)
+            ),
+            use_cqt=bool(getattr(config.model, "d_use_cqt", False)),
+            cqt_bins_per_octave=int(
+                getattr(config.model, "d_cqt_bins_per_octave", 16)
+            ),
+            cqt_bins=int(getattr(config.model, "d_cqt_bins", 128)),
+            cqt_f_min=float(getattr(config.model, "d_cqt_f_min", 80.0)),
+            cqt_channels=tuple(setting("d_cqt_channels", chouwagan_d.CQT_CHANNELS)),
+            use_subband=bool(getattr(config.model, "d_use_subband", False)),
+            subband_bands=int(getattr(config.model, "d_subband_bands", 8)),
+            subband_channels=tuple(
+                setting("d_subband_channels", chouwagan_d.SUBBAND_CHANNELS)
+            ),
+        )
+
+    if discriminator_id == "wavehax":
+        from rvc.lib.algorithm.discriminators.multi import wavehax as wavehax_d
+
+        return wavehax_d.WavehaxDiscriminator(
+            use_spectral_norm=bool(
+                getattr(config.model, "use_spectral_norm", False)
+            ),
+            use_checkpointing=use_checkpointing,
+            sample_rate=config.data.sample_rate,
+            periods=tuple(setting("d_periods", wavehax_d.PERIODS)),
+            period_channels=int(
+                setting("d_period_channels", wavehax_d.PERIOD_CHANNELS)
+            ),
+            period_kernel_sizes=tuple(
+                setting("d_period_kernel_sizes", wavehax_d.PERIOD_KERNEL_SIZES)
+            ),
+            period_downsample_scales=tuple(
+                setting(
+                    "d_period_downsample_scales", wavehax_d.PERIOD_DOWNSAMPLE_SCALES
+                )
+            ),
+            period_max_channels=int(
+                setting("d_period_max_channels", wavehax_d.PERIOD_MAX_CHANNELS)
+            ),
+            resolutions=tuple(
+                tuple(value)
+                for value in setting("d_resolutions", wavehax_d.RESOLUTIONS)
+            ),
+            spectral_channels=int(
+                setting("d_spectral_channels", wavehax_d.SPECTRAL_CHANNELS)
+            ),
+            spectral_kernel_sizes=tuple(
+                tuple(value)
+                for value in setting(
+                    "d_spectral_kernel_sizes", wavehax_d.SPECTRAL_KERNEL_SIZES
+                )
+            ),
+            spectral_strides=tuple(
+                tuple(value)
+                for value in setting("d_spectral_strides", wavehax_d.SPECTRAL_STRIDES)
             ),
         )
 
@@ -670,7 +766,7 @@ def _lazy_r1_penalty(
     return real_grad.square().reshape(real_grad.shape[0], -1).sum(dim=1).mean()
 
 
-def _refinegan_ablation_margin(
+def _ablation_margin(
     model,
     discrete_model,
     discrete_parts,
@@ -852,6 +948,25 @@ def _last_layer_parameter(module):
     return module.weight
 
 
+#: Final projection of each decoder, in the order they are looked up.  The
+#: adaptive adversarial weight differentiates the reconstruction and adversarial
+#: losses with respect to this layer, so it has to be the *last* one that both
+#: reach -- ``conv_post`` for the time-domain decoders, ``output_proj`` for
+#: Wavehax, which emits a complex spectrogram and has no time-domain layer.
+_DECODER_OUTPUT_LAYERS = ("conv_post", "output_proj")
+
+
+def _decoder_output_layer(decoder):
+    for name in _DECODER_OUTPUT_LAYERS:
+        layer = getattr(decoder, name, None)
+        if layer is not None:
+            return layer
+    raise AttributeError(
+        f"{type(decoder).__name__} has none of {_DECODER_OUTPUT_LAYERS}; the "
+        "adaptive adversarial weight has no layer to differentiate."
+    )
+
+
 #: Wall-clock seconds between machine-readable progress lines.  Rich's bar is
 #: for a terminal; this is for whatever is reading the pipe.
 _MACHINE_PROGRESS_INTERVAL = 1.0
@@ -973,15 +1088,30 @@ def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int
     return max(1, min(configured, wanted)) if wanted else configured
 
 
-#: ``loss_disc`` for a discriminator that emits one constant for real and fake.
-#:
-#: This is the operational definition of a dead discriminator: it has stopped
-#: being a function of its input.  Under the LSGAN objective RefineGAN uses,
-#: both sides are symmetric about the midpoint of the real and fake targets, so
-#: the best constant is always 0.5 and the loss it produces is exactly 0.5.
-#: That makes the distance to it an absolute health measure needing no baseline
-#: and no reference run.
+#: ``loss_disc`` for a constant discriminator under the plain LSGAN objective.
 CONSTANT_DISCRIMINATOR_LOSS = 0.5
+
+
+def _constant_discriminator_loss(san_direction_weight: float, san_active: bool) -> float:
+    """``loss_disc`` for a discriminator that emits one constant for real and fake.
+
+    This is the operational definition of a dead discriminator: it has stopped
+    being a function of its input.  It is a fixed number for a given loss form,
+    so the distance to it is an absolute health measure that needs no baseline
+    and no reference run.  Both sides are symmetric about the midpoint of the
+    real and fake targets, so the best constant is always 0.5.
+
+    Mirrors the two branches of :func:`~rvc.train.losses.discriminator_loss`:
+    SAN heads use a squared-softplus surrogate and carry a direction term at
+    ``san_direction_weight``, which puts the floor near 2.2 rather than 0.5.
+    Leaving it at 0.5 under SAN would tell the adversarial governor that a
+    perfectly healthy discriminator had already collapsed, and it would clamp
+    the ceiling to its minimum for the whole run.
+    """
+    if not san_active:
+        return CONSTANT_DISCRIMINATOR_LOSS
+    per_side = math.log1p(math.exp(0.5)) ** 2
+    return (1.0 + max(0.0, float(san_direction_weight))) * 2.0 * per_side
 
 
 class _AdversarialCeilingGovernor:
@@ -1736,10 +1866,14 @@ def _branch_discriminative_norms(net_d):
     Sampled rather than run every step -- see the call site.
     """
     model = net_d.module if hasattr(net_d, "module") else net_d
-    return [
-        float(clip_grad_norm_(branch.parameters(), float("inf")))
-        for branch in model.discriminators
-    ]
+    # The grouping is the discriminator's to state: with per-branch driving off
+    # it reports one group covering every branch, which is the aggregate the
+    # single controller is steering.  Zipping this against ``controller.names``
+    # would otherwise silently truncate to the first branch's norm.
+    groups = getattr(model, "branch_parameter_groups", None)
+    if groups is None:
+        groups = lambda: [branch.parameters() for branch in model.discriminators]
+    return [float(clip_grad_norm_(group, float("inf"))) for group in groups()]
 
 
 def _adaptive_adversarial_weight(
@@ -1814,10 +1948,10 @@ def _adaptive_feature_match_weight(
 
     ``balance_target`` is the fm-to-reconstruction gradient ratio to hold at the
     last decoder layer, so it is directly comparable to
-    ``refinegan_adv_balance_target``.  Its default is where a healthy run sat.
+    ``adv_balance_target``.  Its default is where a healthy run sat.
 
     ``maximum`` is 1.0 on purpose, and it means this can only ever *reduce*
-    ``refinegan_fm_weight``, never amplify it.  The configured weight stays the
+    ``fm_weight``, never amplify it.  The configured weight stays the
     ceiling because the observed failure is overgrowth; letting a controller
     push feature matching above what the config asked for would be a second,
     unproven change riding along with this one.
@@ -1954,7 +2088,7 @@ def get_optimizers(
 
     optim_g = _make_optimizer(net_g, optimizer_choice_g, lr_g, num_epochs=total_epoch_count, num_batches=num_batches, param_groups=g_param_groups)
     lazy_reg_interval = None
-    if vocoder == "refinegan" and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
+    if uses_vits_latent(vocoder) and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
         lazy_reg_interval = int(getattr(config.train, "r1_interval", 16))
     optim_d = _make_optimizer(
         net_d,
@@ -2117,7 +2251,7 @@ def enable_vocoder_compile(net_g, device, rank):
         mode = "default"
         if rank == 0:
             print(
-                "[INIT] 'reduce-overhead' is incompatible with the RefineGAN "
+                "[INIT] 'reduce-overhead' is incompatible with the VITS-latent "
                 "multi-backward loop (CUDA graphs); using "
                 f"'{mode}' instead."
             )
@@ -2132,7 +2266,7 @@ def enable_vocoder_compile(net_g, device, rank):
 
 
 def enable_discriminator_compile(net_d, config, device, rank):
-    """Compile the discriminator, driven by ``refinegan_compile_discriminator``.
+    """Compile the discriminator, driven by ``compile_discriminator``.
 
     Config-driven rather than a run-spec flag: it is a property of the
     RefineGAN discriminator's shape contract, not a choice a user makes per
@@ -2146,7 +2280,7 @@ def enable_discriminator_compile(net_d, config, device, rank):
     """
     if not refinegan_active:
         return False
-    if not bool(getattr(config.train, "refinegan_compile_discriminator", False)):
+    if not bool(getattr(config.train, "compile_discriminator", False)):
         return False
     if device.type != "cuda":
         if rank == 0:
@@ -2170,6 +2304,31 @@ def enable_discriminator_compile(net_d, config, device, rank):
 
 
 @torch.no_grad()
+def _wavehax_source_path_metrics(decoder):
+    """The same excitation-versus-latent ratio, read off Wavehax's input stack.
+
+    Wavehax has no stages to walk: the whole decoder runs at the frame rate and
+    the excitation enters exactly once, at ``input_proj``, a 1x1 over five
+    planes stacked as ``(prior_real, prior_imag, prior_real_proj,
+    prior_imag_proj, conditioning)``.  The first four are a pure function of F0
+    and the fifth is a pure function of the latent, so the ratio of their column
+    norms answers the question the RefineGAN series above asks per stage.  It is
+    reported under the same names -- one stage, which is also the output stage --
+    so a Wavehax run is readable on the same axes.
+    """
+    input_proj = getattr(decoder, "input_proj", None)
+    if input_proj is None or getattr(input_proj, "in_channels", 0) != 5:
+        return {}
+    weight = input_proj.weight
+    excitation = weight[:, :4].norm()
+    main = weight[:, 4:].norm()
+    ratio = (excitation / main.clamp_min(1e-8)).item()
+    return {
+        "Source/inject_ratio_stage_0": ratio,
+        "Source/inject_ratio_output_stage": ratio,
+    }
+
+
 def collect_source_path_metrics(net_g):
     """How hard the pitch template is pushed into each decoder stage.
 
@@ -2183,30 +2342,37 @@ def collect_source_path_metrics(net_g):
     0.4-8% of init on the rest -- the harmonic source enters once, heavily
     filtered, and the network synthesises the rest.
 
-    RefineGAN's U-Net makes the same quantity directly readable.  Every decoder
-    stage opens by concatenating its upsampled activation with the encoder skip
-    taken at that resolution, and that skip is a pure function of the template:
-    the encoder sees nothing else.  ``ParallelResBlock.input_conv`` is the 1x1
-    that decides the mix, so the ratio of its skip-half column norms to its
-    main-half column norms answers "how much of this stage's output is
+    ChouwaGAN's excitation U-Net makes the same quantity directly readable.
+    Every decoder stage opens by concatenating its upsampled activation with the
+    excitation skip taken at that resolution, and that skip is a pure function of
+    the NSF source: the excitation encoder sees nothing else.  ``fusion_proj`` is
+    the 1x1 that decides the mix, so the ratio of its skip-half column norms to
+    its main-half column norms answers "how much of this stage's output is
     excitation rather than latent".
+
+    Only the U-Net excitation path is readable this way.  With
+    ``chouwagan_excitation_unet`` off the source is folded in additively through
+    ``source_gates`` instead of concatenated, so there is no mixing weight to
+    split and the Wavehax reader's ``{}`` is the honest answer.
     """
     model = net_g.module if hasattr(net_g, "module") else net_g
     decoder = getattr(model, "dec", None)
-    stages = getattr(decoder, "upsample_conv_blocks", None)
-    skip_widths = getattr(decoder, "skip_channels", None)
-    if stages is None or not skip_widths:
-        return {}
+    stages = getattr(decoder, "fusion_proj", None)
+    # Skips are built highest-rate first and consumed reversed, so reversing
+    # here puts index ``i`` on the stage that actually concatenates it.  Reading
+    # the width from the decoder rather than inferring it from the channel count
+    # is what keeps a changed schedule from attributing part of the main path to
+    # the excitation.
+    skip_widths = tuple(reversed(getattr(decoder, "exc_skip_channels", ()) or ()))
+    if not stages or not skip_widths:
+        return _wavehax_source_path_metrics(decoder)
 
     metrics = {}
     ratios = []
     for index, stage in enumerate(stages):
-        weight = stage.input_conv.weight
+        weight = stage.weight
         # cat order is (upsampled, skip), so the main path owns the leading
-        # columns.  The split is read from the decoder rather than inferred:
-        # it is only ``in_channels // 3`` under the paper's halving, and the
-        # shipped schedule does not halve, so inferring it would silently
-        # attribute part of the main path to the excitation.
+        # columns.
         skip = int(skip_widths[index])
         main = weight[:, :-skip].norm()
         excitation = weight[:, -skip:].norm()
@@ -2219,6 +2385,33 @@ def collect_source_path_metrics(net_g):
         # share lands directly in the top octave, so it gets a flat alias.
         metrics["Source/inject_ratio_output_stage"] = ratios[-1]
     return metrics
+
+
+def _assert_resumable_architecture(net_g, checkpoint_path):
+    """Refuse to resume from a checkpoint built for a different architecture.
+
+    The equivalent guard already exists on the *pretrained* path and in
+    ``generate_config``; this is the third door into the same room and was the
+    one left open.  A checkpoint written before the id existed reports ``None``
+    and is treated as a mismatch rather than as "nothing to check", for the same
+    reason ``generate_config`` does: the runs that predate the key are exactly
+    the ones whose layout has since changed.
+    """
+    model = net_g.module if hasattr(net_g, "module") else net_g
+    expected = getattr(model, "architecture_id", None)
+    if not expected or expected == "vits_gaussian_v1":
+        return
+    found = torch.load(checkpoint_path, map_location="cpu", weights_only=True).get(
+        "architecture_id"
+    )
+    if found == expected:
+        return
+    raise ValueError(
+        f"Cannot resume from '{os.path.basename(checkpoint_path)}': it was "
+        f"written for architecture '{found or 'unknown'}', but this run builds "
+        f"'{expected}'. Move the old checkpoints out of the experiment folder "
+        f"to start this architecture fresh."
+    )
 
 
 def checkpoint_step_from_path(path):
@@ -2265,6 +2458,16 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
 
             # Init the optimizers
             optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
+
+            # Resuming loads the generator non-strictly for the VITS-latent
+            # vocoders, so nothing downstream would complain if the checkpoint
+            # in this folder belonged to a different decoder: the frontend
+            # weights match either way, the decoder is silently left at its
+            # init, and the run restarts at the old step count with a fully
+            # trained discriminator against a random generator.  RefineGAN and
+            # Wavehax share a config shape and a folder layout, which makes
+            # that one edited ``vocoder`` field away.
+            _assert_resumable_architecture(net_g, g_checkpoint_path)
 
             # Load the model and optim states
             generator_strict_load = strict_load and not refinegan_active
@@ -2603,8 +2806,8 @@ def get_reference_sample(train_loader, device, config):
             int(config.data.filter_length),
             int(config.data.hop_length),
         )
-    elif getattr(config.model, "refinegan_use_periodicity", False) or getattr(
-        config.model, "refinegan_use_frame_energy", False
+    elif getattr(config.model, "use_periodicity", False) or getattr(
+        config.model, "use_frame_energy", False
     ):
         print(
             "[REFERENCE] Custom reference has no audio, so the preview runs "
@@ -2783,19 +2986,19 @@ def run(
     # (self-annealing as the residual shrinks) and L1 above it (robust to the
     # onset/silence bins that a plain MSE would over-weight).
     mel_distance = str(
-        getattr(config.train, "refinegan_mel_distance", "huber")
+        getattr(config.train, "mel_distance", "huber")
     ).lower()
-    mel_huber_beta = float(getattr(config.train, "refinegan_mel_huber_beta", 0.3))
+    mel_huber_beta = float(getattr(config.train, "mel_huber_beta", 0.3))
     # Frequency weighting for that distance.  A mean over bins gives every bin
     # the same vote, and past the Huber knee the vote stops scaling with the
     # error, so a badly wrong minority of bins stays wrong: measured at 46% of
     # the mel error against 32% of the gradient below 1 kHz.  1.0 is off, which
     # is what a config that predates this key gets.
     mel_low_emphasis = float(
-        getattr(config.train, "refinegan_mel_low_emphasis", 1.0)
+        getattr(config.train, "mel_low_emphasis", 1.0)
     )
     mel_low_emphasis_hz = float(
-        getattr(config.train, "refinegan_mel_low_emphasis_hz", 1000.0)
+        getattr(config.train, "mel_low_emphasis_hz", 1000.0)
     )
 
     def _make_mel_distance():
@@ -2809,7 +3012,7 @@ def run(
             base, weighted = torch.nn.MSELoss, True
         else:
             raise ValueError(
-                f"Unknown refinegan_mel_distance {mel_distance!r}: "
+                f"Unknown mel_distance {mel_distance!r}: "
                 "expected 'huber', 'l1' or 'mse'."
             )
         if not weighted or mel_low_emphasis == 1.0:
@@ -2853,10 +3056,10 @@ def run(
             )
     elif spectral_loss == "Multi-Scale Mel Loss":
         # Uses the same configured distance as the single-scale mel loss.  It
-        # used to hardcode L1, which silently ignored ``refinegan_mel_distance``
+        # used to hardcode L1, which silently ignored ``mel_distance``
         # -- selecting this mode quietly discarded the Huber setting.
         #
-        # One caveat worth knowing: ``refinegan_mel_huber_beta`` was tuned
+        # One caveat worth knowing: ``mel_huber_beta`` was tuned
         # against ``wave_to_mel(for_loss=True)``, while this operates on
         # ``log1p(mel * log_scale)``.  The two scales are similar but not
         # identical, so beta is a slightly different L2/L1 crossover here.
@@ -2948,8 +3151,6 @@ def run(
         r1_scaler_state = resumed_extra_d.get("r1_grad_scaler")
         if r1_scaler_state:
             r1_grad_scaler.load_state_dict(r1_scaler_state)
-    if use_amp and rank == 0:
-        info(f"AMP enabled: dtype={amp_dtype}, GradScaler active.", tag="[INIT]")
 
     phase_start_step = global_step
     phase_step = 0
@@ -3052,7 +3253,7 @@ def run(
     adv_ramp_start = fit_schedule(
         0
         if finetune_phase
-        else max(0, int(getattr(config.train, "refinegan_adaptive_adv_ramp_start", 20000))),
+        else max(0, int(getattr(config.train, "adaptive_adv_ramp_start", 20000))),
         planned_steps,
         0.2,
     )
@@ -3060,25 +3261,36 @@ def run(
         max(
             0,
             int(
-                getattr(config.train, "refinegan_adaptive_adv_ramp_steps_finetune", 2000)
+                getattr(config.train, "adaptive_adv_ramp_steps_finetune", 2000)
                 if finetune_phase
-                else getattr(config.train, "refinegan_adaptive_adv_ramp_steps", 80000)
+                else getattr(config.train, "adaptive_adv_ramp_steps", 80000)
             ),
         ),
         planned_steps,
         0.5 if not finetune_phase else 0.25,
+    )
+    # Read off the built discriminator rather than off the config: the config
+    # key only *requests* SAN heads, and a discriminator that does not implement
+    # them would leave the governor's floor describing a loss form nothing
+    # computes.
+    san_active = bool(
+        getattr(net_d.module if hasattr(net_d, "module") else net_d, "supports_san", False)
+    )
+    san_direction_weight = max(
+        0.0,
+        min(1.0, float(getattr(config.train, "san_direction_weight", 0.25))),
     )
     adversarial_ceiling_governor = _AdversarialCeilingGovernor(
         start_step=adv_ramp_start,
         ramp_steps=adv_ramp_steps,
         ceiling_start=1.0,
         ceiling_end=max(
-            max(0.0, float(getattr(config.train, "refinegan_adaptive_adv_min", 0.01))),
-            float(getattr(config.train, "refinegan_adaptive_adv_max", 8.0)),
+            max(0.0, float(getattr(config.train, "adaptive_adv_min", 0.01))),
+            float(getattr(config.train, "adaptive_adv_max", 8.0)),
         ),
-        floor_loss=CONSTANT_DISCRIMINATOR_LOSS,
+        floor_loss=_constant_discriminator_loss(san_direction_weight, san_active),
         collapse_ceiling=max(
-            0.0, float(getattr(config.train, "refinegan_adaptive_adv_min", 0.01))
+            0.0, float(getattr(config.train, "adaptive_adv_min", 0.01))
         ),
     )
 
@@ -3089,9 +3301,9 @@ def run(
         branch_names=getattr(
             net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ()
         ),
-        target_ratio=float(getattr(config.train, "refinegan_r1_target_ratio", 1.0)),
-        maximum=float(getattr(config.train, "refinegan_r1_max_scale", 10000.0)),
-        minimum=float(getattr(config.train, "refinegan_r1_min_scale", 1e-4)),
+        target_ratio=float(getattr(config.train, "r1_target_ratio", 1.0)),
+        maximum=float(getattr(config.train, "r1_max_scale", 10000.0)),
+        minimum=float(getattr(config.train, "r1_min_scale", 1e-4)),
     )
     if r1_controller.load_state_dict(resumed_extra_d.get("r1_controller")):
         info(
@@ -3387,19 +3599,19 @@ def training_loop(
             getattr(net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ())
         )
 
-    refinegan_diagnostics_interval = max(
+    diagnostics_interval = max(
         1,
-        int(getattr(config.train, "refinegan_diagnostics_interval", 256)),
+        int(getattr(config.train, "diagnostics_interval", 256)),
     )
 
     # Same correction for everything sourced from ``discrete_diagnostics``.
-    # Those are produced once every ``refinegan_diagnostics_interval`` steps, so
+    # Those are produced once every ``diagnostics_interval`` steps, so
     # a deque sized in *steps* holds `maxlen * interval` steps of history: at the
     # defaults that is 50 x 256 = 12800 steps, which made the KL/prior series a
     # near-cumulative average of the whole run rather than a recent one. They
     # read low for thousands of steps after the underlying value had moved.
     diagnostic_window = max(
-        2, rolling_loss_steps // max(1, refinegan_diagnostics_interval)
+        2, rolling_loss_steps // max(1, diagnostics_interval)
     )
     for key in (
         "prior_kl_slow",
@@ -3439,9 +3651,22 @@ def training_loop(
     # output conv that sums the waveform-domain loss gradient over B*T samples),
     # so its natural operating point sits in the hundreds.  The clip is a spike
     # guard, not a per-step rescaler -- keep the ceiling well above that range.
-    refinegan_global_clip_g = max(
+    global_clip_g = max(
         0.0,
-        float(getattr(config.train, "refinegan_global_clip_norm_g", 500.0)),
+        float(getattr(config.train, "global_clip_norm_g", 500.0)),
+    )
+    # SAN's direction term, weighted well below the function term: it trains
+    # only the unit-norm projection, and at 1.0 it doubles ``loss_disc`` for a
+    # quantity the generator never sees.  Clamped to [0, 1] because a negative
+    # weight would reward a direction that separates real from fake backwards.
+    san_direction_weight = max(
+        0.0,
+        min(1.0, float(getattr(config.train, "san_direction_weight", 0.25))),
+    )
+    san_active = bool(
+        getattr(
+            net_d.module if hasattr(net_d, "module") else net_d, "supports_san", False
+        )
     )
     adv_warmup_steps = 0 if finetune_phase else max(
         0, int(getattr(config.train, "adv_warmup_steps", 2000))
@@ -3450,15 +3675,15 @@ def training_loop(
     if refinegan_active:
         model_g = net_g.module if hasattr(net_g, "module") else net_g
         refinegan_latent = getattr(model_g, "refinegan_latent", None)
-    refinegan_prior_loss_weight = max(
+    prior_loss_weight = max(
         0.0,
-        float(getattr(config.train, "refinegan_prior_loss_weight", PRIOR_LOSS_WEIGHT_DEFAULT)),
+        float(getattr(config.train, "prior_loss_weight", PRIOR_LOSS_WEIGHT_DEFAULT)),
     )
-    refinegan_prior_warmup_steps = 0 if finetune_phase else max(
+    prior_warmup_steps = 0 if finetune_phase else max(
         0,
-        int(getattr(config.train, "refinegan_prior_warmup_steps", PRIOR_WARMUP_STEPS_DEFAULT)),
+        int(getattr(config.train, "prior_warmup_steps", PRIOR_WARMUP_STEPS_DEFAULT)),
     )
-    # When ``refinegan_kl_target_*`` is set, the rate controller owns the
+    # When ``kl_target_*`` is set, the rate controller owns the
     # KL weight and discards both settings above (see the
     # ``kl_rate_control_active`` test at the loss site).  Silently ignored
     # config is worse than no config: a run tuned by turning these knobs would
@@ -3476,34 +3701,34 @@ def training_loop(
         and refinegan_latent.kl_rate_control_active
     ):
         overridden = []
-        if refinegan_prior_loss_weight != PRIOR_LOSS_WEIGHT_DEFAULT:
-            overridden.append(f"refinegan_prior_loss_weight={refinegan_prior_loss_weight}")
+        if prior_loss_weight != PRIOR_LOSS_WEIGHT_DEFAULT:
+            overridden.append(f"prior_loss_weight={prior_loss_weight}")
         if (
             not finetune_phase
-            and refinegan_prior_warmup_steps != PRIOR_WARMUP_STEPS_DEFAULT
+            and prior_warmup_steps != PRIOR_WARMUP_STEPS_DEFAULT
         ):
-            overridden.append(f"refinegan_prior_warmup_steps={refinegan_prior_warmup_steps}")
+            overridden.append(f"prior_warmup_steps={prior_warmup_steps}")
         if overridden:
             warning(
                 f"KL rate control is active (targets slow="
                 f"{refinegan_latent.kl_target_slow}, fast="
                 f"{refinegan_latent.kl_target_fast}), so it sets the KL weight "
                 f"itself and ignores {', '.join(overridden)}. Change "
-                "refinegan_kl_target_slow/_fast to move the "
+                "kl_target_slow/_fast to move the "
                 "prior/posterior balance.",
                 tag="[INIT]",
             )
-    refinegan_ablation_interval = 0 if finetune_phase else max(
+    ablation_interval = 0 if finetune_phase else max(
         0,
-        int(getattr(config.train, "refinegan_ablation_interval", 0)),
+        int(getattr(config.train, "ablation_interval", 0)),
     )
-    refinegan_ablation_weight = max(
+    ablation_weight = max(
         0.0,
-        float(getattr(config.train, "refinegan_ablation_loss_weight", 0.0)),
+        float(getattr(config.train, "ablation_loss_weight", 0.0)),
     )
-    refinegan_ablation_margin = max(
+    ablation_margin = max(
         0.0,
-        float(getattr(config.train, "refinegan_ablation_margin", 0.01)),
+        float(getattr(config.train, "ablation_margin", 0.01)),
     )
     kl_active_threshold = max(
         0.0,
@@ -3511,7 +3736,7 @@ def training_loop(
     )
     adaptive_adv_interval = max(
         1,
-        int(getattr(config.train, "refinegan_adaptive_adv_interval", 8)),
+        int(getattr(config.train, "adaptive_adv_interval", 8)),
     )
 
     # ---- Adversarial balance --------------------------------------------
@@ -3525,22 +3750,22 @@ def training_loop(
     # capping it there caps the ceiling on final quality.
     adaptive_adv_balance = max(
         0.0,
-        float(getattr(config.train, "refinegan_adv_balance_target", 0.5)),
+        float(getattr(config.train, "adv_balance_target", 0.5)),
     )
     adaptive_adv_min = max(
         0.0,
-        float(getattr(config.train, "refinegan_adaptive_adv_min", 0.01)),
+        float(getattr(config.train, "adaptive_adv_min", 0.01)),
     )
     # The same rule for the other discriminator-derived loss -- see
     # ``_adaptive_feature_match_weight`` for the measurements that motivate it.
-    # 0.0 disables the governor and restores the fixed ``refinegan_fm_weight``.
+    # 0.0 disables the governor and restores the fixed ``fm_weight``.
     adaptive_fm_balance = max(
         0.0,
-        float(getattr(config.train, "refinegan_fm_balance_target", 0.33)),
+        float(getattr(config.train, "fm_balance_target", 0.33)),
     )
     adaptive_fm_min = max(
         0.0,
-        float(getattr(config.train, "refinegan_fm_balance_min", 0.1)),
+        float(getattr(config.train, "fm_balance_min", 0.1)),
     )
     # 8.0 is a judgement call, not a derived constant: it is roughly a quarter
     # of the balance the rule currently requests, an ~8x increase on the old
@@ -3549,15 +3774,15 @@ def training_loop(
     # finished; lower it if loss_disc_real starts falling well below 1.0.
     adaptive_adv_max = max(
         adaptive_adv_min,
-        float(getattr(config.train, "refinegan_adaptive_adv_max", 8.0)),
+        float(getattr(config.train, "adaptive_adv_max", 8.0)),
     )
     adaptive_adv_ramp_start = max(
         0,
-        int(getattr(config.train, "refinegan_adaptive_adv_ramp_start", 20000)),
+        int(getattr(config.train, "adaptive_adv_ramp_start", 20000)),
     )
     adaptive_adv_ramp_steps = max(
         0,
-        int(getattr(config.train, "refinegan_adaptive_adv_ramp_steps", 80000)),
+        int(getattr(config.train, "adaptive_adv_ramp_steps", 80000)),
     )
     # A fine-tune never reaches the pretraining ramp's horizon -- a few thousand
     # steps is typical -- so it gets its own, short one.  It still gets a ramp
@@ -3566,23 +3791,23 @@ def training_loop(
     # on the first batch is how a fine-tune picks up artefacts it never had.
     adaptive_adv_ramp_steps_finetune = max(
         0,
-        int(getattr(config.train, "refinegan_adaptive_adv_ramp_steps_finetune", 2000)),
+        int(getattr(config.train, "adaptive_adv_ramp_steps_finetune", 2000)),
     )
 
     # Feature matching is the other channel that carries texture, and it was
     # hardcoded to 1.0 while being normalised by branch count -- roughly half
     # of HiFi-GAN's convention of 2.0 unnormalised, on a term already three
     # orders of magnitude below the spectral loss.
-    refinegan_fm_weight = max(
+    fm_weight = max(
         0.0,
-        float(getattr(config.train, "refinegan_fm_weight", 2.0)),
+        float(getattr(config.train, "fm_weight", 2.0)),
     )
 
     # Only read by the "Hybrid L1" spectral loss.  Left at 1.0 so the option
     # behaves exactly as before unless it is raised deliberately.
     ms_stft_weight = max(
         0.0,
-        float(getattr(config.train, "refinegan_ms_stft_weight", 1.0)),
+        float(getattr(config.train, "ms_stft_weight", 1.0)),
     )
 
     # ---- Waveform-domain reconstruction terms ---------------------------
@@ -3591,33 +3816,33 @@ def training_loop(
     # tends to drift.  Both terms below are relative (log ratios / max-pool
     # differences), so neither assumes a particular dataset normalisation.
     envelope_loss_weight = max(
-        0.0, float(getattr(config.train, "refinegan_envelope_loss_weight", 3.0))
+        0.0, float(getattr(config.train, "envelope_loss_weight", 3.0))
     )
     envelope_kernel = max(
-        2, int(getattr(config.train, "refinegan_envelope_kernel", 100))
+        2, int(getattr(config.train, "envelope_kernel", 100))
     )
     envelope_stride = max(
-        1, int(getattr(config.train, "refinegan_envelope_stride", 50))
+        1, int(getattr(config.train, "envelope_stride", 50))
     )
     # Amplitude below which the companded envelope stops resolving detail.
     # 1e-3 is about -60 dBFS, under any decay tail worth reproducing.
     envelope_floor = max(
-        1e-8, float(getattr(config.train, "refinegan_envelope_floor", 1e-3))
+        1e-8, float(getattr(config.train, "envelope_floor", 1e-3))
     )
     rms_loss_weight = max(
-        0.0, float(getattr(config.train, "refinegan_rms_loss_weight", 5.0))
+        0.0, float(getattr(config.train, "rms_loss_weight", 5.0))
     )
     rms_window_size = max(
-        16, int(getattr(config.train, "refinegan_rms_window", 1024))
+        16, int(getattr(config.train, "rms_window", 1024))
     )
-    rms_hop_size = max(1, int(getattr(config.train, "refinegan_rms_hop", 256)))
+    rms_hop_size = max(1, int(getattr(config.train, "rms_hop", 256)))
     # One-sided and absolute: only useful when the dataset is peak-normalised
     # below the head's threshold.  Off by default.
     peak_headroom_weight = max(
-        0.0, float(getattr(config.train, "refinegan_peak_headroom_weight", 0.0))
+        0.0, float(getattr(config.train, "peak_headroom_weight", 0.0))
     )
     peak_headroom_threshold = float(
-        getattr(config.train, "refinegan_peak_headroom_threshold", 0.85)
+        getattr(config.train, "peak_headroom_threshold", 0.85)
     )
 
     cached_adaptive_adv = None
@@ -3659,9 +3884,9 @@ def training_loop(
             else:
                 grad_clip_value_g = grad_clip_value_d = float("inf")
 
-            if refinegan_active and refinegan_global_clip_g > 0:
-                grad_clip_value_g = min(grad_clip_value_g, refinegan_global_clip_g)
-                grad_clip_value_d = min(grad_clip_value_d, refinegan_global_clip_g)
+            if refinegan_active and global_clip_g > 0:
+                grad_clip_value_g = min(grad_clip_value_g, global_clip_g)
+                grad_clip_value_d = min(grad_clip_value_d, global_clip_g)
 
 
             # Device handling
@@ -3727,6 +3952,11 @@ def training_loop(
                             y_d_fake,
                             real_spectrograms=real_spectrograms,
                             pair_batches=True,
+                            # Only the *discriminator* update splits the heads:
+                            # the direction output exists to train the
+                            # projection against this loss, and a discriminator
+                            # without SAN heads ignores the flag.
+                            san_training=True,
                         )
                     else:
                         y_d_hat_r, y_d_hat_g, _, _ = net_d(
@@ -3737,6 +3967,7 @@ def training_loop(
                     disc_loss_parts = discriminator_loss(
                         y_d_hat_r,
                         y_d_hat_g,
+                        san_direction_weight=san_direction_weight,
                         normalize=refinegan_active,
                         per_branch=bool(disc_branch_names),
                     )
@@ -3931,7 +4162,7 @@ def training_loop(
                     loss_spectral = loss_l1_mel + loss_ms_stft
                     # Logged post-weight, which is what the sum above actually
                     # sees: the point of these two series is to show whether
-                    # ``refinegan_ms_stft_weight`` is high enough for the
+                    # ``ms_stft_weight`` is high enough for the
                     # MS-STFT term to matter beside a mel term carrying c_mel.
                     loss_spectral_parts = {
                         "loss_spectral_l1_mel": loss_l1_mel,
@@ -3969,15 +4200,15 @@ def training_loop(
 
                 # The probe is instrumentation first and a loss second, so it
                 # is gated on the interval alone.  It used to also require
-                # ``refinegan_ablation_weight > 0``, which meant the only way to
+                # ``ablation_weight > 0``, which meant the only way to
                 # stop paying for a term that does nothing was to also go blind
                 # to the one measurement that says whether a latent dimension is
                 # load-bearing.  ``loss_ablation`` is still scaled by the weight
                 # below, so a weight of zero costs exactly the forward pass.
                 if (
                     refinegan_latent is not None
-                    and refinegan_ablation_interval > 0
-                    and global_step % refinegan_ablation_interval == 0
+                    and ablation_interval > 0
+                    and global_step % ablation_interval == 0
                 ):
                     slow_dimension_count = len(refinegan_latent.slow_levels)
                     fast_dimension_count = len(refinegan_latent.fast_levels)
@@ -3995,7 +4226,7 @@ def training_loop(
                     else:
                         ablation_branch = "fast"
                         ablation_dimension = selected_dimension - slow_dimension_count
-                    ablation_raw, ablation_delta, _ = _refinegan_ablation_margin(
+                    ablation_raw, ablation_delta, _ = _ablation_margin(
                         model_g,
                         refinegan_latent,
                         discrete_parts,
@@ -4007,21 +4238,31 @@ def training_loop(
                         y_hat,
                         ablation_branch,
                         ablation_dimension,
-                        refinegan_ablation_margin,
+                        ablation_margin,
                     )
-                    loss_ablation = ablation_raw * refinegan_ablation_weight
+                    loss_ablation = ablation_raw * ablation_weight
 
                 # Feature Matching loss
                 loss_fm = feature_loss(
                     fmap_r,
                     fmap_g,
                     normalize=refinegan_active,
-                ) * (refinegan_fm_weight if refinegan_active else 2.0)
+                ) * (fm_weight if refinegan_active else 2.0)
 
-                # Generator loss
+                # Generator loss.  ``y_d_hat_g`` comes from the *generator*
+                # update's forward, which never sets ``san_training``, so these
+                # are plain logits and ``san_direction_weight`` is inert -- the
+                # direction output is the discriminator's business alone.
+                #
+                # The squared-softplus surrogate is SAN's, and it is one-sided:
+                # LSGAN's ``(1 - d) ** 2`` also punishes the generator for
+                # scoring *above* the real target, which is not a defect worth
+                # a gradient.
                 loss_adv = generator_loss(
                     y_d_hat_g,
                     normalize=refinegan_active,
+                    san_direction_weight=san_direction_weight,
+                    use_softplus=san_active,
                 )
 
                 loss_prior_slow = torch.zeros((), device=y.device)
@@ -4038,12 +4279,12 @@ def training_loop(
                         # feedback loop.
                         loss_prior = raw_prior_loss
                     else:
-                        if refinegan_prior_warmup_steps:
-                            prior_progress = min(1.0, global_step / refinegan_prior_warmup_steps)
+                        if prior_warmup_steps:
+                            prior_progress = min(1.0, global_step / prior_warmup_steps)
                         else:
                             prior_progress = 1.0
-                        loss_prior = raw_prior_loss * refinegan_prior_loss_weight * prior_progress
-                    if global_step % refinegan_diagnostics_interval == 0:
+                        loss_prior = raw_prior_loss * prior_loss_weight * prior_progress
+                    if global_step % diagnostics_interval == 0:
                         discrete_diagnostics = refinegan_latent.diagnostics(
                             discrete_parts,
                             x_mask,
@@ -4103,7 +4344,9 @@ def training_loop(
                         cached_adaptive_adv is None
                         or global_step % adaptive_adv_interval == 0
                     ):
-                        last_layer = _last_layer_parameter(model_g.dec.conv_post)
+                        last_layer = _last_layer_parameter(
+                            _decoder_output_layer(model_g.dec)
+                        )
                         (
                             cached_adaptive_adv,
                             cached_rec_grad,
@@ -4294,7 +4537,7 @@ def training_loop(
                                 f"{_share:.3f} against a target of "
                                 f"{r1_controller.target_ratio:.2f}. The controller "
                                 f"has no authority left over this branch; raise "
-                                f"refinegan_r1_max_scale.",
+                                f"r1_max_scale.",
                                 tag="[R1]",
                             )
                         for _name, _share in r1_controller.newly_floored():
@@ -4304,7 +4547,7 @@ def training_loop(
                                 f"{_share:.3f} against a target of "
                                 f"{r1_controller.target_ratio:.2f}. The branch is "
                                 f"over-regularised and the controller cannot ease "
-                                f"it further; lower refinegan_r1_min_scale.",
+                                f"it further; lower r1_min_scale.",
                                 tag="[R1]",
                             )
                     writer.add_scalar(
@@ -4317,7 +4560,7 @@ def training_loop(
                         last_layer_adv_grad.item(),
                         global_step,
                     )
-                    # The quantity being held at ``refinegan_adv_balance_target``,
+                    # The quantity being held at ``adv_balance_target``,
                     # on the same terms as ``GAN/fm_to_rec_ratio`` below: *after*
                     # the adaptive weight, so it is what the optimizer receives
                     # rather than what the adversarial term asked for.  The two
@@ -4353,7 +4596,7 @@ def training_loop(
                             last_layer_fm_grad.item(),
                             global_step,
                         )
-                        # The quantity being held at ``refinegan_fm_balance_target``.
+                        # The quantity being held at ``fm_balance_target``.
                         # Reported *after* the weight, so it is what the optimizer
                         # actually receives rather than what fm asked for.
                         writer.add_scalar(

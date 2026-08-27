@@ -1,10 +1,12 @@
-"""VITS-style flow latent frontend feeding the RefineGAN decoder.
+"""VITS-style flow latent frontend, shared by every decoder in this fork.
 
 It exposes ``forward_train`` / ``prior_losses`` / ``diagnostics`` / ``infer`` /
 ``remove_posterior``, which is the contract the decoder, the discriminator, the
 balance controllers and every metric series are written against.  ``content``
-and ``detail`` are concatenated into the conditioning sequence RefineGAN
-refines its pitch template against.
+and ``detail`` are concatenated into one frame-rate conditioning sequence; what
+the decoder does with it is the decoder's business.  RefineGAN refines a pitch
+template against it, Wavehax projects it into the frequency axis of a complex
+spectrogram, and neither choice reaches anything in this file.
 
 This is RVC's VITS posterior-plus-flow, with the four modifications that the
 measurements in this repo argued for:
@@ -47,15 +49,26 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from rvc.configs.vocoders import (
+    get_architecture_id,
+    get_vocoder_ids,
+    uses_vits_latent,
+)
 from rvc.lib.algorithm.normalizing_flow import ResidualCouplingBlock
 from rvc.lib.algorithm.wavenet import WaveNet
 
 # ``net_g`` loads checkpoints non-strictly, so the architecture id is the only
 # thing standing between an incompatible checkpoint and a silently half-random
-# model.  ``refinegan_v1`` marks the decoder swap: the previous ids belonged to
-# latents whose decoder consumed a different conditioning contract entirely.
-ARCHITECTURE_ID = "shiro_vits_flow_refinegan_v1"
-SUPPORTED_ARCHITECTURE_IDS = frozenset((ARCHITECTURE_ID,))
+# model.  It identifies the latent *and* the decoder that consumes it, so it
+# lives per vocoder in ``rvc/configs/vocoders.json`` rather than here -- a
+# second copy of the string in this file could only ever drift out of step with
+# the one the trainer, the exporter and the loader all read.
+ARCHITECTURE_ID = get_architecture_id("chouwagan")
+SUPPORTED_ARCHITECTURE_IDS = frozenset(
+    get_architecture_id(vocoder_id)
+    for vocoder_id in get_vocoder_ids()
+    if uses_vits_latent(vocoder_id)
+)
 
 # Bounds on the predicted log standard deviations.  These exist to stop a bad
 # init from producing inf/nan, not to shape the solution -- a run that *sits* on
@@ -215,7 +228,11 @@ class SpectrogramFrequencyStem(nn.Module):
 
 
 class RefineVitsLatent(nn.Module):
-    """Posterior + normalizing flow latent frontend for the RefineGAN decoder."""
+    """Posterior + normalizing flow latent frontend, decoder-agnostic.
+
+    The name is kept because ``Synthesizer.refinegan_latent`` is a checkpoint
+    key prefix: renaming it would orphan every weight under it.
+    """
 
     architecture_id = ARCHITECTURE_ID
 

@@ -7,12 +7,14 @@ import gradio as gr
 import traceback
 
 from rvc.configs.vocoders import (
+    get_architecture_id,
     get_vocoder_choices,
     get_vocoder_sample_rates,
     get_vocoder_spec,
     normalize_vocoder,
 )
 
+from rvc.lib.algorithm.synthesizers import vocoder_config_from_model
 from rvc.lib.i18n import _
 from rvc.lib.terminal import error as print_error
 
@@ -102,16 +104,10 @@ def extract_small_model(
                 "vocoder": get_vocoder_spec(vocoder_id)["label"],
                 "vocoder_id": vocoder_id,
                 "vocoder_architecture": vocoder_id,
-                "vocoder_config": {
-                    key: value
-                    for key, value in model_config.items()
-                    if key.startswith("refinegan_")
-                },
+                "vocoder_config": vocoder_config_from_model(model_config),
                 "architecture_id": model_config.get(
-                    "refinegan_architecture_id"
-                )
-                if vocoder_id == "refinegan"
-                else "hifi_gan_nsf_v1",
+                    "architecture_id", get_architecture_id(vocoder_id)
+                ),
             }
         )
 

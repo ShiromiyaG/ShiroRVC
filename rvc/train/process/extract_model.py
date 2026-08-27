@@ -7,8 +7,12 @@ from collections import OrderedDict
 
 import torch
 
-from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
-from rvc.lib.algorithm.chouwagan_vits import ARCHITECTURE_ID
+from rvc.configs.vocoders import (
+    get_architecture_id,
+    get_vocoder_spec,
+    normalize_vocoder,
+)
+from rvc.lib.algorithm.synthesizers import vocoder_config_from_model
 from rvc.lib.terminal import error as print_error, success
 
 now_dir = os.getcwd()
@@ -110,11 +114,10 @@ def extract_model(
         # Assigning to opt config
         opt["config"] = config_list
 
-        vocoder_config = {
-            key: value
-            for key, value in hps.model.items()
-            if key.startswith("refinegan_")
-        }
+        # Whatever ``Synthesizer`` does not name in its own signature: the
+        # frontend, decoder and discriminator options the checkpoint has to
+        # carry so ``infer`` can rebuild the same model.
+        vocoder_config = vocoder_config_from_model(dict(hps.model.items()))
 
 
         opt["epoch"] = epoch
@@ -135,13 +138,8 @@ def extract_model(
         opt["vocoder_id"] = vocoder_id
         opt["vocoder_architecture"] = vocoder_architecture
         opt["vocoder_config"] = vocoder_config
-        opt["architecture_id"] = (
-            vocoder_config.get(
-                "refinegan_architecture_id",
-                ARCHITECTURE_ID,
-            )
-            if vocoder_id == "refinegan"
-            else "hifi_gan_nsf_v1"
+        opt["architecture_id"] = vocoder_config.get(
+            "architecture_id", get_architecture_id(vocoder_id)
         )
 
         # Since fork uses new API for weight norm ( parametrizations )

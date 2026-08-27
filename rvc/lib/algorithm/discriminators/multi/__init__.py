@@ -1,9 +1,13 @@
+from .branchwise import BranchwiseDiscriminator
+from .chouwagan import PERIODS, SPECTROGRAM_SPECS, ChouwaGANDiscriminator
 from .mpd_msd_combined import MPD_MSD_Combined
-from .refinegan import PERIODS, RESOLUTIONS, RefineGANDiscriminator
+from .wavehax import WavehaxDiscriminator
 
 __all__ = [
+    "BranchwiseDiscriminator",
+    "ChouwaGANDiscriminator",
     "MPD_MSD_Combined",
-    "RefineGANDiscriminator",
+    "WavehaxDiscriminator",
     "PERIODS",
-    "RESOLUTIONS",
+    "SPECTROGRAM_SPECS",
 ]

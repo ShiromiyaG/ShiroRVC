@@ -132,7 +132,7 @@ def test_round_trip_preserves_every_field(tmp_path):
     spec = TrainRunSpec(
         model_name="round-trip",
         sample_rate=44100,
-        vocoder="refinegan",
+        vocoder="chouwagan",
         batch_size=12,
         gpus="0-1",
         pretrain_g="weights/G.pth",

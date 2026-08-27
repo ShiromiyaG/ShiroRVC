@@ -1,0 +1,260 @@
+{
+  "train": {
+    "spectral_loss": "L1 Mel Loss",
+    "seed": 1234,
+    "learning_rate_g": 0.0001,
+    "learning_rate_d": 0.0004,
+    "betas": [
+      0.8,
+      0.99
+    ],
+    "eps": 1e-09,
+    "lr_decay": 0.999875,
+    "lr_final_ratio": 0.25,
+    "rolling_loss_steps": 50,
+    "validation_preview_dpi": 67,
+    "validation_preview_width": 24.0,
+    "validation_preview_height": 5.8,
+    "segment_size": 17640,
+    "c_mel": 45,
+    "r1_interval": 16,
+    "r1_gamma": 0.25,
+    "r1_segment_size": 6144,
+    "r1_target_ratio": 1.0,
+    "r1_max_scale": 10000.0,
+    "r1_min_scale": 0.0001,
+    "global_clip_norm_g": 500.0,
+    "compile_discriminator": false,
+    "adaptive_adv_interval": 8,
+    "adv_warmup_steps": 2000,
+    "adv_balance_target": 0.8,
+    "adaptive_adv_min": 0.01,
+    "adaptive_adv_max": 3.0,
+    "adaptive_adv_ramp_start": 16000,
+    "adaptive_adv_ramp_steps": 64000,
+    "adaptive_adv_ramp_steps_finetune": 2000,
+    "fm_weight": 2.0,
+    "fm_balance_target": 0.33,
+    "fm_balance_min": 0.1,
+    "ms_stft_weight": 5.0,
+    "prior_loss_weight": 1.0,
+    "prior_warmup_steps": 10000,
+    "ablation_interval": 128,
+    "ablation_loss_weight": 0.0,
+    "ablation_margin": 0.01,
+    "diagnostics_interval": 64,
+    "mel_distance": "huber",
+    "mel_huber_beta": 0.3,
+    "mel_low_emphasis": 1.3,
+    "mel_low_emphasis_hz": 1000.0,
+    "envelope_loss_weight": 3.0,
+    "envelope_kernel": 100,
+    "envelope_stride": 50,
+    "envelope_floor": 0.001,
+    "rms_loss_weight": 5.0,
+    "rms_window": 1024,
+    "rms_hop": 256,
+    "peak_headroom_weight": 0.0,
+    "peak_headroom_threshold": 0.85,
+    "holdout_fraction": 0.02,
+    "holdout_min_slices": 16,
+    "holdout_max_slices": 96,
+    "holdout_max_seconds": 120.0,
+    "holdout_interval": 0,
+    "overtrain_patience": 8,
+    "overtrain_min_delta": 0.001,
+    "ema_decay": 0.999
+  },
+  "data": {
+    "max_wav_value": 32768.0,
+    "sample_rate": 44100,
+    "filter_length": 2048,
+    "hop_length": 441,
+    "win_length": 2048,
+    "n_mel_channels": 128,
+    "mel_fmin": 0.0,
+    "mel_fmax": null
+  },
+  "model": {
+    "inter_channels": 192,
+    "hidden_channels": 192,
+    "filter_channels": 768,
+    "text_enc_hidden_dim": 768,
+    "n_heads": 2,
+    "n_layers": 6,
+    "kernel_size": 3,
+    "p_dropout": 0,
+    "resblock": "wavehax",
+    "resblock_kernel_sizes": [
+      3,
+      7,
+      11
+    ],
+    "resblock_dilation_sizes": [
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        1,
+        3,
+        5
+      ]
+    ],
+    "upsample_rates": [
+      3,
+      3,
+      7,
+      7
+    ],
+    "upsample_initial_channel": 512,
+    "upsample_kernel_sizes": [
+      6,
+      6,
+      14,
+      14
+    ],
+    "use_spectral_norm": false,
+    "gin_channels": 256,
+    "spk_embed_dim": 109,
+    "architecture_id": "shiro_vits_flow_wavehax_v1",
+    "channels": 16,
+    "mult_channels": 3,
+    "convnext_kernel_size": [
+      13,
+      7
+    ],
+    "num_blocks": 8,
+    "n_fft": 882,
+    "prior_type": "pcph_closed_form",
+    "prior_power_factor": 0.1,
+    "prior_noise_amplitude": 0.01,
+    "drop_prob": 0.0,
+    "framewise_norm": false,
+    "use_logmag_phase": false,
+    "d_periods": [
+      2,
+      3,
+      5,
+      7,
+      11
+    ],
+    "d_period_channels": 32,
+    "d_period_kernel_sizes": [
+      5,
+      3
+    ],
+    "d_period_downsample_scales": [
+      3,
+      3,
+      3,
+      3,
+      1
+    ],
+    "d_period_max_channels": 1024,
+    "d_resolutions": [
+      [
+        1024,
+        256,
+        1024
+      ],
+      [
+        2048,
+        512,
+        2048
+      ],
+      [
+        512,
+        128,
+        512
+      ]
+    ],
+    "d_spectral_channels": 32,
+    "d_spectral_kernel_sizes": [
+      [
+        7,
+        5
+      ],
+      [
+        5,
+        3
+      ],
+      [
+        5,
+        3
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        3,
+        3
+      ]
+    ],
+    "d_spectral_strides": [
+      [
+        2,
+        2
+      ],
+      [
+        2,
+        1
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        2,
+        1
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        1,
+        1
+      ]
+    ],
+    "content_channels": 128,
+    "detail_channels": 64,
+    "posterior_channels": 192,
+    "prior_hidden_channels": 192,
+    "vits_latent_channels": 192,
+    "vits_posterior_layers": 16,
+    "vits_flow_blocks": 4,
+    "vits_flow_layers": 4,
+    "vits_free_bits": 0.03,
+    "vits_kl_target": 0.15,
+    "prior_blocks": 4,
+    "prior_heads": 4,
+    "prior_kernel_size": 31,
+    "kl_beta_lr": 0.01,
+    "kl_beta_min": 0.0001,
+    "kl_beta_max": 10.0,
+    "kl_rate_momentum": 0.01,
+    "kl_scale_anchor": 1.0,
+    "feature_scale_anchor": 1.0,
+    "prior_uses_logs": true,
+    "prior_direct_content": true,
+    "prior_replacement_max": 0.7,
+    "prior_replacement_start": 2000,
+    "prior_replacement_ramp": 12000,
+    "prior_replacement_mean_share": 0.5,
+    "use_periodicity": true,
+    "use_frame_energy": true,
+    "segment_energy_floor": 0.05
+  }
+}

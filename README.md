@@ -169,33 +169,70 @@ catalog falls back to English silently rather than raising.
 ## Under the hood
 
 <details>
-<summary><b>The two voice engines</b></summary>
+<summary><b>The voice engines</b></summary>
 
-ShiroRVC ships two vocoders — the part that turns the model's internal
+ShiroRVC ships three vocoders — the part that turns the model's internal
 representation back into sound.
 
-| | **HiFi-GAN** | **RefineGAN** |
-|---|---|---|
-| Sample rates | 32 / 40 / 48 kHz | 44.1 kHz |
-| Frontend | Original VITS (flow + posterior) | VITS flow + posterior, rate-targeted KL |
-| Generator | NSF HiFi-GAN | Pitch-template U-Net (RefineGAN paper) |
-| Discriminator | MPD + MSD | MPD (5 periods) + multi-resolution STFT |
+| | **HiFi-GAN** | **ChouwaGAN** | **Wavehax** |
+|---|---|---|---|
+| Sample rates | 32 / 40 / 48 kHz | 44.1 kHz | 44.1 kHz |
+| Frontend | Original VITS (flow + posterior) | VITS flow + posterior, rate-targeted KL | same as ChouwaGAN |
+| Generator | NSF HiFi-GAN | Anti-aliased NSF with an excitation U-Net | 2D ConvNeXt over a harmonic prior |
+| Discriminator | MPD + MSD | MPD (3 periods) + complex STFT + pseudo-CQT | UnivNet: MPD + multi-resolution STFT |
+| Decoder size | 15.7 M | 3.9 M | 2.0 M |
+| Discriminator size | 71.4 M | 2.5 M | 41.4 M |
 
 **HiFi-GAN** is the well-tested option inherited from the original RVC, and the
 right choice if you want results that behave predictably.
 
-**RefineGAN** is what this fork exists for, aimed at singing at 44.1 kHz. It
-follows the [RefineGAN paper](https://arxiv.org/abs/2111.00962) rather than the
-widely copied Applio port: the decoder refines a **pitch template** — a
-one-sample pulse at every pitch period, uniform noise where the signal is
-unvoiced, scaled by the measured frame intensity — instead of a band-limited
-sine bank. Pitch and loudness are therefore exact before the network does
-anything, and the U-Net only has to supply timbre. Its latent frontend is VITS's
-posterior-plus-flow with a per-dimension KL rate controller, so the latent
-cannot quietly collapse, and a scheduled fraction of every batch is decoded from
-the *prior* so the inference path receives reconstruction gradient. The
-discriminator is the paper's MPD plus a multi-resolution STFT branch, with lazy
-R1 regularisation whose strength is controlled per branch.
+**ChouwaGAN** is what this fork exists for, aimed at singing at 44.1 kHz. Its
+excitation is a band-limited harmonic bank plus noise, and every harmonic is
+faded out as it approaches Nyquist, so the source never aliases and the decoder
+does not spend capacity cancelling tones it was handed. That excitation is
+rendered **once** at the full sample rate and band-limited down through a small
+U-Net, so every decoder stage sees a phase-consistent view of one signal rather
+than an independently re-rendered comb. The trunk itself is depthwise-separable
+with 2x-oversampled SnakeBeta activations, which is why 3.9 M parameters are
+enough. Its latent frontend is VITS's posterior-plus-flow with a per-dimension
+KL rate controller, so the latent cannot quietly collapse, and a scheduled
+fraction of every batch is decoded from the *prior* so the inference path
+receives reconstruction gradient.
+
+Its discriminator judges the **complex** STFT rather than magnitudes, so the
+adversarial signal carries phase, and compresses magnitudes by a power law so
+the sparse 10–20 kHz region is not drowned out by the low bins. Three periods
+rather than five: the five agreed with each other to a rank correlation of
+0.86–0.98, so their count was silently acting as a weight on one opinion. A
+pseudo-CQT branch is on by default — on a log frequency axis a harmonic stack
+slides rigidly with pitch, so one kernel detects it at every f0 — and a PQMF
+sub-band branch is available for inter-band aliasing.
+
+Every branch ends in a **sliced-adversarial (SAN)** head: the output projection
+is split into a unit-norm direction and a learned scale, trained on two separate
+objectives, so the trunk cannot make its own job easier by shrinking the
+projection. Lazy R1 regularisation runs one branch at a time under a per-branch
+strength controller. Both are switchable — `d_use_san` falls back to plain
+LSGAN logits, and `d_branchwise: false` collapses R1 onto a single controller
+and a single summed penalty.
+
+**Wavehax** is a port of the [reference implementation](https://github.com/chomeyama/wavehax),
+decoder and discriminator both; it shares ChouwaGAN's latent frontend and
+training recipe. It never upsamples: the network runs entirely at the frame
+rate, stacking the STFT of a pseudo-constant-power harmonic prior with the
+projected latent into a 2D image, running a ConvNeXt over it, and reaching the
+waveform in a single iSTFT. Since there is no transposed convolution anywhere,
+there is nothing to fold energy back across Nyquist, and the pitch response
+comes from the prior rather than from learned weights. It carries RVC's speaker
+conditioning like the other two — upstream Wavehax has none only because it is
+single-speaker.
+
+Its discriminator is UnivNet's, the one the Wavehax authors trained against.
+Same two families as ChouwaGAN's, different networks: the period branch starts
+at 32 channels and quadruples to 1024 where ChouwaGAN's tops out at 256, and its
+spectral stack is six layers deep against three. The cost is size: 41.4 M
+against ChouwaGAN's 2.5 M, opposite the generator, and `d_period_channels` is
+the knob if that does not fit.
 
 </details>
 

@@ -153,7 +153,7 @@ class TrainingPage(Page):
         row = QHBoxLayout()
         row.setSpacing(12)
         row.addWidget(Field(_("Model name"), self.model_name, _("Creates logs/<name>/. Reuse a name to continue a run.")), 2)
-        row.addWidget(Field(_("Vocoder"), self.vocoder, _("RefineGAN is 44.1 kHz only.")), 1)
+        row.addWidget(Field(_("Vocoder"), self.vocoder, _("ChouwaGAN and Wavehax are 44.1 kHz only.")), 1)
         row.addWidget(Field(_("Sample rate"), self.sample_rate, ""), 1)
         card.body.addLayout(row)
 

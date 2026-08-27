@@ -8,7 +8,7 @@
         "selected_lang": "en_US"
     },
     "flask_server": false,
-    "version": "4.3.0",
+    "version": "",
     "model_author": "None",
-    "use_fp16": true
+    "use_fp16": false
 }

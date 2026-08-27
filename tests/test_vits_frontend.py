@@ -12,7 +12,7 @@ import inspect
 import pytest
 import torch
 
-from rvc.lib.algorithm.chouwagan_vits import (
+from rvc.lib.algorithm.chouwa_vits import (
     ARCHITECTURE_ID as VITS_ARCHITECTURE_ID,
     RefineVitsLatent,
 )
@@ -80,7 +80,7 @@ def _inputs(model, batch=2, frames=24):
 
 def test_the_architecture_id_marks_the_decoder_it_was_trained_against():
     """A checkpoint from an older decoder must fail the guard, not load."""
-    assert VITS_ARCHITECTURE_ID.endswith("refinegan_v1")
+    assert VITS_ARCHITECTURE_ID.endswith("chouwagan_v1")
 
 
 def test_every_attribute_the_trainer_reaches_for_exists():

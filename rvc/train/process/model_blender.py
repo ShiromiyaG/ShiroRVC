@@ -2,8 +2,11 @@ import os
 import torch
 from collections import OrderedDict
 
-from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
-from rvc.lib.algorithm.chouwagan_vits import ARCHITECTURE_ID
+from rvc.configs.vocoders import (
+    get_architecture_id,
+    get_vocoder_spec,
+    normalize_vocoder,
+)
 from rvc.lib.terminal import error as print_error, info, install_rich_print, success
 
 install_rich_print()
@@ -73,20 +76,14 @@ def model_blender(name, path1, path2, ratio):
         architecture_id = ckpt1.get(
             "architecture_id",
             vocoder_config.get(
-                "refinegan_architecture_id",
-                ARCHITECTURE_ID,
-            )
-            if vocoder_id == "refinegan"
-            else "hifi_gan_nsf_v1",
+                "architecture_id", get_architecture_id(vocoder_id)
+            ),
         )
         other_architecture_id = ckpt2.get(
             "architecture_id",
             ckpt2.get("vocoder_config", {}).get(
-                "refinegan_architecture_id",
-                ARCHITECTURE_ID,
-            )
-            if other_vocoder_id == "refinegan"
-            else "hifi_gan_nsf_v1",
+                "architecture_id", get_architecture_id(other_vocoder_id)
+            ),
         )
         if architecture_id != other_architecture_id:
             err_msg = "The model architecture revisions are not the same."

@@ -1,9 +1,9 @@
-DISCRETE_INFERENCE_MODE_LABEL = "RefineGAN latent inference mode"
+DISCRETE_INFERENCE_MODE_LABEL = "ChouwaGAN latent inference mode"
 DISCRETE_INFERENCE_MODE_INFO = (
     "Deterministic uses the prior mean; stochastic samples the continuous "
-    "slow and fast latent distributions used by RefineGAN."
+    "slow and fast latent distributions used by ChouwaGAN."
 )
-DISCRETE_TEMPERATURE_LABEL = "RefineGAN latent temperature"
+DISCRETE_TEMPERATURE_LABEL = "ChouwaGAN latent temperature"
 DISCRETE_TEMPERATURE_INFO = (
     "Higher values increase variation in stochastic continuous latent sampling."
 )

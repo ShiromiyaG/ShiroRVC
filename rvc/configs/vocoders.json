@@ -11,18 +11,36 @@
         "pretrained_dir": "hifi-gan",
         "supports_smartcutter": true,
         "generator": "hifi_nsf",
-        "discriminator": "mpd_msd"
+        "discriminator": "mpd_msd",
+        "latent": "gaussian_flow",
+        "architecture_id": "hifi_gan_nsf_v1"
     },
-    "refinegan": {
-        "label": "RefineGAN",
-        "architecture": "refinegan",
-        "config_dir": "refinegan",
+    "chouwagan": {
+        "label": "ChouwaGAN",
+        "architecture": "chouwagan",
+        "config_dir": "chouwagan",
         "sample_rates": [
             44100
         ],
-        "pretrained_dir": "refinegan",
+        "pretrained_dir": "chouwagan",
         "supports_smartcutter": false,
-        "generator": "refinegan",
-        "discriminator": "refinegan"
+        "generator": "chouwagan",
+        "discriminator": "chouwagan",
+        "latent": "vits",
+        "architecture_id": "shiro_vits_flow_chouwagan_v1"
+    },
+    "wavehax": {
+        "label": "Wavehax",
+        "architecture": "wavehax",
+        "config_dir": "wavehax",
+        "sample_rates": [
+            44100
+        ],
+        "pretrained_dir": "wavehax",
+        "supports_smartcutter": false,
+        "generator": "wavehax",
+        "discriminator": "wavehax",
+        "latent": "vits",
+        "architecture_id": "shiro_vits_flow_wavehax_v1"
     }
 }

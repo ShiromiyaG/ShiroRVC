@@ -1,3 +1,4 @@
+import inspect
 import math
 import torch
 from typing import Optional, List
@@ -5,12 +6,14 @@ import random
 from torch.nn.utils.parametrize import remove_parametrizations
 
 from rvc.lib.algorithm import generators
-from rvc.configs.vocoders import get_vocoder_spec, normalize_vocoder
-from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
-from rvc.lib.algorithm.chouwagan_vits import (
-    ARCHITECTURE_ID as REFINEGAN_VITS_ARCHITECTURE_ID,
-    RefineVitsLatent,
+from rvc.configs.vocoders import (
+    get_architecture_id,
+    get_vocoder_spec,
+    normalize_vocoder,
+    uses_vits_latent,
 )
+from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
+from rvc.lib.algorithm.chouwa_vits import RefineVitsLatent
 from rvc.lib.algorithm.frame_features import (
     conditioning_channels,
     frame_conditioning,
@@ -32,6 +35,24 @@ from rvc.lib.algorithm.posterior_encoder import PosteriorEncoder
 
 
 debug_shapes = False
+
+
+def vocoder_config_from_model(model: dict) -> dict:
+    """Split a config's ``model`` block into the vocoder's share of it.
+
+    Config keys used to be tagged by prefix, and the exporter selected them with
+    ``startswith("refinegan_")``.  Without the prefix there is nothing to match
+    on, so the split is stated once, here, as "everything ``Synthesizer`` does
+    not name in its own signature" -- the frontend, decoder and discriminator
+    options, which is exactly what lands in ``**kwargs``.
+
+    Derived from the signature rather than listed, because a hand-maintained
+    list would silently start exporting -- or silently stop exporting -- a key
+    the moment the constructor changed, and the failure is invisible: the
+    checkpoint rebuilds with that module left at its default.
+    """
+    return {key: value for key, value in model.items() if key not in _SYNTHESIZER_KEYS}
+
 
 class Synthesizer(torch.nn.Module):
     def __init__(
@@ -73,30 +94,32 @@ class Synthesizer(torch.nn.Module):
         self.vocoder = vocoder_id
         self.sr = sr
         self.architecture_id = "vits_gaussian_v1"
+        # The VITS latent frontend, the discrete prior and every latent option
+        # below belong to the frontend rather than to the decoder, so they are
+        # shared by every vocoder the registry marks as using it -- RefineGAN
+        # and Wavehax both do.  Only the ``dec`` module differs.
+        vits_latent = uses_vits_latent(vocoder_id)
 
-        refinegan_options = {}
-        if vocoder_config:
-            refinegan_options.update(vocoder_config)
-        refinegan_options.update(
-            {
-                key: value
-                for key, value in kwargs.items()
-                if key.startswith("refinegan_")
-            }
-        )
+        # Every model key beyond this constructor's own signature is vocoder
+        # configuration -- the frontend's, the decoder's or the discriminator's.
+        # It arrives in ``kwargs`` on a training run and in ``vocoder_config``
+        # when a checkpoint is rebuilt for inference; the two never overlap, and
+        # ``kwargs`` wins if they somehow do.  See ``vocoder_config_from_model``,
+        # which is the exporter's side of the same split.
+        vocoder_options = {**(vocoder_config or {}), **kwargs}
 
         # ---- Measured frame conditioning and segment sampling -------------
         # All three default to off, so a config that predates them builds the
         # previous model exactly.
-        self.use_periodicity = vocoder_id == "refinegan" and bool(
-            refinegan_options.get("refinegan_use_periodicity", False)
+        self.use_periodicity = vits_latent and bool(
+            vocoder_options.get("use_periodicity", False)
         )
-        self.use_frame_energy = vocoder_id == "refinegan" and bool(
-            refinegan_options.get("refinegan_use_frame_energy", False)
+        self.use_frame_energy = vits_latent and bool(
+            vocoder_options.get("use_frame_energy", False)
         )
         self.segment_energy_floor = (
-            float(refinegan_options.get("refinegan_segment_energy_floor", 0.0))
-            if vocoder_id == "refinegan"
+            float(vocoder_options.get("segment_energy_floor", 0.0))
+            if vits_latent
             else 0.0
         )
         # ``spec_channels`` is ``filter_length // 2 + 1``; the frame features
@@ -105,7 +128,7 @@ class Synthesizer(torch.nn.Module):
         # Must match the decoder's own nominal template amplitude, since it is
         # what the measured envelope is expressed relative to.
         self.template_wave_amp = float(
-            refinegan_options.get("refinegan_wave_amp", 0.1)
+            vocoder_options.get("wave_amp", 0.1)
         )
 
 
@@ -122,101 +145,100 @@ class Synthesizer(torch.nn.Module):
         }
 
         dec_kwargs["initial_channel"] = inter_channels
-        if vocoder_config:
-            dec_kwargs.update(vocoder_config)
-        if vocoder_id == "hifi":
+        # Each decoder names the options it understands and swallows the rest,
+        # so a config carrying both decoders' keys builds either one.  Anything
+        # the config pins that ``dec_kwargs`` also derives is handed over rather
+        # than passed twice, which would be a duplicate keyword argument.
+        decoder_config = dict(vocoder_options)
+        for key in list(decoder_config):
+            if key in dec_kwargs:
+                dec_kwargs[key] = decoder_config.pop(key)
+        generator_id = vocoder_spec["generator"]
+        if generator_id == "hifi_nsf":
             self.dec = generators.HiFiGANNSFGenerator(**dec_kwargs)
-        elif vocoder_id == "refinegan":
+        elif generator_id in ("chouwagan", "wavehax"):
             if int(sr) != 44100:
-                raise ValueError("RefineGAN only supports 44.1 kHz configurations.")
-            refinegan_decoder_config = {
-                key: dec_kwargs.pop(key)
-                for key in list(dec_kwargs)
-                if key.startswith("refinegan_")
-            }
-            refinegan_decoder_config.update(
-                {
-                    key: value
-                    for key, value in kwargs.items()
-                    if key.startswith("refinegan_")
-                }
+                raise ValueError(
+                    f"{vocoder_spec['label']} only supports 44.1 kHz configurations."
+                )
+            decoder_class = (
+                generators.ChouwaGANGenerator
+                if generator_id == "chouwagan"
+                else generators.WavehaxGenerator
             )
-            self.dec = generators.RefineGANGenerator(
-                **dec_kwargs,
-                **refinegan_decoder_config,
-            )
+            self.dec = decoder_class(**dec_kwargs, **decoder_config)
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
 
         self.refinegan_latent = None
-        if vocoder_id == "refinegan":
+        if vits_latent:
             # The architecture id travels with the checkpoint and is checked
             # before loading.  ``net_g`` loads non-strictly, so without it a
             # checkpoint from a different latent layout would load with every
             # latent module silently left at its init.
             self.architecture_id = str(
-                refinegan_options.get(
-                    "refinegan_architecture_id",
-                    REFINEGAN_VITS_ARCHITECTURE_ID,
+                vocoder_options.get(
+                    "architecture_id",
+                    get_architecture_id(vocoder_id),
                 )
             )
             self.refinegan_latent = RefineVitsLatent(
                 input_channels=inter_channels,
                 spec_channels=spec_channels,
                 content_channels=int(
-                    refinegan_options.get("refinegan_content_channels", 128)
+                    vocoder_options.get("content_channels", 128)
                 ),
                 detail_channels=int(
-                    refinegan_options.get("refinegan_detail_channels", 64)
+                    vocoder_options.get("detail_channels", 64)
                 ),
                 gin_channels=gin_channels,
                 posterior_channels=int(
-                    refinegan_options.get("refinegan_posterior_channels", 192)
+                    vocoder_options.get("posterior_channels", 192)
                 ),
                 prior_hidden_channels=int(
-                    refinegan_options.get("refinegan_prior_hidden_channels", 192)
+                    vocoder_options.get("prior_hidden_channels", 192)
                 ),
                 latent_channels=int(
-                    refinegan_options.get("refinegan_vits_latent_channels", 192)
+                    vocoder_options.get("vits_latent_channels", 192)
                 ),
                 posterior_layers=int(
-                    refinegan_options.get("refinegan_vits_posterior_layers", 16)
+                    vocoder_options.get("vits_posterior_layers", 16)
                 ),
-                flow_blocks=int(refinegan_options.get("refinegan_vits_flow_blocks", 4)),
-                flow_layers=int(refinegan_options.get("refinegan_vits_flow_layers", 4)),
+                flow_blocks=int(vocoder_options.get("vits_flow_blocks", 4)),
+                flow_layers=int(vocoder_options.get("vits_flow_layers", 4)),
                 prior_blocks=int(
-                    refinegan_options.get("refinegan_prior_blocks", 4)
+                    vocoder_options.get("prior_blocks", 4)
                 ),
-                prior_heads=int(refinegan_options.get("refinegan_prior_heads", 4)),
+                prior_heads=int(vocoder_options.get("prior_heads", 4)),
                 prior_kernel_size=int(
-                    refinegan_options.get("refinegan_prior_kernel_size", 31)
+                    vocoder_options.get("prior_kernel_size", 31)
                 ),
                 kl_free_bits=float(
-                    refinegan_options.get("refinegan_vits_free_bits", 0.03)
+                    vocoder_options.get("vits_free_bits", 0.03)
                 ),
-                kl_target=float(refinegan_options.get("refinegan_vits_kl_target", 0.15)),
+                kl_target=float(vocoder_options.get("vits_kl_target", 0.15)),
                 kl_beta_lr=float(
-                    refinegan_options.get("refinegan_kl_beta_lr", 0.01)
+                    vocoder_options.get("kl_beta_lr", 0.01)
                 ),
                 kl_beta_min=float(
-                    refinegan_options.get("refinegan_kl_beta_min", 1e-4)
+                    vocoder_options.get("kl_beta_min", 1e-4)
                 ),
                 kl_beta_max=float(
-                    refinegan_options.get("refinegan_kl_beta_max", 10.0)
+                    vocoder_options.get("kl_beta_max", 10.0)
                 ),
                 kl_rate_momentum=float(
-                    refinegan_options.get("refinegan_kl_rate_momentum", 0.01)
+                    vocoder_options.get("kl_rate_momentum", 0.01)
                 ),
                 kl_scale_anchor=float(
-                    refinegan_options.get("refinegan_kl_scale_anchor", 1.0)
+                    vocoder_options.get("kl_scale_anchor", 1.0)
                 ),
                 feature_scale_anchor=float(
-                    refinegan_options.get("refinegan_feature_scale_anchor", 1.0)
+                    vocoder_options.get("feature_scale_anchor", 1.0)
                 ),
                 content_feature_channels=(
                     int(text_enc_hidden_dim)
                     if bool(
-                        refinegan_options.get("refinegan_prior_direct_content", True)
+                        vocoder_options.get("prior_direct_content", True)
                     )
                     else 0
                 ),
@@ -224,20 +246,20 @@ class Synthesizer(torch.nn.Module):
                     self.use_periodicity, self.use_frame_energy
                 ),
                 prior_uses_logs=bool(
-                    refinegan_options.get("refinegan_prior_uses_logs", False)
+                    vocoder_options.get("prior_uses_logs", False)
                 ),
                 prior_replacement_max=float(
-                    refinegan_options.get("refinegan_prior_replacement_max", 0.0)
+                    vocoder_options.get("prior_replacement_max", 0.0)
                 ),
                 prior_replacement_start=int(
-                    refinegan_options.get("refinegan_prior_replacement_start", 5000)
+                    vocoder_options.get("prior_replacement_start", 5000)
                 ),
                 prior_replacement_ramp=int(
-                    refinegan_options.get("refinegan_prior_replacement_ramp", 20000)
+                    vocoder_options.get("prior_replacement_ramp", 20000)
                 ),
                 prior_replacement_mean_share=float(
-                    refinegan_options.get(
-                        "refinegan_prior_replacement_mean_share", 0.5
+                    vocoder_options.get(
+                        "prior_replacement_mean_share", 0.5
                     )
                 ),
             )
@@ -355,7 +377,7 @@ class Synthesizer(torch.nn.Module):
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "refinegan"}:
+        if self.vocoder not in {"hifi", "chouwagan", "wavehax"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode
@@ -584,3 +606,12 @@ class Synthesizer(torch.nn.Module):
             o = self.dec(z * x_mask, nsff0, g)
 
             return o, x_mask, (z, z_p, m_p, logs_p)
+
+
+#: Everything ``Synthesizer.__init__`` consumes by name.  Anything else a config
+#: names is vocoder configuration; see ``vocoder_config_from_model``.
+_SYNTHESIZER_KEYS = frozenset(
+    name
+    for name, parameter in inspect.signature(Synthesizer.__init__).parameters.items()
+    if parameter.kind is not inspect.Parameter.VAR_KEYWORD and name != "self"
+)

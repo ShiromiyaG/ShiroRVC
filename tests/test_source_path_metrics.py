@@ -11,13 +11,16 @@ single-tap ``stride=1, kernel=1`` with no filter at all.  That is where RVC's
 mirroring comes from, and the decay to 0.4% is passive: nothing in a mel loss
 sees a spectral image.
 
-RefineGAN makes the same quantity directly readable.  Each decoder stage opens
-by concatenating its upsampled activation with the encoder skip taken at that
-resolution, and the encoder sees nothing but the pitch template -- so the skip
-*is* the excitation, and ``ParallelResBlock.input_conv`` is the 1x1 that weighs
-it.  A ratio that silently read the wrong half of that concatenated weight would
-report the main path as the excitation and look like a plausible number forever,
-which is what these tests exist to prevent.
+ChouwaGAN's excitation U-Net makes the same quantity directly readable.  Each
+decoder stage opens by concatenating its upsampled activation with the
+excitation skip taken at that resolution, and the excitation encoder sees
+nothing but the NSF source -- so the skip *is* the excitation, and
+``fusion_proj`` is the 1x1 that weighs it.  A ratio that silently read the wrong
+half of that concatenated weight would report the main path as the excitation
+and look like a plausible number forever, which is what these tests exist to
+prevent.  So would reading the skip widths in build order: the encoder produces
+them highest-rate first and the decoder consumes them reversed, and the two
+orders only disagree numerically, never structurally.
 """
 
 from __future__ import annotations
@@ -33,42 +36,47 @@ sys.path.insert(0, str(ROOT))
 
 torch = pytest.importorskip("torch", reason="the collector reads real weights", exc_type=ImportError)
 
-from rvc.lib.algorithm.generators.refinegan import RefineGANGenerator  # noqa: E402
+from rvc.lib.algorithm.generators.chouwagan import ChouwaGANGenerator  # noqa: E402
 
 TRAIN_PY = ROOT / "rvc" / "train" / "train.py"
 RATES = (3, 3, 7, 7)
+
+
+#: ``collect_source_path_metrics`` delegates to the Wavehax reader when the
+#: decoder has no stages to walk, so both have to come across together.
+_LIFTED = ("collect_source_path_metrics", "_wavehax_source_path_metrics")
 
 
 @pytest.fixture(scope="module")
 def collect():
     """Lift the collector out of ``train.py``, whose module body reads argv."""
     tree = ast.parse(TRAIN_PY.read_text(encoding="utf-8"))
+    namespace: dict = {"torch": torch}
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "collect_source_path_metrics":
-            namespace: dict = {"torch": torch}
+        if isinstance(node, ast.FunctionDef) and node.name in _LIFTED:
             exec(compile(ast.Module([node], []), str(TRAIN_PY), "exec"), namespace)
-            return namespace["collect_source_path_metrics"]
-    pytest.fail("train.py no longer defines collect_source_path_metrics")
+    missing = [name for name in _LIFTED if name not in namespace]
+    if missing:
+        pytest.fail(f"train.py no longer defines {missing}")
+    return namespace["collect_source_path_metrics"]
 
 
-def _generator(**overrides) -> RefineGANGenerator:
+def _generator(**overrides) -> ChouwaGANGenerator:
     torch.manual_seed(0)
     kwargs = dict(
         initial_channel=192,
         gin_channels=256,
         sr=44100,
         upsample_rates=RATES,
+        chouwagan_excitation_unet=True,
     )
     kwargs.update(overrides)
-    return RefineGANGenerator(**kwargs)
+    return ChouwaGANGenerator(**kwargs)
 
 
-#: The shipped schedule, which deliberately does not halve.
-WIDE = dict(
-    refinegan_decoder_channels=[256, 128, 96, 64],
-    refinegan_resblock_kernel_sizes=[[3, 7, 11], [3, 7, 11], [11], [11]],
-    refinegan_resblock_dilations=[[1, 3, 5], [1, 3, 5], [1, 3], [1, 3]],
-)
+def _skip_width(decoder, stage: int) -> int:
+    """The skip width stage ``stage`` concatenates, in the decoder's own order."""
+    return int(decoder.exc_skip_channels[len(decoder.channels) - 1 - stage])
 
 
 class _Model(torch.nn.Module):
@@ -100,14 +108,14 @@ def test_every_stage_reports_a_ratio(collect):
     )
 
 
-def test_the_ratio_splits_the_input_conv_the_way_the_decoder_does(collect):
-    """``forward_core`` concatenates ``(upsampled, skip)``; reading the halves
+def test_the_ratio_splits_the_fusion_conv_the_way_the_decoder_does(collect):
+    """The decoder concatenates ``(upsampled, skip)``; reading the halves
     backwards would report the main path as the excitation and never look
     wrong."""
-    decoder = _generator(**WIDE)
+    decoder = _generator()
     stage = 0
-    conv = decoder.upsample_conv_blocks[stage].input_conv
-    skip_channels = decoder.skip_channels[stage]
+    conv = decoder.fusion_proj[stage]
+    skip_channels = _skip_width(decoder, stage)
 
     with torch.no_grad():
         # Zero the excitation columns only.  The ratio has to go to zero; if the
@@ -121,32 +129,31 @@ def test_the_ratio_splits_the_input_conv_the_way_the_decoder_does(collect):
     assert metrics[f"Source/inject_ratio_stage_{stage + 1}"] > 0.0
 
 
-@pytest.mark.parametrize("overrides", [{}, WIDE], ids=["paper", "shipped"])
-def test_the_split_is_read_from_the_decoder_not_inferred(collect, overrides):
-    """Inferring it as ``in_channels // 3`` is only right under the halving.
+def test_the_skip_widths_are_read_in_the_decoders_order(collect):
+    """``exc_skip_channels`` is in *encoder* order -- highest rate first.
 
-    The shipped schedule stops halving at the top, so at stages 2 and 3 that
-    inference would hand 10 and 10 channels of the *main* path to the
-    excitation and report a ratio that looks plausible and is wrong.
+    Stage ``i`` concatenates ``exc_skip_channels[n - 1 - i]``, so walking the
+    tuple forwards would take the wrong number of columns at every stage but the
+    middle one, and still produce a finite, plausible ratio.
     """
-    decoder = _generator(**overrides)
+    decoder = _generator()
 
-    assert len(decoder.skip_channels) == len(RATES)
-    for index, (upsample, block) in enumerate(
-        zip(decoder.upsample_blocks, decoder.upsample_conv_blocks)
-    ):
-        skip = decoder.skip_channels[index]
-        assert block.input_conv.weight.shape[1] == upsample.out_channels + skip
+    assert len(decoder.exc_skip_channels) == len(RATES)
+    assert decoder.exc_skip_channels != tuple(reversed(decoder.exc_skip_channels))
+    for stage, conv in enumerate(decoder.fusion_proj):
+        expected = decoder.channels[stage] + _skip_width(decoder, stage)
+        assert conv.weight.shape[1] == expected
 
 
-def test_zeroing_the_skip_zeroes_the_ratio_on_the_shipped_schedule(collect):
+def test_zeroing_every_skip_zeroes_every_ratio(collect):
     """The end-to-end guard that the split lands on the right columns."""
-    decoder = _generator(**WIDE)
+    decoder = _generator()
     for stage in range(len(RATES)):
-        conv = decoder.upsample_conv_blocks[stage].input_conv
-        skip = decoder.skip_channels[stage]
+        conv = decoder.fusion_proj[stage]
         with torch.no_grad():
-            conv.parametrizations.weight.original1[:, -skip:] = 0.0
+            conv.parametrizations.weight.original1[
+                :, -_skip_width(decoder, stage) :
+            ] = 0.0
     metrics = collect(_Model(decoder))
 
     for stage in range(len(RATES)):
@@ -155,11 +162,11 @@ def test_zeroing_the_skip_zeroes_the_ratio_on_the_shipped_schedule(collect):
 
 def test_a_shrinking_excitation_column_lowers_the_ratio(collect):
     """The series has to be monotone in the thing it claims to measure."""
-    decoder = _generator(**WIDE)
+    decoder = _generator()
     before = collect(_Model(decoder))["Source/inject_ratio_stage_0"]
 
-    conv = decoder.upsample_conv_blocks[0].input_conv
-    skip_channels = decoder.skip_channels[0]
+    conv = decoder.fusion_proj[0]
+    skip_channels = _skip_width(decoder, 0)
     with torch.no_grad():
         conv.parametrizations.weight.original1[:, -skip_channels:] *= 0.01
     after = collect(_Model(decoder))["Source/inject_ratio_stage_0"]
@@ -172,7 +179,17 @@ def test_ddp_wrapper_is_unwrapped(collect):
     assert collect(_Wrapped(model)) == collect(model)
 
 
-def test_a_non_refinegan_decoder_reports_nothing(collect):
+def test_the_additive_excitation_path_reports_nothing(collect):
+    """With the U-Net off the source is added through ``source_gates``, not
+    concatenated, so there is no mixing weight to split -- and the collector
+    must say so rather than inventing a ratio out of the upsampling conv."""
+    decoder = _generator(chouwagan_excitation_unet=False)
+
+    assert decoder.exc_skip_channels == ()
+    assert collect(_Model(decoder)) == {}
+
+
+def test_a_decoder_without_an_excitation_path_reports_nothing(collect):
     """The call site guards on the vocoder, but the collector is also asked
     about HiFi-GAN by anything that reuses it, and must not raise."""
 
