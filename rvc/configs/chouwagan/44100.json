@@ -169,6 +169,7 @@
     "chouwagan_output_head_ceiling": 1.0,
     "chouwagan_remove_output_dc": true,
     "d_branchwise": true,
+    "d_generator_branchwise": false,
     "d_use_san": true,
     "d_periods": [
       2,
@@ -200,7 +201,7 @@
     "prior_blocks": 4,
     "prior_heads": 4,
     "prior_kernel_size": 31,
-    "latent_checkpointing": false,
+    "latent_checkpointing": true,
     "kl_beta_lr": 0.01,
     "kl_beta_min": 0.0001,
     "kl_beta_max": 10.0,

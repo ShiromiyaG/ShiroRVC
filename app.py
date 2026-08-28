@@ -9,6 +9,22 @@ import traceback
 # local-only, so skip it. Set before importing gradio -- it is read at import.
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
+# Notebook hosts (Colab) export MPLBACKEND=module://matplotlib_inline.backend_inline
+# for their own kernel. We run in our own venv where that module usually is not
+# installed, and Gradio imports matplotlib on every API call -- which then dies on
+# the unresolvable backend. Fall back to the headless one when the pointed-at
+# module is missing; a backend that does resolve is left alone.
+_mpl_backend = os.environ.get("MPLBACKEND", "")
+if _mpl_backend.startswith("module://"):
+    import importlib.util
+
+    try:
+        _resolved = importlib.util.find_spec(_mpl_backend[len("module://") :])
+    except (ImportError, ValueError):
+        _resolved = None
+    if _resolved is None:
+        os.environ["MPLBACKEND"] = "Agg"
+
 # Torch and Gradio are both ~2s to import and have no import relationship, so
 # pulling torch in on a worker while the main thread imports Gradio overlaps
 # whatever each spends outside the GIL (mostly loading native extensions).

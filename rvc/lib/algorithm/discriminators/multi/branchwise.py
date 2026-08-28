@@ -60,6 +60,22 @@ class BranchwiseDiscriminator(nn.Module):
 
     uses_branchwise_r1 = True
 
+    #: Whether the *generator* step drives the branches one at a time.  Set by
+    #: the trainer, read only by the trainer: nothing in this module's own
+    #: forward consumes it, because it decides how a caller walks the branches
+    #: rather than what any branch is.
+    #:
+    #: Deliberately independent of ``branchwise``.  That one changes the shape
+    #: of the regularisation -- which branch R1 penalises, how many
+    #: ``loss_disc`` series exist, how the R1 strength controller is grouped --
+    #: and switching it changes what the run optimises.  This one only decides
+    #: whether the generator's adversarial and feature-matching terms are
+    #: accumulated branch by branch or in one joint pass; the losses and the
+    #: gradients are identical either way, and the only trade is peak memory
+    #: against step time.  Tying them together would make a memory decision
+    #: silently move the R1 layout, and vice versa.
+    generator_branchwise = True
+
     #: Whether the branches accept ``san_training`` and can return a
     #: ``[function, direction]`` logit pair.  A subclass sets this on the
     #: instance when its heads are actually built with SAN projections; the

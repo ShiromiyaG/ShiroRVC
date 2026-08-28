@@ -170,7 +170,7 @@ class Synthesizer(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
 
-        self.refinegan_latent = None
+        self.chouwa_latent = None
         if vits_latent:
             # The architecture id travels with the checkpoint and is checked
             # before loading.  ``net_g`` loads non-strictly, so without it a
@@ -182,7 +182,7 @@ class Synthesizer(torch.nn.Module):
                     get_architecture_id(vocoder_id),
                 )
             )
-            self.refinegan_latent = RefineVitsLatent(
+            self.chouwa_latent = RefineVitsLatent(
                 input_channels=inter_channels,
                 # Deliberately *not* the decoder's ``checkpointing``: the two
                 # stacks are separately profitable, so each gets its own key.
@@ -286,7 +286,7 @@ class Synthesizer(torch.nn.Module):
 
 
         # ------   [ Posterior Encoder ] Extracts latents (z) from target audio (training only)   -----------------------------------
-        if self.refinegan_latent is None:
+        if self.chouwa_latent is None:
             self.enc_q = PosteriorEncoder(
                 in_channels=spec_channels,
                 out_channels=inter_channels,
@@ -333,7 +333,7 @@ class Synthesizer(torch.nn.Module):
 
     def remove_weight_norm(self):
         """Removes weight normalization from the model."""
-        for module in [self.dec, self.flow, self.enc_q, self.refinegan_latent]:
+        for module in [self.dec, self.flow, self.enc_q, self.chouwa_latent]:
             if module is not None:
                 self._remove_weight_norm_from(module)
 
@@ -346,8 +346,8 @@ class Synthesizer(torch.nn.Module):
         to discard the ``logs_p`` half entirely, leaving those weights untrained
         and throwing away the encoder's uncertainty estimate.
         """
-        if self.refinegan_latent is not None and getattr(
-            self.refinegan_latent, "prior_uses_logs", False
+        if self.chouwa_latent is not None and getattr(
+            self.chouwa_latent, "prior_uses_logs", False
         ):
             return torch.cat((m_p, logs_p), dim=1)
         return m_p
@@ -370,13 +370,13 @@ class Synthesizer(torch.nn.Module):
 
     def set_training_step(self, step: int) -> None:
         """Update the discrete prior replacement schedule for the next batch."""
-        if self.refinegan_latent is not None:
-            self.refinegan_latent.set_training_step(step)
+        if self.chouwa_latent is not None:
+            self.chouwa_latent.set_training_step(step)
 
     def remove_training_modules(self) -> None:
         """Drop training-only posterior modules before exporting/inference."""
-        if self.refinegan_latent is not None:
-            self.refinegan_latent.remove_posterior()
+        if self.chouwa_latent is not None:
+            self.chouwa_latent.remove_posterior()
         self.enc_q = None
         self.flow = None
 
@@ -458,7 +458,7 @@ class Synthesizer(torch.nn.Module):
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
         if spec is not None:
-            if self.refinegan_latent is not None:
+            if self.chouwa_latent is not None:
                 conditioning = frame_conditioning(
                     spec,
                     pitchf,
@@ -468,7 +468,7 @@ class Synthesizer(torch.nn.Module):
                     self.use_frame_energy,
                     x_mask,
                 )
-                discrete_parts = self.refinegan_latent.forward_train(
+                discrete_parts = self.chouwa_latent.forward_train(
                     self._prior_content_stats(m_p, logs_p),
                     spec,
                     g,
@@ -572,7 +572,7 @@ class Synthesizer(torch.nn.Module):
         # TextEncoder
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
-        if self.refinegan_latent is not None:
+        if self.chouwa_latent is not None:
             temperature = max(1e-3, float(temperature))
             # Measured from the *source* spectrogram, by the same code the
             # trainer uses.  ``frame_conditioning`` returns None when the
@@ -587,7 +587,7 @@ class Synthesizer(torch.nn.Module):
                 self.use_frame_energy,
                 x_mask,
             )
-            content, detail, _, _, slow_detail, fast_detail = self.refinegan_latent.infer(
+            content, detail, _, _ = self.chouwa_latent.infer(
                 self._prior_content_stats(m_p, logs_p),
                 g,
                 x_mask,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import logging
+import os
 import re
 import sys
 from collections.abc import Iterable, Iterator
@@ -90,11 +91,28 @@ def progress_handle(progress: Progress, task_id: int) -> ProgressHandle:
     return ProgressHandle(progress, task_id)
 
 
+def _force_terminal() -> bool | None:
+    """Whether to write ANSI escapes even though the stream is not a TTY.
+
+    Hosted notebooks (Colab) pipe the process' stderr into the cell output and
+    render escape sequences there, but the pipe fails ``isatty()`` -- so Rich
+    strips every colour by default.  ``FORCE_COLOR``/``TTY_COMPATIBLE`` are the
+    user's override and Rich reads them itself, so only the Colab case is
+    decided here; ``None`` leaves the autodetection alone everywhere else.
+    """
+    if os.environ.get("FORCE_COLOR") or os.environ.get("TTY_COMPATIBLE"):
+        return None
+    if os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("COLAB_GPU"):
+        return True
+    return None
+
+
 def get_console() -> Console:
     global _console
     if _console is None:
         _console = Console(
             file=sys.stderr,
+            force_terminal=_force_terminal(),
             highlight=False,
             log_path=False,
             markup=False,

@@ -101,7 +101,9 @@ def get_pretrained_list():
 
 def get_pretrained_sample_rates(model):
     data = fetch_pretrained_data()
-    return list(data[model].keys())
+    if model not in data:
+        model = next(iter(data), None)
+    return list(data[model].keys()) if model else []
 
 
 def get_file_size(url):
@@ -121,6 +123,12 @@ def download_file(url, destination_path, progress_bar):
 
 def download_pretrained_model(model, sample_rate):
     data = fetch_pretrained_data()
+    if model not in data or sample_rate not in data[model]:
+        raise gr.Error(
+            message=_("{name} is not available at {rate}.").format(
+                name=model, rate=sample_rate
+            )
+        )
     paths = data[model][sample_rate]
     pretraineds_custom_path = os.path.join(
         "rvc", "models", "pretraineds", "custom"
@@ -164,9 +172,10 @@ def download_pretrained_model(model, sample_rate):
 
 
 def update_sample_rate_dropdown(model):
+    sample_rates = get_pretrained_sample_rates(model)
     return {
-        "choices": get_pretrained_sample_rates(model),
-        "value": get_pretrained_sample_rates(model)[0],
+        "choices": sample_rates,
+        "value": sample_rates[0] if sample_rates else None,
         "__type__": "update",
     }
 
@@ -204,18 +213,21 @@ def download_tab():
             outputs=[dropbox],
         )
         gr.Markdown(value=_("## Download Pretrained Models"))
+        pretrained_list = get_pretrained_list()
+        default_pretrained = pretrained_list[0] if pretrained_list else None
+        default_sample_rates = get_pretrained_sample_rates(default_pretrained)
         pretrained_model = gr.Dropdown(
             label=_("Pretrained"),
             info=_("Select the pretrained model you want to download."),
-            choices=get_pretrained_list(),
-            value="Titan",
+            choices=pretrained_list,
+            value=default_pretrained,
             interactive=True,
         )
         pretrained_sample_rate = gr.Dropdown(
             label=_("Sampling Rate"),
             info=_("And select the sampling rate."),
-            choices=get_pretrained_sample_rates(pretrained_model.value),
-            value="40k",
+            choices=default_sample_rates,
+            value=default_sample_rates[0] if default_sample_rates else None,
             interactive=True,
             allow_custom_value=True,
         )

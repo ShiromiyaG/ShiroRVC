@@ -175,7 +175,7 @@ def test_prior_losses_weight_each_dimension_by_its_own_multiplier():
         "content": torch.ones(1, 16, frames),
         "detail": torch.ones(1, 16, frames),
     }
-    _slow, loss_fast, _total = module.prior_losses(parts, mask=None)
+    loss_fast, _total = module.prior_losses(parts, mask=None)
 
     expected = 0.5 * module.kl_log_beta_fast.exp().sum()
     assert loss_fast == pytest.approx(float(expected), rel=1e-5)

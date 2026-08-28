@@ -202,8 +202,51 @@ def test_it_never_touches_the_discriminators_own_gradients(
     ), "the generator step must not write into the discriminator"
 
 
-def test_the_flag_that_selects_it_is_the_one_the_discriminator_carries():
-    """``branchwise`` is read off the discriminator rather than re-derived from
-    the config, so the R1 layout and the generator step cannot disagree."""
+def test_the_generator_flag_is_not_the_r1_flag():
+    """Two separate decisions, and they must not be read off one another.
+
+    ``d_branchwise`` changes what the run optimises: which branch R1 penalises,
+    how many ``loss_disc`` series exist, how the R1 strength controller is
+    grouped.  ``d_generator_branchwise`` changes only peak memory against step
+    time, with identical losses and gradients.  Tying them would make a memory
+    decision silently move the R1 layout.
+    """
     source = TRAIN_PY.read_text(encoding="utf-8")
-    assert 'getattr(discriminator_model, "branchwise", False)' in source
+    assert 'getattr(discriminator_model, "generator_branchwise", False)' in source
+    assert 'getattr(config.model, "d_generator_branchwise", True)' in source
+    # The R1 flag stays a constructor argument; the generator flag stays out of
+    # every discriminator signature.
+    assert 'branchwise=bool(getattr(config.model, "d_branchwise", True))' in source
+
+
+def test_both_configs_carry_the_generator_flag():
+    import json
+
+    for vocoder in ("chouwagan", "wavehax"):
+        config = json.loads(
+            (ROOT / "rvc" / "configs" / vocoder / "44100.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # The key has to be *present* so it is discoverable next to the other
+        # ``d_*`` options.  Its value is the run's to choose -- pinning True
+        # here would turn a memory decision into a test failure.
+        assert isinstance(config["model"]["d_generator_branchwise"], bool)
+
+
+def test_the_two_flags_move_independently(discriminator):
+    """A discriminator built with ``branchwise=False`` still accepts the
+    per-branch generator step, and vice versa: the loop walks
+    ``discriminators`` directly and never consults the R1 layout."""
+    assert discriminator.branchwise is True
+    assert discriminator.generator_branchwise is True
+
+    torch.manual_seed(0)
+    joint_r1 = chouwagan_d.ChouwaGANDiscriminator(
+        use_checkpointing=False, sample_rate=44100, branchwise=False
+    ).train()
+    assert joint_r1.branchwise is False
+    assert joint_r1.num_branches == 1
+    # Untouched by the R1 flag: it is the class default until the trainer sets
+    # it from ``d_generator_branchwise``.
+    assert joint_r1.generator_branchwise is True

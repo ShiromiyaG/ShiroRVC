@@ -53,7 +53,7 @@ def extract_small_model(
                 key: value.half()
                 for key, value in ckpt.items()
                 if "enc_q" not in key
-                and not key.startswith("refinegan_latent.posterior")
+                and not key.startswith("chouwa_latent.posterior")
 
             }
         )

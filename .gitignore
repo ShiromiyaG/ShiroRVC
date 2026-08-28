@@ -2,12 +2,6 @@
 !assets/audios/.gitkeep
 !assets/datasets/.gitkeep
 !assets/audios/audio-others/.gitkeep
-!logs/.gitkeep
-!logs/mute/
-!logs/mute_spin_v1/
-!logs/mute_spin_v2/
-!logs/reference/
-!logs/reference/**
 !rvc/models/pretraineds/.gitkeep
 !rvc/models/pretraineds/hifi-gan/.gitkeep
 !rvc/models/pretraineds/custom/.gitkeep
@@ -45,12 +39,20 @@ ffmpeg.exe
 
 # Application data and downloaded resources
 assets/audios/
-assets/datasets/
+assets/datasets/*
+!assets/datasets/.gitkeep
 assets/audios/audio-others/
 assets/training_presets/
 logs/*
+!logs/.gitkeep
 !logs/run_tensorboard_in_model_folder.bat
 !logs/run_tensorboard_in_model_folder.sh
+# The mute clips are inputs to preprocessing, not run output: extraction pads
+# every dataset with them, so a fresh clone cannot preprocess without them.
+!logs/mute/
+!logs/mute_spin_v1/
+!logs/mute_spin_v2/
+!logs/reference/
 rvc/models/pretraineds/
 rvc/models/pretraineds/hifi-gan
 rvc/models/pretraineds/custom

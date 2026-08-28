@@ -301,7 +301,7 @@ swap_start_step = 0  # Filled at resume: global_step when the swap was enabled
 swap_completed = False
 
 # Freezes the whole frontend: everything outside `dec.` and `emb_g.`
-# ( RefineGAN: enc_p + refinegan_latent / legacy VITS: enc_p + enc_q + flow )
+# ( VITS latent: enc_p + chouwa_latent / legacy VITS: enc_p + enc_q + flow )
 freeze_vae = False # If true, lets only vocoder ( dec ), spk embedding and discriminator learn
 
 # ----  Global LR scales  ----
@@ -631,6 +631,24 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
     )
 
 def get_d_model(config, vocoder, use_checkpointing):
+    """Build the discriminator and apply the trainer's execution policy.
+
+    ``d_branchwise`` is architecture-adjacent -- it decides what R1 penalises
+    and how many ``loss_disc`` series exist -- so it is a constructor argument.
+    ``d_generator_branchwise`` is not: it only decides whether the generator
+    step walks the branches one at a time, which is a peak-memory-against-step-
+    time trade with identical losses and gradients either way.  Setting it here
+    keeps it out of every discriminator's signature, and keeps the two
+    decisions from being read as one.
+    """
+    model = _build_d_model(config, vocoder, use_checkpointing)
+    model.generator_branchwise = bool(
+        getattr(config.model, "d_generator_branchwise", True)
+    )
+    return model
+
+
+def _build_d_model(config, vocoder, use_checkpointing):
     vocoder = normalize_vocoder(vocoder)
     discriminator_id = get_discriminator_id(vocoder)
     # JSON has no tuples, so a configured schedule arrives as nested lists.  The
@@ -651,6 +669,8 @@ def get_d_model(config, vocoder, use_checkpointing):
             # Per-branch driving: R1 rotated one branch at a time under its own
             # strength controller, plus a ``loss_disc`` series per branch.  Off
             # collapses all of that onto one branch; see ``branchwise.py``.
+            # This is *not* the generator step's per-branch execution -- that is
+            # ``d_generator_branchwise``, applied in ``get_d_model``.
             branchwise=bool(getattr(config.model, "d_branchwise", True)),
             # Sliced-adversarial heads.  Off falls back to plain LSGAN logits,
             # and ``_constant_discriminator_loss`` moves the governor's floor
@@ -782,7 +802,6 @@ def _ablation_margin(
     sid,
     target,
     full_output,
-    branch,
     dimension,
     margin,
 ):
@@ -819,9 +838,8 @@ def _ablation_margin(
     be dense enough to steer.
     """
     with torch.no_grad():
-        ablated_detail, _, _ = discrete_model.ablate_dimension(
+        ablated_detail = discrete_model.ablate_dimension(
             discrete_parts,
-            branch,
             dimension,
             discrete_parts["content"].shape[-1],
         )
@@ -925,9 +943,10 @@ def _branchwise_generator_terms(
     The joint path holds every branch's feature maps and activation graph alive
     at once, from the forward until the single ``loss_gan`` backward, which is
     at the far end of the step: one copy of the largest intermediate tensors in
-    the step per branch, held across every reconstruction loss in between.  Here each branch is forwarded on a *detached* copy of the
-    waveform, differentiated immediately, and dropped before the next one
-    starts, so the peak holds one branch instead of all of them.  What survives
+    the step per branch, held across every reconstruction loss in between.
+    Here each branch is forwarded on a *detached* copy of the waveform,
+    differentiated immediately, and dropped before the next one starts, so the
+    peak holds one branch instead of all of them.  What survives
     the loop is two waveform-shaped gradients, which are the same size as
     ``y_hat``.
 
@@ -2152,13 +2171,13 @@ def _generator_gradient_metrics(net_g):
         if name.startswith("enc_p."):
             group = "content_encoder"
         elif (
-            name.startswith("refinegan_latent.posterior_fast_head")
-            or name.startswith("refinegan_latent.fast_to_")
+            name.startswith("chouwa_latent.posterior_fast_head")
+            or name.startswith("chouwa_latent.fast_to_")
         ):
             group = "latent"
-        elif name.startswith("refinegan_latent.posterior"):
+        elif name.startswith("chouwa_latent.posterior"):
             group = "posterior"
-        elif name.startswith("refinegan_latent.prior"):
+        elif name.startswith("chouwa_latent.prior"):
             group = "prior"
         elif name.startswith("dec."):
             group = "decoder"
@@ -2263,7 +2282,7 @@ def apply_frontend_freeze(net_g, rank):
     Freeze the frontend for fine-tuning, driven by the `freeze_vae` flag.
 
     Everything outside `dec.` and `emb_g.` is frozen, which on RefineGAN means
-    `enc_p` plus the SVAE prior/posterior under `refinegan_latent`.
+    `enc_p` plus the SVAE prior/posterior under `chouwa_latent`.
     """
     if not freeze_vae:
         if rank == 0:
@@ -2287,7 +2306,7 @@ def apply_finetune_freezes(net_g, rank):
         return
 
     model = net_g.module if hasattr(net_g, "module") else net_g
-    discrete = getattr(model, "refinegan_latent", None)
+    discrete = getattr(model, "chouwa_latent", None)
     if discrete is None:
         return
 
@@ -3693,13 +3712,9 @@ def training_loop(
         "loss_fm": deque(maxlen=rolling_loss_steps),
         "loss_spectral": deque(maxlen=rolling_loss_steps),
         "loss_prior": deque(maxlen=rolling_loss_steps),
-        "loss_prior_slow": deque(maxlen=rolling_loss_steps),
         "loss_prior_fast": deque(maxlen=rolling_loss_steps),
-        "prior_kl_slow": deque(maxlen=rolling_loss_steps),
         "prior_kl_fast": deque(maxlen=rolling_loss_steps),
-        "prior_std_slow": deque(maxlen=rolling_loss_steps),
         "prior_std_fast": deque(maxlen=rolling_loss_steps),
-        "posterior_std_slow": deque(maxlen=rolling_loss_steps),
         "posterior_std_fast": deque(maxlen=rolling_loss_steps),
         "scale_anchor": deque(maxlen=rolling_loss_steps),
         "prior_replacement": deque(maxlen=rolling_loss_steps),
@@ -3770,11 +3785,8 @@ def training_loop(
         2, rolling_loss_steps // max(1, diagnostics_interval)
     )
     for key in (
-        "prior_kl_slow",
         "prior_kl_fast",
-        "prior_std_slow",
         "prior_std_fast",
-        "posterior_std_slow",
         "posterior_std_fast",
         "scale_anchor",
         "prior_replacement",
@@ -3786,16 +3798,12 @@ def training_loop(
         "content_rms",
         "posterior_detail_rms",
         "prior_detail_rms",
-        "kl_beta_slow",
         "kl_beta_fast",
         # Collapse detectors.  The rate controller targets the per-dim *mean*,
         # which a collapsed latent satisfies exactly, so none of the series
         # above can show the latent concentrating into a handful of dimensions.
-        "kl_effective_dims_slow",
         "kl_effective_dims_fast",
-        "kl_above_floor_slow",
         "kl_above_floor_fast",
-        "kl_median_slow",
         "kl_median_fast",
     ):
         avg_rolling_cache[key] = deque(maxlen=diagnostic_window)
@@ -3827,10 +3835,10 @@ def training_loop(
     adv_warmup_steps = 0 if finetune_phase else max(
         0, int(getattr(config.train, "adv_warmup_steps", 2000))
     )
-    refinegan_latent = None
+    chouwa_latent = None
     if refinegan_active:
         model_g = net_g.module if hasattr(net_g, "module") else net_g
-        refinegan_latent = getattr(model_g, "refinegan_latent", None)
+        chouwa_latent = getattr(model_g, "chouwa_latent", None)
     prior_loss_weight = max(
         0.0,
         float(getattr(config.train, "prior_loss_weight", PRIOR_LOSS_WEIGHT_DEFAULT)),
@@ -3853,8 +3861,8 @@ def training_loop(
     # past.  A value equal to the default says nothing about intent.
     if (
         rank == 0
-        and refinegan_latent is not None
-        and refinegan_latent.kl_rate_control_active
+        and chouwa_latent is not None
+        and chouwa_latent.kl_rate_control_active
     ):
         overridden = []
         if prior_loss_weight != PRIOR_LOSS_WEIGHT_DEFAULT:
@@ -3866,12 +3874,10 @@ def training_loop(
             overridden.append(f"prior_warmup_steps={prior_warmup_steps}")
         if overridden:
             warning(
-                f"KL rate control is active (targets slow="
-                f"{refinegan_latent.kl_target_slow}, fast="
-                f"{refinegan_latent.kl_target_fast}), so it sets the KL weight "
+                f"KL rate control is active (target "
+                f"{chouwa_latent.kl_target_fast}), so it sets the KL weight "
                 f"itself and ignores {', '.join(overridden)}. Change "
-                "kl_target_slow/_fast to move the "
-                "prior/posterior balance.",
+                "kl_target to move the prior/posterior balance.",
                 tag="[INIT]",
             )
     ablation_interval = 0 if finetune_phase else max(
@@ -4065,7 +4071,7 @@ def training_loop(
                 y_hat, ids_slice, x_mask, z_mask, vae_parts = model_output
 
                 discrete_parts = None
-                if refinegan_latent is not None:
+                if chouwa_latent is not None:
                     discrete_parts = vae_parts
                     z = z_p = m_q = logs_q = None
                     m_p = None
@@ -4247,10 +4253,12 @@ def training_loop(
                 for parameter in discriminator_model.parameters():
                     parameter.requires_grad_(False)
 
-                # ``d_branchwise`` now governs the generator step as well as
-                # R1.  Off, this is the joint forward it always was.
+                # ``d_generator_branchwise``, which is a memory decision and
+                # deliberately not ``d_branchwise``: the R1 layout is a
+                # separate question.  Off, this is the joint forward it always
+                # was.
                 branchwise_generator = bool(
-                    getattr(discriminator_model, "branchwise", False)
+                    getattr(discriminator_model, "generator_branchwise", False)
                 )
                 if branchwise_generator:
                     branch_terms = _branchwise_generator_terms(
@@ -4283,7 +4291,6 @@ def training_loop(
             # Compute generator losses:
             loss_ablation = torch.zeros((), device=y.device)
             ablation_delta = None
-            ablation_branch = None
             ablation_dimension = None
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
 
@@ -4386,29 +4393,20 @@ def training_loop(
                 # load-bearing.  ``loss_ablation`` is still scaled by the weight
                 # below, so a weight of zero costs exactly the forward pass.
                 if (
-                    refinegan_latent is not None
+                    chouwa_latent is not None
                     and ablation_interval > 0
                     and global_step % ablation_interval == 0
                 ):
-                    slow_dimension_count = len(refinegan_latent.slow_levels)
-                    fast_dimension_count = len(refinegan_latent.fast_levels)
-                    total_dimension_count = slow_dimension_count + fast_dimension_count
-                    selected_dimension = int(
+                    ablation_dimension = int(
                         torch.randint(
-                            total_dimension_count,
+                            len(chouwa_latent.fast_levels),
                             (),
                             device=y.device,
                         ).item()
                     )
-                    if selected_dimension < slow_dimension_count:
-                        ablation_branch = "slow"
-                        ablation_dimension = selected_dimension
-                    else:
-                        ablation_branch = "fast"
-                        ablation_dimension = selected_dimension - slow_dimension_count
                     ablation_raw, ablation_delta, _ = _ablation_margin(
                         model_g,
-                        refinegan_latent,
+                        chouwa_latent,
                         discrete_parts,
                         ids_slice,
                         config.train.segment_size // config.data.hop_length,
@@ -4416,7 +4414,6 @@ def training_loop(
                         sid,
                         y,
                         y_hat,
-                        ablation_branch,
                         ablation_dimension,
                         ablation_margin,
                     )
@@ -4454,15 +4451,14 @@ def training_loop(
                         use_softplus=san_active,
                     )
 
-                loss_prior_slow = torch.zeros((), device=y.device)
                 loss_prior_fast = torch.zeros((), device=y.device)
                 loss_prior = torch.zeros((), device=y.device)
                 discrete_diagnostics = {}
-                if refinegan_latent is not None:
-                    loss_prior_slow, loss_prior_fast, raw_prior_loss = (
-                        refinegan_latent.prior_losses(discrete_parts, x_mask)
+                if chouwa_latent is not None:
+                    loss_prior_fast, raw_prior_loss = chouwa_latent.prior_losses(
+                        discrete_parts, x_mask
                     )
-                    if refinegan_latent.kl_rate_control_active:
+                    if chouwa_latent.kl_rate_control_active:
                         # The rate controller owns the KL weight: applying the
                         # fixed weight and warmup on top would fight its own
                         # feedback loop.
@@ -4474,7 +4470,7 @@ def training_loop(
                             prior_progress = 1.0
                         loss_prior = raw_prior_loss * prior_loss_weight * prior_progress
                     if global_step % diagnostics_interval == 0:
-                        discrete_diagnostics = refinegan_latent.diagnostics(
+                        discrete_diagnostics = chouwa_latent.diagnostics(
                             discrete_parts,
                             x_mask,
                         )
@@ -4622,7 +4618,7 @@ def training_loop(
                 loss_gen_total = loss_core + loss_gan
                 if rank == 0 and ablation_delta is not None:
                     writer.add_scalar(
-                        f"diag/ablation_delta/{ablation_branch}_dim_{ablation_dimension}",
+                        f"diag/ablation_delta/dim_{ablation_dimension}",
                         ablation_delta.item(),
                         global_step,
                     )
@@ -5051,7 +5047,6 @@ def training_loop(
                     part_key, deque(maxlen=rolling_loss_steps)
                 ).append(part_value.detach())
             avg_rolling_cache["loss_prior"].append(loss_prior.detach())
-            avg_rolling_cache["loss_prior_slow"].append(loss_prior_slow.detach())
             avg_rolling_cache["loss_prior_fast"].append(loss_prior_fast.detach())
             if refinegan_active:
                 avg_rolling_cache["loss_envelope"].append(loss_envelope.detach())
@@ -5062,11 +5057,8 @@ def training_loop(
                 avg_rolling_cache["loss_kl"].append(loss_kl.detach())
             if discrete_diagnostics:
                 for key in (
-                    "prior_kl_slow",
                     "prior_kl_fast",
-                    "prior_std_slow",
                     "prior_std_fast",
-                    "posterior_std_slow",
                     "posterior_std_fast",
                     "scale_anchor",
                     "prior_replacement",
@@ -5074,18 +5066,15 @@ def training_loop(
                     "content_rms",
                     "posterior_detail_rms",
                     "prior_detail_rms",
-                    "kl_effective_dims_slow",
                     "kl_effective_dims_fast",
-                    "kl_above_floor_slow",
                     "kl_above_floor_fast",
-                    "kl_median_slow",
                     "kl_median_fast",
                 ):
                     if key in discrete_diagnostics:
                         avg_rolling_cache[key].append(
                             discrete_diagnostics[key].detach()
                         )
-                for key in ("kl_beta_slow", "kl_beta_fast"):
+                for key in ("kl_beta_fast",):
                     if key in discrete_diagnostics:
                         avg_rolling_cache.setdefault(
                             key,

@@ -77,7 +77,7 @@ def extract_model(
         def is_training_only_key(key):
             return (
                 "enc_q" in key
-                or key.startswith("refinegan_latent.posterior")
+                or key.startswith("chouwa_latent.posterior")
 
             )
 

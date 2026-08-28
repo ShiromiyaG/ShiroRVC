@@ -36,8 +36,10 @@ measurements in this repo argued for:
 
 The single latent branch is called "fast" throughout -- ``fast_to_content``,
 ``kl_fast_per_dim``, ``posterior_fast_head`` -- because train.py groups
-parameters and names metric series off exactly those prefixes.  The "slow"
-slots stay empty, so the shared logging simply omits them.
+parameters and names metric series off exactly those prefixes.  There was a
+matching set of "slow" slots, empty in every code path since the two-rate SVAE
+was removed; they were deleted on 2026-08-27 along with the branch argument
+they existed to make meaningful.
 """
 
 from __future__ import annotations
@@ -157,8 +159,23 @@ class EBranchformerBlock(nn.Module):
         value = norm(value)
         return value if mask is None else value * mask
 
-    def forward(self, value: Tensor, mask: Optional[Tensor]) -> Tensor:
+    def forward(
+        self,
+        value: Tensor,
+        mask: Optional[Tensor],
+        film_scale: Optional[Tensor] = None,
+        film_shift: Optional[Tensor] = None,
+    ) -> Tensor:
         mask = _resize_mask(mask, value.shape[-1])
+        if film_scale is not None:
+            # Per-block speaker FiLM (VITS2's speaker-conditioned encoder):
+            # zero-initialised, so this is the identity at init and only grows
+            # a per-layer speaker signal as training finds it useful, instead
+            # of relying on the single additive injection at the stack's input
+            # to survive four layers of LayerNorm.
+            value = value * (1.0 + film_scale) + film_shift
+            if mask is not None:
+                value = value * mask
         # ``(batch, 1, 1, key)`` broadcasts over heads and query positions.  The
         # key set always retains at least one real frame, so no query row is
         # fully masked and the softmax cannot produce NaN.
@@ -231,8 +248,12 @@ class SpectrogramFrequencyStem(nn.Module):
 class RefineVitsLatent(nn.Module):
     """Posterior + normalizing flow latent frontend, decoder-agnostic.
 
-    The name is kept because ``Synthesizer.refinegan_latent`` is a checkpoint
-    key prefix: renaming it would orphan every weight under it.
+    Attached to the synthesizer as ``chouwa_latent``, which makes that string a
+    checkpoint key prefix: every weight in this module is stored under it, and
+    ``net_g`` loads non-strictly, so renaming the attribute again would leave
+    the whole latent silently at its initialisation rather than failing.  It
+    was ``refinegan_latent`` until 2026-08-27; checkpoints written before that
+    do not load into this class.
     """
 
     architecture_id = ARCHITECTURE_ID
@@ -291,17 +312,13 @@ class RefineVitsLatent(nn.Module):
         self.detail_channels = int(detail_channels)
         self.latent_channels = int(latent_channels)
 
-        # One branch.  The empty ``slow_levels`` keeps the shared ablation
-        # sampler and the shared logging from ever selecting a slow dimension.
-        self.slow_levels: Tuple[int, ...] = ()
+        # One branch.  ``fast_levels`` is what the ablation sampler draws a
+        # dimension from.
         self.fast_levels = tuple(range(self.latent_channels))
-        self.slow_latent_channels = 0
         self.fast_latent_channels = self.latent_channels
 
         self.kl_free_bits_fast = float(kl_free_bits)
-        self.kl_free_bits_slow = float(kl_free_bits)
         self.kl_target_fast = max(0.0, float(kl_target))
-        self.kl_target_slow = 0.0
         self.kl_beta_lr = max(0.0, float(kl_beta_lr))
         self.kl_beta_min = max(1e-8, float(kl_beta_min))
         self.kl_beta_max = max(self.kl_beta_min, float(kl_beta_max))
@@ -348,6 +365,24 @@ class RefineVitsLatent(nn.Module):
         self.prior_f0 = nn.Conv1d(2, int(prior_hidden_channels), 1)
         self.prior_speaker = nn.Conv1d(int(gin_channels), int(prior_hidden_channels), 1)
 
+        # VITS2-style speaker-conditioned encoder: FiLM (scale, shift) fed to
+        # every EBranchformer block, on top of the single additive injection
+        # above -- that injection alone has to survive `prior_blocks` rounds of
+        # LayerNorm before reaching the prior head, and each norm is free to
+        # wash part of it out.  Zero-initialised so training starts identical
+        # to the pre-FiLM model and only opens this path where it helps.
+        self.prior_speaker_film = nn.Conv1d(
+            int(gin_channels), int(prior_hidden_channels) * 2, 1
+        )
+        nn.init.zeros_(self.prior_speaker_film.weight)
+        nn.init.zeros_(self.prior_speaker_film.bias)
+
+        # ``prior_blocks = 0`` is the off switch for the E-Branchformer stack:
+        # the loop in ``_prior_features`` then runs zero times and the prior
+        # head reads the summed projections directly, which makes the prior a
+        # linear, frame-local map of content + f0 + speaker.  It is a config
+        # value rather than a second boolean because "how many" already answers
+        # "whether".
         self.prior_blocks = nn.ModuleList(
             [
                 EBranchformerBlock(prior_hidden_channels, prior_heads, prior_kernel_size)
@@ -512,10 +547,12 @@ class RefineVitsLatent(nn.Module):
                 1,
             )
         value = value + self.prior_f0(_resize_sequence(f0, content_stats.shape[-1]))
+        film_scale = film_shift = None
         if g is not None:
             value = value + self.prior_speaker(g).expand(-1, -1, value.shape[-1])
+            film_scale, film_shift = self.prior_speaker_film(g).chunk(2, dim=1)
         for block in self.prior_blocks:
-            value = self._maybe_checkpoint(block, value, mask)
+            value = self._maybe_checkpoint(block, value, mask, film_scale, film_shift)
         return value if mask is None else value * mask
 
     def _posterior_distribution(self, spec, condition, g, mask):
@@ -543,11 +580,7 @@ class RefineVitsLatent(nn.Module):
 
     def _latent_to_decoder(self, z: Tensor, target_length: int):
         resized = _resize_sequence(z, target_length)
-        content = self.fast_to_content(resized)
-        detail = self.fast_to_detail(resized)
-        # One branch, so the slow half of the decoder's detail contract is the
-        # zero tensor rather than a second projection.
-        return content, detail, torch.zeros_like(detail), detail
+        return self.fast_to_content(resized), self.fast_to_detail(resized)
 
     # -- the training pass ---------------------------------------------------
 
@@ -609,12 +642,10 @@ class RefineVitsLatent(nn.Module):
                 prior_replacement = z.new_zeros(())
                 prior_replacement_mean = z.new_zeros(())
 
-        content_out, detail, slow_detail, fast_detail = self._latent_to_decoder(
-            z, content_stats.shape[-1]
-        )
+        content_out, detail = self._latent_to_decoder(z, content_stats.shape[-1])
         with torch.no_grad():
             with torch.autocast(device_type=device_type, enabled=False):
-                _, prior_detail, _, _ = self._latent_to_decoder(
+                _, prior_detail = self._latent_to_decoder(
                     self.flow(
                         prior[0], flow_mask,
                         g=g.float() if g is not None else None, reverse=True,
@@ -625,8 +656,6 @@ class RefineVitsLatent(nn.Module):
         return {
             "content": content_out,
             "detail": detail,
-            "detail_slow": slow_detail,
-            "detail_fast": fast_detail,
             "posterior_fast_distribution": posterior,
             "prior_fast_distribution": prior,
             "posterior_z_p": z_p,
@@ -708,16 +737,15 @@ class RefineVitsLatent(nn.Module):
         anchor = self._scale_anchor(parts)
         parts["scale_anchor"] = anchor.detach()
 
-        zero = dims.new_zeros(())
         if not self.kl_rate_control_active:
             parts["kl_beta_fast"] = dims.new_ones(())
             total_fast = clamped.sum()
-            return zero, total_fast, total_fast + anchor
+            return total_fast, total_fast + anchor
 
         beta = self._kl_beta(dims, self.kl_target_fast).detach()
         parts["kl_beta_fast"] = beta.mean()
         loss_fast = (clamped * beta).sum()
-        return zero, loss_fast, loss_fast + anchor
+        return loss_fast, loss_fast + anchor
 
     @staticmethod
     def _kl_effective_dims(per_dim: Tensor) -> Tensor:
@@ -752,13 +780,15 @@ class RefineVitsLatent(nn.Module):
                 "kl_fast_per_dim": fast_kl,
             }
 
-    def ablate_dimension(self, parts, branch: str, dimension: int, target_length: int):
-        if str(branch).lower() != "fast":
-            raise ValueError("The VITS frontend has a single latent branch.")
+    def ablate_dimension(self, parts, dimension: int, target_length: int) -> Tensor:
+        """The decoder's ``detail`` with one latent dimension zeroed.
+
+        There is one branch, so the dimension index addresses it directly; the
+        ``branch`` argument this used to take could only ever be ``"fast"``.
+        """
         z = parts["posterior_fast_values"].clone()
         z[:, int(dimension)] = 0.0
-        _, detail, slow_detail, fast_detail = self._latent_to_decoder(z, target_length)
-        return detail, slow_detail, fast_detail
+        return self._latent_to_decoder(z, target_length)[1]
 
     # -- inference -----------------------------------------------------------
 
@@ -785,10 +815,8 @@ class RefineVitsLatent(nn.Module):
             else _resize_mask(mask, z_p.shape[-1]).to(z_p.dtype)
         )
         z = self.flow(z_p, flow_mask, g=g, reverse=True)
-        content_out, detail, slow_detail, fast_detail = self._latent_to_decoder(
-            z, content_stats.shape[-1]
-        )
-        return content_out, detail, z, z, slow_detail, fast_detail
+        content_out, detail = self._latent_to_decoder(z, content_stats.shape[-1])
+        return content_out, detail, z, z
 
     def remove_posterior(self) -> None:
         self.posterior_input = None

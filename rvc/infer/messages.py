@@ -1,7 +1,7 @@
 DISCRETE_INFERENCE_MODE_LABEL = "ChouwaGAN latent inference mode"
 DISCRETE_INFERENCE_MODE_INFO = (
     "Deterministic uses the prior mean; stochastic samples the continuous "
-    "slow and fast latent distributions used by ChouwaGAN."
+    "latent distribution used by ChouwaGAN."
 )
 DISCRETE_TEMPERATURE_LABEL = "ChouwaGAN latent temperature"
 DISCRETE_TEMPERATURE_INFO = (

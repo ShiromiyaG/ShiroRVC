@@ -30,9 +30,7 @@ REQUIRED_METHODS = (
 )
 REQUIRED_ATTRIBUTES = (
     "architecture_id",
-    "slow_levels",
     "fast_levels",
-    "kl_target_slow",
     "kl_target_fast",
     "kl_rate_control_active",
     "posterior_available",
@@ -98,23 +96,23 @@ def test_forward_train_emits_every_key_the_decoder_and_trainer_read():
     for key in (
         "content",
         "detail",
-        "detail_slow",
-        "detail_fast",
         "prior_replacement",
         "prior_replacement_mean",
     ):
         assert key in parts, key
     assert parts["content"].shape[1] == 32
     assert parts["detail"].shape[1] == 16
-    assert parts["detail_slow"].shape == parts["detail_fast"].shape
+    # The two-rate SVAE's "slow" halves are gone; the decoder's contract is the
+    # content/detail pair and nothing beside it.
+    assert "detail_slow" not in parts and "detail_fast" not in parts
 
 
 def test_losses_and_diagnostics_are_finite_and_differentiable():
     model = _build().train()
     model.set_training_step(10_000)
     parts = model.forward_train(**_inputs(model))
-    slow, fast, total = model.prior_losses(parts, torch.ones(2, 1, 24))
-    assert float(slow) == 0.0            # one branch: the slow slot stays empty
+    fast, total = model.prior_losses(parts, torch.ones(2, 1, 24))
+    assert torch.isfinite(fast)
     assert torch.isfinite(total)
     total.backward()
     assert model.prior_content.weight.grad is not None
@@ -123,19 +121,26 @@ def test_losses_and_diagnostics_are_finite_and_differentiable():
     diagnostics = model.diagnostics(parts, torch.ones(2, 1, 24))
     assert "kl_fast_per_dim" in diagnostics
     assert diagnostics["kl_fast_per_dim"].numel() == 64
-    # The shared logger only emits keys that are present, so the absent slow
-    # entries must simply not be there rather than be zeros.
-    assert not any(key.startswith("kl_slow") for key in diagnostics)
+    # The shared logger only emits keys that are present, and there is no
+    # second branch to emit: a "slow" series would be a permanent zero line.
+    assert not any("slow" in key for key in diagnostics)
     for value in diagnostics.values():
         assert torch.isfinite(value).all()
 
 
-def test_ablation_sampler_can_never_pick_a_slow_dimension():
+def test_the_ablation_sampler_addresses_the_one_branch_directly():
+    """``fast_levels`` is the whole index space the trainer draws from, and
+    ``ablate_dimension`` no longer takes a branch to disambiguate."""
     model = _build()
-    assert len(model.slow_levels) == 0
     assert len(model.fast_levels) == model.latent_channels
-    with pytest.raises(ValueError):
-        model.ablate_dimension({}, "slow", 0, 8)
+    assert not hasattr(model, "slow_levels")
+
+    model.train()
+    model.set_training_step(10_000)
+    parts = model.forward_train(**_inputs(model))
+    ablated = model.ablate_dimension(parts, 0, parts["content"].shape[-1])
+    assert ablated.shape == parts["detail"].shape
+    assert not torch.equal(ablated, parts["detail"])
 
 
 def test_prior_replacement_reaches_the_flow_and_the_prior():
@@ -192,7 +197,7 @@ def test_remove_posterior_keeps_the_flow():
 def test_parameter_names_land_in_the_trainer_groups():
     """train.py groups by prefix; names outside those prefixes fall to 'other'."""
     model = _build()
-    known = ("posterior", "prior", "fast_to_", "slow_to_", "content", "flow")
+    known = ("posterior", "prior", "fast_to_", "content", "flow")
     unmatched = {
         name
         for name, _ in model.named_parameters()

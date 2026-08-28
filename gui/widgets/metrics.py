@@ -60,10 +60,9 @@ PRESETS: dict[str, list[str]] = {
         "grad_norm_g", "grad_norm_d", "grad_norm_d_r1", "grad_clip_hit_rate_g",
     ],
     "Latent": [
-        "loss_prior_slow", "loss_prior_fast", "prior_kl_slow", "prior_kl_fast",
-        "prior_replacement",
+        "loss_prior_fast", "prior_kl_fast", "prior_replacement",
     ],
-    "Schedule": ["lr_g", "lr_d", "kl_beta_slow", "kl_beta_fast"],
+    "Schedule": ["lr_g", "lr_d", "kl_beta_fast"],
 }
 
 

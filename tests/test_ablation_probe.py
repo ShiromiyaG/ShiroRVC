@@ -58,7 +58,7 @@ def test_the_probe_still_respects_its_interval(source):
     guard = _probe_guard(source)
     names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
     assert "ablation_interval" in names
-    assert "refinegan_latent" in names
+    assert "chouwa_latent" in names
 
 
 def test_the_loss_is_still_scaled_by_its_weight(source):
