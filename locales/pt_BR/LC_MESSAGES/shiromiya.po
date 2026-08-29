@@ -2263,6 +2263,9 @@ msgstr "{label} · {n} amostra(s){detail}"
 msgid "{label}, {sample} — the generated clip is the model's own inference path, so it is what conversion will sound like."
 msgstr "{label}, {sample} — o clipe gerado usa o próprio caminho de inferência do modelo, então é assim que a conversão vai soar."
 
+msgid "{name} is not available at {rate}."
+msgstr "{name} não esta disponível em {rate}."
+
 msgid "{name} saved in {folder}"
 msgstr "{name} salvo em {folder}"
 

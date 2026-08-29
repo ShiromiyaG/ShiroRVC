@@ -204,3 +204,47 @@ def test_holdout_evaluator_passes_the_spectrogram():
     assert "model.infer(" in body
     call = body.split("model.infer(", 1)[1].split(")", 1)[0]
     assert "spec" in call, call
+
+
+def test_frame_energy_does_not_depend_on_how_the_audio_was_cut_up():
+    """The same audio must measure the same whether or not it was split.
+
+    ``frame_energy`` is relative to a mean, and the two sides of the model cut
+    audio differently: training reads 3 s preprocessing slices, the inference
+    pipeline cuts long files into ~38 s segments.  While that mean was taken
+    over "whatever tensor arrived", the same frame scored differently on each
+    side and stepped at every cut -- which is inaudible in any metric and
+    audible in the output.  A fixed-duration window removes the dependency.
+    """
+    rng = np.random.default_rng(0)
+    seconds = 24
+    frames = seconds * TRAIN_SR // TRAIN_HOP
+    # A loud half and a half 12 dB quieter, so a whole-tensor mean and a local
+    # one genuinely disagree.
+    time = np.arange(seconds * TRAIN_SR) / TRAIN_SR
+    quiet = np.where(time < seconds / 2, 1.0, 10 ** (-12 / 20))
+    audio = (np.sin(2 * np.pi * 220 * time) * quiet * 0.3).astype(np.float32)
+    audio += 0.01 * rng.standard_normal(audio.size).astype(np.float32)
+
+    def energy(samples):
+        spec = spectrogram_for_features(
+            torch.from_numpy(samples), TRAIN_NFFT, TRAIN_HOP
+        )
+        return frame_energy(spec.unsqueeze(0))[0, 0]
+
+    whole = energy(audio)
+    cut = TRAIN_SR * seconds // 2
+    halves = torch.cat((energy(audio[:cut]), energy(audio[cut:])))
+
+    n = min(whole.shape[-1], halves.shape[-1])
+    # Frames within half a window of the seam see edge padding instead of their
+    # true neighbours; everything further away must agree closely.
+    from rvc.lib.algorithm.frame_features import ENERGY_REFERENCE_FRAMES
+
+    margin = ENERGY_REFERENCE_FRAMES
+    seam = cut // TRAIN_HOP
+    interior = torch.ones(n, dtype=torch.bool)
+    interior[max(0, seam - margin) : seam + margin] = False
+    difference = (whole[:n] - halves[:n])[interior].abs().max()
+    assert difference < 0.05, difference
+    assert frames > 0

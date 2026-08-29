@@ -205,24 +205,58 @@ class NoiseInjection(nn.Module):
 
 
 class AntiAliasedSnakeBeta(nn.Module):
-    """SnakeBeta surrounded by a 2x low-pass resampling pair."""
+    """SnakeBeta, optionally surrounded by a 2x low-pass resampling pair.
 
-    def __init__(self, channels: int, rolloff: float = 0.95):
+    The pair is the single most expensive thing in this decoder.  Measured on
+    CPU at batch 8 / 0.4 s, removing it from all 21 activations takes the
+    decoder from 782 ms to 469 ms -- **40%** -- which is why a 3.9 M ChouwaGAN
+    runs slower than a 15.7 M NSF-HiFiGAN that has no such pair at all.
+
+    ``filter_width`` used to be hardcoded to 4 here while
+    ``chouwagan_filter_width`` was threaded everywhere else, so the config key
+    reached the excitation encoder and the upsamplers but *not* the 21
+    activations that carry the cost.  Setting it to 2 measured as a 2% change,
+    i.e. noise, because it was not connected to anything that mattered.  It is
+    connected now: 4 gives a 17-tap kernel, 2 gives 9.
+
+    ``antialias=False`` drops the pair entirely.  It changes no parameter --
+    ``alpha`` and ``beta`` are the only weights -- so the choice is free to make
+    per stage without touching the state dict.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        rolloff: float = 0.95,
+        filter_width: int = 4,
+        antialias: bool = True,
+    ):
         super().__init__()
         initial = math.log(math.expm1(1.0))
         self.alpha = nn.Parameter(torch.full((channels,), initial))
         self.beta = nn.Parameter(torch.full((channels,), initial))
-        self.upsample = AntiAliasedUpsample1d(2, filter_width=4, rolloff=rolloff)
-        self.downsample = FixedLowPass1d(2, width=4, rolloff=rolloff, stride=2)
+        self.antialias = bool(antialias)
+        if self.antialias:
+            self.upsample = AntiAliasedUpsample1d(
+                2, filter_width=int(filter_width), rolloff=rolloff
+            )
+            self.downsample = FixedLowPass1d(
+                2, width=int(filter_width), rolloff=rolloff, stride=2
+            )
+        else:
+            self.upsample = self.downsample = None
 
-    def forward(self, x: Tensor) -> Tensor:
-        original_length = x.shape[-1]
-        x = self.upsample(x)
-
+    def _snake(self, x: Tensor) -> Tensor:
         alpha = F.softplus(self.alpha).view(1, -1, 1) + 1e-4
         beta = F.softplus(self.beta).view(1, -1, 1) + 1e-4
-        x = x + torch.sin(alpha * x).square() / beta
+        return x + torch.sin(alpha * x).square() / beta
 
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.antialias:
+            return self._snake(x)
+        original_length = x.shape[-1]
+        x = self.upsample(x)
+        x = self._snake(x)
         x = self.downsample(x)
         if x.shape[-1] > original_length:
             x = x[..., :original_length]
@@ -334,10 +368,28 @@ class BandLimitedNSFSource(nn.Module):
             # whatever the measurement says.
             harmonicity = harmonicity.clamp(0.0, 1.0) * voiced_envelope
 
-        phase = torch.cumsum(
-            2.0 * math.pi * f0 / self.sample_rate,
-            dim=-1,
-        )
+        # Accumulated in cycles, in float64, and wrapped to ``[0, 1)`` before
+        # anything multiplies it by a harmonic index.
+        #
+        # This used to be a float32 ``cumsum`` of radians, unbounded, feeding
+        # ``sin(phase * h)`` with ``h`` up to ``harmonic_count``.  The phase of
+        # the top harmonic therefore reached 4.8e6 rad over a 30 s span, where
+        # a float32 ULP is 0.5 rad, and the error *grows along the span*:
+        # measured against float64 at 200 Hz, the h=128 term is off by -62 dB
+        # over 0.4 s, -44 dB over 3 s and **-24 dB over 30 s**.  Training reads
+        # ``segment_size`` samples -- 0.4 s, where this is inaudible -- while
+        # validation previews and the inference pipeline render a whole span,
+        # so the decoder is never taught to cancel a defect it only ever meets
+        # at generation time.  Broadband phase noise on the upper harmonics is
+        # what "metallic" sounds like.
+        #
+        # Wrapping is exact rather than an approximation: ``frac(c)`` differs
+        # from ``c`` by an integer, ``h`` is an integer, so their product
+        # differs by an integer number of cycles and ``sin`` does not see it.
+        # The float64 accumulation is what keeps the wrap itself honest -- the
+        # running total is unbounded before ``frac`` takes it.
+        cycles = torch.cumsum(f0.double() / self.sample_rate, dim=-1)
+        phase = ((2.0 * math.pi) * (cycles - cycles.floor())).to(f0.dtype)
         harmonics = torch.arange(
             1,
             self.harmonic_count + 1,
@@ -477,10 +529,14 @@ class DepthwiseSeparableUnit(nn.Module):
         dilation: int,
         expansion: int,
         rolloff: float,
+        filter_width: int = 4,
+        antialias: bool = True,
     ):
         super().__init__()
         hidden = int(channels * expansion)
-        self.activation = AntiAliasedSnakeBeta(channels, rolloff)
+        self.activation = AntiAliasedSnakeBeta(
+            channels, rolloff, filter_width, antialias
+        )
         self.expand = weight_norm(nn.Conv1d(channels, hidden, 1))
         self.depthwise = weight_norm(
             nn.Conv1d(
@@ -503,6 +559,98 @@ class DepthwiseSeparableUnit(nn.Module):
         return residual + x
 
 
+class DenseUnit(nn.Module):
+    """One dense convolution where :class:`DepthwiseSeparableUnit` runs three.
+
+    Same residual shape, same activation, same receptive field -- the inverted
+    bottleneck (1x1 expand, depthwise k, 1x1 project) collapses into a single
+    ``Conv1d(channels, channels, k)``.
+
+    This trades FLOPs for dispatches, which is the right trade here and not a
+    general one.  Measured on this box (RTX 5060, eager, batch 8, 300 frames),
+    the whole training step spends 100% of its wall clock enqueueing work:
+    10 439 aten dispatches per generator forward against 2 579 CUDA kernels, so
+    75% of the dispatches launch nothing at all and the GPU idles for over half
+    the step.  The ``conv1d -> convolution -> _convolution -> cudnn_convolution``
+    chain alone costs ~63 us of CPU per call, and the separable unit pays it
+    three times to do less arithmetic than one dense conv does paying it once.
+
+    ``expansion`` is accepted and ignored: it sizes the bottleneck this unit
+    does not have.  It stays in the signature so the two units are
+    interchangeable at every call site, and so a config carrying
+    ``chouwagan_expansion`` still builds either one.
+
+    The parameter count moves -- ``C^2 k`` against ``2 C^2 e + C e k`` -- so
+    this is a different model, not a faster spelling of the same one.  At the
+    shipped schedule that is 5.15 M against 3.93 M.
+
+    **Measured, it does not pay, which is why the shipped config does not use
+    it.**  On the decoder alone (RTX 5060, eager, batch 8, 40-frame segment) it
+    drops the dispatch count 27% -- 2 631 aten ops to 1 931 -- and converts
+    almost none of that into wall clock: against the separable unit with the
+    same anti-alias schedule, 31.45 ms against 28.79 ms forward (9% *slower*)
+    and 75.68 ms against 77.68 ms forward-and-backward (3% faster).  The reason
+    is that the decoder is not the dispatch-bound half of this model: at a
+    40-frame segment its kernels already carry real work, and once the stage-3
+    anti-alias pair is gone it is GPU-bound, where the extra FLOPs stop being
+    free.  The frontend is the dispatch-bound half, and it runs 300 frames of
+    much smaller kernels.
+    It is kept because the trade is real where dispatch dominates, and because
+    the measurement above is worth being able to repeat.
+
+    Switching to it moves every block's checkpoint keys, and the architecture id
+    is what keeps a checkpoint of one style from loading non-strictly into the
+    other.  ``train.py`` pins that id from ``vocoders.json`` rather than from
+    the model config, so enabling this **requires bumping it there** as well.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        dilation: int,
+        expansion: int,
+        rolloff: float,
+        filter_width: int = 4,
+        antialias: bool = True,
+    ):
+        super().__init__()
+        del expansion
+        self.activation = AntiAliasedSnakeBeta(
+            channels, rolloff, filter_width, antialias
+        )
+        self.conv = weight_norm(
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size,
+                padding=((kernel_size - 1) * dilation) // 2,
+                dilation=dilation,
+            )
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.conv(self.activation(x))
+
+
+#: The residual units a stage can be built from.  ``separable`` is the original
+#: inverted bottleneck; ``dense`` is the one-convolution form above.
+UNIT_STYLES = {
+    "separable": DepthwiseSeparableUnit,
+    "dense": DenseUnit,
+}
+
+
+def _unit_class(style: str):
+    try:
+        return UNIT_STYLES[str(style)]
+    except KeyError:
+        raise ValueError(
+            "Unknown ChouwaGAN unit style %r; expected one of %s."
+            % (style, ", ".join(sorted(UNIT_STYLES)))
+        ) from None
+
+
 class LiteAMPBranch(nn.Module):
     def __init__(
         self,
@@ -511,16 +659,22 @@ class LiteAMPBranch(nn.Module):
         dilations: Sequence[int],
         expansion: int,
         rolloff: float,
+        filter_width: int = 4,
+        antialias: bool = True,
+        unit_style: str = "separable",
     ):
         super().__init__()
+        unit = _unit_class(unit_style)
         self.units = nn.ModuleList(
             [
-                DepthwiseSeparableUnit(
+                unit(
                     channels,
                     int(kernel),
                     int(dilation),
                     expansion,
                     rolloff,
+                    filter_width,
+                    antialias,
                 )
                 for dilation in dilations
             ]
@@ -540,6 +694,9 @@ class LiteAMPBlock(nn.Module):
         dilations: Sequence[int],
         expansion: int,
         rolloff: float,
+        filter_width: int = 4,
+        antialias: bool = True,
+        unit_style: str = "separable",
     ):
         super().__init__()
         self.branches = nn.ModuleList(
@@ -550,6 +707,9 @@ class LiteAMPBlock(nn.Module):
                     dilations,
                     expansion,
                     rolloff,
+                    filter_width,
+                    antialias,
+                    unit_style,
                 )
                 for kernel in kernels
             ]
@@ -689,6 +849,7 @@ class ChouwaGANGenerator(nn.Module):
         chouwagan_harmonics: int = 7,
         chouwagan_noise_std: float = 0.01,
         chouwagan_filter_width: int = 4,
+        chouwagan_antialias_stages: Optional[Sequence[int]] = None,
         chouwagan_rolloff: float = 0.95,
         chouwagan_latent_mixer_kernel: int = 7,
         chouwagan_latent_mixer_dilations: Sequence[int] = (1, 3),
@@ -699,6 +860,7 @@ class ChouwaGANGenerator(nn.Module):
         chouwagan_output_head_threshold: float = 0.85,
         chouwagan_output_head_ceiling: float = 1.0,
         chouwagan_remove_output_dc: bool = True,
+        chouwagan_unit_style: str = "separable",
         **_: object,
     ):
         super().__init__()
@@ -736,9 +898,13 @@ class ChouwaGANGenerator(nn.Module):
             if gin_channels
             else None
         )
+        # Validated once, here, so an unknown style fails at construction rather
+        # than at the first stage that happens to build a unit.
+        self.unit_style = str(chouwagan_unit_style)
+        unit = _unit_class(self.unit_style)
         self.latent_mixer = nn.Sequential(
             *(
-                DepthwiseSeparableUnit(
+                unit(
                     int(upsample_initial_channel),
                     int(chouwagan_latent_mixer_kernel),
                     int(dilation),
@@ -785,6 +951,49 @@ class ChouwaGANGenerator(nn.Module):
                 torch.full((len(self.channels),), source_gate)
             )
 
+        # Which upsampling stages get the anti-aliased activation pair.  ``None``
+        # means all of them, which is what BigVGAN does and what this decoder
+        # did until 2026-08-28.
+        #
+        # Cost is *not* spread evenly, because it scales with channels x length
+        # and the stages trade one for the other unevenly.  Measured per stage
+        # as a share of the whole decoder (CPU, batch 8, 0.4 s):
+        #
+        #   stage 0  256 ch @   300 Hz internal   5.6%
+        #   stage 1  160 ch @   900 Hz internal   7.1%
+        #   stage 2   80 ch @  6300 Hz internal  10.4%
+        #   stage 3   40 ch @ 44100 Hz internal  27.0%
+        #   post_activation                      11.6%
+        #
+        # The last stage plus the post activation are 38.6% on their own,
+        # against 23.1% for the first three together.  And the quality argument
+        # runs the *other* way: folding at stage 0 lands inside the audible
+        # core, because its internal Nyquist is 150 Hz, while folding at stage 3
+        # lands in the top octave under a 22.05 kHz Nyquist.  So the cheap
+        # stages are the ones worth protecting, which is why dropping the last
+        # is the first thing to try and not the last.
+        #
+        # Re-measured on GPU (RTX 5060, eager, batch 8, 0.4 s), per activation,
+        # wall with the pair against wall without, and how much of that is GPU
+        # rather than dispatch:
+        #
+        #   stage 0  256 ch @   120   0.53 -> 0.26 ms   (GPU 0.10 -> 0.02)
+        #   stage 1  160 ch @   360   0.55 -> 0.56 ms   (GPU 0.20 -> 0.02)
+        #   stage 2   80 ch @  2520   0.79 -> 0.40 ms   (GPU 0.72 -> 0.08)
+        #   stage 3   40 ch @ 17640   3.43 -> 0.68 ms   (GPU 3.33 -> 0.65)
+        #
+        # Weighted by the activations per stage (6, 6, 3, 3 plus the post one),
+        # dropping stage 3 is worth ~11 ms of a 117.8 ms forward while dropping
+        # stages 0 and 1 is worth ~1.6 ms.  The two arguments agree, so the
+        # shipped config drops the last stage and keeps the cheap ones.
+        stage_count = len(self.upsample_rates)
+        if chouwagan_antialias_stages is None:
+            self.antialias_stages = tuple(range(stage_count))
+        else:
+            self.antialias_stages = tuple(
+                sorted({int(value) % stage_count for value in chouwagan_antialias_stages})
+            )
+
         self.ups = nn.ModuleList()
         self.noise_injection = nn.ModuleList() if chouwagan_noise_injection else None
         self.blocks = nn.ModuleList()
@@ -826,17 +1035,27 @@ class ChouwaGANGenerator(nn.Module):
                     chouwagan_dilations,
                     expansion,
                     chouwagan_rolloff,
+                    chouwagan_filter_width,
+                    index in self.antialias_stages,
+                    self.unit_style,
                 )
             )
             current_channels = channels
 
-        self.post_activation = AntiAliasedSnakeBeta(current_channels, chouwagan_rolloff)
+        # ``post_activation`` runs at the output rate, exactly like the last
+        # stage, so it follows the same decision rather than carrying its own key.
+        self.post_activation = AntiAliasedSnakeBeta(
+            current_channels,
+            chouwagan_rolloff,
+            chouwagan_filter_width,
+            (stage_count - 1) in self.antialias_stages,
+        )
         self.conv_post = weight_norm(nn.Conv1d(current_channels, 1, 7, padding=3))
         self.output_upsample = AntiAliasedUpsample1d(
-            2, filter_width=4, rolloff=chouwagan_rolloff
+            2, filter_width=chouwagan_filter_width, rolloff=chouwagan_rolloff
         )
         self.output_downsample = FixedLowPass1d(
-            2, width=4, rolloff=chouwagan_rolloff, stride=2
+            2, width=chouwagan_filter_width, rolloff=chouwagan_rolloff, stride=2
         )
         # The bounded head runs inside the 2x oversampled pair so the limiter's
         # own harmonics are filtered instead of aliasing back into the band.

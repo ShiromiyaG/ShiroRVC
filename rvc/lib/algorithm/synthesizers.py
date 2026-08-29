@@ -13,7 +13,7 @@ from rvc.configs.vocoders import (
     uses_vits_latent,
 )
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
-from rvc.lib.algorithm.chouwa_vits import RefineVitsLatent
+from rvc.lib.algorithm.chouwa_vits import ATTENTION_WINDOW, RefineVitsLatent
 from rvc.lib.algorithm.frame_features import (
     conditioning_channels,
     frame_conditioning,
@@ -215,6 +215,22 @@ class Synthesizer(torch.nn.Module):
                     vocoder_options.get("prior_blocks", 4)
                 ),
                 prior_heads=int(vocoder_options.get("prior_heads", 4)),
+                flow_dilation_rate=int(
+                    vocoder_options.get("vits_flow_dilation_rate", 2)
+                ),
+                flow_coupling=str(
+                    vocoder_options.get("vits_flow_coupling", "wavenet")
+                ),
+                flow_filter_channels=int(
+                    vocoder_options.get("vits_flow_filter_channels", 384)
+                ),
+                flow_heads=int(vocoder_options.get("vits_flow_heads", 2)),
+                cond_rank=int(vocoder_options.get("cond_rank", 128)),
+                prior_attention_window=int(
+                    vocoder_options.get(
+                        "prior_attention_window", ATTENTION_WINDOW
+                    )
+                ),
                 prior_kernel_size=int(
                     vocoder_options.get("prior_kernel_size", 31)
                 ),

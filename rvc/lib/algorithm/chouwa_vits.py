@@ -81,6 +81,35 @@ SUPPORTED_ARCHITECTURE_IDS = frozenset(
 LOGS_MIN = -6.0
 LOGS_MAX = 2.0
 
+#: Standardisation for the posterior's spectrogram input, measured over 66
+#: slices of the 44.1 kHz pretrain set (8940 frames): ``log(spec)`` has mean
+#: -3.78 and standard deviation 2.24 there.
+#:
+#: The transform used to be ``log1p(spec)``, and ``log1p(x) ~= x`` over exactly
+#: the range most bins live in -- the median magnitude is 0.019 -- so the
+#: posterior's convolutional stem was reading a very nearly *linear*
+#: spectrogram.  The stem has no per-bin normalisation, so what it can resolve
+#: is set by the input's numeric range, and a linear one is owned by the loud
+#: low end.  Measured as each band's share of the per-bin temporal variance the
+#: stem actually sees:
+#:
+#: | band | ``log1p`` | ``log`` |
+#: |---|---|---|
+#: | 0-2 kHz | 48.2% | 13.0% |
+#: | 6-12 kHz | 25.1% | 33.3% |
+#: | 12-22 kHz | **5.2%** | **32.2%** |
+#:
+#: A 6.3x difference above 12 kHz.  The posterior is the only path that sees
+#: the target's fine structure at all, so anything it cannot resolve cannot
+#: reach the latent, and the decoder never gets taught the detail.
+#:
+#: Padding has to be re-zeroed after this: ``log1p(0)`` is 0 and cost nothing,
+#: while ``log`` of a padded frame is a large negative constant that the stem's
+#: width-3 time kernel would smear into the real frames beside it.
+LOG_SPEC_FLOOR = 1e-5
+LOG_SPEC_MEAN = -3.78
+LOG_SPEC_STD = 2.24
+
 
 def _resize_mask(mask: Optional[Tensor], length: int) -> Optional[Tensor]:
     if mask is None:
@@ -105,11 +134,45 @@ class ChannelLayerNorm(nn.Module):
         return self.norm(value.transpose(1, 2)).transpose(1, 2)
 
 
+#: Half-width, in frames, of the prior's self-attention window.  ``0`` restores
+#: the unbounded attention this stack used until 2026-08-28.
+#:
+#: The global branch had no positional encoding and no window, so its softmax
+#: ran over every frame it was handed -- and the two sides of the model hand it
+#: very different amounts.  Training reads the dataset's preprocessing slices,
+#: which are all exactly 3.00 s (298 frames at hop 441), while the inference
+#: pipeline feeds a whole silence-delimited span, tens of seconds of it.  The
+#: attention distribution is not scale-free, so the same frame is encoded
+#: differently depending only on how much audio arrived with it.
+#:
+#: Measured on ``logs/pretrain`` at step 24393, taking one 3 s item and
+#: re-encoding it inside progressively longer same-speaker context: the prior
+#: mean moves **0.27 sigma at 6 s, 0.40 sigma at 12 s** and settles near 0.28,
+#: with cosine similarity falling to 0.906.  For scale, the whole
+#: posterior-to-prior mismatch that inference already pays is 0.82 sigma, so
+#: this is a third to a half of that again, bought for nothing.
+#:
+#: 150 is the training context: at +/-150 frames every query sees the same 3 s
+#: span it saw in training, whatever the caller passes, so the encoding of a
+#: frame stops depending on its neighbours' existence.  The local conv branch
+#: (kernel 31) was already bounded; this only stops the global branch from
+#: being the one part of the frontend that cannot be evaluated the way it was
+#: fitted.
+ATTENTION_WINDOW = 150
+
+
 class EBranchformerBlock(nn.Module):
     """Compact local/global branchformer block for the 100 Hz prior stream."""
 
-    def __init__(self, channels: int, heads: int = 4, kernel_size: int = 31):
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 4,
+        kernel_size: int = 31,
+        attention_window: int = ATTENTION_WINDOW,
+    ):
         super().__init__()
+        self.attention_window = max(0, int(attention_window))
         channels = int(channels)
         heads = max(1, min(int(heads), channels))
         while channels % heads:
@@ -146,6 +209,35 @@ class EBranchformerBlock(nn.Module):
             nn.Conv1d(channels * 2, channels, 1),
         )
 
+    def _attention_mask(
+        self, mask: Optional[Tensor], length: int, device, batch: int
+    ) -> Optional[Tensor]:
+        """``(batch, 1, query, key)`` for SDPA, or ``None`` when nothing bounds it.
+
+        Two things are combined here: the padding mask, which is over keys only,
+        and the band from ``attention_window``.  A padded query row can end up
+        with no key left -- its band covers only padding -- and a fully masked
+        row makes ``softmax`` return NaN, which then survives the output masking
+        because ``0 * NaN`` is NaN.  Those rows are given their own position
+        back; the result is discarded by the caller's mask either way, but it is
+        finite.
+        """
+        window = self.attention_window
+        keys = None if mask is None else mask.bool().unsqueeze(1)
+        if window <= 0 or window >= length:
+            return keys
+        positions = torch.arange(length, device=device)
+        band = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs() <= window
+        band = band.unsqueeze(0).unsqueeze(0)
+        if keys is None:
+            return band.expand(batch, 1, length, length)
+        allowed = band & keys
+        empty = ~allowed.any(dim=-1, keepdim=True)
+        if bool(empty.any()):
+            eye = torch.eye(length, dtype=torch.bool, device=device)
+            allowed = allowed | (empty & eye)
+        return allowed
+
     @staticmethod
     def _normalize(norm: ChannelLayerNorm, value: Tensor, mask: Optional[Tensor]) -> Tensor:
         """Layer-norm, then re-zero padding.
@@ -176,10 +268,9 @@ class EBranchformerBlock(nn.Module):
             value = value * (1.0 + film_scale) + film_shift
             if mask is not None:
                 value = value * mask
-        # ``(batch, 1, 1, key)`` broadcasts over heads and query positions.  The
-        # key set always retains at least one real frame, so no query row is
-        # fully masked and the softmax cannot produce NaN.
-        attention_mask = None if mask is None else mask.bool().unsqueeze(1)
+        attention_mask = self._attention_mask(
+            mask, value.shape[-1], value.device, value.shape[0]
+        )
         value = value + 0.5 * self.ffn_in(self._normalize(self.ffn_norm_in, value, mask))
         local = self.local(self._normalize(self.local_norm, value, mask))
         normalized = self._normalize(self.global_norm, value, mask)
@@ -274,9 +365,15 @@ class RefineVitsLatent(nn.Module):
         flow_blocks: int = 4,
         flow_layers: int = 4,
         flow_kernel_size: int = 5,
+        flow_dilation_rate: int = 2,
+        flow_coupling: str = "wavenet",
+        flow_filter_channels: int = 384,
+        flow_heads: int = 2,
+        cond_rank: int = 128,
         prior_blocks: int = 4,
         prior_heads: int = 4,
         prior_kernel_size: int = 31,
+        prior_attention_window: int = ATTENTION_WINDOW,
         kl_free_bits: float = 0.03,
         kl_target: float = 0.15,
         kl_beta_lr: float = 0.01,
@@ -345,6 +442,8 @@ class RefineVitsLatent(nn.Module):
             1.0, max(0.0, float(prior_replacement_mean_share))
         )
 
+        self.prior_attention_window = max(0, int(prior_attention_window))
+
         # ---- Prior ---------------------------------------------------------
         self.prior_uses_logs = bool(prior_uses_logs)
         prior_input_channels = self.input_channels * (2 if self.prior_uses_logs else 1)
@@ -385,7 +484,12 @@ class RefineVitsLatent(nn.Module):
         # "whether".
         self.prior_blocks = nn.ModuleList(
             [
-                EBranchformerBlock(prior_hidden_channels, prior_heads, prior_kernel_size)
+                EBranchformerBlock(
+                    prior_hidden_channels,
+                    prior_heads,
+                    prior_kernel_size,
+                    prior_attention_window,
+                )
                 for _ in range(int(prior_blocks))
             ]
         )
@@ -397,14 +501,25 @@ class RefineVitsLatent(nn.Module):
         # Kept at inference: the prior is over ``z_p`` and the decoder consumes
         # ``z``, so this is not a training-only module and must not be stripped
         # by ``extract_model`` -- which is why it is not named ``posterior_*``.
+        # ``dilation_rate`` was pinned at 1, so all ``flow_layers`` of the
+        # coupling net ran undilated: 4 layers of kernel 5 is a receptive field
+        # of 17 frames, **0.17 s**.  At 2 the dilations are 1/2/4/8 and it is
+        # 61 frames, 0.61 s, for no extra parameter.  Irrelevant to the
+        # transformer coupling, which has no dilation, but it is what the
+        # WaveNet path should have been all along.
         self.flow = ResidualCouplingBlock(
             channels=self.latent_channels,
             hidden_channels=int(posterior_channels),
             n_flows=int(flow_blocks),
             n_layers=int(flow_layers),
             kernel_size=int(flow_kernel_size),
-            dilation_rate=1,
+            dilation_rate=int(flow_dilation_rate),
             gin_channels=int(gin_channels),
+            coupling_net=str(flow_coupling),
+            cond_rank=int(cond_rank),
+            filter_channels=int(flow_filter_channels),
+            n_heads=int(flow_heads),
+            attention_window=self.prior_attention_window,
         )
 
         # ---- Posterior (training only) --------------------------------------
@@ -420,6 +535,7 @@ class RefineVitsLatent(nn.Module):
             dilation_rate=int(posterior_dilation_rate),
             n_layers=int(posterior_layers),
             gin_channels=int(gin_channels),
+            cond_rank=int(cond_rank),
         )
         self.posterior_fast_head = nn.Conv1d(
             int(posterior_channels), self.latent_channels * 2, 1
@@ -556,8 +672,13 @@ class RefineVitsLatent(nn.Module):
         return value if mask is None else value * mask
 
     def _posterior_distribution(self, spec, condition, g, mask):
-        target = torch.log1p(spec.float().clamp_min(0.0))
+        target = spec.float().clamp_min(LOG_SPEC_FLOOR).log()
+        target = (target - LOG_SPEC_MEAN) / LOG_SPEC_STD
         target_mask = _resize_mask(mask, target.shape[-1])
+        if target_mask is not None:
+            # See LOG_SPEC_MEAN: a padded frame is now a large constant rather
+            # than zero, and the stem's time kernel is three wide.
+            target = target * target_mask
         value = self._maybe_checkpoint(self.posterior_input, target, target_mask)
         value = value + self.posterior_condition(
             _resize_sequence(condition.detach(), target.shape[-1])
@@ -806,15 +927,23 @@ class RefineVitsLatent(nn.Module):
         prior_features = self._prior_features(
             content_stats, g, mask, pitchf, content, frame_conditioning
         )
-        prior = self._distribution(self.prior_fast_head(prior_features))
-        scale = 0.0 if deterministic else max(0.0, float(temperature))
-        z_p = self._sample(*prior, scale=scale)
-        flow_mask = (
-            torch.ones_like(z_p[:, :1])
-            if mask is None
-            else _resize_mask(mask, z_p.shape[-1]).to(z_p.dtype)
-        )
-        z = self.flow(z_p, flow_mask, g=g, reverse=True)
+        # Same FP32 island as ``forward_train``: the exp/log of the distribution
+        # head and the coupling flow's scale term are what need the precision,
+        # and inference has to run the arithmetic the weights were fitted under
+        # or the two paths stop agreeing. Costs nothing while inference is FP32
+        # anyway, and stops autocast from quietly changing the output.
+        with torch.autocast(device_type=content_stats.device.type, enabled=False):
+            prior = self._distribution(self.prior_fast_head(prior_features.float()))
+            scale = 0.0 if deterministic else max(0.0, float(temperature))
+            z_p = self._sample(*prior, scale=scale)
+            flow_mask = (
+                torch.ones_like(z_p[:, :1])
+                if mask is None
+                else _resize_mask(mask, z_p.shape[-1]).to(z_p.dtype)
+            )
+            z = self.flow(
+                z_p, flow_mask, g=g.float() if g is not None else None, reverse=True
+            )
         content_out, detail = self._latent_to_decoder(z, content_stats.shape[-1])
         return content_out, detail, z, z
 

@@ -4,7 +4,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ShiroRVC\n"
-"POT-Creation-Date: 2026-08-27 10:07+0000\n"
+"POT-Creation-Date: 2026-08-28 13:33+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -26,15 +26,15 @@ msgid ""
 "- Single Index binds one uploaded index to every model.\n"
 msgstr ""
 
-#: tabs/download/download.py:176
+#: tabs/download/download.py:185
 msgid "## Download Model"
 msgstr ""
 
-#: tabs/download/download.py:206
+#: tabs/download/download.py:215
 msgid "## Download Pretrained Models"
 msgstr ""
 
-#: tabs/download/download.py:195
+#: tabs/download/download.py:204
 msgid "## Quick drag-and-drop"
 msgstr ""
 
@@ -202,7 +202,7 @@ msgstr ""
 msgid "Analyzing…"
 msgstr ""
 
-#: tabs/download/download.py:216
+#: tabs/download/download.py:228
 msgid "And select the sampling rate."
 msgstr ""
 
@@ -495,7 +495,7 @@ msgid "Cleaning strength"
 msgstr ""
 
 #: gui/widgets/console.py:81
-#: gui/widgets/metrics.py:236
+#: gui/widgets/metrics.py:235
 msgid "Clear"
 msgstr ""
 
@@ -732,11 +732,11 @@ msgid "Discriminator pretrained file."
 msgstr ""
 
 #: gui/views/tools.py:168
-#: tabs/download/download.py:227
+#: tabs/download/download.py:239
 msgid "Download"
 msgstr ""
 
-#: tabs/download/download.py:189
+#: tabs/download/download.py:198
 #: tabs/voice_blender/voice_blender.py:70
 msgid "Download Model"
 msgstr ""
@@ -749,7 +749,7 @@ msgstr ""
 msgid "Download selected"
 msgstr ""
 
-#: tabs/download/download.py:184
+#: tabs/download/download.py:193
 msgid "Download status."
 msgstr ""
 
@@ -757,7 +757,7 @@ msgstr ""
 msgid "Downloading prerequisites…"
 msgstr ""
 
-#: tabs/download/download.py:135
+#: tabs/download/download.py:143
 msgid "Downloading pretrained model..."
 msgstr ""
 
@@ -774,7 +774,7 @@ msgstr ""
 msgid "Drag and drop your model here"
 msgstr ""
 
-#: tabs/download/download.py:197
+#: tabs/download/download.py:206
 msgid "Drop a .pth and .index file to copy them into the model folder."
 msgstr ""
 
@@ -1051,7 +1051,7 @@ msgstr ""
 msgid "Fit to window"
 msgstr ""
 
-#: gui/widgets/metrics.py:142
+#: gui/widgets/metrics.py:141
 msgid "Fold the chart away and give the width to the steps."
 msgstr ""
 
@@ -1243,7 +1243,7 @@ msgstr ""
 msgid "HiFi-GAN pretrained models"
 msgstr ""
 
-#: gui/widgets/metrics.py:141
+#: gui/widgets/metrics.py:140
 msgid "Hide"
 msgstr ""
 
@@ -1409,7 +1409,7 @@ msgstr ""
 msgid "Interpolates two checkpoints. Both must share an architecture and sample rate."
 msgstr ""
 
-#: tabs/download/download.py:179
+#: tabs/download/download.py:188
 msgid "Introduce the model link"
 msgstr ""
 
@@ -1505,7 +1505,7 @@ msgstr ""
 msgid "Link"
 msgstr ""
 
-#: gui/widgets/metrics.py:134
+#: gui/widgets/metrics.py:133
 msgid "Live metrics"
 msgstr ""
 
@@ -1513,12 +1513,12 @@ msgstr ""
 msgid "Load from preset"
 msgstr ""
 
-#: gui/widgets/metrics.py:207
+#: gui/widgets/metrics.py:206
 #: gui/widgets/status.py:161
 msgid "Log"
 msgstr ""
 
-#: gui/widgets/metrics.py:210
+#: gui/widgets/metrics.py:209
 msgid "Log scale. Worth turning on for losses: the first 2% of a run covers most of the range, and flattens everything after it."
 msgstr ""
 
@@ -1560,7 +1560,7 @@ msgstr ""
 msgid "Model Bundles"
 msgstr ""
 
-#: tabs/download/download.py:178
+#: tabs/download/download.py:187
 msgid "Model Link"
 msgstr ""
 
@@ -1758,7 +1758,7 @@ msgstr ""
 msgid "Output Folder"
 msgstr ""
 
-#: tabs/download/download.py:183
+#: tabs/download/download.py:192
 #: tabs/inference/inference.py:821
 #: tabs/inference/inference.py:1119
 #: tabs/settings/sections/language.py:68
@@ -1856,7 +1856,7 @@ msgstr ""
 msgid "Performance"
 msgstr ""
 
-#: gui/widgets/metrics.py:451
+#: gui/widgets/metrics.py:450
 msgid "Pick a preset above, or tick metrics below."
 msgstr ""
 
@@ -1959,7 +1959,7 @@ msgstr ""
 msgid "Presets from assets/formant_shift."
 msgstr ""
 
-#: tabs/download/download.py:208
+#: tabs/download/download.py:220
 #: tabs/train/train.py:815
 msgid "Pretrained"
 msgstr ""
@@ -1968,7 +1968,7 @@ msgstr ""
 msgid "Pretrained Custom Settings"
 msgstr ""
 
-#: tabs/download/download.py:162
+#: tabs/download/download.py:170
 msgid "Pretrained model downloaded successfully!"
 msgstr ""
 
@@ -2024,7 +2024,7 @@ msgstr ""
 msgid "Ratio"
 msgstr ""
 
-#: gui/widgets/metrics.py:216
+#: gui/widgets/metrics.py:215
 msgid "Raw"
 msgstr ""
 
@@ -2108,7 +2108,7 @@ msgstr ""
 
 #: gui/views/monitor.py:93
 #: gui/widgets/forms.py:372
-#: gui/widgets/metrics.py:161
+#: gui/widgets/metrics.py:160
 msgid "Rescan"
 msgstr ""
 
@@ -2160,7 +2160,7 @@ msgstr ""
 msgid "Sample rate"
 msgstr ""
 
-#: tabs/download/download.py:215
+#: tabs/download/download.py:227
 #: tabs/train/train.py:458
 msgid "Sampling Rate"
 msgstr ""
@@ -2231,7 +2231,7 @@ msgstr ""
 msgid "Search feature ratio"
 msgstr ""
 
-#: gui/widgets/metrics.py:250
+#: gui/widgets/metrics.py:249
 msgid "Search metrics…"
 msgstr ""
 
@@ -2295,7 +2295,7 @@ msgstr ""
 msgid "Select the format to export the audio."
 msgstr ""
 
-#: tabs/download/download.py:209
+#: tabs/download/download.py:221
 msgid "Select the pretrained model you want to download."
 msgstr ""
 
@@ -2357,7 +2357,7 @@ msgstr ""
 msgid "Show in folder"
 msgstr ""
 
-#: gui/widgets/metrics.py:219
+#: gui/widgets/metrics.py:218
 msgid "Show the unsmoothed trace behind each line."
 msgstr ""
 
@@ -2410,7 +2410,7 @@ msgstr ""
 msgid "Smooth the extracted pitch curve. Default: 0.006."
 msgstr ""
 
-#: gui/widgets/metrics.py:197
+#: gui/widgets/metrics.py:196
 msgid "Smoothing"
 msgstr ""
 
@@ -3006,7 +3006,7 @@ msgstr ""
 msgid "Which model to convert into."
 msgstr ""
 
-#: gui/widgets/metrics.py:159
+#: gui/widgets/metrics.py:158
 msgid "Which training log to follow."
 msgstr ""
 
@@ -3014,7 +3014,7 @@ msgstr ""
 msgid "Which voice inside the .srvc bundle to use."
 msgstr ""
 
-#: gui/widgets/metrics.py:180
+#: gui/widgets/metrics.py:179
 msgid "Window"
 msgstr ""
 
@@ -3151,6 +3151,10 @@ msgstr ""
 
 #: gui/views/monitor.py:357
 msgid "{label}, {sample} — the generated clip is the model's own inference path, so it is what conversion will sound like."
+msgstr ""
+
+#: tabs/download/download.py:128
+msgid "{name} is not available at {rate}."
 msgstr ""
 
 #: tabs/download/download.py:53

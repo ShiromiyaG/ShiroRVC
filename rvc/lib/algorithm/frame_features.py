@@ -36,6 +36,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 BAND_LIMIT_HZ = 8000.0
@@ -103,29 +104,73 @@ def frame_periodicity(
     return (periodicity.clamp(0.0, 1.0) * voiced).unsqueeze(1)
 
 
+#: Length of the window ``frame_energy`` measures against, in frames.  Both
+#: paths run at a 100 Hz frame rate -- hop 441 at 44.1 kHz in training, hop 160
+#: at 16 kHz in the inference pipeline -- so one frame count serves both, and
+#: 200 frames is 2 s.
+#:
+#: A fixed duration rather than "the whole tensor": the reference used to be the
+#: mean of whatever it was handed, which made the feature depend on how the
+#: audio had been cut up.  Training reads 3 s preprocessing slices while the
+#: inference pipeline cuts long files into ~38 s segments, so the same audio was
+#: measured against two different spans.  On 26 slices of the pretrain set that
+#: skewed the distribution the model reads: the training p99 is +5.04 and the
+#: 38 s-segment p99 only +2.11, so at inference the prior essentially never saw
+#: the high-energy end it was trained on, and the value stepped at every cut.
+#:
+#: It has to be shorter than the preprocessing slice, or the window is mostly
+#: edge padding on the training side and stops being local there.  Measured
+#: across window lengths on the pretrain set, the 99th percentile of the value
+#: the prior reads agrees between a 3 s slice and a 38 s segment to +3.108 vs
+#: +3.155 at 200 frames, against +3.719 vs +3.581 at 300.  Shorter still tightens
+#: the variance ratio a little more (1.09 at 50 frames against 1.15 here) but
+#: gives up the loudness contrast that makes the feature worth measuring.
+ENERGY_REFERENCE_FRAMES = 200
+
+
+def _local_mean(value: Tensor, window: int, valid: Optional[Tensor]) -> Tensor:
+    """Centred moving mean over ``window`` frames, ignoring padded positions.
+
+    Replicate padding at the edges rather than zero: a zero would be read as
+    silence and drag the reference down for the first and last frames of every
+    item.
+    """
+    window = max(1, min(int(window), value.shape[-1]))
+    left, right = window // 2, window - 1 - window // 2
+    numerator = value if valid is None else value * valid
+    numerator = F.pad(numerator.unsqueeze(1), (left, right), mode="replicate")
+    total = F.avg_pool1d(numerator, window, 1)[:, 0, : value.shape[-1]]
+    if valid is None:
+        return total
+    weight = F.pad(valid.unsqueeze(1), (left, right), mode="replicate")
+    weight = F.avg_pool1d(weight, window, 1)[:, 0, : value.shape[-1]]
+    return total / weight.clamp_min(1e-6)
+
+
 def frame_energy(spec: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-    """Log frame energy relative to the utterance mean, ``(batch, 1, frames)``.
+    """Log frame energy relative to the local mean, ``(batch, 1, frames)``.
 
     Relative, not absolute: the between-file spread is 13.7 dB on this dataset
     and is genuinely unknowable from content, but it is also the part that a
     differently normalised input file would corrupt.  The within-file envelope
     is 19.8 dB, is what the envelope losses actually ask for, and survives any
     gain change.
+
+    Local, not per-item: see ``ENERGY_REFERENCE_FRAMES``.  The window is the
+    same duration wherever this runs, so a clip converted whole and the same
+    clip converted as part of a longer file get the same measurement.
     """
     spec = spec.float()
     power = spec.square().mean(dim=1).clamp_min(1e-12)           # (b, t)
     log_power = power.log()
-    if mask is None:
-        reference = log_power.mean(dim=-1, keepdim=True)
-    else:
+    valid = None
+    if mask is not None:
         valid = mask.reshape(log_power.shape[0], -1).float()
         if valid.shape[-1] != log_power.shape[-1]:
-            valid = torch.nn.functional.interpolate(
+            valid = F.interpolate(
                 valid.unsqueeze(1), size=log_power.shape[-1], mode="nearest"
             ).squeeze(1)
-        reference = (log_power * valid).sum(-1, keepdim=True) / valid.sum(
-            -1, keepdim=True
-        ).clamp_min(1.0)
+    reference = _local_mean(log_power, ENERGY_REFERENCE_FRAMES, valid)
     return ((log_power - reference) / ENERGY_LOG_SCALE).unsqueeze(1)
 
 
@@ -157,6 +202,27 @@ def frame_conditioning(
     return torch.cat(channels, dim=1)
 
 
+#: Where ``template_amplitude`` stops being linear.  Below it the envelope is
+#: untouched, which covers everything up to +14 dB over the reference -- the
+#: 99th percentile of the training set sits under this.
+TEMPLATE_AMPLITUDE_KNEE = 0.5
+
+
+def soft_limit(value: Tensor, knee: float, ceiling: float) -> Tensor:
+    """Identity below ``knee``, smoothly asymptotic to ``ceiling`` above it.
+
+    Same shape as the generator's output limiter (``generators.chouwagan.
+    soft_clip``), kept separate because this one takes a non-negative envelope
+    rather than a signed waveform and must not be tied to the decoder's own
+    thresholds.
+    """
+    span = float(ceiling) - float(knee)
+    if span <= 0.0:
+        return value.clamp(0.0, float(ceiling))
+    excess = (value - float(knee)).clamp_min(0.0)
+    return value.clamp(max=float(knee)) + span * torch.tanh(excess / span)
+
+
 def template_amplitude(energy: Tensor, wave_amp: float = 0.1) -> Tensor:
     """Turn relative log frame energy into RefineGAN's intensity envelope.
 
@@ -168,10 +234,19 @@ def template_amplitude(energy: Tensor, wave_amp: float = 0.1) -> Tensor:
     utterance mean at the template's nominal level.
 
     Computed in FP32: the exponential of a +/- 3 sigma log energy overflows the
-    FP16 range for loud frames well before the clamp could catch it.
+    FP16 range for loud frames well before the limiter could catch it.
+
+    The ceiling is approached smoothly rather than clipped.  Substituting the
+    definition of ``frame_energy`` leaves ``wave_amp * rms / reference_rms``,
+    so a hard clamp at 1.0 bit at only +20 dB over the reference -- and the
+    within-file envelope is 19.8 dB, so it bit constantly: 9.8% of frames of
+    the pretrain set came out pinned at exactly 1.0, every loud transient
+    flattened onto the same value with no gradient left to separate them.
+    Compressing instead keeps loud frames ordered and bounded.
     """
     energy = energy.float()
-    return (float(wave_amp) * torch.exp(0.5 * ENERGY_LOG_SCALE * energy)).clamp(0.0, 1.0)
+    amplitude = float(wave_amp) * torch.exp(0.5 * ENERGY_LOG_SCALE * energy)
+    return soft_limit(amplitude, TEMPLATE_AMPLITUDE_KNEE, 1.0)
 
 
 def conditioning_channels(use_periodicity: bool, use_energy: bool) -> int:

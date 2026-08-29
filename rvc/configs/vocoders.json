@@ -27,7 +27,7 @@
         "generator": "chouwagan",
         "discriminator": "chouwagan",
         "latent": "vits",
-        "architecture_id": "shiro_vits_flow_chouwagan_v1"
+        "architecture_id": "shiro_vits_flow_chouwagan_v2"
     },
     "wavehax": {
         "label": "Wavehax",
@@ -41,6 +41,6 @@
         "generator": "wavehax",
         "discriminator": "wavehax",
         "latent": "vits",
-        "architecture_id": "shiro_vits_flow_wavehax_v1"
+        "architecture_id": "shiro_vits_flow_wavehax_v2"
     }
 }

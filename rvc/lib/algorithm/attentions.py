@@ -91,6 +91,16 @@ class MultiHeadAttention(nn.Module):
         x = self.conv_o(x)
         return x
 
+    def _block_mask(self, length: int, device) -> torch.Tensor:
+        """``True`` where a query may *not* attend, cached by length and device."""
+        key = (length, device)
+        if getattr(self, "_block_mask_key", None) != key:
+            band = torch.ones(length, length, dtype=torch.bool, device=device)
+            band = band.triu(-self.block_length).tril(self.block_length)
+            self._block_mask_cache = ~band
+            self._block_mask_key = key
+        return self._block_mask_cache
+
     def attention(
         self,
         query: torch.Tensor,
@@ -127,12 +137,12 @@ class MultiHeadAttention(nn.Module):
                 assert (
                     t_s == t_t
                 ), "Local attention is only available for self-attention."
-                block_mask = (
-                    torch.ones_like(scores)
-                    .triu(-self.block_length)
-                    .tril(self.block_length)
-                )
-                scores = scores.masked_fill(block_mask == 0, -1e4)
+                # Cached: the band depends only on the length, and building it
+                # allocated a full ``(batch, heads, t, t)`` tensor on every
+                # call -- 115 MB per attention at 3800 frames, for a mask that
+                # is the same every time.  Measured as ~1.4x of the whole
+                # coupling net's forward at 3000 frames.
+                scores = scores.masked_fill(self._block_mask(t_s, scores.device), -1e4)
         p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
         p_attn = self.drop(p_attn)
         output = torch.matmul(p_attn, value)

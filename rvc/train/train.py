@@ -4458,17 +4458,20 @@ def training_loop(
                     loss_prior_fast, raw_prior_loss = chouwa_latent.prior_losses(
                         discrete_parts, x_mask
                     )
-                    if chouwa_latent.kl_rate_control_active:
-                        # The rate controller owns the KL weight: applying the
-                        # fixed weight and warmup on top would fight its own
-                        # feedback loop.
-                        loss_prior = raw_prior_loss
+                    # ``kl_beta`` is a *ceiling* multiplier now: it sits at
+                    # ``kl_beta_min`` until the measured rate exceeds
+                    # ``kl_target`` and only ever rises from there, so below the
+                    # cap the weight really is ``prior_loss_weight`` and the
+                    # startup ramp is not fighting a feedback loop -- the rate
+                    # climbs from ~0, which is the region where the controller
+                    # is pinned and inert.  It used to be skipped here because
+                    # ``kl_beta_min`` was 1e-4 and the controller was a
+                    # two-sided target that owned the magnitude outright.
+                    if prior_warmup_steps:
+                        prior_progress = min(1.0, global_step / prior_warmup_steps)
                     else:
-                        if prior_warmup_steps:
-                            prior_progress = min(1.0, global_step / prior_warmup_steps)
-                        else:
-                            prior_progress = 1.0
-                        loss_prior = raw_prior_loss * prior_loss_weight * prior_progress
+                        prior_progress = 1.0
+                    loss_prior = raw_prior_loss * prior_loss_weight * prior_progress
                     if global_step % diagnostics_interval == 0:
                         discrete_diagnostics = chouwa_latent.diagnostics(
                             discrete_parts,

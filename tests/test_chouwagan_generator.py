@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 torch = pytest.importorskip("torch", reason="the decoder needs torch", exc_type=ImportError)
 
 from rvc.lib.algorithm.generators.chouwagan import (  # noqa: E402
+    DETERMINISTIC_PHASE_SEED,
     BandLimitedNSFSource,
     ChouwaGANGenerator,
     soft_clip,
@@ -175,6 +176,48 @@ def test_harmonics_past_nyquist_contribute_nothing():
     assert torch.allclose(excitations[0], excitations[1], atol=2e-3)
 
 
+def test_the_top_harmonic_keeps_its_phase_once_the_accumulator_is_large():
+    """``prepare`` used to accumulate phase as unbounded float32 radians and
+    then multiply by the harmonic index, so the top harmonic's phase reached
+    4.8e6 rad over a 30 s span -- where a float32 ULP is 0.5 rad -- and the
+    error grew along the span.  Training reads 0.4 s segments, where it is
+    inaudible, so only previews and inference ever met it: a defect the decoder
+    cannot be taught to cancel because it never sees it.
+
+    Driven by f0 rather than by length, to reach the same accumulator without
+    allocating a 30 s harmonic bank.  1 s at 6 kHz is 6000 cycles and the 128th
+    harmonic of that is the same 4.8e6 rad.  The bank ``prepare`` returns is
+    unmasked, so the harmonic is there whatever Nyquist says about it.
+
+    The deterministic offsets are reproduced from the same seed, which is what
+    lets this compare against float64 term by term rather than in aggregate.
+    """
+    sample_rate = 44100.0
+    length = int(sample_rate)
+    harmonic_count = 128
+    f0 = torch.full((1, 16), 6000.0)
+
+    source = _source(harmonic_count=harmonic_count).eval()
+    source.deterministic = True
+    resampled, _, _, harmonic_wave, _, _ = source.prepare(f0, length)
+
+    generator = torch.Generator()
+    generator.manual_seed(DETERMINISTIC_PHASE_SEED)
+    offsets = torch.zeros(1, 1, harmonic_count)
+    offsets[..., 1:] = torch.rand(
+        (1, 1, harmonic_count - 1), generator=generator
+    ) * (2.0 * math.pi)
+
+    phase = torch.cumsum(2.0 * math.pi * resampled.double() / sample_rate, dim=-1)
+    for harmonic in (1, harmonic_count):
+        reference = torch.sin(
+            phase * harmonic + float(offsets[0, 0, harmonic - 1])
+        ).float()
+        error = harmonic_wave[..., harmonic - 1] - reference
+        level = 20.0 * math.log10(float(error.pow(2).mean().sqrt()) + 1e-12)
+        assert level < -80.0, f"harmonic {harmonic} is {level:.1f} dB off"
+
+
 def test_the_excitation_scale_does_not_move_with_the_harmonic_count():
     """It is divided by its own masked normaliser, which is what lets the
     decoder's ``source_gates`` and fusion weights mean the same thing across
@@ -305,3 +348,111 @@ def test_the_shipped_config_builds_the_decoder_it_describes():
     assert decoder.channels == tuple(model["chouwagan_channels"])
     assert decoder.excitation_unet is model["chouwagan_excitation_unet"]
     assert decoder.source.harmonic_count == model["chouwagan_harmonics"]
+
+
+def test_the_filter_width_key_reaches_the_activation_pair():
+    """It was hardcoded to 4 in ``AntiAliasedSnakeBeta`` while threaded elsewhere.
+
+    So the one config key you would reach for to make the 21 activation
+    resamplers cheaper controlled the excitation encoder and the upsamplers and
+    nothing else.  Setting it measured as a 2% change -- noise -- because it was
+    not connected to what costs the time.
+    """
+    from rvc.lib.algorithm.generators.chouwagan import AntiAliasedSnakeBeta
+
+    taps = {}
+    for width in (2, 4):
+        act = AntiAliasedSnakeBeta(8, rolloff=0.95, filter_width=width)
+        taps[width] = act.downsample.kernel.shape[-1]
+    assert taps[2] < taps[4], taps
+    assert taps == {2: 9, 4: 17}, taps
+
+
+def test_skipping_the_antialias_pair_changes_no_parameter():
+    """Which stages get the pair has to be free to choose, and it is.
+
+    ``alpha`` and ``beta`` are the only weights in the activation; the
+    resamplers are fixed windowed-sinc buffers registered non-persistently.  So
+    ``chouwagan_antialias_stages`` never moves a checkpoint key.
+    """
+    from rvc.lib.algorithm.generators.chouwagan import AntiAliasedSnakeBeta
+
+    with_pair = AntiAliasedSnakeBeta(8, antialias=True)
+    without = AntiAliasedSnakeBeta(8, antialias=False)
+    assert set(with_pair.state_dict()) == set(without.state_dict())
+    assert sum(p.numel() for p in with_pair.parameters()) == sum(
+        p.numel() for p in without.parameters()
+    )
+    x = torch.randn(2, 8, 64)
+    assert torch.isfinite(without(x)).all()
+    assert without(x).shape == with_pair(x).shape
+
+
+# --------------------------------------------------------------------------
+# Residual unit style
+
+
+def test_the_default_unit_style_is_still_the_separable_one():
+    """A config predating the key has to build the previous model exactly."""
+    from rvc.lib.algorithm.generators.chouwagan import DepthwiseSeparableUnit
+
+    decoder = _generator()
+    assert decoder.unit_style == "separable"
+    assert isinstance(decoder.blocks[0].branches[0].units[0], DepthwiseSeparableUnit)
+    assert isinstance(decoder.latent_mixer[0], DepthwiseSeparableUnit)
+
+
+def test_the_dense_unit_runs_one_convolution_where_the_separable_runs_three():
+    """The whole point of the style: dispatches, not arithmetic.
+
+    The training step is CPU-bound end to end, and the
+    ``conv1d -> convolution -> _convolution -> cudnn_convolution`` chain costs
+    ~63 us of CPU per call.  Counting the convolutions is therefore counting the
+    cost, which is why this pins the count and not a wall clock.
+    """
+    from rvc.lib.algorithm.generators.chouwagan import DenseUnit
+
+    separable = _generator().blocks[0].branches[0].units[0]
+    dense = _generator(chouwagan_unit_style="dense").blocks[0].branches[0].units[0]
+
+    assert isinstance(dense, DenseUnit)
+    n = lambda unit: sum(isinstance(m, torch.nn.Conv1d) for m in unit.modules())
+    assert n(separable) == 3
+    assert n(dense) == 1
+
+
+def test_the_dense_unit_keeps_the_decoder_contract():
+    decoder = _generator(chouwagan_unit_style="dense").eval()
+    latent, f0, g = _inputs()
+
+    with torch.no_grad():
+        audio = decoder(latent, f0, g)
+
+    assert audio.shape == (latent.shape[0], 1, latent.shape[-1] * UPSAMPLE)
+    assert torch.isfinite(audio).all()
+
+
+def test_the_dense_unit_keeps_the_receptive_field_of_the_one_it_replaces():
+    """Same kernel, same dilation: only the bottleneck goes away."""
+    separable = _generator().blocks[0].branches[0].units[0]
+    dense = _generator(chouwagan_unit_style="dense").blocks[0].branches[0].units[0]
+
+    assert dense.conv.kernel_size == separable.depthwise.kernel_size
+    assert dense.conv.dilation == separable.depthwise.dilation
+    assert dense.conv.padding == separable.depthwise.padding
+
+
+def test_the_two_styles_do_not_share_a_state_dict():
+    """Which is why the architecture id moves with this option.
+
+    ``net_g`` loads non-strictly, so without the guard a ``v2`` checkpoint would
+    load into a dense trunk with every block silently left at its init.
+    """
+    separable = set(_generator().state_dict())
+    dense = set(_generator(chouwagan_unit_style="dense").state_dict())
+    assert separable != dense
+
+
+def test_an_unknown_unit_style_fails_at_construction():
+    with pytest.raises(ValueError):
+        _generator(chouwagan_unit_style="depthwise")
