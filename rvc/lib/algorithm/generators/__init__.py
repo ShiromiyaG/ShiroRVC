@@ -1,5 +1,5 @@
 from .chouwagan import ChouwaGANGenerator
 from .hifigan_nsf import HiFiGANNSFGenerator
-from .wavehax import WavehaxGenerator
+from .refinegan import RefineGANGenerator
 
-__all__ = ["ChouwaGANGenerator", "HiFiGANNSFGenerator", "WavehaxGenerator"]
+__all__ = ["ChouwaGANGenerator", "HiFiGANNSFGenerator", "RefineGANGenerator"]

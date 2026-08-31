@@ -34,7 +34,7 @@ class TransformerCouplingNet(nn.Module):
     which is what keeps a frame's encoding independent of how much audio arrived
     with it: training reads 3.00 s slices and the inference pipeline feeds a
     whole silence-delimited span.  The same argument, and the same measurement,
-    as ``chouwa_vits.ATTENTION_WINDOW``.  ``window_size`` is a different thing --
+    as the prior's attention window was.  ``window_size`` is a different thing --
     Glow-TTS relative position embeddings, which the E-Branchformer prior does
     not have at all.
 

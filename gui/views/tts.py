@@ -115,9 +115,8 @@ class TtsPage(Page):
 
         settings = self.settings.values()
         # run_tts_script does not take these; the synthesised source has no
-        # formants to shift and no latent to temperature-scale.
-        for key in ("formant_shifting", "formant_qfrency", "formant_timbre",
-                    "deterministic", "latent_temperature"):
+        # formants to shift.
+        for key in ("formant_shifting", "formant_qfrency", "formant_timbre"):
             settings.pop(key, None)
         values.pop("bundle_submodel", None)
 

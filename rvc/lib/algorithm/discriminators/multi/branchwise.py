@@ -10,10 +10,10 @@ double-backward of R1 eager.  All of that is stated here, once, as
 
 A subclass only has to build its branches and say how many of them are periods
 and how many are spectral; everything below is architecture-agnostic.  It was
-extracted from ``RefineGANDiscriminator`` when Wavehax brought a second
-discriminator with the same contract and a different network -- the alternative
-was a second copy of this file, which would have drifted the moment either one
-was touched.
+extracted from ``RefineGANDiscriminator`` when a second branched
+discriminator arrived with the same contract and a different network -- the
+alternative was a second copy of this file, which would have drifted the moment
+either one was touched.
 
 Branch protocol.  Period branches are called with the waveform.  Spectral
 branches expose ``spectrogram(audio) -> Tensor`` and

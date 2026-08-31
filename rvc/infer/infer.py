@@ -39,11 +39,9 @@ from rvc.configs.vocoders import (
     get_architecture_id,
     get_vocoder_spec,
     normalize_vocoder,
-    uses_vits_latent,
+    uses_chouwagan_stack,
 )
 from rvc.infer.messages import (
-    INFER_MODE_DETERMINISTIC,
-    INFER_MODE_STOCHASTIC,
     INFER_RANDOM_SEED_EXPOSED,
     INFER_SEED_SPECIFIED,
 )
@@ -163,6 +161,7 @@ class VoiceConverter:
         f0_method: str = "rmvpe",
         index_rate: float = 0.75,
         volume_envelope: float = 1,
+        silence_gate_db: float = -60.0,
         protect: float = 0.5,
         split_audio: bool = False,
         f0_autotune: bool = False,
@@ -177,8 +176,6 @@ class VoiceConverter:
         sid: int = 0,
         seed: int = 0,
         bundle_submodel: str = None,
-        deterministic: bool = True,
-        latent_temperature: float = 1.0,
         index_k: int = 8,
         index_power: float = 2.0,
         index_continuity: float = 0.5,
@@ -195,6 +192,12 @@ class VoiceConverter:
             index_power (float): Exponent of the inverse-distance weighting.
             index_continuity (float): Weight of the temporal continuity bonus.
             volume_envelope (int): RMS mix rate.
+            silence_gate_db (float): Input level, in dBFS, under which the output
+                is faded out.  The content encoder gives digital silence a
+                full-magnitude embedding whose direction depends on the rest of
+                the chunk, and the decoder renders that as hiss; this is what
+                keeps it out of passages the input says are empty.  None or -inf
+                disables the gate.
             protect (float): Protection rate for certain audio segments.
             f0_method (str): Method for F0 extraction.
             audio_input_path (str): Path to the input audio file.
@@ -265,12 +268,7 @@ class VoiceConverter:
             if seed != 0:
                 torch.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
-                mode = (
-                    INFER_MODE_DETERMINISTIC
-                    if deterministic
-                    else INFER_MODE_STOCHASTIC
-                )
-                info(INFER_SEED_SPECIFIED.format(mode=mode, seed=seed), tag="[INFER]")
+                info(INFER_SEED_SPECIFIED.format(seed=seed), tag="[INFER]")
             else:
                 seed = random.randint(0, 2**32 - 1)
                 random.seed(seed)
@@ -303,14 +301,13 @@ class VoiceConverter:
                         pitch_guidance=self.use_f0,
                         filter_radius=filter_radius,
                         volume_envelope=volume_envelope,
+                        silence_gate_db=silence_gate_db,
                         version=self.version,
                         protect=protect,
                         f0_autotune=f0_autotune,
                         f0_autotune_strength=f0_autotune_strength,
                         f0_file=f0_file,
                         seed=seed,
-                        deterministic=deterministic,
-                        latent_temperature=latent_temperature,
                         loaded_index=self.loaded_index,
                         index_meta_payload=self.loaded_index_meta,
                         retrieval_config=retrieval_config,
@@ -547,9 +544,15 @@ class VoiceConverter:
                     self.active_cpt.get("vocoder_architecture", self.active_cpt.get("vocoder", "hifi")),
                 )
             )
-            if uses_vits_latent(self.vocoder):
+            vocoder_config = self.active_cpt.get("vocoder_config", {}) or {}
+            # Decoder options that move the id -- the iSTFT hop among them --
+            # travel in ``vocoder_config``, so the guard reads them from the
+            # checkpoint rather than from any config file.
+            if uses_chouwagan_stack(self.vocoder):
                 architecture_id = self.active_cpt.get("architecture_id")
-                if architecture_id != get_architecture_id(self.vocoder):
+                if architecture_id != get_architecture_id(
+                    self.vocoder, vocoder_config
+                ):
                     raise ValueError(
                         f"Unsupported {get_vocoder_spec(self.vocoder)['label']} "
                         f"architecture: {architecture_id or 'unknown'}."
@@ -559,17 +562,16 @@ class VoiceConverter:
                 "use_f0": self.use_f0,
                 "text_enc_hidden_dim": self.text_enc_hidden_dim,
                 "vocoder": self.vocoder,
-                "vocoder_config": self.active_cpt.get("vocoder_config", {}),
+                "vocoder_config": vocoder_config,
             }
 
             # Model init
             self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
 
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
-            if uses_vits_latent(self.vocoder):
-                self.net_g.remove_training_modules()
-            else:
-                del self.net_g.enc_q # Posterior encoder is training-only
+            # ``remove_training_modules`` drops the posterior on either
+            # frontend and keeps the flow where inference needs it.
+            self.net_g.remove_training_modules()
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
             # Fold weight norm into the weights: the generator is frozen from

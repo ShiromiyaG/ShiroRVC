@@ -25,10 +25,6 @@ install_rich_print()
 
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE
 from rvc.lib.utils import extract_features
-from rvc.lib.algorithm.frame_features import (
-    matched_n_fft,
-    spectrogram_for_features,
-)
 from rvc.infer.retrieval import IndexRetriever, RetrievalConfig
 from rvc.lib.terminal import get_console
 
@@ -48,6 +44,92 @@ class AudioProcessor:
     """
     A class for processing audio signals, specifically for adjusting RMS levels.
     """
+
+    @staticmethod
+    def gate_to_source(
+        source_audio: np.ndarray,
+        source_rate: int,
+        target_audio: np.ndarray,
+        target_rate: int,
+        threshold_db: float = -60.0,
+        knee_db: float = 12.0,
+        hold_ms: float = 120.0,
+        release_ms: float = 80.0,
+    ):
+        """Silence the output wherever the *input* carries nothing.
+
+        The content encoder has no absolute notion of level.  Its first conv
+        layer is group-normalised over the whole chunk and its transformer
+        attends across all of it, so digital silence does not come out as a
+        "nothing" vector: it gets a full-magnitude embedding whose direction
+        depends on whatever else is in the chunk.  Measured on contentvec, the
+        same silence embeds at cosine 0.54 to itself depending on the company it
+        keeps, at a feature norm of 9.65 against 9.92 -- and the decoder then
+        renders that faithfully, as broadband hiss.  On a 288 s stem this put
+        -56 dBFS of noise over passages where the input was exactly 0.0, and
+        only over the chunks that also contained singing: chunks that were
+        entirely silent came out at -107 dBFS.
+
+        The decoder is not what is wrong.  Handed the features the *training*
+        extraction produces, it tracks level to within 3 dB down to -120 dBFS
+        frames.  So the fix belongs here, at the one place that still knows what
+        the input actually was.
+
+        Keyed on the input rather than the output, because that is the only
+        signal that knows the difference between silence and a quiet passage the
+        model rendered well.  Below ``threshold_db`` the gain fades to zero over
+        ``knee_db``; ``hold_ms`` keeps the gate open across short dips so a word
+        does not lose its tail, and ``release_ms`` closes it smoothly, since a
+        step in the gain is a click.  Nothing above the knee is touched at all,
+        which is what separates this from ``change_rms``: quiet-but-real audio
+        keeps whatever dynamics the model gave it.
+        """
+        if threshold_db is None or not np.isfinite(threshold_db):
+            return target_audio
+        source = np.asarray(source_audio, dtype=np.float64)
+        if source.ndim > 1:
+            source = source.mean(axis=-1)
+        window = max(1, int(source_rate * 0.020))
+        hop = max(1, int(source_rate * 0.005))
+        if source.size < window or target_audio.size == 0:
+            return target_audio
+
+        views = np.lib.stride_tricks.sliding_window_view(source, window)[::hop]
+        level = 20.0 * np.log10(np.sqrt((views**2).mean(axis=-1)) + 1e-12)
+
+        knee = max(1e-6, float(knee_db))
+        gain = np.clip((level - (float(threshold_db) - knee)) / knee, 0.0, 1.0)
+        if gain.min() >= 1.0:
+            return target_audio
+
+        # Hold: a dilation of the open gate, so a dip shorter than the hold
+        # never closes it.  Written as a max over shifts rather than pulled from
+        # scipy.ndimage to keep this dependency-free.
+        hold = int(round(float(hold_ms) / 1000.0 * source_rate / hop))
+        if hold > 0:
+            held = gain.copy()
+            for shift in range(1, hold + 1):
+                held[shift:] = np.maximum(held[shift:], gain[:-shift])
+            gain = held
+
+        # Release: instantaneous to open, exponential to close.
+        frames_per_second = source_rate / hop
+        decay = float(
+            np.exp(-1.0 / max(1e-6, float(release_ms) / 1000.0 * frames_per_second))
+        )
+        smoothed = np.empty_like(gain)
+        running = gain[0]
+        for index, value in enumerate(gain):
+            running = value if value >= running else running * decay
+            smoothed[index] = running
+
+        # The gate is measured at the source rate and applied at the target's,
+        # which are rarely the same; the centre of each analysis window is where
+        # its measurement belongs.
+        centres = (np.arange(smoothed.size) * hop + window / 2.0) / source_rate
+        positions = np.arange(target_audio.shape[0]) / float(target_rate)
+        envelope = np.interp(positions, centres, smoothed).astype(target_audio.dtype)
+        return target_audio * envelope
 
     def change_rms(
         source_audio: np.ndarray,
@@ -333,8 +415,6 @@ class Pipeline:
         version,
         protect,
         seed,
-        deterministic=True,
-        latent_temperature=1.0,
         retrieval_config=None,
         do_normalize=False,
     ):
@@ -353,8 +433,6 @@ class Pipeline:
             version: Model version (Keep to support old models).
             protect: Protection level for preserving the original pitch.
             seed: Seed for randomization of noise.
-            deterministic: Whether to use argmax discrete codes and deterministic NSF excitation.
-            latent_temperature: Sampling temperature for non-deterministic discrete codes.
             retrieval_config: Neighbour count, weighting and continuity for the retrieval.
             do_normalize: Whether the embedder wants its input layer-normalised.
         """
@@ -404,20 +482,6 @@ class Pipeline:
                 pitch, pitchf = None, None
             p_len = torch.tensor([p_len], device=self.device).long()
 
-            # Periodicity and loudness are measured from the *source* here,
-            # with the same code and the same Hz-per-bin the trainer used on
-            # the target.  A model built without those features ignores it.
-            source_spec = None
-            if getattr(net_g, "use_periodicity", False) or getattr(
-                net_g, "use_frame_energy", False
-            ):
-                n_fft = matched_n_fft(self.sample_rate)
-                source_spec = spectrogram_for_features(
-                    torch.from_numpy(audio0).float().to(self.device),
-                    n_fft,
-                    self.window,
-                )
-
             # Inference
             audio1 = (
                 net_g.infer(
@@ -427,9 +491,6 @@ class Pipeline:
                     nsff0=pitchf.float(),       # float f0 curve
                     sid=sid,                    # speaker id
                     seed=seed,                  # inference seed
-                    spec=source_spec,           # source spectrogram for frame features
-                    deterministic=deterministic,
-                    temperature=latent_temperature,
                 )[0][0, 0]
                 .detach()
                 .cpu()
@@ -501,11 +562,10 @@ class Pipeline:
         f0_file,
         seed,
         loaded_index=None,
-        deterministic=True,
-        latent_temperature=1.0,
         index_meta_payload=None,
         retrieval_config=None,
         do_normalize=False,
+        silence_gate_db=-60.0,
     ):
         """
         The main pipeline function for performing voice conversion.
@@ -530,12 +590,12 @@ class Pipeline:
             f0_autotune: Whether to apply autotune to the F0 contour.
             f0_file: Path to a file containing an F0 contour to use.
             seed: Seed for randomization of noise.
-            deterministic: Whether to use argmax discrete codes and deterministic NSF excitation.
-            latent_temperature: Sampling temperature for non-deterministic discrete codes.
             loaded_index: A pre-loaded FAISS index object.
             index_meta_payload: Serialised sidecar accompanying ``loaded_index``.
             retrieval_config: Neighbour count, weighting and continuity for the retrieval.
             do_normalize: Whether the embedder wants its input layer-normalised.
+            silence_gate_db: Input level below which the output is faded out.
+                None or -inf disables it.  See ``AudioProcessor.gate_to_source``.
         """
 
         if seed == 0:
@@ -623,8 +683,6 @@ class Pipeline:
                         version,
                         protect,
                         seed,
-                        deterministic,
-                        latent_temperature,
                         retrieval_config,
                         do_normalize,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
@@ -643,8 +701,6 @@ class Pipeline:
                         version,
                         protect,
                         seed,
-                        deterministic,
-                        latent_temperature,
                         retrieval_config,
                         do_normalize,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
@@ -666,8 +722,6 @@ class Pipeline:
                     version,
                     protect,
                     seed,
-                    deterministic,
-                    latent_temperature,
                     retrieval_config,
                     do_normalize,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
@@ -686,8 +740,6 @@ class Pipeline:
                     version,
                     protect,
                     seed,
-                    deterministic,
-                    latent_temperature,
                     retrieval_config,
                     do_normalize,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
@@ -699,6 +751,12 @@ class Pipeline:
             audio_opt = AudioProcessor.change_rms(
                 audio, self.sample_rate, audio_opt, self.tgt_sr, volume_envelope
             )
+
+        # After the envelope blend, so the gate has the last word on anything
+        # the input says is silent.
+        audio_opt = AudioProcessor.gate_to_source(
+            audio, self.sample_rate, audio_opt, self.tgt_sr, silence_gate_db
+        )
 
         audio_max = np.abs(audio_opt).max() / 0.99
         if audio_max > 1:

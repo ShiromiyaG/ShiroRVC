@@ -45,16 +45,50 @@ TRAIN_PY = ROOT / "rvc" / "train" / "train.py"
 CONFIG = ROOT / "rvc" / "configs" / "chouwagan" / "44100.json"
 
 
+def _lift(*names: str) -> dict:
+    """Lift definitions out of ``train.py``, whose module body reads argv.
+
+    ``_adaptive_feature_match_weight`` measures its gradient through
+    ``_probe_gradient`` and that helper's scale constants, so the namespace has
+    to carry those too or the rule cannot be called at all.
+    """
+    tree = ast.parse(TRAIN_PY.read_text(encoding="utf-8"))
+    wanted = set(names)
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted:
+            body.append(node)
+            wanted.discard(node.name)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in wanted
+            for target in node.targets
+        ):
+            body.append(node)
+            wanted.difference_update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+    if wanted:
+        pytest.fail(f"train.py no longer defines {sorted(wanted)}")
+    namespace: dict = {"torch": torch}
+    exec(compile(ast.Module(body, []), str(TRAIN_PY), "exec"), namespace)
+    return namespace
+
+
 @pytest.fixture(scope="module")
 def rule():
-    """Lift the helper out of ``train.py``, whose module body reads argv."""
-    tree = ast.parse(TRAIN_PY.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_adaptive_feature_match_weight":
-            namespace: dict = {"torch": torch}
-            exec(compile(ast.Module([node], []), str(TRAIN_PY), "exec"), namespace)
-            return namespace["_adaptive_feature_match_weight"]
-    pytest.fail("train.py no longer defines _adaptive_feature_match_weight")
+    return _lift(
+        "_PROBE_SCALE_ATTEMPTS",
+        "_PROBE_SCALE_STEP",
+        "_probe_gradient",
+        "_adaptive_feature_match_weight",
+    )["_adaptive_feature_match_weight"]
+
+
+@pytest.fixture(scope="module")
+def probe():
+    return _lift("_PROBE_SCALE_ATTEMPTS", "_PROBE_SCALE_STEP", "_probe_gradient")[
+        "_probe_gradient"
+    ]
 
 
 def _probe(fm_gradient_scale: float):

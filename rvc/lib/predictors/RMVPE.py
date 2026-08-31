@@ -461,8 +461,12 @@ class RMVPE0Predictor:
         """
         with torch.no_grad():
             n_frames = mel.shape[-1]
+            pad = 32 * ((n_frames - 1) // 32 + 1) - n_frames
+            # Reflect padding cannot exceed the input length, and a clip shorter
+            # than 32 frames (~0.3 s) always needs more padding than it has
+            # frames.  Repeat the last frame there instead of failing outright.
             mel = F.pad(
-                mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode="reflect"
+                mel, (0, pad), mode="reflect" if pad < n_frames else "replicate"
             )
             padded_frames = mel.shape[-1]
 

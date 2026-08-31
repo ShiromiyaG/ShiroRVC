@@ -75,11 +75,7 @@ def extract_model(
             model_author = data.get("model_author", None)
 
         def is_training_only_key(key):
-            return (
-                "enc_q" in key
-                or key.startswith("chouwa_latent.posterior")
-
-            )
+            return "enc_q" in key
 
         opt = OrderedDict(
             weight={

@@ -1,6 +1,6 @@
 {
     "train": {
-        "spectral_loss": "L1 Mel Loss",
+        "spectral_loss": "Multi-Scale Mel Loss",
         "seed": 1234,
         "learning_rate_g": 0.0001,
         "learning_rate_d": 0.0001,
@@ -15,7 +15,7 @@
         "validation_preview_dpi": 67,
         "validation_preview_width": 24.0,
         "validation_preview_height": 5.8,
-        "segment_size": 17280,
+        "segment_size": 17640,
         "c_mel": 45,
         "c_kl": 1.0,
         "holdout_fraction": 0.02,
@@ -36,9 +36,9 @@
     },
     "data": {
         "max_wav_value": 32768.0,
-        "sample_rate": 48000,
+        "sample_rate": 44100,
         "filter_length": 2048,
-        "hop_length": 480,
+        "hop_length": 441,
         "win_length": 2048,
         "n_mel_channels": 128,
         "mel_fmin": 0.0,
@@ -77,20 +77,27 @@
             ]
         ],
         "upsample_rates": [
-            12,
-            10,
-            2,
-            2
+            3,
+            3,
+            7,
+            7
         ],
         "upsample_initial_channel": 512,
         "upsample_kernel_sizes": [
-            24,
-            20,
-            4,
-            4
+            6,
+            6,
+            14,
+            14
         ],
+        "d_version": "v3",
+        "d_periods": null,
+        "d_resolutions": null,
+        "d_frequency_strides": null,
         "use_spectral_norm": false,
         "gin_channels": 256,
-        "spk_embed_dim": 109
+        "spk_embed_dim": 109,
+        "refinegan_start_channels": 16,
+        "refinegan_leaky_relu_slope": 0.2,
+        "architecture_id": "vits_gaussian_v1"
     }
 }

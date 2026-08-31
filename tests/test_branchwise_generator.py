@@ -222,7 +222,7 @@ def test_the_generator_flag_is_not_the_r1_flag():
 def test_both_configs_carry_the_generator_flag():
     import json
 
-    for vocoder in ("chouwagan", "wavehax"):
+    for vocoder in ("chouwagan",):
         config = json.loads(
             (ROOT / "rvc" / "configs" / vocoder / "44100.json").read_text(
                 encoding="utf-8"

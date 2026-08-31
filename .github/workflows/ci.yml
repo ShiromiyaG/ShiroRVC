@@ -3,7 +3,7 @@ name: CI
 # Runs on every push and pull request.
 #
 # This exists because the release workflow used to be the only one: it triggers
-# on a VERSION change, so the test suite ran roughly once per release and the
+# on a version change, so the test suite ran roughly once per release and the
 # first sign that a commit had broken something arrived while trying to publish
 # it.  The checks here are the cheap half -- ubuntu, about a minute -- and the
 # expensive Windows installer build lives in build-windows.yml, which fires only

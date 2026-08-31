@@ -42,9 +42,9 @@ TRAIN_PY = ROOT / "rvc" / "train" / "train.py"
 RATES = (3, 3, 7, 7)
 
 
-#: ``collect_source_path_metrics`` delegates to the Wavehax reader when the
-#: decoder has no stages to walk, so both have to come across together.
-_LIFTED = ("collect_source_path_metrics", "_wavehax_source_path_metrics")
+#: ``collect_source_path_metrics`` returns ``{}`` when the decoder has no
+#: stages to walk, so it comes across on its own.
+_LIFTED = ("collect_source_path_metrics",)
 
 
 @pytest.fixture(scope="module")
@@ -201,3 +201,114 @@ def test_a_decoder_without_an_excitation_path_reports_nothing(collect):
 
     assert collect(_Model(_HiFiish())) == {}
     assert collect(_Model(torch.nn.Identity())) == {}
+
+
+class TestLatentGateSeries:
+    """The gate multiplies the skip, so the ``fusion_proj`` ratio alone stopped
+    being the excitation share the stage actually sees -- and the gate's mean
+    cannot be derived from its bias, which is why the decoder measures it."""
+
+    @staticmethod
+    def _drive(decoder, batch: int = 2, frames: int = 30):
+        """One forward, which is what fills the telemetry buffers."""
+        torch.manual_seed(1)
+        with torch.no_grad():
+            decoder(
+                torch.randn(batch, 192, frames),
+                torch.rand(batch, frames) * 200.0 + 100.0,
+                torch.randn(batch, 256, 1),
+            )
+
+    def test_the_series_start_at_their_initialisation_values(self, collect):
+        decoder = _generator(chouwagan_latent_source_gate=True)
+        metrics = collect(_Model(decoder))
+
+        for stage in range(len(RATES)):
+            # ``2 * sigmoid(0)`` is 1.0: fully open, costing the stage nothing.
+            assert metrics[f"Source/latent_gate_mean_stage_{stage}"] == pytest.approx(1.0)
+            assert metrics[f"Source/latent_gate_saturation_stage_{stage}"] == 0.0
+            # And not yet a function of the latent at all.  This series leaving
+            # zero is the evidence that the pitch path became conditional on z.
+            assert metrics[f"Source/latent_gate_sensitivity_stage_{stage}"] == 0.0
+
+    def test_the_effective_ratio_equals_the_raw_one_while_the_gate_is_open(self, collect):
+        decoder = _generator(chouwagan_latent_source_gate=True)
+        self._drive(decoder)
+        metrics = collect(_Model(decoder))
+
+        for stage in range(len(RATES)):
+            assert metrics[f"Source/inject_ratio_effective_stage_{stage}"] == pytest.approx(
+                metrics[f"Source/inject_ratio_stage_{stage}"], rel=1e-5
+            )
+        assert metrics["Source/inject_ratio_effective_output_stage"] == pytest.approx(
+            metrics["Source/inject_ratio_output_stage"], rel=1e-5
+        )
+
+    def test_closing_the_gate_moves_the_effective_ratio_and_not_the_raw_one(self, collect):
+        decoder = _generator(chouwagan_latent_source_gate=True)
+        self._drive(decoder)
+        before = collect(_Model(decoder))
+
+        with torch.no_grad():
+            # A large negative bias drives ``2 * sigmoid`` toward 0: the stage
+            # refuses the excitation even though ``fusion_proj`` still weighs it
+            # exactly as before.
+            torch.nn.init.constant_(decoder.latent_gates[0].bias, -4.0)
+        self._drive(decoder)
+        after = collect(_Model(decoder))
+
+        assert after["Source/inject_ratio_stage_0"] == pytest.approx(
+            before["Source/inject_ratio_stage_0"]
+        )
+        assert after["Source/latent_gate_mean_stage_0"] < 0.05
+        assert after["Source/inject_ratio_effective_stage_0"] < 0.05 * before[
+            "Source/inject_ratio_stage_0"
+        ]
+
+    def test_the_mean_is_measured_and_not_derived_from_the_bias(self, collect):
+        """The regression this whole path exists for.
+
+        A saturating gate's mean is set by the shape of the split between its
+        floor and its ceiling, not by its centre, so ``2 * sigmoid(bias)`` can
+        be arbitrarily far from the truth.  On a real checkpoint it read 1.00
+        where the measured mean was 0.41.
+        """
+        decoder = _generator(chouwagan_latent_source_gate=True)
+        gate = decoder.latent_gates[0]
+        with torch.no_grad():
+            # Wide logits around an offset centre.  Once the sigmoid saturates,
+            # the mean is driven by how the elements split between the floor and
+            # the ceiling and stays near 1.0, while the bias-only estimate
+            # follows the centre down to 0.54.
+            torch.nn.init.normal_(gate.weight, std=4.0)
+            torch.nn.init.constant_(gate.bias, -1.0)
+            bias_only = float((2.0 * torch.sigmoid(gate.bias)).mean())
+        self._drive(decoder)
+        metrics = collect(_Model(decoder))
+
+        assert bias_only == pytest.approx(0.5379, abs=1e-3)
+        assert metrics["Source/latent_gate_saturation_stage_0"] > 0.1
+        assert abs(metrics["Source/latent_gate_mean_stage_0"] - bias_only) > 0.2
+
+    def test_an_ungated_decoder_reports_no_gate_series(self, collect):
+        decoder = _generator(chouwagan_latent_source_gate=False)
+        metrics = collect(_Model(decoder))
+
+        # The raw series has to survive, or a run without the gate loses the
+        # measurement this whole module exists for.
+        assert "Source/inject_ratio_stage_0" in metrics
+        assert not [key for key in metrics if "latent_gate" in key]
+        assert not [key for key in metrics if "effective" in key]
+
+    def test_the_buffers_stay_out_of_the_state_dict(self):
+        """Telemetry must not become a resume hazard.
+
+        A persistent buffer would add keys to every future checkpoint and make
+        strict loading refuse every existing one, which is a high price for a
+        number that is recomputed on the next forward anyway.
+        """
+        decoder = _generator(chouwagan_latent_source_gate=True)
+        keys = decoder.state_dict().keys()
+
+        assert not [key for key in keys if "latent_gate_mean" in key]
+        assert not [key for key in keys if "latent_gate_saturation" in key]

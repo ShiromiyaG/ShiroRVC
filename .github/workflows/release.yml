@@ -16,14 +16,19 @@ name: Release
 # that name -- both read it from version.py, and tests/test_app_identity.py
 # fails the build if any copy of it drifts.
 
-# Releases are cut by editing the VERSION file.  Push that edit to main and
-# this workflow tags it and publishes; no separate tagging step, and no way for
-# the published version to disagree with what the two interfaces report, since
-# both read the same file.
+# Releases are cut by editing the "version" key of assets/config.json.  Push
+# that edit to main and this workflow tags it and publishes; no separate tagging
+# step, and no way for the published version to disagree with what the two
+# interfaces report, since both read the same file.
+#
+# That file is also the settings file the theme, language, model-author and FP16
+# tabs write, so a commit touching any of those triggers this too.  Harmless:
+# the gate below refuses to publish a version that already has a release, so a
+# spurious trigger builds artifacts and stops.
 on:
   push:
     branches: [main]
-    paths: ["VERSION"]
+    paths: ["assets/config.json"]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -53,21 +58,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read VERSION and decide
+      - name: Read the version and decide
         id: meta
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VERSION="$(tr -d '[:space:]' < VERSION)"
-          if [ -z "$VERSION" ]; then
-            echo "::error file=VERSION::VERSION is empty."
+          # Through version.py rather than jq: it is the same reader the two
+          # interfaces use, so a malformed config fails here instead of
+          # publishing a release the application would report as 0.0.0.
+          VERSION="$(python3 -c 'import version; print(version.read_version())')"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "0.0.0" ]; then
+            echo "::error file=assets/config.json::no usable \"version\" key."
             exit 1
           fi
           # A three-part number keeps the tag, the installer filenames and the
           # version both interfaces display in the same shape.
           if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
-            echo "::error file=VERSION::'$VERSION' is not a valid version (expected e.g. 1.2.3)."
+            echo "::error file=assets/config.json::'$VERSION' is not a valid version (expected e.g. 1.2.3)."
             exit 1
           fi
 

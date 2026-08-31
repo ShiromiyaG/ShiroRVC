@@ -24,13 +24,78 @@ arch_config_paths = get_vocoder_config_paths()
 _APP_CONFIG_PATH = os.path.join("assets", "config.json")
 
 
-def get_use_fp16() -> bool:
-    """The persisted "train under FP16 autocast" preference."""
+#: Compute capability at which FP16 is known to be the better default.
+#:
+#: At 7.0 and up (Volta onward) there are FP16 tensor cores, and the full
+#: training step -- decoder plus discriminator, forward and backward, batch 8
+#: over 0.4 s -- was measured on an RTX 5060 at:
+#:
+#:   RefineGAN   5.12 -> 3.78 GiB   385 -> 337 ms
+#:   ChouwaGAN   4.27 -> 2.61 GiB   227 -> 185 ms
+#:
+#: Below 7.0 there are no FP16 tensor cores, so none of that speed is on offer.
+#: What happens instead is *not measured here* -- no such card was available --
+#: and it is genuinely uncertain: cuDNN and cuBLAS often accumulate in FP32 on
+#: those parts regardless of the input dtype, so the step pays cast overhead and
+#: collects halved memory traffic, which can land either way.  The memory saving
+#: is the part that holds regardless: half the bytes per activation is a
+#: property of the dtype, not of the hardware.
+#:
+#: So this is the cutoff for *defaulting* to FP16, not for allowing it.  Below
+#: it the setting stays available and simply is not switched on for someone who
+#: never asked, because an unmeasured trade is not a default.  Note also that
+#: the FP32 baseline is not the same on both sides: TF32 needs 8.0, so a
+#: pre-Volta card is compared against plain FP32, a weaker baseline than the one
+#: the numbers above beat.
+_FP16_MIN_CAPABILITY = (7, 0)
+
+
+def fp16_is_supported() -> bool:
+    """Whether this machine should train under FP16 autocast.
+
+    Not merely "does the maths run" -- every CUDA card back to Kepler can
+    multiply half-precision numbers.  The question is whether it has the tensor
+    cores to make it pay, which is what the capability check is for.
+    """
+
+    if not torch.cuda.is_available():
+        return False
+    # ROCm reports a gfx architecture through the same call, and its numbers do
+    # not mean CUDA capabilities.  Every ROCm card torch supports has usable
+    # FP16, so the version check is the whole test there.
+    if getattr(torch.version, "hip", None):
+        return True
+    try:
+        return torch.cuda.get_device_capability() >= _FP16_MIN_CAPABILITY
+    except (AssertionError, RuntimeError):
+        return False
+
+
+def _read_app_config() -> dict:
     try:
         with open(_APP_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return bool(json.load(f).get("use_fp16", False))
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return False
+            stored = json.load(f)
+        return stored if isinstance(stored, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def get_use_fp16() -> bool:
+    """The persisted "train under FP16 autocast" preference.
+
+    Absent means *undecided*, not "off": the machine is asked instead, so a
+    fresh install on capable hardware starts in FP16 without anyone finding the
+    settings tab.  The answer is deliberately *not* written back -- the file
+    then records only what a person chose, a read-only install works by
+    construction, and moving a config between machines re-asks rather than
+    carrying one machine's answer to another.  ``set_use_fp16`` is what makes
+    the value explicit, and from then on it wins.
+    """
+
+    stored = _read_app_config()
+    if "use_fp16" in stored:
+        return bool(stored["use_fp16"])
+    return fp16_is_supported()
 
 def singleton(cls):
     instances = {}
@@ -46,6 +111,8 @@ class Config:
     def __init__(self):
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
+        # Reading it is what decides it on a first start, so this call has to
+        # come after ``self.device`` and before anything reports the precision.
         initial_precision = self.get_precision()
 
         get_console().log(

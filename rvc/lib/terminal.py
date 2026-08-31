@@ -32,6 +32,10 @@ from rich.text import Text
 
 
 _console: Console | None = None
+#: The ``sys.stderr`` the cached console was built around, so a harness that
+#: swaps the stream out from under us gets a new console instead of writes to a
+#: closed file.  See :func:`get_console`.
+_console_stream: Any = None
 _rich_handler: RichHandler | None = None
 _rich_print_installed = False
 _builtin_print = builtins.print
@@ -108,16 +112,29 @@ def _force_terminal() -> bool | None:
 
 
 def get_console() -> Console:
-    global _console
-    if _console is None:
+    """The shared console, rebuilt if ``sys.stderr`` has been replaced.
+
+    ``Console`` captures the stream object at construction, not the name, so a
+    console built while some harness had swapped ``sys.stderr`` keeps writing to
+    that stream forever -- and once the harness closes it, every later print
+    raises ``ValueError: I/O operation on closed file``.  In production the
+    stream never changes and this is a no-op; under pytest's capture, or a GUI
+    that redirects logs, it is the difference between working and failing
+    depending on which code printed first.
+    """
+
+    global _console, _console_stream
+    stream = sys.stderr
+    if _console is None or _console_stream is not stream:
         _console = Console(
-            file=sys.stderr,
+            file=stream,
             force_terminal=_force_terminal(),
             highlight=False,
             log_path=False,
             markup=False,
             soft_wrap=True,
         )
+        _console_stream = stream
     return _console
 
 

@@ -156,6 +156,9 @@ class ConversionSettings(QWidget):
         self.volume_envelope = SliderSpin(
             0, 1, 0.01, decimals=2, value=defaults["volume_envelope"]
         )
+        self.silence_gate_db = SliderSpin(
+            -120, 0, 1, decimals=0, value=defaults["silence_gate_db"]
+        )
         self.protect = SliderSpin(0, 0.5, 0.01, decimals=2, value=defaults["protect"])
 
         low, high, step, decimals = defaults["filter_radius_range"]
@@ -215,13 +218,6 @@ class ConversionSettings(QWidget):
         self.f0_file = PathPicker(filters="F0 curve (*.f0 *.txt);;All files (*.*)",
                                   placeholder=_("Optional external pitch curve"))
         self.seed = SliderSpin(0, 2**16, 1, decimals=0, value=defaults["seed"])
-        self.deterministic = Toggle(
-            _("Deterministic"), _("Reproducible output for a given seed."),
-            checked=defaults["deterministic"],
-        )
-        self.temperature = SliderSpin(
-            0, 2, 0.01, decimals=2, value=defaults["latent_temperature"]
-        )
 
         self.filter_radius_field = Field(
             _("Filter radius"), self.filter_radius,
@@ -242,6 +238,7 @@ class ConversionSettings(QWidget):
         row = QHBoxLayout()
         row.setSpacing(12)
         row.addWidget(Field(_("Volume envelope"), self.volume_envelope, _("1 keeps the output's own dynamics; 0 copies the input's.")))
+        row.addWidget(Field(_("Silence gate"), self.silence_gate_db, _("Fades out the output where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off.")))
         row.addWidget(Field(_("Pitch algorithm"), self.f0_method, _("rmvpe is the recommended default.")))
         layout.addLayout(row)
         layout.addWidget(Field(_("Embedder"), self.embedder, _("Model used to extract speaker-independent content features.")))
@@ -310,9 +307,7 @@ class ConversionSettings(QWidget):
         )
         self.advanced.add_row(
             Field(_("Seed"), self.seed, _("0 picks a fresh seed each run.")),
-            Field(_("Latent temperature"), self.temperature, _("ChouwaGAN and Wavehax only. Above 1 adds variation, below 1 flattens it.")),
         )
-        self.advanced.add(self.deterministic)
 
         # Dependent controls start in the state their toggle implies rather
         # than waiting for the first click.
@@ -338,6 +333,7 @@ class ConversionSettings(QWidget):
             "index_power": self.index_power.value(),
             "index_continuity": self.index_continuity.value(),
             "volume_envelope": self.volume_envelope.value(),
+            "silence_gate_db": self.silence_gate_db.value(),
             "protect": self.protect.value(),
             # Not coerced to int: the single-file profile's 0.006 is a float
             # upstream, and rounding it here would change the pitch smoothing.
@@ -356,8 +352,6 @@ class ConversionSettings(QWidget):
             "formant_timbre": self.formant_timbre.value(),
             "f0_file": self.f0_file.path() or None,
             "seed": int(self.seed.value()),
-            "deterministic": self.deterministic.isChecked(),
-            "latent_temperature": self.temperature.value(),
         }
 
 

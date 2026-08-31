@@ -46,25 +46,6 @@ def precision_tab():
     with gr.Row():
         with gr.Column():
 
-            gr.Markdown(
-                _("### Precision\n"
-                  "The default is **FP32** master weights with **TF32** tensor "
-                  "cores - no autocast, no loss scaler. TF32 is toggled per run "
-                  "in the Training tab.\n\n"
-                  "**FP16** adds `torch.autocast` plus a `GradScaler` on top. It "
-                  "keeps the same 11-bit mantissa as TF32 (gradient cosine 0.99 "
-                  "against a true-FP32 reference, where BF16's 8-bit mantissa "
-                  "measured only 0.77-0.82), but its narrow exponent range can "
-                  "overflow, which is what the scaler is for. Distribution math "
-                  "and the NSF source stay in FP32; the convolutional backbone - "
-                  "the dominant cost - runs in FP16.\n\n"
-                  "Turn it on for the memory and speed, turn it off if a run "
-                  "shows the scaler backing off repeatedly or losses going "
-                  "non-finite. BF16 is not offered: it loses too much mantissa "
-                  "for this model, whose oscillatory NSF source and L1-on-log-mel "
-                  "loss produce heavily cancelling sums.")
-            )
-
             use_fp16 = gr.Checkbox(
                 label=_("FP16 training (autocast + GradScaler)"),
                 info=_("Applies to runs started after this is saved. Needs a CUDA GPU."),

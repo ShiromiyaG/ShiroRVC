@@ -2,7 +2,7 @@ import os
 import shutil
 from random import shuffle
 from rvc.configs.config import Config
-from rvc.lib.terminal import info
+from rvc.lib.terminal import info, warning
 import json
 import librosa
 import soundfile as sf
@@ -150,11 +150,38 @@ def generate_filelist(
     f0_dir = os.path.join(model_path, "f0")
     f0nsf_dir = os.path.join(model_path, "f0_voiced")
 
-    gt_wavs_files = sorted(os.listdir(gt_wavs_dir), key=lambda x: x.split(".")[0])
-    feature_files = sorted(os.listdir(feature_dir), key=lambda x: x.split(".")[0])
+    def _stem(name: str) -> str:
+        # f0 files are "<clip>.wav.npy", features "<clip>.npy", audio "<clip>.wav".
+        for suffix in (".npy", ".wav"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name
 
-    f0_files = sorted(os.listdir(f0_dir), key=lambda x: x.split(".")[0])
-    f0nsf_files = sorted(os.listdir(f0nsf_dir), key=lambda x: x.split(".")[0])
+    def _by_stem(directory: str) -> dict:
+        return {_stem(name): name for name in os.listdir(directory)}
+
+    gt_wavs_by_stem = _by_stem(gt_wavs_dir)
+    feature_by_stem = _by_stem(feature_dir)
+    f0_by_stem = _by_stem(f0_dir)
+    f0nsf_by_stem = _by_stem(f0nsf_dir)
+
+    # Pair by clip name rather than by list position: a clip that failed one of
+    # the extraction passes leaves a hole, and index pairing would silently
+    # marry every later clip's audio to another clip's pitch.
+    complete = sorted(
+        set(gt_wavs_by_stem)
+        & set(feature_by_stem)
+        & set(f0_by_stem)
+        & set(f0nsf_by_stem)
+    )
+    incomplete = sorted(set(gt_wavs_by_stem) - set(complete))
+    if incomplete:
+        warning(
+            f"Skipping {len(incomplete)} clip(s) missing features or pitch: "
+            + ", ".join(incomplete[:10])
+            + (" ..." if len(incomplete) > 10 else ""),
+            tag="[EXTRACT]",
+        )
 
     options = []
 
@@ -169,7 +196,11 @@ def generate_filelist(
 
     sids = []
     
-    for gt_wavs_file, feature_file, f0_file, f0nsf_file in zip(gt_wavs_files, feature_files, f0_files, f0nsf_files, strict=True):
+    for stem in complete:
+        gt_wavs_file = gt_wavs_by_stem[stem]
+        feature_file = feature_by_stem[stem]
+        f0_file = f0_by_stem[stem]
+        f0nsf_file = f0nsf_by_stem[stem]
         sid = gt_wavs_file.split("_")[0]
         if sid not in sids:
             sids.append(sid)

@@ -52,7 +52,9 @@ def _write(path: Path, payload):
 def test_a_config_from_an_older_architecture_is_replaced(tmp_path, shipped):
     stale = json.loads(json.dumps(shipped))
     stale["model"]["architecture_id"] = "shiro_vits_svae_v2"
-    stale["model"]["vits_latent_channels"] = 64
+    # A shape-defining key the stale config disagrees on: the point of the
+    # guard is that it does not survive the replacement.
+    stale["model"]["chouwagan_channels"] = [64, 64, 64]
     _write(tmp_path / "config.json", stale)
 
     generate_config(44100, str(tmp_path), "chouwagan")
@@ -61,8 +63,8 @@ def test_a_config_from_an_older_architecture_is_replaced(tmp_path, shipped):
     assert written["model"]["architecture_id"] == (
         shipped["model"]["architecture_id"]
     )
-    assert written["model"]["vits_latent_channels"] == (
-        shipped["model"]["vits_latent_channels"]
+    assert written["model"]["chouwagan_channels"] == (
+        shipped["model"]["chouwagan_channels"]
     )
 
 

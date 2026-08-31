@@ -130,9 +130,7 @@ def slice_segments(
     ]
 
 
-def rand_slice_segments(
-    x, x_lengths=None, segment_size=4, frame_energy=None, energy_floor=0.0
-):
+def rand_slice_segments(x, x_lengths=None, segment_size=4):
     """
     Randomly slice segments from a tensor.
 
@@ -140,52 +138,12 @@ def rand_slice_segments(
         x: The tensor to slice.
         x_lengths: The lengths of the sequences.
         segment_size: The size of each segment.
-        frame_energy: Optional per-frame energy ``(batch, frames)`` used to skip
-            segments with no signal in them.
-        energy_floor: A segment is eligible when its mean energy is at least
-            this fraction of the utterance's own mean.  ``0`` keeps the plain
-            uniform draw.
-
-    Measured on this dataset, 9% of uniformly drawn segments are essentially
-    silence and 23% are under 5% voiced.  Unvoiced is not waste -- fricatives
-    and breath are exactly the detail this model is short of -- so the floor is
-    on *energy*, not on voicing, and it is relative to each utterance so a
-    quiet recording is not filtered away wholesale.
     """
     b, d, t = x.size()
     if x_lengths is None:
         x_lengths = t
     ids_str_max = x_lengths - segment_size + 1
-
-    if frame_energy is None or energy_floor <= 0.0:
-        ids_str = (torch.rand([b], device=x.device) * ids_str_max).to(dtype=torch.long)
-        return slice_segments(x, ids_str, segment_size, dim=3), ids_str
-
-    energy = frame_energy.float().clamp_min(0.0)
-    if energy.shape[-1] < segment_size:
-        ids_str = (torch.rand([b], device=x.device) * ids_str_max).to(dtype=torch.long)
-        return slice_segments(x, ids_str, segment_size, dim=3), ids_str
-
-    # Mean energy of every candidate segment, in one pass.
-    cumulative = torch.nn.functional.pad(energy.cumsum(-1), (1, 0))
-    starts = cumulative.shape[-1] - segment_size
-    window_mean = (
-        cumulative[:, segment_size:] - cumulative[:, :starts]
-    ) / float(segment_size)
-
-    reference = energy.mean(dim=-1, keepdim=True).clamp_min(1e-12)
-    eligible = (window_mean >= energy_floor * reference).float()
-
-    # Starts past the sequence length are never eligible.
-    positions = torch.arange(window_mean.shape[-1], device=x.device).unsqueeze(0)
-    limit = torch.as_tensor(ids_str_max, device=x.device).reshape(-1, 1)
-    eligible = eligible * (positions < limit).float()
-
-    # A uniform draw over the whole valid range is the fallback for an
-    # utterance where nothing clears the floor; adding it everywhere at a small
-    # weight keeps the sampler defined without a branch.
-    weights = eligible + 1e-6 * (positions < limit).float()
-    ids_str = torch.multinomial(weights.clamp_min(1e-12), 1).squeeze(-1).long()
+    ids_str = (torch.rand([b], device=x.device) * ids_str_max).to(dtype=torch.long)
     return slice_segments(x, ids_str, segment_size, dim=3), ids_str
 
 

@@ -1,8 +1,8 @@
 """ChouwaGAN's decoder: a compact anti-aliased NSF generator for 44.1 kHz.
 
-Ported back from ``ShiroRVC``.  What it is, against the two decoders it sits
-beside: RefineGAN drives a *deterministic pulse template* through dense
-ResBlocks, Wavehax works in the complex STFT domain, and this one drives a
+Ported back from ``ShiroRVC``.  What it is, against the decoder it sits beside:
+RefineGAN drives a *deterministic pulse template* through dense
+ResBlocks, and this one drives a
 *band-limited harmonic bank plus noise* through depthwise-separable blocks whose
 activations are 2x-oversampled SnakeBeta.  The excitation is the part that
 distinguishes it -- every harmonic is masked as it approaches Nyquist, so the
@@ -13,7 +13,7 @@ Two things the original had are **not** here, both because what fed them was
 deleted with the SVAE:
 
 * the hierarchical latent path (separate ``content_latent``/``detail_latent``
-  inputs with their own gates).  ``RefineVitsLatent`` hands the decoder one
+  inputs with their own gates).  The latent frontend hands the decoder one
   concatenated ``z``, exactly as it does for the other two decoders, so a second
   entry point would be dead configuration.
 * late detail fusion, which consumed the SVAE's slow/fast latents.
@@ -24,7 +24,7 @@ deleted with the SVAE:
 from __future__ import annotations
 
 import math
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -34,117 +34,16 @@ from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
 
 
-def _safe_pad(x: Tensor, padding: int) -> Tensor:
-    if padding == 0:
-        return x
-    mode = "reflect" if x.shape[-1] > padding else "replicate"
-    return F.pad(x, (padding, padding), mode=mode)
-
-
-def _lowpass_kernel(factor: int, width: int, rolloff: float) -> Tensor:
-    half = max(1, int(width) * max(1, int(factor)))
-    positions = torch.arange(-half, half + 1, dtype=torch.float32)
-    cutoff = 0.5 * float(rolloff) / max(1, int(factor))
-    kernel = 2.0 * cutoff * torch.sinc(2.0 * cutoff * positions)
-    kernel = kernel * torch.kaiser_window(
-        kernel.numel(), periodic=False, beta=14.0, dtype=kernel.dtype
-    )
-    return (kernel / kernel.sum()).view(1, 1, -1)
-
-
-class FixedLowPass1d(nn.Module):
-    def __init__(
-        self,
-        factor: int,
-        width: int = 4,
-        rolloff: float = 0.95,
-        stride: int = 1,
-    ):
-        super().__init__()
-        self.stride = int(stride)
-        self.register_buffer(
-            "kernel", _lowpass_kernel(factor, width, rolloff), persistent=False
-        )
-
-    def _grouped_kernel(self, x: Tensor) -> Tensor:
-        """The per-channel kernel, cached across calls.
-
-        ``.to()`` plus ``.expand()`` ran on every forward of every instance.
-        Each is cheap on its own and neither shows up in the GPU trace, but at
-        26 instances called several times per step they are pure dispatch on a
-        step that is already CPU-bound.  The cache is keyed by the only three
-        things that can change it.
-        """
-        channels = int(x.shape[1])
-        key = (channels, x.dtype, x.device)
-        if getattr(self, "_kernel_key", None) != key:
-            self._kernel_cache = (
-                self.kernel.to(device=x.device, dtype=x.dtype)
-                .expand(channels, -1, -1)
-                .contiguous()
-            )
-            self._kernel_key = key
-        return self._kernel_cache
-
-    def forward(self, x: Tensor) -> Tensor:
-        kernel = self._grouped_kernel(x)
-        padding = (kernel.shape[-1] - 1) // 2
-        return F.conv1d(
-            _safe_pad(x, padding),
-            kernel,
-            stride=self.stride,
-            groups=x.shape[1],
-        )
-
-
-class AntiAliasedUpsample1d(nn.Module):
-    def __init__(self, factor: int, filter_width: int, rolloff: float):
-        super().__init__()
-        self.factor = int(factor)
-        kernel = _lowpass_kernel(self.factor, filter_width, rolloff)
-        self.register_buffer("kernel", kernel, persistent=False)
-
-        kernel_size = int(kernel.shape[-1])
-        self.pad = kernel_size // self.factor - 1
-        self.pad_left = self.pad * self.factor + (kernel_size - self.factor) // 2
-        self.pad_right = self.pad * self.factor + (kernel_size - self.factor + 1) // 2
-
-    def _grouped_kernel(self, x: Tensor) -> Tensor:
-        channels = int(x.shape[1])
-        key = (channels, x.dtype, x.device)
-        if getattr(self, "_kernel_key", None) != key:
-            self._kernel_cache = (
-                self.kernel.to(device=x.device, dtype=x.dtype)
-                .expand(channels, -1, -1)
-                .contiguous()
-            )
-            self._kernel_key = key
-        return self._kernel_cache
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.factor == 1:
-            return x
-        channels = x.shape[1]
-        kernel = self._grouped_kernel(x)
-        x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        # ``padding`` crops the transposed convolution's own output instead of
-        # computing 43 samples per call and then throwing them away.  It is
-        # symmetric, and ``pad_left``/``pad_right`` differ by one whenever
-        # ``kernel_size - factor`` is odd -- which it always is here, since the
-        # kernel length is odd and the factor even.  So the symmetric part goes
-        # to the convolution and only the remaining single sample is trimmed;
-        # using ``output_padding`` to absorb it instead would shift the whole
-        # signal by one sample at 2x rate, which is a phase change in the
-        # anti-aliasing path, not an optimisation.
-        x = self.factor * F.conv_transpose1d(
-            x,
-            kernel,
-            stride=self.factor,
-            padding=self.pad_left,
-            groups=channels,
-        )
-        trim = self.pad_right - self.pad_left
-        return x if trim == 0 else x[..., :-trim]
+#: The windowed-sinc resamplers moved to ``rvc.lib.algorithm.resampling`` when
+#: RefineGAN started using them too.  They are re-exported here because this is
+#: where every existing import of them points.
+from rvc.lib.algorithm.resampling import (  # noqa: E402
+    DEFAULT_FILTER_BETA,
+    AntiAliasedUpsample1d,
+    FixedLowPass1d,
+    filter_schedule,
+    lowpass_kernel as _lowpass_kernel,
+)
 
 
 def soft_clip(
@@ -167,6 +66,77 @@ def soft_clip(
     excess = (magnitude - float(threshold)).clamp_min(0.0)
     compressed = span * torch.tanh(excess / span)
     return x.sign() * (magnitude.clamp(max=float(threshold)) + compressed)
+
+
+class ISTFTHead(nn.Module):
+    """Finish the last upsampling factor with an inverse STFT.
+
+    The two ``x7`` stages carry 82 k of this decoder's 4.0 M parameters and own
+    everything above ~1 kHz, which is exactly the band the mel error sits in.
+    Widening them in the time domain works but is paid for in activation
+    memory: every residual unit past the last upsample stores a tensor at
+    44.1 kHz, and the measured cost of a merely adequate schedule is 5.4 GB at
+    batch 8, which does not leave room for the discriminator on an 8 GB card.
+
+    This is iSTFTNet's answer.  The time-domain stack stops at ``sr / hop`` and
+    a linear projection predicts one complex frame per output frame, which
+    overlap-adds to the waveform.  No activation is ever materialised at the
+    output rate, so the freed budget can be spent where the capacity is
+    actually missing.
+
+    ``hop`` is the *remaining* upsample factor, and it should stay small for the
+    same reason iSTFTNet keeps it at 4 of 256: the head is linear, and the
+    further it has to reach the more of the spectrum's structure has to be
+    guessed by a single projection.  Predicting magnitude and phase rather than
+    real and imaginary parts is also iSTFTNet's, and for the same reason -- the
+    magnitude is forced positive by ``exp`` instead of being an unconstrained
+    difference of two free parameters.
+
+    ``n_fft`` is ``2 * hop`` for 50% overlap.  With a Hann window that is
+    exactly COLA, so the overlap-add needs no envelope correction and the
+    transform is an identity on a signal it did not modify.
+    """
+
+    def __init__(self, channels: int, hop: int, kernel_size: int = 7):
+        super().__init__()
+        self.hop = int(hop)
+        self.n_fft = 2 * self.hop
+        self.n_bins = self.n_fft // 2 + 1
+        self.proj = weight_norm(
+            nn.Conv1d(
+                int(channels),
+                2 * self.n_bins,
+                int(kernel_size),
+                padding=int(kernel_size) // 2,
+            )
+        )
+        # Periodic, not symmetric: the COLA property above is a statement about
+        # a window tiled at ``hop``, and ``periodic=False`` breaks it.
+        self.register_buffer(
+            "window", torch.hann_window(self.n_fft, periodic=True), persistent=False
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        magnitude, phase = self.proj(x).chunk(2, dim=1)
+        # Clamped before the exponential rather than after: a spectrogram bin of
+        # a signal in [-1, 1] cannot exceed ``n_fft``, and without the ceiling a
+        # single early step can produce an inf that poisons the whole overlap-add
+        # and every gradient behind it.
+        magnitude = magnitude.clamp(max=math.log(float(self.n_fft))).exp()
+        spectrum = torch.polar(magnitude.float(), phase.float())
+        frames = torch.fft.irfft(spectrum, n=self.n_fft, dim=1)
+        frames = frames * self.window.view(1, -1, 1)
+        waveform = F.fold(
+            frames,
+            output_size=(1, (frames.shape[-1] - 1) * self.hop + self.n_fft),
+            kernel_size=(1, self.n_fft),
+            stride=(1, self.hop),
+        ).squeeze(2)
+        # Drop the half-window of ramp at each end that has no partner frame to
+        # complete the overlap-add, so the result lines up sample-for-sample
+        # with ``frames * hop`` -- the length every other head returns.
+        edge = (self.n_fft - self.hop) // 2
+        return waveform[..., edge : edge + frames.shape[-1] * self.hop]
 
 
 class DCBlocker(nn.Module):
@@ -230,6 +200,7 @@ class AntiAliasedSnakeBeta(nn.Module):
         rolloff: float = 0.95,
         filter_width: int = 4,
         antialias: bool = True,
+        filter_beta: float = DEFAULT_FILTER_BETA,
     ):
         super().__init__()
         initial = math.log(math.expm1(1.0))
@@ -238,10 +209,17 @@ class AntiAliasedSnakeBeta(nn.Module):
         self.antialias = bool(antialias)
         if self.antialias:
             self.upsample = AntiAliasedUpsample1d(
-                2, filter_width=int(filter_width), rolloff=rolloff
+                2,
+                filter_width=int(filter_width),
+                rolloff=rolloff,
+                filter_beta=filter_beta,
             )
             self.downsample = FixedLowPass1d(
-                2, width=int(filter_width), rolloff=rolloff, stride=2
+                2,
+                width=int(filter_width),
+                rolloff=rolloff,
+                stride=2,
+                filter_beta=filter_beta,
             )
         else:
             self.upsample = self.downsample = None
@@ -265,21 +243,6 @@ class AntiAliasedSnakeBeta(nn.Module):
         return x
 
 
-# Seed for the reproducible excitation noise used when ``deterministic`` is set.
-DETERMINISTIC_NOISE_SEED = 0
-
-# Same idea for the harmonic phase offsets.  Training draws a fresh offset per
-# harmonic on every batch, so the decoder only ever sees excitations from that
-# random-phase distribution and must be phase-agnostic.  ``deterministic``
-# inference used to leave the offsets at zero instead, which is not a draw from
-# that distribution -- it is its extreme: aligning every harmonic maximises the
-# crest factor.  Measured at f0=200 Hz against 200 random draws, the aligned
-# excitation is 1.31x peakier than a training one at 16 harmonics and 1.57x at
-# 32, so the gap widens with every harmonic added.  Drawing a fixed-seed offset
-# keeps inference reproducible while keeping it in distribution, exactly as
-# DETERMINISTIC_NOISE_SEED does for the noise term.
-DETERMINISTIC_PHASE_SEED = 1
-
 # Half-width of the voiced/unvoiced amplitude crossfade.  Measured on a 180 Hz
 # burst, this drops the waveform discontinuity at the boundary from 0.140 to
 # 0.006; anything longer buys nothing and only smears the transition.
@@ -297,7 +260,6 @@ class BandLimitedNSFSource(nn.Module):
         self.sample_rate = float(sample_rate)
         self.harmonic_count = int(harmonic_count)
         self.noise_std = float(noise_std)
-        self.deterministic = False
         self.crossfade_samples = max(
             1, int(round(self.sample_rate * VOICED_CROSSFADE_SECONDS))
         )
@@ -404,42 +366,13 @@ class BandLimitedNSFSource(nn.Module):
             dtype=f0.dtype,
         )
         if self.harmonic_count > 1:
-            if self.training or not self.deterministic:
-                phase_offset[..., 1:] = torch.rand_like(phase_offset[..., 1:]) * (
-                    2.0 * math.pi
-                )
-            else:
-                # See DETERMINISTIC_PHASE_SEED: leaving these at zero hands the
-                # decoder the one excitation shape it never trained on.
-                generator = torch.Generator(device=f0.device)
-                generator.manual_seed(DETERMINISTIC_PHASE_SEED)
-                phase_offset[..., 1:] = (
-                    torch.rand(
-                        phase_offset[..., 1:].shape,
-                        generator=generator,
-                        device=f0.device,
-                        dtype=f0.dtype,
-                    )
-                    * (2.0 * math.pi)
-                )
+            phase_offset[..., 1:] = torch.rand_like(phase_offset[..., 1:]) * (
+                2.0 * math.pi
+            )
         harmonic_wave = torch.sin(
             phase.unsqueeze(-1) * harmonics.view(1, 1, -1) + phase_offset
         )
-        if self.training or not self.deterministic:
-            noise = torch.randn_like(f0)
-        else:
-            # `deterministic` asks for a reproducible excitation, not a silent
-            # one.  Unvoiced frames carry no harmonic component, so the noise
-            # term is the *entire* excitation there; zeroing it hands the
-            # decoder an input it never saw in training and those regions come
-            # out as digital silence -- no room tone, no breath, a hard cut at
-            # the end of every utterance.  A fixed generator keeps the output
-            # reproducible while staying in distribution.
-            generator = torch.Generator(device=f0.device)
-            generator.manual_seed(DETERMINISTIC_NOISE_SEED)
-            noise = torch.randn(
-                f0.shape, generator=generator, device=f0.device, dtype=f0.dtype
-            )
+        noise = torch.randn_like(f0)
         return f0, voiced, voiced_envelope, harmonic_wave, noise, harmonicity
 
     @torch.compiler.disable
@@ -531,11 +464,12 @@ class DepthwiseSeparableUnit(nn.Module):
         rolloff: float,
         filter_width: int = 4,
         antialias: bool = True,
+        filter_beta: float = DEFAULT_FILTER_BETA,
     ):
         super().__init__()
         hidden = int(channels * expansion)
         self.activation = AntiAliasedSnakeBeta(
-            channels, rolloff, filter_width, antialias
+            channels, rolloff, filter_width, antialias, filter_beta
         )
         self.expand = weight_norm(nn.Conv1d(channels, hidden, 1))
         self.depthwise = weight_norm(
@@ -613,11 +547,12 @@ class DenseUnit(nn.Module):
         rolloff: float,
         filter_width: int = 4,
         antialias: bool = True,
+        filter_beta: float = DEFAULT_FILTER_BETA,
     ):
         super().__init__()
         del expansion
         self.activation = AntiAliasedSnakeBeta(
-            channels, rolloff, filter_width, antialias
+            channels, rolloff, filter_width, antialias, filter_beta
         )
         self.conv = weight_norm(
             nn.Conv1d(
@@ -662,6 +597,7 @@ class LiteAMPBranch(nn.Module):
         filter_width: int = 4,
         antialias: bool = True,
         unit_style: str = "separable",
+        filter_beta: float = DEFAULT_FILTER_BETA,
     ):
         super().__init__()
         unit = _unit_class(unit_style)
@@ -675,6 +611,7 @@ class LiteAMPBranch(nn.Module):
                     rolloff,
                     filter_width,
                     antialias,
+                    filter_beta,
                 )
                 for dilation in dilations
             ]
@@ -697,6 +634,7 @@ class LiteAMPBlock(nn.Module):
         filter_width: int = 4,
         antialias: bool = True,
         unit_style: str = "separable",
+        filter_beta: float = DEFAULT_FILTER_BETA,
     ):
         super().__init__()
         self.branches = nn.ModuleList(
@@ -710,6 +648,7 @@ class LiteAMPBlock(nn.Module):
                     filter_width,
                     antialias,
                     unit_style,
+                    filter_beta,
                 )
                 for kernel in kernels
             ]
@@ -780,8 +719,9 @@ class ExcitationEncoder(nn.Module):
         skip_channels: Sequence[int],
         bottleneck_channels: int,
         kernel_size: int = 7,
-        filter_width: int = 4,
-        rolloff: float = 0.95,
+        filter_width: int | Sequence[int] = 4,
+        rolloff: float | Sequence[float] = 0.95,
+        filter_beta: float | Sequence[float] = DEFAULT_FILTER_BETA,
         slope: float = 0.2,
     ):
         super().__init__()
@@ -798,14 +738,31 @@ class ExcitationEncoder(nn.Module):
         self.units = nn.ModuleList()
         current = skip_channels[0]
         targets = list(skip_channels[1:]) + [self.bottleneck_channels]
-        for factor, target in zip(reversed(tuple(upsample_rates)), targets, strict=True):
+        # ``filter_width``, ``rolloff`` and ``filter_beta`` may each be one value
+        # per *stage*.  The decimations below walk the stages in reverse -- the
+        # first one runs at the output rate -- so the schedules are reversed with
+        # them and each stage's source view is filtered exactly as tightly as
+        # that stage's activations are.
+        stages = len(tuple(upsample_rates))
+        widths = filter_schedule(filter_width, stages, "excitation filter widths", 1)
+        rolloffs = filter_schedule(rolloff, stages, "excitation rolloffs")
+        betas = filter_schedule(filter_beta, stages, "excitation filter betas", 0.0)
+        for factor, target, width, stage_rolloff, beta in zip(
+            reversed(tuple(upsample_rates)),
+            targets,
+            reversed(widths),
+            reversed(rolloffs),
+            reversed(betas),
+            strict=True,
+        ):
             self.downs.append(
                 nn.Sequential(
                     FixedLowPass1d(
                         int(factor),
-                        width=int(filter_width),
-                        rolloff=rolloff,
+                        width=int(width),
+                        rolloff=stage_rolloff,
                         stride=int(factor),
+                        filter_beta=beta,
                     ),
                     weight_norm(nn.Conv1d(current, int(target), 1)),
                 )
@@ -848,15 +805,18 @@ class ChouwaGANGenerator(nn.Module):
         chouwagan_expansion: int | Sequence[int] = (2, 2, 1, 1),
         chouwagan_harmonics: int = 7,
         chouwagan_noise_std: float = 0.01,
-        chouwagan_filter_width: int = 4,
+        chouwagan_filter_width: int | Sequence[int] = 4,
+        chouwagan_filter_beta: float | Sequence[float] = DEFAULT_FILTER_BETA,
         chouwagan_antialias_stages: Optional[Sequence[int]] = None,
-        chouwagan_rolloff: float = 0.95,
+        chouwagan_rolloff: float | Sequence[float] = 0.95,
         chouwagan_latent_mixer_kernel: int = 7,
         chouwagan_latent_mixer_dilations: Sequence[int] = (1, 3),
         chouwagan_latent_mixer_expansion: int = 2,
         chouwagan_excitation_unet: bool = False,
         chouwagan_excitation_kernel: int = 7,
+        chouwagan_latent_source_gate: bool = True,
         chouwagan_noise_injection: bool = False,
+        chouwagan_istft_hop: int = 0,
         chouwagan_output_head_threshold: float = 0.85,
         chouwagan_output_head_ceiling: float = 1.0,
         chouwagan_remove_output_dc: bool = True,
@@ -871,11 +831,91 @@ class ChouwaGANGenerator(nn.Module):
         self.checkpointing = bool(checkpointing)
         self.excitation_unet = bool(chouwagan_excitation_unet)
         self.initial_channel = int(initial_channel)
-        self.upsample_rates = tuple(int(value) for value in upsample_rates)
-        self.total_upsample = math.prod(self.upsample_rates)
+        full_rates = tuple(int(value) for value in upsample_rates)
+        self.total_upsample = math.prod(full_rates)
+        # ``upsample_rates`` is the whole hop and stays that way -- it is what
+        # the rest of the pipeline means by a frame.  ``chouwagan_istft_hop``
+        # says how much of its *tail* the iSTFT head covers, so the time-domain
+        # stack is built from the prefix that remains.  Only a suffix product
+        # is accepted: a hop that does not fall on a stage boundary would leave
+        # a fractional stage with no defined channel width.
+        self.istft_hop = max(0, int(chouwagan_istft_hop))
+        stage_limit = len(full_rates)
+        if self.istft_hop > 1:
+            tail = 1
+            stage_limit = None
+            for index in range(len(full_rates), 0, -1):
+                if tail == self.istft_hop:
+                    stage_limit = index
+                    break
+                tail *= full_rates[index - 1]
+            if not stage_limit:
+                raise ValueError(
+                    f"ChouwaGAN istft_hop ({self.istft_hop}) must be the product "
+                    f"of a non-empty proper suffix of upsample_rates "
+                    f"{full_rates}, leaving at least one time-domain stage."
+                )
+        else:
+            self.istft_hop = 0
+
+        self.upsample_rates = full_rates[:stage_limit]
+        self.body_upsample = math.prod(self.upsample_rates)
+        chouwagan_channels = tuple(chouwagan_channels)[:stage_limit]
+        chouwagan_block_kernels = tuple(chouwagan_block_kernels)[:stage_limit]
+        if not isinstance(chouwagan_expansion, int):
+            chouwagan_expansion = tuple(chouwagan_expansion)[:stage_limit]
+        # ---- Resampling filter length, per stage ----------------------------
+        # Where the fold *lands* is what makes it audible, and that is a
+        # property of the stage's rate: stage 0 runs at 300 Hz internally, so
+        # anything it folds is below 150 Hz and inside the excitation's own
+        # band; the output stage runs at 44.1 kHz, where a 19 kHz component's
+        # second-order product lands at 6.1 kHz.  Measured, a long filter at the
+        # output stage buys 20-30 dB and the same filter at stage 0 buys nothing
+        # -- and the output stage is also the expensive one, so paying for both
+        # ends is exactly backwards.  A scalar still means "the same everywhere".
+        #
+        # ``rolloff`` and ``filter_beta`` are per-stage for the same reason and
+        # they are per-stage *together*: they are one filter design, and a
+        # per-stage width fights a global shape.  What the frame grid actually
+        # needs is paid at stages 0 and 1 -- the latent enters at 100 Hz with
+        # content up to its own Nyquist, and at ``rolloff = 0.95`` the first
+        # image of that band is rejected by 9 dB, which is what puts a mirrored
+        # partial 20 dB under every harmonic at +-100 Hz.  Widening only there
+        # costs 73 taps at 300 and 900 Hz, against the output stage's 27% of the
+        # decoder, and the output stage keeps 0.95 because lowering its rolloff
+        # spends real audio bandwidth: its pair runs at 88.2 kHz, where 0.88
+        # would put -3 dB at 19.4 kHz.
+        stage_total = len(self.upsample_rates)
+        self.filter_widths = tuple(
+            int(value)
+            for value in filter_schedule(
+                chouwagan_filter_width, stage_total, "ChouwaGAN filter widths", 1
+            )
+        )
+        self.rolloffs = filter_schedule(
+            chouwagan_rolloff, stage_total, "ChouwaGAN rolloffs"
+        )
+        if any(not 0.0 < value <= 1.0 for value in self.rolloffs):
+            raise ValueError("ChouwaGAN rolloffs must lie in (0, 1].")
+        self.filter_betas = filter_schedule(
+            chouwagan_filter_beta, stage_total, "ChouwaGAN filter betas", 0.0
+        )
+        #: The output head and ``post_activation`` both run at the output rate,
+        #: so they follow the last stage rather than carrying their own key.
+        tail_width = self.filter_widths[-1]
+        tail_rolloff = self.rolloffs[-1]
+        tail_beta = self.filter_betas[-1]
+
         self.channels = tuple(int(value) for value in chouwagan_channels)
         if len(self.channels) != len(self.upsample_rates):
-            raise ValueError("ChouwaGAN channel and upsample schedules must match.")
+            raise ValueError(
+                f"ChouwaGAN has {len(self.upsample_rates)} time-domain stages "
+                f"{self.upsample_rates} but {len(self.channels)} channel widths "
+                f"{self.channels}. With chouwagan_istft_hop="
+                f"{self.istft_hop or 0} the head covers the tail of "
+                f"upsample_rates, so the channel, kernel and expansion "
+                f"schedules describe the stages that remain."
+            )
         if isinstance(chouwagan_expansion, int):
             stage_expansions = (int(chouwagan_expansion),) * len(self.channels)
         else:
@@ -909,7 +949,10 @@ class ChouwaGANGenerator(nn.Module):
                     int(chouwagan_latent_mixer_kernel),
                     int(dilation),
                     int(chouwagan_latent_mixer_expansion),
-                    chouwagan_rolloff,
+                    self.rolloffs[0],
+                    self.filter_widths[0],
+                    True,
+                    self.filter_betas[0],
                 )
                 for dilation in chouwagan_latent_mixer_dilations
             )
@@ -936,16 +979,33 @@ class ChouwaGANGenerator(nn.Module):
                 skip_channels,
                 skip_channels[-1],
                 kernel_size=int(chouwagan_excitation_kernel),
-                filter_width=chouwagan_filter_width,
-                rolloff=chouwagan_rolloff,
+                filter_width=self.filter_widths,
+                rolloff=self.rolloffs,
+                filter_beta=self.filter_betas,
             )
             self.exc_bottleneck = weight_norm(
                 nn.Conv1d(skip_channels[-1], int(upsample_initial_channel), 1)
             )
             self.exc_bottleneck_gate = nn.Parameter(torch.tensor(math.log(0.25 / 0.75)))
             self.register_parameter("source_gates", None)
+            # ---- Latent gating of the excitation skips ----------------------
+            # Without this the excitation U-Net is a full-width path from f0 to
+            # the sample that never touches the latent: it is re-injected at
+            # every stage and measures ~0.70 of the activation norm there.  A
+            # decoder that can rebuild a stage from pitch alone makes the
+            # posterior's residual information optional, and the KL rate falls
+            # to zero for a structural reason no free-bits floor can reach.
+            #
+            # Gating each skip by a per-frame signal predicted from the latent
+            # makes the pitch path usable only *through* the latent.  The gate
+            # is ``2 * sigmoid``: with the projection zero-initialised it is
+            # exactly 1.0 everywhere at step 0, so a resumed run starts
+            # numerically identical to an ungated one, and it starts at the
+            # sigmoid's steepest point rather than in a saturated tail.
+            self.latent_source_gate = bool(chouwagan_latent_source_gate)
         else:
             self.exc_skip_channels = ()
+            self.latent_source_gate = False
             source_gate = math.log(0.25 / 0.75)
             self.source_gates = nn.Parameter(
                 torch.full((len(self.channels),), source_gate)
@@ -995,6 +1055,7 @@ class ChouwaGANGenerator(nn.Module):
             )
 
         self.ups = nn.ModuleList()
+        self.latent_gates = nn.ModuleList() if self.latent_source_gate else None
         self.noise_injection = nn.ModuleList() if chouwagan_noise_injection else None
         self.blocks = nn.ModuleList()
         current_channels = int(upsample_initial_channel)
@@ -1010,8 +1071,9 @@ class ChouwaGANGenerator(nn.Module):
                 nn.Sequential(
                     AntiAliasedUpsample1d(
                         factor,
-                        filter_width=chouwagan_filter_width,
-                        rolloff=chouwagan_rolloff,
+                        filter_width=self.filter_widths[index],
+                        rolloff=self.rolloffs[index],
+                        filter_beta=self.filter_betas[index],
                     ),
                     weight_norm(nn.Conv1d(current_channels, channels, 1)),
                 )
@@ -1022,6 +1084,15 @@ class ChouwaGANGenerator(nn.Module):
                 self.fusion_proj.append(
                     weight_norm(nn.Conv1d(channels + skip, channels, 1))
                 )
+                if self.latent_gates is not None:
+                    # Deliberately *not* weight-normalised: weight norm
+                    # reparameterises a zero weight into a zero magnitude with
+                    # an undefined direction, which destroys the identity
+                    # initialisation this gate depends on.
+                    gate = nn.Conv1d(int(upsample_initial_channel), skip, 1)
+                    nn.init.zeros_(gate.weight)
+                    nn.init.zeros_(gate.bias)
+                    self.latent_gates.append(gate)
             else:
                 self.source_projections.append(
                     weight_norm(nn.Conv1d(1, channels, 1, bias=False))
@@ -1034,28 +1105,70 @@ class ChouwaGANGenerator(nn.Module):
                     chouwagan_block_kernels[index],
                     chouwagan_dilations,
                     expansion,
-                    chouwagan_rolloff,
-                    chouwagan_filter_width,
+                    self.rolloffs[index],
+                    self.filter_widths[index],
                     index in self.antialias_stages,
                     self.unit_style,
+                    self.filter_betas[index],
                 )
             )
             current_channels = channels
+
+        # ---- Gate telemetry --------------------------------------------------
+        # The gate's *mean* cannot be read off its weights.  ``2 * sigmoid(bias)``
+        # looked like a fair proxy and is not: measured on a trained checkpoint
+        # the logits are wide enough to pin roughly 30% of the elements at the
+        # ceiling and another 6-21% at the floor, so the gate behaves as a hard
+        # mask rather than a smooth multiplier, and the bias-only estimate was
+        # wrong by up to 2.4x -- in the direction that hid the interesting
+        # result, since the output-rate stage's real mean is 0.41 against a
+        # bias-only 1.00.  So the mean is measured where it actually exists.
+        #
+        # Both buffers are non-persistent: they are instrumentation, they must
+        # not enter ``state_dict`` (which would break strict resume from every
+        # existing checkpoint) and the EMA, which shadows ``state_dict``, has no
+        # business averaging them.
+        if self.latent_gates is not None:
+            self.register_buffer(
+                "latent_gate_mean",
+                torch.ones(len(self.channels)),
+                persistent=False,
+            )
+            self.register_buffer(
+                "latent_gate_saturation",
+                torch.zeros(len(self.channels)),
+                persistent=False,
+            )
 
         # ``post_activation`` runs at the output rate, exactly like the last
         # stage, so it follows the same decision rather than carrying its own key.
         self.post_activation = AntiAliasedSnakeBeta(
             current_channels,
-            chouwagan_rolloff,
-            chouwagan_filter_width,
+            tail_rolloff,
+            tail_width,
             (stage_count - 1) in self.antialias_stages,
+            tail_beta,
         )
-        self.conv_post = weight_norm(nn.Conv1d(current_channels, 1, 7, padding=3))
+        self.istft_head = (
+            ISTFTHead(current_channels, self.istft_hop) if self.istft_hop else None
+        )
+        self.conv_post = (
+            weight_norm(nn.Conv1d(current_channels, 1, 7, padding=3))
+            if self.istft_hop == 0
+            else None
+        )
         self.output_upsample = AntiAliasedUpsample1d(
-            2, filter_width=chouwagan_filter_width, rolloff=chouwagan_rolloff
+            2,
+            filter_width=tail_width,
+            rolloff=tail_rolloff,
+            filter_beta=tail_beta,
         )
         self.output_downsample = FixedLowPass1d(
-            2, width=chouwagan_filter_width, rolloff=chouwagan_rolloff, stride=2
+            2,
+            width=tail_width,
+            rolloff=tail_rolloff,
+            stride=2,
+            filter_beta=tail_beta,
         )
         # The bounded head runs inside the 2x oversampled pair so the limiter's
         # own harmonics are filtered instead of aliasing back into the band.
@@ -1095,8 +1208,14 @@ class ChouwaGANGenerator(nn.Module):
         if self.cond is not None and g is not None:
             x = x + self.cond(g)
         x = self.latent_mixer(x)
+        # Captured before the excitation bottleneck is folded in, so the gates
+        # below are a function of the latent and the speaker only.  Reading it
+        # after would let the excitation set its own gate, which is the loop
+        # this is meant to cut.
+        latent_code = x
 
         output_length = x.shape[-1] * self.total_upsample
+        body_length = x.shape[-1] * self.body_upsample
         with torch.no_grad():
             source_state = self.source.prepare(f0, output_length, periodicity)
 
@@ -1106,8 +1225,14 @@ class ChouwaGANGenerator(nn.Module):
             # view from it, which is both cheaper than the four per-stage
             # renders and phase-consistent across resolutions.
             with torch.no_grad():
+                # At the *body* rate rather than the output rate: the encoder
+                # decimates by the stage factors it was built from, so its skips
+                # only line up with the stages when its input starts where the
+                # last stage ends.  ``prepare`` still runs at the full hop, so
+                # the phase accumulator keeps its resolution and only the
+                # rendered view is coarser.
                 full_source = self.source.render(
-                    source_state, output_length, float(self.sr)
+                    source_state, body_length, self.sr / max(1, self.istft_hop)
                 )
             excitation_skips, excitation_bottleneck = self.exc_encoder(
                 full_source.to(dtype=x.dtype),
@@ -1121,15 +1246,32 @@ class ChouwaGANGenerator(nn.Module):
             source_gates = torch.sigmoid(self.source_gates)
 
         stage_count = len(self.ups)
+        gate_means: List[Tensor] = []
+        gate_saturations: List[Tensor] = []
         for index in range(stage_count):
             upsample = self.ups[index]
             block = self.blocks[index]
             x = upsample(x)
             if self.excitation_unet:
-                skip = excitation_skips[stage_count - 1 - index]
-                x = self.fusion_proj[index](
-                    torch.cat((x, skip.to(dtype=x.dtype)), dim=1)
-                )
+                skip = excitation_skips[stage_count - 1 - index].to(dtype=x.dtype)
+                if self.latent_gates is not None:
+                    gate = 2.0 * torch.sigmoid(self.latent_gates[index](latent_code))
+                    # Measured before the resample: same per-frame values, fewer
+                    # elements, and no interpolation smearing the tails that the
+                    # saturation share is counting.
+                    gate_means.append(gate.detach().float().mean())
+                    gate_saturations.append(
+                        (gate.detach().float() > 1.98).float().mean()
+                    )
+                    if gate.shape[-1] != skip.shape[-1]:
+                        gate = F.interpolate(
+                            gate,
+                            size=skip.shape[-1],
+                            mode="linear",
+                            align_corners=False,
+                        )
+                    skip = skip * gate
+                x = self.fusion_proj[index](torch.cat((x, skip), dim=1))
             else:
                 with torch.no_grad():
                     source = self._source_for_stage(source_state, index, x.shape[-1])
@@ -1142,12 +1284,29 @@ class ChouwaGANGenerator(nn.Module):
             else:
                 x = block(x)
 
-        x = self.post_activation(x)
-        x = self.conv_post(x)
+        if gate_means:
+            # One stacked write per forward rather than four scattered ones:
+            # a single whole-buffer mutation at the end of the graph is the
+            # shape ``torch.compile`` functionalises most cheaply, and keeping
+            # it out of the loop body means the stages themselves stay pure.
+            with torch.no_grad():
+                self.latent_gate_mean.copy_(torch.stack(gate_means))
+                self.latent_gate_saturation.copy_(torch.stack(gate_saturations))
 
-        x = self.output_upsample(x)
-        x = soft_clip(x, self.output_head_threshold, self.output_head_ceiling)
-        x = self.output_downsample(x)
+        x = self.post_activation(x)
+        if self.istft_head is not None:
+            # The limiter is skipped rather than moved after the overlap-add.
+            # It exists to be run inside a 2x oversampled pair so its own
+            # harmonics are filtered instead of aliasing back into the band, and
+            # applying it to the finished waveform would reintroduce exactly the
+            # aliasing the pair was there to prevent.  The head's bounded
+            # magnitude is what keeps the output in range instead.
+            x = self.istft_head(x)
+        else:
+            x = self.conv_post(x)
+            x = self.output_upsample(x)
+            x = soft_clip(x, self.output_head_threshold, self.output_head_ceiling)
+            x = self.output_downsample(x)
         if self.dc_blocker is not None:
             x = self.dc_blocker(x)
         return x

@@ -13,6 +13,7 @@ import numpy as np
 import soundfile as sf
 
 from collections import OrderedDict
+from typing import NamedTuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -981,6 +982,36 @@ def train_loader_safety(train_loader):
         os._exit(1)
 
 
+def substitute_speaker_embeddings(state_dict, net_g):
+    """Swap a pretrain's ``emb_g.weight`` for the model's own fresh rows.
+
+    Substituting rather than dropping the key on purpose: the VITS-latent
+    vocoders load their pretrained generator *strictly*, where a missing key is
+    an error, and a load that silently skips a tensor is exactly what this path
+    must not produce.  Returns a shallow copy -- the caller's checkpoint dict is
+    left alone, because it may still be read for other keys.
+    """
+
+    if "emb_g.weight" not in state_dict:
+        return state_dict
+    target = net_g.module if hasattr(net_g, "module") else net_g
+    updated = dict(state_dict)
+    updated["emb_g.weight"] = target.emb_g.weight.detach().cpu().clone()
+    return updated
+
+
+class SpeakerLayout(NamedTuple):
+    """How many rows ``emb_g`` gets, and whether a pretrain's rows are usable.
+
+    ``embed_dim`` is what the synthesizer is built with.  ``reset_pretrained``
+    says the pretrained checkpoint's speaker table describes *other* speakers
+    and must not be inherited -- see :func:`verify_spk_dim`.
+    """
+
+    embed_dim: int
+    reset_pretrained: bool
+
+
 def verify_spk_dim(
     config,
     model_info_path,
@@ -989,31 +1020,85 @@ def verify_spk_dim(
     rank,
     pretrainG
 ):
+    """Resolve ``spk_embed_dim`` and decide whether to keep a pretrain's ``emb_g``.
+
+    Three sources, most specific last: the config's default, the dataset's own
+    count from ``model_info.json``, and a checkpoint's row count.
+
+    The last one used to win unconditionally, which is what made a multispeaker
+    fine-tune start with *the pretrain's* speaker table.  That is not a harmless
+    initialisation.  Measured on ``f0G40k``: ``dec.cond`` reads the directions
+    the trained embedding occupies with 1.53x the gain it gives random ones, so
+    at step 0 the decoder renders each of your speakers as a specific, confident
+    pretrain identity, and the run has to move away from a wrong answer rather
+    than toward a right one.  On a small dataset it does not move far enough and
+    the pretrain's timbre stays audible -- the leak people report.  Dropping the
+    table costs nothing in separation: after ``dec.cond`` four freshly
+    initialised speakers sit 62.3 apart against 41.0 for four inherited ones.
+
+    The rule is the shape, because the shape is what actually carries the
+    question.  Rows that disagree with the dataset's speaker count cannot be
+    this dataset's speakers, so they go.  Rows that agree almost certainly are
+    -- that is staged pretraining handing its own table forward -- so they stay.
+    Single-speaker runs keep the old behaviour outright: there is no
+    cross-speaker leak to fix, and row 0 is a working starting timbre.
+
+    A resume is never touched: ``G_*.pth`` in the experiment folder *is* this
+    run's table and its width is not negotiable.
+    """
+
     embedder_name = "contentvec"  # Default embedder
     spk_dim = config.model.spk_embed_dim  # 109 default speakers
+    dataset_speakers = None
 
     try:
         with open(model_info_path, "r") as f:
             model_info = json.load(f)
             embedder_name = model_info["embedder_model"]
-            spk_dim = model_info["speakers_id"]
+            dataset_speakers = int(model_info["speakers_id"])
+            spk_dim = dataset_speakers
     except Exception as e:
-        warning(f"Could not read the model info file ({e}); using defaults.", tag="[INIT]")
+        if rank == 0:
+            warning(
+                f"Could not read the model info file ({e}); using defaults.",
+                tag="[INIT]",
+            )
 
+    reset_pretrained = False
     try:
         last_g = latest_checkpoint_path(experiment_dir, "G_*.pth")
         chk_path = (last_g if last_g else (pretrainG if pretrainG not in ("", "None") else None))
         if chk_path:
             ckpt = torch.load(chk_path, map_location="cpu", weights_only=True)
-            spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
+            checkpoint_speakers = ckpt["model"]["emb_g.weight"].shape[0]
             del ckpt
+            if (
+                last_g is None
+                and dataset_speakers is not None
+                and dataset_speakers > 1
+                and checkpoint_speakers != dataset_speakers
+            ):
+                spk_dim = dataset_speakers
+                reset_pretrained = True
+            else:
+                spk_dim = checkpoint_speakers
     except Exception as e:
-        warning(
-            f"Could not read the checkpoint ({e}); using the default speaker count.",
-            tag="[INIT]",
-        )
+        # Rank-gated like every other message here: without it each DDP rank
+        # prints the same warning, which reads as several different failures.
+        if rank == 0:
+            warning(
+                f"Could not read the checkpoint ({e}); using the default speaker count.",
+                tag="[INIT]",
+            )
 
     if rank == 0:
         info(f"Initializing the generator with {spk_dim} speakers.", tag="[INIT]")
+        if reset_pretrained:
+            info(
+                "The pretrained speaker table describes a different set of "
+                "speakers and will not be inherited; this run's embeddings "
+                "start fresh.",
+                tag="[INIT]",
+            )
 
-    return spk_dim
+    return SpeakerLayout(spk_dim, reset_pretrained)

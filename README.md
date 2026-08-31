@@ -174,14 +174,14 @@ catalog falls back to English silently rather than raising.
 ShiroRVC ships three vocoders — the part that turns the model's internal
 representation back into sound.
 
-| | **HiFi-GAN** | **ChouwaGAN** | **Wavehax** |
+| | **HiFi-GAN** | **ChouwaGAN** | **RefineGAN** |
 |---|---|---|---|
 | Sample rates | 32 / 40 / 48 kHz | 44.1 kHz | 44.1 kHz |
-| Frontend | Original VITS (flow + posterior) | VITS flow + posterior, rate-targeted KL | same as ChouwaGAN |
-| Generator | NSF HiFi-GAN | Anti-aliased NSF with an excitation U-Net | 2D ConvNeXt over a harmonic prior |
-| Discriminator | MPD + MSD | MPD (3 periods) + complex STFT + pseudo-CQT | UnivNet: MPD + multi-resolution STFT |
-| Decoder size | 15.7 M | 3.9 M | 2.0 M |
-| Discriminator size | 71.4 M | 2.5 M | 41.4 M |
+| Frontend | Original VITS (flow + posterior) | VITS flow + posterior, rate-targeted KL | Original VITS (flow + posterior) |
+| Generator | NSF HiFi-GAN | Anti-aliased NSF with an excitation U-Net | Pulse template refined through parallel ResBlocks |
+| Discriminator | MPD + MSD | MPD (3 periods) + complex STFT + pseudo-CQT | MPD + MSD |
+| Decoder size | 15.7 M | 3.9 M | 13.2 M |
+| Discriminator size | 71.4 M | 2.5 M | 71.4 M |
 
 **HiFi-GAN** is the well-tested option inherited from the original RVC, and the
 right choice if you want results that behave predictably.
@@ -216,23 +216,19 @@ strength controller. Both are switchable — `d_use_san` falls back to plain
 LSGAN logits, and `d_branchwise: false` collapses R1 onto a single controller
 and a single summed penalty.
 
-**Wavehax** is a port of the [reference implementation](https://github.com/chomeyama/wavehax),
-decoder and discriminator both; it shares ChouwaGAN's latent frontend and
-training recipe. It never upsamples: the network runs entirely at the frame
-rate, stacking the STFT of a pseudo-constant-power harmonic prior with the
-projected latent into a 2D image, running a ConvNeXt over it, and reaching the
-waveform in a single iSTFT. Since there is no transposed convolution anywhere,
-there is nothing to fold energy back across Nyquist, and the pitch response
-comes from the prior rather than from learned weights. It carries RVC's speaker
-conditioning like the other two — upstream Wavehax has none only because it is
-single-speaker.
+**RefineGAN** is [Applio](https://github.com/IAHispano/Applio)'s decoder, ported
+unchanged and configured for 44.1 kHz (`[3, 3, 7, 7]` upsampling against the
+441-sample hop). It works the other way around from the two above: instead of
+upsampling a latent and adding a source, it builds a sine excitation at the full
+rate, downsamples it into a channel pyramid with Kaiser-windowed resampling, and
+refines the latent against that pyramid through parallel multi-kernel ResBlocks,
+concatenating the matching excitation scale at every step.
 
-Its discriminator is UnivNet's, the one the Wavehax authors trained against.
-Same two families as ChouwaGAN's, different networks: the period branch starts
-at 32 channels and quadruples to 1024 where ChouwaGAN's tops out at 256, and its
-spectral stack is six layers deep against three. The cost is size: 41.4 M
-against ChouwaGAN's 2.5 M, opposite the generator, and `d_period_channels` is
-the knob if that does not fit.
+It runs on the stock VITS skeleton — `enc_q` + flow + `c_kl` — and on the plain
+MPD + MSD discriminator, so none of ChouwaGAN's adversarial machinery applies to
+it: **no SAN heads, no R1 penalty, no per-branch driving**. That makes it the
+conservative 44.1 kHz option, and the one to compare ChouwaGAN against, since
+the only thing that differs between the two runs is `net_g.dec`.
 
 </details>
 

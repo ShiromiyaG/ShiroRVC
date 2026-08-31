@@ -452,3 +452,127 @@ def test_remove_weight_norm_preserves_the_logits():
 
     for left, right in zip(before, after):
         assert torch.allclose(left, right, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# branch-by-branch configuration
+# --------------------------------------------------------------------------
+
+
+def test_a_family_can_be_turned_off_entirely_from_the_config():
+    """``_build_d_model``'s ``setting`` helper was ``getattr(...) or default``,
+    which collapsed "absent" and "empty": a config asking for *no* period
+    branches got the full set back and there was no way to drop a family from
+    JSON at all.  ``None`` means "use the default", ``[]`` means "none".
+
+    Worth having because the families cost very different things -- measured
+    fwd+bwd at batch 8 over 0.4 s, the three spectrogram branches are ~13 ms and
+    176 MiB against the period branches' far larger share.
+    """
+
+    from rvc.lib.algorithm.discriminators.multi.chouwagan import (
+        ChouwaGANDiscriminator,
+    )
+
+    def names(**overrides):
+        return ChouwaGANDiscriminator(
+            use_san=False, branchwise=True, use_checkpointing=False, **overrides
+        ).all_branch_names
+
+    assert names() == (
+        "period_2", "period_5", "period_11", "stft_512", "stft_1024", "stft_2048",
+    )
+    assert names(periods=()) == ("stft_512", "stft_1024", "stft_2048")
+    assert names(spectrogram_specs=()) == ("period_2", "period_5", "period_11")
+    assert names(periods=(2,)) == (
+        "period_2", "stft_512", "stft_1024", "stft_2048",
+    )
+
+
+def test_the_setting_helper_distinguishes_absent_from_empty():
+    """Mirrors ``_build_d_model``'s reader.  ``train.py`` cannot be imported
+    (it parses ``sys.argv`` at module scope), so the semantics are pinned here
+    against the same three inputs the real one sees from JSON."""
+
+    import types
+
+    def setting(model, name, default=None):
+        value = getattr(model, name, None)
+        return default if value is None else value
+
+    default = (2, 5, 11)
+    assert setting(types.SimpleNamespace(), "d_periods", default) == default
+    assert setting(types.SimpleNamespace(d_periods=None), "d_periods", default) == default
+    assert setting(types.SimpleNamespace(d_periods=[]), "d_periods", default) == []
+    assert setting(types.SimpleNamespace(d_periods=[3]), "d_periods", default) == [3]
+
+
+def test_the_edited_families_still_run():
+    from rvc.lib.algorithm.discriminators.multi.chouwagan import ChouwaGANDiscriminator
+
+    model = ChouwaGANDiscriminator(
+        use_san=False, branchwise=False, periods=(2,), spectrogram_specs=()
+    ).eval()
+    assert model.all_branch_names == ("period_2",)
+    real = torch.randn(2, 1, 17640) * 0.1
+    fake = torch.randn(2, 1, 17640) * 0.1
+    with torch.no_grad():
+        y_d_rs, y_d_gs, fmap_rs, fmap_gs = model(real, fake)
+    assert len(y_d_rs) == len(y_d_gs) == len(fmap_rs) == len(fmap_gs) == 1
+
+
+def test_one_boolean_per_family_turns_it_off_here_too():
+    """``d_use_periods`` / ``d_use_spectrogram`` mirror the mpd_msd path.
+    ``d_use_cqt`` and ``d_use_subband`` were already booleans because each is a
+    single branch rather than a family."""
+
+    import types
+
+    from rvc.lib.algorithm.discriminators.multi.chouwagan import (
+        ChouwaGANDiscriminator,
+        PERIODS,
+        SPECTROGRAM_SPECS,
+    )
+
+    def setting(model, name, default=None):
+        value = getattr(model, name, None)
+        return default if value is None else value
+
+    def names(**overrides):
+        model = types.SimpleNamespace(**overrides)
+        return ChouwaGANDiscriminator(
+            use_san=False,
+            branchwise=True,
+            periods=(
+                ()
+                if not setting(model, "d_use_periods", True)
+                else tuple(setting(model, "d_periods", PERIODS))
+            ),
+            spectrogram_specs=(
+                ()
+                if not setting(model, "d_use_spectrogram", True)
+                else tuple(setting(model, "d_spectrogram_specs", SPECTROGRAM_SPECS))
+            ),
+        ).all_branch_names
+
+    assert names() == (
+        "period_2", "period_5", "period_11", "stft_512", "stft_1024", "stft_2048",
+    )
+    assert names(d_use_periods=False) == ("stft_512", "stft_1024", "stft_2048")
+    assert names(d_use_spectrogram=False) == ("period_2", "period_5", "period_11")
+    # Off wins over the content key here as well.
+    assert names(d_use_periods=False, d_periods=[2, 3]) == (
+        "stft_512", "stft_1024", "stft_2048",
+    )
+
+
+def test_the_shipped_config_carries_the_switches():
+    import json
+    from pathlib import Path
+
+    model = json.loads(
+        (Path(__file__).resolve().parent.parent
+         / "rvc" / "configs" / "chouwagan" / "44100.json").read_text()
+    )["model"]
+    assert model["d_use_periods"] is True
+    assert model["d_use_spectrogram"] is True

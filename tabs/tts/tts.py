@@ -265,6 +265,15 @@ def tts_tab():
                 value=0.5,
                 interactive=True,
             )
+            silence_gate_db = gr.Slider(
+                minimum=-120,
+                maximum=0,
+                step=1,
+                label=_("Silence Gate"),
+                info=_("Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."),
+                value=-60,
+                interactive=True,
+            )
             f0_method = gr.Radio(
                 label=_("Pitch extraction algorithm"),
                 info=_("Pitch algorithm. RMVPE is the recommended default."),
@@ -406,6 +415,7 @@ def tts_tab():
             index_k,
             index_power,
             index_continuity,
+            silence_gate_db,
         ],
         outputs=[vc_output1, vc_output2],
     )

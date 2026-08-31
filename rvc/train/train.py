@@ -10,7 +10,7 @@ import sys
 from itertools import islice
 from collections import deque
 from distutils.util import strtobool
-from random import randint
+from random import randint, Random
 import signal
 import threading
 from contextlib import contextmanager
@@ -82,6 +82,7 @@ from utils import (
     old_session_cleanup,
     print_init_setup,
     train_loader_safety,
+    substitute_speaker_embeddings,
     verify_spk_dim
 )
 
@@ -102,13 +103,12 @@ from mel_processing import MultiScaleMelSpectrogramLoss
 
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
-from rvc.lib.algorithm.frame_features import spectrogram_for_features
 from rvc.configs.vocoders import (
     get_architecture_id,
     get_discriminator_id,
     get_vocoder_spec,
     normalize_vocoder,
-    uses_vits_latent,
+    uses_chouwagan_stack,
 )
 from rvc.train.run_spec import TrainRunSpec
 
@@ -220,11 +220,16 @@ validation_preview_figsize = (
     max(1.0, float(getattr(config.train, "validation_preview_height", 5.8))),
 )
 
-# Named for the machinery rather than for the decoder: RefineGAN and Wavehax
-# share the VITS latent frontend, the per-branch discriminator and every
-# ``*`` loss below, and differ only in ``net_g.dec``.
-refinegan_active = uses_vits_latent(vocoder)
-if refinegan_active and sample_rate != 44100:
+# Two independent facts, kept apart because they used to be one flag.
+#
+# ``chouwagan_stack_active`` is about the *decoder stack*: it turns on the
+# per-branch SAN discriminator, the R1 strength controller, the waveform
+# reconstruction terms and the retain_graph backward pattern.  Only ChouwaGAN
+# uses those.  Applio's RefineGAN is registered with the plain MPD+MSD
+# discriminator and so leaves this False -- no SAN, no R1, no per-branch
+# driving, which is exactly why this is no longer called ``refinegan_active``.
+chouwagan_stack_active = uses_chouwagan_stack(vocoder)
+if chouwagan_stack_active and sample_rate != 44100:
     raise ValueError(
         f"{get_vocoder_spec(vocoder)['label']} requires the 44.1 kHz configuration."
     )
@@ -301,7 +306,7 @@ swap_start_step = 0  # Filled at resume: global_step when the swap was enabled
 swap_completed = False
 
 # Freezes the whole frontend: everything outside `dec.` and `emb_g.`
-# ( VITS latent: enc_p + chouwa_latent / legacy VITS: enc_p + enc_q + flow )
+# ( enc_p + enc_q + flow )
 freeze_vae = False # If true, lets only vocoder ( dec ), spk embedding and discriminator learn
 
 # ----  Global LR scales  ----
@@ -439,6 +444,150 @@ def setup_env_and_distr(rank, n_gpus, device, device_id, config):
     if torch.cuda.is_available():
         torch.cuda.set_device(device_id)
 
+class _HoldoutSet:
+    """Fixed excerpts of a fixed length, kept in RAM and batched on demand.
+
+    The evaluation used to run through a ``DataLoader`` at batch size 1.  That
+    was not a throughput choice: the collate pads every item up to the longest
+    one in the batch, and padding silence into the mel puts a constant in the
+    metric that moves with whatever else lands beside it -- at batch 1 there is
+    nothing to pad against.
+
+    Cropping every excerpt to the same number of frames removes the padding
+    instead of the batching.  That matters because the step here is dispatch
+    bound rather than compute bound, so a batch of eight costs barely more than
+    a batch of one and the evaluation stops spending its wall clock in Python.
+
+    Holds the excerpts rather than the batches so :meth:`shrink` can re-form
+    them: the evaluation decodes several seconds per item where a training step
+    decodes a fraction of one, so it can be the largest allocation in the run
+    even though it stores no gradients.
+    """
+
+    def __init__(self, items, batch_size, label="holdout"):
+        self.items = list(items)
+        self.batch_size = max(1, int(batch_size))
+        self.label = label
+        # Ground truth does not depend on the weights, so its mel is computed
+        # once for the life of the run rather than once per evaluation.  Keyed
+        # by length as well as by batch, so a decoder whose output length moves
+        # cannot silently be compared against the wrong excerpt.
+        self._target_mels = {}
+
+    def __len__(self):
+        return len(self.items)
+
+    @property
+    def frames(self):
+        return self.items[0][0].shape[0] if self.items else 0
+
+    def seconds(self, config):
+        return self.frames * config.data.hop_length / config.data.sample_rate
+
+    def batches(self):
+        for start in range(0, len(self.items), self.batch_size):
+            chunk = self.items[start : start + self.batch_size]
+            yield start // self.batch_size, self._collate(chunk)
+
+    @staticmethod
+    def _collate(chunk):
+        phone = torch.stack([item[0] for item in chunk])
+        pitch = torch.stack([item[1] for item in chunk])
+        pitchf = torch.stack([item[2] for item in chunk])
+        spectrogram = torch.stack([item[3] for item in chunk])
+        wave = torch.stack([item[4] for item in chunk])
+        sid = torch.cat([item[5] for item in chunk])
+        # Every excerpt is the same length by construction, which is the whole
+        # point: no padding, so no per-item lengths to carry.
+        frames = torch.full((len(chunk),), phone.shape[1], dtype=torch.long)
+        samples = torch.full((len(chunk),), wave.shape[-1], dtype=torch.long)
+        return (
+            phone,
+            frames,
+            pitch,
+            pitchf,
+            spectrogram,
+            frames,
+            wave,
+            samples,
+            sid,
+        )
+
+    def target_mel(self, index, length, factory):
+        cached = self._target_mels.get(index)
+        if cached is None or cached[0] != length:
+            cached = (length, factory())
+            self._target_mels[index] = cached
+        return cached[1]
+
+    def shrink(self):
+        """Halve the batch.  False once there is nothing left to halve."""
+        if self.batch_size <= 1:
+            return False
+        self.batch_size = max(1, self.batch_size // 2)
+        self._target_mels.clear()
+        return True
+
+
+def _uniform_excerpts(
+    dataset,
+    indices,
+    crop_frames,
+    config,
+    batch_size,
+    label="holdout",
+    fixed=False,
+    limit=None,
+):
+    """Load rows and crop them all to one shared length.
+
+    ``crop_frames`` is a ceiling rather than a demand: unless ``fixed``, the
+    crop lands at the lower quartile of what the rows actually carry, so three
+    excerpts in four survive it.  Taking the ceiling literally would leave the
+    set to whichever recording happened to be longest.
+
+    ``fixed`` is for the training probe, which has to be cropped exactly like
+    the holdout or the two numbers are not comparable.
+    """
+    hop = config.data.hop_length
+    rows = []
+    for index in indices:
+        spectrogram, wave, phone, pitch, pitchf, sid = dataset[index]
+        frames = min(spectrogram.shape[-1], phone.shape[0], wave.shape[-1] // hop)
+        if frames > 0:
+            rows.append((frames, spectrogram, wave, phone, pitch, pitchf, sid))
+    if not rows:
+        return None
+
+    if fixed:
+        crop = max(1, int(crop_frames))
+    else:
+        ordered = sorted(row[0] for row in rows)
+        crop = max(1, min(int(crop_frames), ordered[len(ordered) // 4]))
+
+    items = []
+    for frames, spectrogram, wave, phone, pitch, pitchf, sid in rows:
+        if frames < crop:
+            continue
+        # Cloned: the crops are views onto whole files, and keeping views would
+        # keep every one of those files resident for the life of the run.
+        items.append(
+            (
+                phone[:crop, :].clone(),
+                pitch[:crop].clone(),
+                pitchf[:crop].clone(),
+                spectrogram[:, :crop].clone(),
+                wave[:, : crop * hop].clone(),
+                sid.clone(),
+            )
+        )
+        if limit is not None and len(items) >= int(limit):
+            break
+    if not items:
+        return None
+    return _HoldoutSet(items, batch_size, label=label)
+
+
 def prepare_dataloaders(config, n_gpus, rank, batch_size):
     from data_utils import (
         DistributedBucketSampler,
@@ -512,72 +661,75 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
     )
     train_loader_safety(train_loader)
 
-    # Batch size 1: the collate pads to the longest item, and padding silence
-    # into the mel would put a constant in the metric that moves with whatever
-    # else lands in the batch.  A single item has nothing to pad against.
-    holdout_batches = None
+    # Materialised once and kept: the point of a holdout is that every
+    # evaluation scores the exact same audio, and re-reading it through a
+    # loader each time would also cost more than the forward pass.
+    holdout_set = None
+    probe_set = None
     if holdout_dataset is not None and rank == 0:
-        holdout_loader = DataLoader(
-            holdout_dataset,
-            batch_size=1,
-            num_workers=0,
-            shuffle=False,
-            pin_memory=False,
-            collate_fn=collate_fn,
+        crop_frames = max(
+            1,
+            int(
+                float(getattr(config.train, "holdout_crop_seconds", 3.0))
+                * config.data.sample_rate
+                / config.data.hop_length
+            ),
         )
-        # Materialised once and kept: the point of a holdout is that every
-        # evaluation scores the exact same audio, and re-reading it through a
-        # loader each time would also cost more than the forward pass.
-        holdout_batches = list(holdout_loader)
+        eval_batch = int(getattr(config.train, "holdout_batch_size", 4))
+        holdout_set = _uniform_excerpts(
+            holdout_dataset,
+            range(len(holdout_dataset.audiopaths_and_text)),
+            crop_frames,
+            config,
+            eval_batch,
+            label="holdout",
+        )
+        if holdout_set is None:
+            warning(
+                "Held-out rows were all too short to score; detection is off.",
+                tag="[HOLDOUT]",
+            )
+        else:
+            print(
+                f"[HOLDOUT] Scoring {len(holdout_set)} excerpts of "
+                f"{holdout_set.seconds(config):.1f}s each, batched "
+                f"{holdout_set.batch_size} at a time."
+            )
 
-    return train_loader, holdout_batches
+        # The same measurement on slices the model *has* been trained on.  The
+        # held-out curve alone mixes two movements -- the model is still
+        # learning, and it is starting to memorise -- and only their difference
+        # is overtraining.  Subtracting the probe removes the shared trend, so
+        # the turn shows up earlier and more cleanly than in the absolute
+        # number.  Same crop and same count as the holdout, or the two are not
+        # comparable; sampled deterministically, so a resume scores the same
+        # slices rather than leaking a fresh draw into the comparison.
+        if holdout_set is not None and bool(
+            getattr(config.train, "holdout_train_probe", True)
+        ):
+            pool = list(range(len(train_dataset.audiopaths_and_text)))
+            sampled = Random(int(getattr(config.train, "seed", 1234))).sample(
+                pool, min(len(pool), 2 * len(holdout_set))
+            )
+            probe_set = _uniform_excerpts(
+                train_dataset,
+                sampled,
+                holdout_set.frames,
+                config,
+                eval_batch,
+                label="train probe",
+                fixed=True,
+                limit=len(holdout_set),
+            )
+
+    return train_loader, holdout_set, probe_set
 
 def get_g_model(config, sample_rate, vocoder, use_checkpointing):
     from rvc.lib.algorithm.synthesizers import Synthesizer
-    if uses_vits_latent(vocoder):
-        refinegan_defaults = {
-            "content_channels": 128,
-            "detail_channels": 64,
-            "posterior_channels": 192,
-            "prior_hidden_channels": 192,
-            "prior_blocks": 4,
-            "prior_heads": 4,
-            "prior_kernel_size": 31,
-            # Activation checkpointing for the latent frontend only (prior
-            # stack + posterior encoder), independent of the decoder's own
-            # ``use_checkpointing``.  Off by default: it trades a second
-            # forward over those stacks for their activations, which is a win
-            # only on a run that is actually short on memory.
-            "latent_checkpointing": False,
-            # A fraction of the 0.15 rate target, not most of it.  The
-            # controller pins the per-dim *mean* at the target, so the floor
-            # does not add rate -- it only decides how much of a fixed budget is
-            # spent before allocation starts.  Push it near the target and
-            # latent collapse becomes the optimum, which the mean cannot see.
-            # Do not "fix" a collapse by raising these.
-            "vits_free_bits": 0.03,
-            "vits_kl_target": 0.15,
-            "kl_scale_anchor": 1.0,
-            "feature_scale_anchor": 1.0,
-            # The decoder only learns to make good audio from prior latents on
-            # the replaced fraction of the batch, and inference is 100% prior.
-            # The start and ramp are early on purpose: the reconstruction
-            # gradient is the only pressure that makes the prior *informative*
-            # rather than merely cheap to match, and it has to arrive before the
-            # window in which the latent can collapse has closed.
-            "prior_replacement_max": 0.7,
-            "prior_replacement_start": 2000,
-            "prior_replacement_ramp": 12000,
-            # Half the replaced items decode from the prior mean, which is what
-            # ``infer`` supplies, and half from a prior sample.  Training only
-            # on samples leaves the decoder unpractised at the operating point
-            # inference uses; see ``RefineVitsLatent._replacement_scales``.
-            "prior_replacement_mean_share": 0.5,
-            "prior_uses_logs": True,
-        }
+    if chouwagan_stack_active:
         # Decoder-specific defaults.  Only the selected decoder's are applied,
-        # so a Wavehax run does not carry RefineGAN's channel schedule in its
-        # config and vice versa.
+        # so a run does not carry another decoder's channel schedule in its
+        # config, and only keys the config leaves *absent* are filled in.
         decoder_defaults = {
             # The decoder is depthwise-separable and its blocks narrow as the
             # rate climbs, which is affordable because the excitation U-Net --
@@ -590,33 +742,24 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
                 "chouwagan_block_kernels": [[3, 7], [3, 7], [7], [7]],
                 "chouwagan_dilations": [1, 3, 5],
                 "chouwagan_expansion": [2, 2, 1, 1],
+                "chouwagan_istft_hop": 0,
                 "chouwagan_harmonics": 128,
                 "chouwagan_excitation_unet": True,
+                "chouwagan_latent_source_gate": True,
                 "chouwagan_remove_output_dc": True,
             },
-            # ``wavehax.v2.yaml``, with n_fft left to default to twice the
-            # 441-sample hop.  The kernel is wider across frequency than across
-            # time because the structure being modelled is a harmonic comb.
-            "wavehax": {
-                "channels": 16,
-                "mult_channels": 3,
-                "kernel_size": [13, 7],
-                "num_blocks": 8,
-                "prior_type": "pcph_closed_form",
-                "drop_prob": 0.0,
-                "framewise_norm": False,
-                "use_logmag_phase": False,
-            },
         }
-        refinegan_defaults.update(
+        decoder_config_defaults = dict(
             decoder_defaults.get(get_vocoder_spec(vocoder)["generator"], {})
         )
         # The id is pinned rather than read from the config: ``net_g`` loads
         # non-strictly, so a checkpoint whose latent or decoder layout differs
         # would otherwise load with the mismatched modules left at their init
         # instead of failing the guard.
-        config.model["architecture_id"] = get_architecture_id(vocoder)
-        for key, value in refinegan_defaults.items():
+        config.model["architecture_id"] = get_architecture_id(
+            vocoder, config.model.__dict__
+        )
+        for key, value in decoder_config_defaults.items():
             if key not in config.model:
                 config.model[key] = value
     model_config = config.model.__dict__.copy()
@@ -655,7 +798,15 @@ def _build_d_model(config, vocoder, use_checkpointing):
     # discriminators normalise them themselves; passing them through untouched
     # keeps this function free of the branch layout.
     def setting(name, default=None):
-        return getattr(config.model, name, None) or default
+        """``None``/absent means "use the default"; ``[]`` means "none of these".
+
+        This was ``value or default``, which collapsed the two: a config asking
+        for *no* period branches got the full set back, and there was no way to
+        turn a whole family off from JSON.
+        """
+
+        value = getattr(config.model, name, None)
+        return default if value is None else value
 
     if discriminator_id == "chouwagan":
         from rvc.lib.algorithm.discriminators.multi import chouwagan as chouwagan_d
@@ -676,15 +827,28 @@ def _build_d_model(config, vocoder, use_checkpointing):
             # and ``_constant_discriminator_loss`` moves the governor's floor
             # with it -- the two loss forms have different floors.
             use_san=bool(getattr(config.model, "d_use_san", True)),
-            periods=tuple(setting("d_periods", chouwagan_d.PERIODS)),
+            # Same two layers as the mpd_msd path below: ``d_use_periods`` /
+            # ``d_use_spectrogram`` switch a family off, ``d_periods`` /
+            # ``d_spectrogram_specs`` say which members it has when it is on.
+            # ``d_use_cqt`` and ``d_use_subband`` are already booleans because
+            # each is a single branch rather than a family.
+            periods=(
+                ()
+                if not setting("d_use_periods", True)
+                else tuple(setting("d_periods", chouwagan_d.PERIODS))
+            ),
             spectrogram_channels=tuple(
                 setting("d_spectrogram_channels", chouwagan_d.SPECTROGRAM_CHANNELS)
             ),
             spectrogram_compression=float(
                 getattr(config.model, "d_spectrogram_compression", 0.3)
             ),
-            spectrogram_specs=tuple(
-                setting("d_spectrogram_specs", chouwagan_d.SPECTROGRAM_SPECS)
+            spectrogram_specs=(
+                ()
+                if not setting("d_use_spectrogram", True)
+                else tuple(
+                    setting("d_spectrogram_specs", chouwagan_d.SPECTROGRAM_SPECS)
+                )
             ),
             use_cqt=bool(getattr(config.model, "d_use_cqt", False)),
             cqt_bins_per_octave=int(
@@ -700,54 +864,59 @@ def _build_d_model(config, vocoder, use_checkpointing):
             ),
         )
 
-    if discriminator_id == "wavehax":
-        from rvc.lib.algorithm.discriminators.multi import wavehax as wavehax_d
-
-        return wavehax_d.WavehaxDiscriminator(
-            use_spectral_norm=bool(
-                getattr(config.model, "use_spectral_norm", False)
-            ),
-            use_checkpointing=use_checkpointing,
-            sample_rate=config.data.sample_rate,
-            periods=tuple(setting("d_periods", wavehax_d.PERIODS)),
-            period_channels=int(
-                setting("d_period_channels", wavehax_d.PERIOD_CHANNELS)
-            ),
-            period_kernel_sizes=tuple(
-                setting("d_period_kernel_sizes", wavehax_d.PERIOD_KERNEL_SIZES)
-            ),
-            period_downsample_scales=tuple(
-                setting(
-                    "d_period_downsample_scales", wavehax_d.PERIOD_DOWNSAMPLE_SCALES
-                )
-            ),
-            period_max_channels=int(
-                setting("d_period_max_channels", wavehax_d.PERIOD_MAX_CHANNELS)
-            ),
-            resolutions=tuple(
-                tuple(value)
-                for value in setting("d_resolutions", wavehax_d.RESOLUTIONS)
-            ),
-            spectral_channels=int(
-                setting("d_spectral_channels", wavehax_d.SPECTRAL_CHANNELS)
-            ),
-            spectral_kernel_sizes=tuple(
-                tuple(value)
-                for value in setting(
-                    "d_spectral_kernel_sizes", wavehax_d.SPECTRAL_KERNEL_SIZES
-                )
-            ),
-            spectral_strides=tuple(
-                tuple(value)
-                for value in setting("d_spectral_strides", wavehax_d.SPECTRAL_STRIDES)
-            ),
-        )
-
     from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined
 
+    # ``mpd_msd`` is Applio's ``v2``; ``mpd_msd_v3`` is the layout Applio picks
+    # for RefineGAN specifically -- five period branches instead of eight, plus
+    # three multi-resolution spectrogram branches.  The id carries the version
+    # so the registry stays the single place a vocoder's discriminator is
+    # chosen by default.
+    #
+    # ``d_version`` overrides it, because the choice is a VRAM decision as much
+    # as a quality one.  Measured on an 8 GB card, batch 8 over 0.4 s, decoder
+    # plus both discriminator passes:
+    #
+    #   v2         4.64 GiB    498 ms/step
+    #   v3         6.42 GiB   5912 ms/step   (does not fit; the allocator
+    #                                         thrashing is the 12x, not the
+    #                                         branches, which are worth 1.8x)
+    #   v3l        5.97 GiB   1282 ms/step
+    #   v3l + checkpointing
+    #              3.43 GiB   1024 ms/step
+    #   v3l, batch 6
+    #              4.72 GiB    640 ms/step
+    #
+    # ``v3`` is what both RefineGAN configs ship, and it is exact Applio parity.
+    #
+    # ``v3l`` -- v3's branches with the frequency axis downsampled in the last
+    # two layers -- was the default on the strength of the 24% above.  It did
+    # not survive re-measurement: on an RTX 5060 it moved neither step time nor
+    # peak VRAM against v3.  The branch microbenchmark it was chosen on
+    # (81.1 ms / 342 MiB against 107.0 / 396, see the parity tests) is real, but
+    # the discriminator is not the bound half of the step, so a saving there
+    # does not reach the step -- the same reason the eager step is dispatch- and
+    # not kernel-bound.  It stays available as an override; it is just not worth
+    # spending parity on by default.
+    # ``d_version: "v2"`` is the one that actually buys VRAM back.
+    version = "v3" if discriminator_id == "mpd_msd_v3" else "v2"
+    version = str(getattr(config.model, "d_version", None) or version)
+    # Branch-by-branch overrides on top of the preset, in two layers.
+    #
+    # ``d_use_*`` is the switch: one boolean per family, all defaulting to on.
+    # ``d_periods``/``d_resolutions`` are the *content* of a family that is on --
+    # ``None`` keeps the preset's, a list replaces it.  Two keys rather than one
+    # because "off" and "which ones" are different questions, and answering the
+    # first should not require writing out an empty list.
     return MPD_MSD_Combined(
         config.model.use_spectral_norm,
         use_checkpointing=use_checkpointing,
+        version=version,
+        periods=[] if not setting("d_use_periods", True) else setting("d_periods"),
+        resolutions=(
+            [] if not setting("d_use_resolutions", True) else setting("d_resolutions")
+        ),
+        frequency_strides=setting("d_frequency_strides"),
+        use_msd=bool(setting("d_use_msd", True)),
     )
 
 
@@ -792,81 +961,55 @@ def _lazy_r1_penalty(
     return real_grad.square().reshape(real_grad.shape[0], -1).sum(dim=1).mean()
 
 
-def _ablation_margin(
+
+def _prior_gap(
     model,
-    discrete_model,
-    discrete_parts,
+    m_p,
+    x_mask,
     ids_slice,
     segment_size,
     pitchf,
     sid,
     target,
     full_output,
-    dimension,
-    margin,
+    config,
 ):
-    """Measure one latent dimension: is the decoder actually using it?
+    """Is the Gaussian posterior carrying anything the prior does not have?
 
-    Returns ``(loss, delta, ablated_error)``.  ``delta`` is the measurement and
-    is the reason to call this at all: mel L1 with the dimension zeroed minus
-    mel L1 with it intact, so positive means zeroing the dimension hurt, i.e.
-    it was load-bearing.  It is the only signal here that distinguishes a dead
-    dimension from one the prior simply predicts well -- per-dimension KL
-    cannot, because KL measures ``posterior || prior`` with both learned, and a
-    low value means "the prior predicts it" at least as often as it means
-    "nothing is there".
+    Decodes twice from the same batch -- once from the posterior sample ``z``
+    that produced ``full_output``, once from the prior mean pushed through the
+    flow -- and returns the mel L1 gap between them.  This is the measurement
+    ``diag/kl_*`` cannot make, and the distinction matters because the two
+    failure modes are indistinguishable in KL: a rate near zero means "the
+    prior predicts the posterior" exactly as often as it means "the posterior
+    stopped encoding anything", and only the second one is a problem.
 
-    ``loss`` is kept for callers that still want it, but it should be weighted
-    at zero, and the reasons are worth stating so it does not get switched back
-    on by intuition:
+    A large gap with a small KL says the posterior is load-bearing and the flow
+    simply has not caught up -- training will close it.  A small gap says the
+    decoder would produce the same audio without ever seeing the spectrogram,
+    which is the collapse worth acting on.  The prior mean is used rather than
+    a sample so the number is not confounded by the prior's variance.
 
-    * It has no gradient toward its stated purpose.  ``ablated_error`` is
-      detached -- and computed under ``no_grad`` besides -- so the only
-      derivative is ``d/d full_error = 1``.  The term therefore adds *generic
-      reconstruction pressure*, scaled by how useless the probed dimension was.
-      It cannot make that dimension carry information, which is the thing it is
-      named for.  The detach is not the bug: without it the cheapest way to
-      raise ``ablated_error`` is to inflate the dimension's output scale, which
-      makes ablation more destructive without making it more informative.
-    * Even with a correct gradient it would be too dilute to matter.  One
-      dimension is drawn uniformly per interval out of 96, so a given dimension
-      is touched once every ``96 * interval`` steps -- ample for a histogram and
-      nowhere near enough to shape a parameter.
-
-    The dilution argument is what makes this a diagnostic rather than a loss: a
-    measurement only has to be dense enough to average, while a gradient has to
-    be dense enough to steer.
+    Diagnostic only: everything here runs under ``no_grad``.  A term of this
+    shape has no gradient toward its own stated purpose -- the cheapest way to
+    inflate it is to make the latent's scale destructive rather than
+    informative -- so it is measured and never optimised.
     """
     with torch.no_grad():
-        ablated_detail = discrete_model.ablate_dimension(
-            discrete_parts,
-            dimension,
-            discrete_parts["content"].shape[-1],
-        )
-    content_slice = commons.slice_segments(
-        discrete_parts["content"], ids_slice, segment_size, dim=3
-    )
-    detail_slice = commons.slice_segments(
-        ablated_detail, ids_slice, segment_size, dim=3
-    )
-    pitchf_slice = commons.slice_segments(pitchf, ids_slice, segment_size, dim=2)
-    speaker = model.emb_g(sid).unsqueeze(-1)
+        speaker = model.emb_g(sid).unsqueeze(-1)
+        z_prior = model.flow(m_p * x_mask, x_mask, g=speaker, reverse=True) * x_mask
+        z_slice = commons.slice_segments(z_prior, ids_slice, segment_size, dim=3)
+        pitchf_slice = commons.slice_segments(pitchf, ids_slice, segment_size, dim=2)
+        prior_output = model.dec(z_slice, pitchf_slice, g=speaker)
 
-    with torch.no_grad():
-        ablated_output = model.dec(
-            torch.cat((content_slice, detail_slice), dim=1),
-            pitchf_slice,
-            g=speaker,
+        target_mel = wave_to_mel(config, target)
+        full_error = F.l1_loss(
+            wave_to_mel(config, full_output).float(), target_mel.float()
         )
-
-    target_mel = wave_to_mel(config, target)
-    full_mel = wave_to_mel(config, full_output)
-    ablated_mel = wave_to_mel(config, ablated_output)
-    full_error = F.l1_loss(full_mel.float(), target_mel.float())
-    ablated_error = F.l1_loss(ablated_mel.float(), target_mel.float())
-    delta = ablated_error - full_error.detach()
-    loss = F.relu(full_error + float(margin) - ablated_error.detach())
-    return loss, delta.detach(), ablated_error.detach()
+        prior_error = F.l1_loss(
+            wave_to_mel(config, prior_output).float(), target_mel.float()
+        )
+    return (prior_error - full_error).detach(), prior_error.detach()
 
 
 def _clip_or_sample_grad_norm(
@@ -1024,17 +1167,100 @@ def _branchwise_generator_terms(
     }
 
 
+# The balance rule measures gradient norms with ``torch.autograd.grad``, and
+# that traversal runs *outside* the ``GradScaler`` -- the scaler only covers
+# what goes through ``scale(...).backward()``.  Under FP16 the probe therefore
+# has no overflow protection at all, and a reconstruction loss in the tens
+# overflows the half range on its way back through the decoder.  The overflow
+# becomes ``inf``, ``inf - inf`` becomes ``NaN``, and the ratio of two NaN
+# norms is NaN -- which is then cached for ``adaptive_adv_interval`` steps and
+# multiplied into ``loss_gen_total``.  Measured on the 44.1 kHz FP16 pretrain:
+# 50 of 50 generator steps skipped, every loss component finite and only the
+# weights NaN, the scaler halving its scale every step from 2**10 to 2**-40.
+#
+# What makes this free to fix is that the rule is a *ratio*: ``||d(s*L)/dp||/s``
+# is the same number for every ``s``, so each term can be measured through
+# whatever scale keeps it inside the half range -- smaller when it overflows,
+# larger when it underflows to nothing.  In FP32 the first attempt always
+# succeeds and ``s`` stays 1.0, so nothing about the existing behaviour moves.
+_PROBE_SCALE_ATTEMPTS = 6
+_PROBE_SCALE_STEP = 256.0
+
+
+def _probe_gradient(make_gradient):
+    """One balance-rule gradient, measured through a scale that survives FP16.
+
+    ``make_gradient(scale)`` returns ``d(scale * loss) / d(parameter)``, or
+    ``None`` where the term does not reach the parameter at all.  Returns
+    ``(gradient, norm)`` in FP32 and at unit scale, so callers see exactly the
+    numbers they saw before -- the scale exists only inside the measurement.
+
+    Returns the last attempt's values rather than raising when no scale works;
+    the caller decides what a failed probe means, because that decision belongs
+    where the cached weight lives.
+    """
+    scale = 1.0
+    direction = 0.0
+    gradient = None
+    norm = None
+    finite_gradient = None
+    finite_norm = None
+    for _ in range(_PROBE_SCALE_ATTEMPTS):
+        scaled = make_gradient(scale)
+        if scaled is None:
+            return None, None
+        gradient = scaled.detach().float() / scale
+        norm = gradient.norm()
+        value = float(norm)
+        if value == value and value != float("inf"):
+            finite_gradient = gradient
+            finite_norm = norm
+            if value > 0.0:
+                return gradient, norm
+            # Exactly zero: either the term genuinely does not move this
+            # parameter, or every element underflowed.  One measurement through
+            # a larger scale tells the two apart, and a term that is really
+            # zero stays zero at any scale.
+            step = _PROBE_SCALE_STEP
+        elif direction == _PROBE_SCALE_STEP:
+            # Growing the scale broke the measurement instead of rescuing it:
+            # ``scale`` itself has outgrown the half range, so the multiply
+            # that seeds the traversal is now ``inf`` and the zero it was
+            # chasing was a real zero.  Keep the zero.
+            break
+        else:
+            step = 1.0 / _PROBE_SCALE_STEP
+        if direction and step != direction:
+            # The two failure modes point opposite ways.  A term that overflows
+            # at one scale and vanishes at the next has no representable
+            # measurement, so stop rather than oscillate between them.
+            break
+        direction = step
+        scale *= step
+    if finite_norm is not None:
+        return finite_gradient, finite_norm
+    return gradient, norm
+
+
 def _wave_parameter_gradient(y_hat, wave_gradient, parameter):
-    """``d loss / d parameter`` for a loss that reaches it only through ``y_hat``."""
+    """``d loss / d parameter`` for a loss that reaches it only through ``y_hat``.
+
+    Scaled like every other balance-rule probe -- this traversal crosses the
+    whole decoder in whatever dtype autocast recorded, so it overflows for the
+    same reason and is measured the same way.  See ``_probe_gradient``.
+    """
     if wave_gradient is None:
         return None
-    return torch.autograd.grad(
-        y_hat,
-        parameter,
-        grad_outputs=wave_gradient,
-        retain_graph=True,
-        allow_unused=True,
-    )[0]
+    gradient, _ = _probe_gradient(
+        lambda scale: torch.autograd.grad(
+            y_hat,
+            parameter,
+            grad_outputs=wave_gradient * scale,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+    )
+    return gradient
 
 
 def _accumulate_gradients(parameters, gradients):
@@ -1115,14 +1341,22 @@ def _last_layer_parameter(module):
 #: Final projection of each decoder, in the order they are looked up.  The
 #: adaptive adversarial weight differentiates the reconstruction and adversarial
 #: losses with respect to this layer, so it has to be the *last* one that both
-#: reach -- ``conv_post`` for the time-domain decoders, ``output_proj`` for
-#: Wavehax, which emits a complex spectrogram and has no time-domain layer.
-_DECODER_OUTPUT_LAYERS = ("conv_post", "output_proj")
+#: reach.  Every decoder here is time-domain, so it is ``conv_post``;
+#: ``output_proj`` stays in the lookup for a decoder that emits a spectrogram.
+#: ``istft_head.proj`` is dotted because ChouwaGAN's iSTFT head keeps its
+#: projection inside the head module.  It comes first: with the head active
+#: ``conv_post`` is ``None``, and it is the head's projection that both the
+#: reconstruction and the adversarial loss actually reach last.
+_DECODER_OUTPUT_LAYERS = ("istft_head.proj", "conv_post", "output_proj")
 
 
 def _decoder_output_layer(decoder):
     for name in _DECODER_OUTPUT_LAYERS:
-        layer = getattr(decoder, name, None)
+        layer = decoder
+        for part in name.split("."):
+            layer = getattr(layer, part, None)
+            if layer is None:
+                break
         if layer is not None:
             return layer
     raise AttributeError(
@@ -1174,12 +1408,6 @@ def _emit_machine_progress(
         flush=True,
     )
 
-
-#: Defaults for the two prior-loss knobs.  Named because the "was this set on
-#: purpose?" test compares against them, and a literal repeated at the
-#: comparison would drift from the literal in the ``getattr`` fallback.
-PRIOR_LOSS_WEIGHT_DEFAULT = 1.0
-PRIOR_WARMUP_STEPS_DEFAULT = 10000
 
 #: How fast ``loss_disc`` may drift upward, per 10k steps, while still counting
 #: as a healthy GAN rather than a generator running away from its critic.
@@ -1520,16 +1748,35 @@ def _cpu_state_dict(source):
     }
 
 
-def _holdout_spectral_loss(net_g, batches, config, device):
-    """Mel distance between the *inference* path and ground truth, held out.
+def _holdout_metrics(
+    net_g,
+    excerpts,
+    config,
+    device,
+    want_latent=True,
+    noise_scale=0.0,
+):
+    """Score held-out audio down the inference path, in a single pass.
 
-    Deliberately the inference path (``infer``) and not the training forward.
-    On RefineGAN the training path samples the posterior, which has seen the
-    target spectrogram, and a model that is memorising scores well there long
-    after it has stopped generalising.  ``infer`` runs prior-only, which is
-    what inference actually does, and the same call works for the HiFi-GAN
-    synthesizer -- so one metric covers both vocoders and every existing
-    pretrain.
+    ``mel_l1`` is the mel distance between what a listener actually gets and
+    the ground truth: the prior path, not the training forward.  The training
+    path samples a posterior that has seen the target spectrogram, and a model
+    that is memorising scores well there long after it has stopped
+    generalising.
+
+    Prior, posterior and the gap between them all come out of the same pass
+    over the same weights.  This used to be two functions -- one calling
+    ``Synthesizer.infer``, one rebuilding the prior path by hand -- which
+    decoded the prior twice per excerpt and, worse, did it under *different*
+    weights: the metric under the EMA, the diagnostic under the live model.  So
+    the two prior numbers sat side by side in TensorBoard without being
+    comparable.  ``latent_prior`` is gone for the same reason: it *is*
+    ``mel_l1``.
+
+    ``noise_scale`` is the prior draw.  ``Synthesizer.infer`` hardcodes
+    0.66666; at 0 this decodes the prior mean instead, which makes the metric a
+    pure function of the weights and removes a sampling floor that was eating
+    most of its dynamic range.
 
     Plain L1 on the log-mel, with no adversarial, feature-matching or KL term:
     those are scored against a discriminator and a schedule that keep moving,
@@ -1537,20 +1784,27 @@ def _holdout_spectral_loss(net_g, batches, config, device):
     generator.
     """
     model = net_g.module if hasattr(net_g, "module") else net_g
+    # ``flow`` is what turns a prior draw into something the decoder can use;
+    # without it there is no inference path to rebuild by hand and ``infer`` is
+    # the only way in.  ``enc_q`` is dropped for export, which is the one state
+    # in which the posterior half cannot be measured at all.
+    manual_prior = getattr(model, "flow", None) is not None
+    want_latent = (
+        want_latent and manual_prior and getattr(model, "enc_q", None) is not None
+    )
     was_training = model.training
     model.eval()
-    total = 0.0
+    totals = {"mel_l1": 0.0}
+    if want_latent:
+        totals["latent_gap"] = 0.0
+        totals["latent_posterior"] = 0.0
     count = 0
 
-    # The metric has to be a pure function of the weights, and ``infer`` draws
-    # noise on both paths: the RefineGAN branch consumes RNG even when
-    # ``deterministic`` zeroes the scale, and the VITS/HiFi-GAN branch ignores
-    # the flag entirely and always samples at 0.66666 (see
-    # ``Synthesizer.infer``).  Left alone that would put fresh sampling noise
-    # into every evaluation, which on the HiFi-GAN path is the whole signal.
-    # Pinning the seed makes each evaluation see identical noise; restoring the
-    # state afterwards keeps a variable number of draws from shifting the
-    # training stream underneath the run.
+    # The metric has to be a pure function of the weights, and the prior draw
+    # is noise: at ``noise_scale`` 0 there is none, and above it the seed is
+    # pinned so every evaluation sees the same draw.  Restoring the state
+    # afterwards keeps a variable number of draws from shifting the training
+    # stream underneath the run.
     rng_state = torch.get_rng_state()
     cuda_rng_state = (
         torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -1560,12 +1814,28 @@ def _holdout_spectral_loss(net_g, batches, config, device):
         torch.cuda.manual_seed_all(0x5EED)
 
     try:
-        with torch.no_grad():
-            for batch in batches:
+        # The same autocast the training step runs under, so the metric
+        # measures the model as it is actually being trained, and
+        # ``inference_mode`` rather than ``no_grad`` because nothing here is
+        # ever differentiated.
+        with torch.inference_mode(), autocast(
+            device_type="cuda", enabled=use_amp, dtype=amp_dtype
+        ):
+            for index, batch in excerpts.batches():
                 # Not named ``spec``: ``test_run_spec`` audits every
                 # ``spec.<field>`` in this file against the run spec, and a
                 # local of that name collides with the check.
-                phone, phone_lengths, pitch, pitchf, holdout_spec, _spec_lengths, wave, wave_lengths, sid = batch
+                (
+                    phone,
+                    phone_lengths,
+                    pitch,
+                    pitchf,
+                    holdout_spec,
+                    holdout_spec_lengths,
+                    wave,
+                    wave_lengths,
+                    sid,
+                ) = batch
                 phone = phone.to(device, non_blocking=True)
                 phone_lengths = phone_lengths.to(device, non_blocking=True)
                 pitch = pitch.to(device, non_blocking=True)
@@ -1573,23 +1843,65 @@ def _holdout_spectral_loss(net_g, batches, config, device):
                 sid = sid.to(device, non_blocking=True)
                 wave = wave.to(device, non_blocking=True)
 
-                # The held-out spectrogram, not a placeholder: a model trained
-                # with the measured frame features has to be *scored* with them
-                # too.  Left out, this evaluates a path the weights were never
-                # trained for and reports the mismatch as a quality regression.
-                holdout_spec = holdout_spec.to(device, non_blocking=True)
+                g = model.emb_g(sid).unsqueeze(-1)
+                if manual_prior:
+                    m_p, logs_p, x_mask = model.enc_p(
+                        phone=phone, pitch=pitch, lengths=phone_lengths
+                    )
+                    z_p = m_p
+                    if noise_scale:
+                        z_p = (
+                            m_p
+                            + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale
+                        )
+                    z_prior = model.flow(z_p * x_mask, x_mask, g=g, reverse=True)
+                    z_prior = z_prior * x_mask
+                    frames = min(z_prior.shape[-1], pitchf.shape[-1])
+                    prior_wave = model.dec(
+                        z_prior[..., :frames], pitchf[..., :frames], g=g
+                    )
+                else:
+                    prior_wave, *_ = model.infer(
+                        phone, phone_lengths, pitch, pitchf, sid, 0
+                    )
+                    frames = pitchf.shape[-1]
 
-                generated, *_ = model.infer(
-                    phone, phone_lengths, pitch, pitchf, sid, 0, holdout_spec
-                )
-                # ``infer`` rebuilds the waveform from frame-rate features, so
-                # its length lands within a hop of the target rather than on it.
-                length = min(generated.shape[-1], wave.shape[-1], int(wave_lengths.min()))
+                posterior_wave = None
+                if want_latent:
+                    holdout_spec = holdout_spec.to(device, non_blocking=True)
+                    holdout_spec_lengths = holdout_spec_lengths.to(
+                        device, non_blocking=True
+                    )
+                    z_q, _, _, spec_mask = model.enc_q(
+                        holdout_spec, holdout_spec_lengths, g=g
+                    )
+                    posterior_wave = model.dec(
+                        (z_q * spec_mask)[..., :frames], pitchf[..., :frames], g=g
+                    )
+
+                # The decoder rebuilds the waveform from frame-rate features,
+                # so its length lands within a hop of the excerpt rather than
+                # on it.
+                length = min(prior_wave.shape[-1], wave.shape[-1])
+                if posterior_wave is not None:
+                    length = min(length, posterior_wave.shape[-1])
                 if length <= config.data.filter_length:
                     continue
-                target_mel = wave_to_mel(config, wave[..., :length], num_mels=None)
-                output_mel = wave_to_mel(config, generated[..., :length], num_mels=None)
-                total += float(F.l1_loss(output_mel, target_mel))
+                target_mel = excerpts.target_mel(
+                    index,
+                    length,
+                    lambda: wave_to_mel(config, wave[..., :length], num_mels=None),
+                )
+                prior_mel = wave_to_mel(config, prior_wave[..., :length], num_mels=None)
+                totals["mel_l1"] += float(F.l1_loss(prior_mel, target_mel))
+                if posterior_wave is not None:
+                    posterior_mel = wave_to_mel(
+                        config, posterior_wave[..., :length], num_mels=None
+                    )
+                    totals["latent_gap"] += float(F.l1_loss(prior_mel, posterior_mel))
+                    totals["latent_posterior"] += float(
+                        F.l1_loss(posterior_mel, target_mel)
+                    )
                 count += 1
     finally:
         torch.set_rng_state(rng_state)
@@ -1597,7 +1909,32 @@ def _holdout_spectral_loss(net_g, batches, config, device):
             torch.cuda.set_rng_state_all(cuda_rng_state)
         if was_training:
             model.train()
-    return total / count if count else float("nan")
+
+    if not count:
+        return {"mel_l1": float("nan")}
+    return {key: value / count for key, value in totals.items()}
+
+
+def _holdout_metrics_resilient(net_g, excerpts, config, device, **kwargs):
+    """:func:`_holdout_metrics`, but an oversized batch is halved, not fatal.
+
+    The evaluation decodes seconds of audio per item where a training step
+    decodes a fraction of one, so its batch can be the largest allocation in
+    the run despite storing no gradients -- and it would be a poor trade to
+    lose a training run to a diagnostic.
+    """
+    while True:
+        try:
+            return _holdout_metrics(net_g, excerpts, config, device, **kwargs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if not excerpts.shrink():
+                raise
+            warning(
+                f"{excerpts.label} evaluation ran out of memory; retrying at "
+                f"batch {excerpts.batch_size}.",
+                tag="[HOLDOUT]",
+            )
 
 
 class _OvertrainMonitor:
@@ -1609,63 +1946,167 @@ class _OvertrainMonitor:
     turn is to score audio it has never been trained on and watch for the
     minimum.
 
-    Keeps the weights from that minimum.  ``patience`` is counted in
-    evaluations rather than steps so it does not silently change meaning when
-    the interval does, and ``min_delta`` is relative so it means the same thing
-    at any loss scale.
+    Two things here are judged against a *noise band* rather than a fixed
+    threshold, because a fixed threshold means something different in every
+    run:
 
-    There are two questions here and they want opposite thresholds, which is
-    why they are tracked separately:
+    * The score is median-filtered over ``smoothing`` evaluations before
+      anything is decided on it.  A single-point argmin over a flat tail picks
+      the luckiest evaluation rather than the best weights: on the run that
+      motivated this, the last six scores spanned 0.4% and the winner beat its
+      neighbour by 0.1%.
+    * ``min_delta`` is only a floor now.  The band is the residual spread of
+      the recent scores about a straight line through them, so a curve that is
+      still falling fast has a narrow band while a flat noisy one has a wide
+      one.  It is what the run itself says a real change looks like.
 
-    * *Which weights do we keep?*  The lowest held-out loss, full stop.  A
-      threshold here throws away a real improvement for being small, and since
-      :func:`_deliverable_weights` prefers ``state_dict`` over everything else,
-      the run would export weights it had itself measured as worse.
-    * *Has the run stopped improving?*  Here a threshold is the whole point.
-      Without one, noise resets the counter forever and the detector never
-      fires; the counter has to ignore improvements too small to be real.
+    The median filter is centred, so the point being judged is one evaluation
+    behind the newest and its weights have to still be around when it is
+    judged -- which is why this keeps a short window of state dicts rather than
+    a single snapshot.
 
-    Using one number for both means picking which of the two to get wrong.
+    There are still two questions here, and they still want different answers:
+
+    * *Which weights do we keep?*  The lowest smoothed score.  Ties inside the
+      band go to the earlier step: the same measured quality with less
+      memorisation behind it, and the later one only won on noise.
+    * *Has the run stopped improving?*  The counter ignores anything inside the
+      band, so noise cannot reset it forever.
     """
 
-    def __init__(self, patience: int = 8, min_delta: float = 0.001):
+    def __init__(self, patience=8, min_delta=0.001, smoothing=3, noise_window=6):
         self.patience = max(1, int(patience))
         self.min_delta = max(0.0, float(min_delta))
+        self.smoothing = max(1, int(smoothing))
+        self.noise_window = max(4, int(noise_window))
+        #: Best *smoothed* score, and the step whose weights produced it.
         self.best = float("inf")
         self.best_step: int | None = None
         self.state_dict: dict | None = None
-        # The last value good enough to count as progress.  Separate from
+        #: Best single score ever seen.  Not a selection criterion; it is what
+        #: decides whether an evaluation is close enough to the running best to
+        #: be worth cloning weights for.
+        self.best_raw = float("inf")
+        # The last score good enough to count as progress.  Separate from
         # ``best`` because it moves on a coarser ratchet.
         self.patience_reference = float("inf")
-        self.since_best = 0
+        self.since_progress = 0
         self.history: list[tuple[int, float]] = []
+        self.smoothed = float("nan")
+        self.sigma = 0.0
+        # Once the run has been called, every further evaluation is paying for
+        # a number nothing acts on; see :meth:`backoff`.
+        self.interval_scale = 1
+        self._window = deque(maxlen=self.smoothing)
+
+    def _band(self, reference):
+        """How large a change has to be before it is evidence rather than noise."""
+        if not math.isfinite(reference):
+            return 0.0
+        return max(self.sigma, self.min_delta * abs(reference))
+
+    def _noise_sigma(self) -> float:
+        """Residual spread of the recent scores about a straight line.
+
+        A trend line and not a mean: a run that is genuinely improving has a
+        large spread about its mean and a small one about its slope, and it is
+        the second that says how much of an evaluation-to-evaluation
+        difference is real.  Returns 0 until there are enough points to fit,
+        which leaves ``min_delta`` as the floor in the meantime.
+        """
+        recent = [value for _, value in self.history[-self.noise_window :]]
+        count = len(recent)
+        if count < 4:
+            return 0.0
+        mean_x = (count - 1) / 2.0
+        mean_y = sum(recent) / count
+        variance_x = sum((index - mean_x) ** 2 for index in range(count))
+        covariance = sum(
+            (index - mean_x) * (value - mean_y) for index, value in enumerate(recent)
+        )
+        slope = covariance / variance_x if variance_x else 0.0
+        intercept = mean_y - slope * mean_x
+        residuals = [
+            value - (slope * index + intercept) for index, value in enumerate(recent)
+        ]
+        return math.sqrt(sum(r * r for r in residuals) / max(1, count - 2))
 
     def update(self, source, value: float, step: int) -> bool:
         """``source`` is whatever produced ``value``: a model, or a ``WeightEMA``.
 
-        Returns whether this is a new best, which is what the caller marks in
-        the log.  Keeping the weights that were actually scored is the whole
-        contract -- snapshotting the live model while having measured the
-        average would deliver a model nobody evaluated.
+        Returns whether this evaluation moved the best, which is what the
+        caller marks in the log.  Keeping the weights that were actually scored
+        is the whole contract -- snapshotting the live model while having
+        measured the average would deliver a model nobody evaluated -- and with
+        a centred filter that means keeping the weights of the middle of the
+        window, not of the newest evaluation.
         """
         if not math.isfinite(value):
             return False
         self.history.append((int(step), float(value)))
-        improved = value < self.best
-        if improved:
-            self.best = float(value)
-            self.best_step = int(step)
-            self.state_dict = _cpu_state_dict(source)
-        if value < self.patience_reference * (1.0 - self.min_delta):
-            self.patience_reference = float(value)
-            self.since_best = 0
+        self.sigma = self._noise_sigma()
+
+        # A state dict per evaluation is a copy of the model per evaluation, so
+        # only evaluations close enough to the running best to still win one
+        # are cloned.  A window entry without weights can never be selected,
+        # which costs nothing: for it to have won, its neighbours would have to
+        # drag a score that far off the best back under it.
+        competitive = (
+            not math.isfinite(self.best_raw)
+            or value <= self.best_raw + 2.0 * self._band(self.best_raw)
+        )
+        self._window.append(
+            (int(step), float(value), _cpu_state_dict(source) if competitive else None)
+        )
+        self.best_raw = min(self.best_raw, float(value))
+
+        if len(self._window) < self.smoothing:
+            # Until the window fills there is nothing to filter with, so the
+            # detector behaves like the unsmoothed one rather than reporting a
+            # half-formed median -- which on an even window is not a median at
+            # all, it is whichever side the tie broke towards.
+            self.smoothed = float(value)
+            center_step, _center_value, center_state = self._window[-1]
         else:
-            self.since_best += 1
+            scores = sorted(entry[1] for entry in self._window)
+            self.smoothed = scores[len(scores) // 2]
+            center_step, _center_value, center_state = self._window[
+                len(self._window) // 2
+            ]
+
+        improved = False
+        if center_state is not None and self.smoothed < self.best - self._band(
+            self.best
+        ):
+            improved = True
+            self.best = float(self.smoothed)
+            self.best_step = int(center_step)
+            self.state_dict = center_state
+
+        if self.smoothed < self.patience_reference - self._band(
+            self.patience_reference
+        ):
+            self.patience_reference = float(self.smoothed)
+            self.since_progress = 0
+        else:
+            self.since_progress += 1
         return improved
+
+    def backoff(self, factor: int = 4) -> int:
+        """Evaluate less often once the run has already been called.
+
+        The detector fires long before a 200-epoch run ends, and with
+        ``stop_on_overtrain`` off the run keeps going -- paying full price for
+        the evaluation every interval to keep confirming an answer it already
+        has.  It still evaluates, because a run can come back, just not as
+        often.
+        """
+        self.interval_scale = max(1, int(self.interval_scale * max(1, int(factor))))
+        return self.interval_scale
 
     @property
     def overtrained(self) -> bool:
-        return self.state_dict is not None and self.since_best >= self.patience
+        return self.state_dict is not None and self.since_progress >= self.patience
 
 
 def _deliverable_weights(overtrain_monitor, ema, model_g):
@@ -2057,36 +2498,38 @@ def _adaptive_adversarial_weight(
     Reporting just the clamped value hides a saturated weight as a flat line at
     the ceiling, which is indistinguishable from a healthy constant.
     """
-    reconstruction_gradient = torch.autograd.grad(
-        loss_reconstruction,
-        parameter,
-        retain_graph=True,
-        create_graph=False,
-        allow_unused=True,
-    )[0]
-    if adversarial_gradient is None:
-        # ``None`` where the branchwise step has already produced this by the
-        # chain rule from the waveform: there the adversarial loss is a
-        # detached scalar with no graph left to differentiate.
-        adversarial_gradient = torch.autograd.grad(
-            loss_adversarial,
+    zero = loss_reconstruction.detach().float().new_zeros(())
+    _, reconstruction_norm = _probe_gradient(
+        lambda scale: torch.autograd.grad(
+            loss_reconstruction * scale,
             parameter,
             retain_graph=True,
             create_graph=False,
             allow_unused=True,
         )[0]
+    )
+    if adversarial_gradient is None:
+        # ``None`` where the branchwise step has already produced this by the
+        # chain rule from the waveform: there the adversarial loss is a
+        # detached scalar with no graph left to differentiate.
+        _, adversarial_norm = _probe_gradient(
+            lambda scale: torch.autograd.grad(
+                loss_adversarial * scale,
+                parameter,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+        )
+    else:
+        # Already measured through the probe scale by
+        # ``_wave_parameter_gradient``, which is where that traversal happens.
+        adversarial_norm = adversarial_gradient.detach().float().norm()
 
-    zero = loss_reconstruction.detach().new_zeros(())
-    reconstruction_norm = (
-        reconstruction_gradient.detach().float().norm()
-        if reconstruction_gradient is not None
-        else zero
-    )
-    adversarial_norm = (
-        adversarial_gradient.detach().float().norm()
-        if adversarial_gradient is not None
-        else zero
-    )
+    if reconstruction_norm is None:
+        reconstruction_norm = zero
+    if adversarial_norm is None:
+        adversarial_norm = zero
     requested = (
         balance_target * reconstruction_norm / (adversarial_norm + 1e-6)
     ).detach()
@@ -2126,27 +2569,29 @@ def _adaptive_feature_match_weight(
     push feature matching above what the config asked for would be a second,
     unproven change riding along with this one.
     """
-    zero = loss_feature_match.detach().new_zeros(())
-    feature_match_gradient = feature_gradient
-    if feature_match_gradient is None:
+    zero = loss_feature_match.detach().float().new_zeros(())
+    if feature_gradient is None:
         # A detached loss with no supplied gradient means feature matching is
         # not reaching the decoder at all; a detached loss *with* one is the
         # branchwise step, which computed it from the waveform instead.
         if not loss_feature_match.requires_grad:
             return loss_feature_match.detach().new_ones(()), zero, zero
 
-        feature_match_gradient = torch.autograd.grad(
-            loss_feature_match,
-            parameter,
-            retain_graph=True,
-            create_graph=False,
-            allow_unused=True,
-        )[0]
-    feature_match_norm = (
-        feature_match_gradient.detach().float().norm()
-        if feature_match_gradient is not None
-        else zero
-    )
+        _, feature_match_norm = _probe_gradient(
+            lambda scale: torch.autograd.grad(
+                loss_feature_match * scale,
+                parameter,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+        )
+        if feature_match_norm is None:
+            feature_match_norm = zero
+    else:
+        # Already measured through the probe scale by
+        # ``_wave_parameter_gradient``.
+        feature_match_norm = feature_gradient.detach().float().norm()
     requested = (
         balance_target * reconstruction_norm / (feature_match_norm + 1e-6)
     ).detach()
@@ -2159,7 +2604,6 @@ def _generator_gradient_metrics(net_g):
     groups = {
         "content_encoder": [],
         "posterior": [],
-        "latent": [],
         "prior": [],
         "decoder": [],
         "speaker": [],
@@ -2170,14 +2614,9 @@ def _generator_gradient_metrics(net_g):
             continue
         if name.startswith("enc_p."):
             group = "content_encoder"
-        elif (
-            name.startswith("chouwa_latent.posterior_fast_head")
-            or name.startswith("chouwa_latent.fast_to_")
-        ):
-            group = "latent"
-        elif name.startswith("chouwa_latent.posterior"):
+        elif name.startswith("enc_q."):
             group = "posterior"
-        elif name.startswith("chouwa_latent.prior"):
+        elif name.startswith("flow."):
             group = "prior"
         elif name.startswith("dec."):
             group = "decoder"
@@ -2263,7 +2702,7 @@ def get_optimizers(
 
     optim_g = _make_optimizer(net_g, optimizer_choice_g, lr_g, num_epochs=total_epoch_count, num_batches=num_batches, param_groups=g_param_groups)
     lazy_reg_interval = None
-    if uses_vits_latent(vocoder) and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
+    if chouwagan_stack_active and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
         lazy_reg_interval = int(getattr(config.train, "r1_interval", 16))
     optim_d = _make_optimizer(
         net_d,
@@ -2281,8 +2720,8 @@ def apply_frontend_freeze(net_g, rank):
     """
     Freeze the frontend for fine-tuning, driven by the `freeze_vae` flag.
 
-    Everything outside `dec.` and `emb_g.` is frozen, which on RefineGAN means
-    `enc_p` plus the SVAE prior/posterior under `chouwa_latent`.
+    Everything outside `dec.` and `emb_g.` is frozen, which means `enc_p`, the
+    posterior encoder and the flow.
     """
     if not freeze_vae:
         if rank == 0:
@@ -2300,42 +2739,8 @@ def apply_frontend_freeze(net_g, rank):
         print(f"[INIT] Frontend frozen: everything but dec/emb_g ({frozen_params:,} params)")
 
 
-def apply_finetune_freezes(net_g, rank):
-    """Keep the learned content/code distribution stable during Refine fine-tuning."""
-    if not finetune_phase:
-        return
-
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    discrete = getattr(model, "chouwa_latent", None)
-    if discrete is None:
-        return
-
-    frozen_modules = [
-        getattr(model, "enc_p", None),
-        getattr(discrete, "posterior_input", None),
-        getattr(discrete, "posterior_condition", None),
-        getattr(discrete, "posterior_enc", None),
-        getattr(discrete, "posterior_fast_head", None),
-    ]
-    frozen_params = 0
-    for module in frozen_modules:
-        if module is None:
-            continue
-        for parameter in module.parameters():
-            if parameter.requires_grad:
-                parameter.requires_grad = False
-                frozen_params += parameter.numel()
-
-    if rank == 0:
-        print(
-            f"[INIT] Refine fine-tune frontend frozen: {frozen_params:,} params; "
-            "decoder, speaker embedding, prior and continuous latent adapters remain trainable."
-        )
-
-
 def apply_training_freezes(net_g, rank):
     apply_frontend_freeze(net_g, rank)
-    apply_finetune_freezes(net_g, rank)
 
 
 def apply_resume_lr_override(optim_g, optim_d=None):
@@ -2405,7 +2810,7 @@ def enable_vocoder_compile(net_g, device, rank):
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
 
     mode = torch_compile_mode
-    if refinegan_active:
+    if chouwagan_stack_active:
         # The RefineGAN loop backwards through the decoder graph more than once
         # per step: `loss_core.backward(retain_graph=True)` is followed by the
         # decoder-only `autograd.grad` for the GAN term, plus the adaptive-adv
@@ -2415,7 +2820,7 @@ def enable_vocoder_compile(net_g, device, rank):
         import torch._functorch.config as functorch_config
 
         functorch_config.donated_buffer = False
-    if refinegan_active and mode == "reduce-overhead":
+    if chouwagan_stack_active and mode == "reduce-overhead":
         # `reduce-overhead` records CUDA graphs, which cannot survive the extra
         # backward passes above: the Grad_Source probes fire on step 50 and trip
         # "graph recording observed an input tensor deallocate during graph
@@ -2453,7 +2858,7 @@ def enable_discriminator_compile(net_d, config, device, rank):
     (see :func:`enable_vocoder_compile`) and which an 8 GiB card has no room
     for besides.  Plain fusion is the whole benefit here, so the mode is fixed.
     """
-    if not refinegan_active:
+    if not chouwagan_stack_active:
         return False
     if not bool(getattr(config.train, "compile_discriminator", False)):
         return False
@@ -2478,32 +2883,6 @@ def enable_discriminator_compile(net_d, config, device, rank):
     return enabled
 
 
-@torch.no_grad()
-def _wavehax_source_path_metrics(decoder):
-    """The same excitation-versus-latent ratio, read off Wavehax's input stack.
-
-    Wavehax has no stages to walk: the whole decoder runs at the frame rate and
-    the excitation enters exactly once, at ``input_proj``, a 1x1 over five
-    planes stacked as ``(prior_real, prior_imag, prior_real_proj,
-    prior_imag_proj, conditioning)``.  The first four are a pure function of F0
-    and the fifth is a pure function of the latent, so the ratio of their column
-    norms answers the question the RefineGAN series above asks per stage.  It is
-    reported under the same names -- one stage, which is also the output stage --
-    so a Wavehax run is readable on the same axes.
-    """
-    input_proj = getattr(decoder, "input_proj", None)
-    if input_proj is None or getattr(input_proj, "in_channels", 0) != 5:
-        return {}
-    weight = input_proj.weight
-    excitation = weight[:, :4].norm()
-    main = weight[:, 4:].norm()
-    ratio = (excitation / main.clamp_min(1e-8)).item()
-    return {
-        "Source/inject_ratio_stage_0": ratio,
-        "Source/inject_ratio_output_stage": ratio,
-    }
-
-
 def collect_source_path_metrics(net_g):
     """How hard the pitch template is pushed into each decoder stage.
 
@@ -2525,10 +2904,54 @@ def collect_source_path_metrics(net_g):
     its main-half column norms answers "how much of this stage's output is
     excitation rather than latent".
 
+    With ``chouwagan_latent_source_gate`` on that ratio stops being the whole
+    answer: the skip is scaled by ``2 * sigmoid(gate(latent))`` before it
+    reaches ``fusion_proj``, so the mixing weight and the gate multiply, and
+    reporting the weight alone silently understates or overstates the share.
+    Four series come out of it, answering different questions:
+
+    ``inject_ratio_stage_i``
+        The raw ``fusion_proj`` ratio, unchanged, so a gated run stays
+        comparable against one without the gate.
+    ``latent_gate_mean_stage_i``
+        The gate's mean over the last forward's batch, read from the buffer the
+        decoder writes.  1.0 at initialisation.
+    ``latent_gate_saturation_stage_i``
+        The share of gate elements pinned at the ceiling.  A saturated gate is a
+        hard mask, not a multiplier, and this is what says which of the two is
+        being reported.
+    ``latent_gate_sensitivity_stage_i``
+        The norm of the gate's weight: how much the multiplier varies with the
+        latent.  Exactly 0.0 at initialisation, so this is the series that says
+        whether the pitch path has become conditional on ``z`` at all, which is
+        the whole point of the gate.
+    ``inject_ratio_effective_stage_i``
+        ``inject_ratio * latent_gate_mean``: the excitation share the stage
+        really sees.
+
+    The mean is measured rather than derived, and the reason is worth keeping
+    because the derivation looked convincing.  ``2 * sigmoid(bias)`` -- the
+    gate's value when the latent contributes nothing -- is free to compute here
+    and equals ``E[2*sigmoid(b + w.z)]`` to first order whenever ``w.z`` is
+    small and centred.  Neither condition survives training.  Measured on
+    ``G_8139`` of the first gated run, over 48 real clips: the logits are wide
+    enough to pin ~30% of the elements at the ceiling and 6-21% at the floor, so
+    the gate is a hard mask whose mean is set by the *shape* of that split, not
+    by its centre.  The bias-only estimate read 1.00 at the output-rate stage
+    where the true mean is 0.41 -- wrong by 2.4x, and wrong in the direction
+    that hid the result, since the real number says the gate closes the
+    excitation down at exactly the stage where spectral mirroring lives.
+
+    So the decoder measures it in ``forward`` and parks it in a non-persistent
+    buffer, and this function reads that buffer.  It costs two reductions per
+    stage and one stacked buffer write per forward, which is the price of a
+    series that is a measurement instead of a guess.
+
     Only the U-Net excitation path is readable this way.  With
     ``chouwagan_excitation_unet`` off the source is folded in additively through
-    ``source_gates`` instead of concatenated, so there is no mixing weight to
-    split and the Wavehax reader's ``{}`` is the honest answer.
+    ``source_gates`` instead of concatenated, and RefineGAN concatenates its
+    downsampled excitation straight into a ParallelResBlock, so in both cases
+    there is no mixing weight to split and ``{}`` is the honest answer.
     """
     model = net_g.module if hasattr(net_g, "module") else net_g
     decoder = getattr(model, "dec", None)
@@ -2540,10 +2963,20 @@ def collect_source_path_metrics(net_g):
     # the excitation.
     skip_widths = tuple(reversed(getattr(decoder, "exc_skip_channels", ()) or ()))
     if not stages or not skip_widths:
-        return _wavehax_source_path_metrics(decoder)
+        return {}
+
+    gates = getattr(decoder, "latent_gates", None)
+    # Written by the decoder's last forward.  Absent only before the first one,
+    # where the initialised buffers already hold the right answer (an open gate
+    # that is not yet saturated).
+    measured_mean = getattr(decoder, "latent_gate_mean", None)
+    measured_saturation = getattr(decoder, "latent_gate_saturation", None)
+    if measured_mean is None or measured_saturation is None:
+        gates = None
 
     metrics = {}
     ratios = []
+    effective_ratios = []
     for index, stage in enumerate(stages):
         weight = stage.weight
         # cat order is (upsampled, skip), so the main path owns the leading
@@ -2555,10 +2988,26 @@ def collect_source_path_metrics(net_g):
         metrics[f"Source/inject_ratio_stage_{index}"] = ratio
         ratios.append(ratio)
 
+        if gates is None or index >= len(gates):
+            continue
+        gate = gates[index]
+        with torch.no_grad():
+            sensitivity = float(gate.weight.norm())
+            gate_mean = float(measured_mean[index])
+            saturation = float(measured_saturation[index])
+        metrics[f"Source/latent_gate_mean_stage_{index}"] = gate_mean
+        metrics[f"Source/latent_gate_saturation_stage_{index}"] = saturation
+        metrics[f"Source/latent_gate_sensitivity_stage_{index}"] = sensitivity
+        effective = ratio * gate_mean
+        metrics[f"Source/inject_ratio_effective_stage_{index}"] = effective
+        effective_ratios.append(effective)
+
     if ratios:
         # The last stage runs at the output rate: it is the one whose excitation
         # share lands directly in the top octave, so it gets a flat alias.
         metrics["Source/inject_ratio_output_stage"] = ratios[-1]
+    if effective_ratios:
+        metrics["Source/inject_ratio_effective_output_stage"] = effective_ratios[-1]
     return metrics
 
 
@@ -2596,7 +3045,7 @@ def checkpoint_step_from_path(path):
     return int(match.group(1)) if match else 0
 
 
-def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, device, device_id, n_gpus, rank):
+def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, device, device_id, n_gpus, rank, reset_pretrained_embeddings=False):
     # Init the models
     net_g = get_g_model(config, sample_rate, vocoder, use_checkpointing)
     net_d = get_d_model(config, vocoder, use_checkpointing)
@@ -2639,13 +3088,13 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             # in this folder belonged to a different decoder: the frontend
             # weights match either way, the decoder is silently left at its
             # init, and the run restarts at the old step count with a fully
-            # trained discriminator against a random generator.  RefineGAN and
-            # Wavehax share a config shape and a folder layout, which makes
-            # that one edited ``vocoder`` field away.
+            # trained discriminator against a random generator.  The vocoders
+            # share a config shape and a folder layout, which makes that one
+            # edited ``vocoder`` field away.
             _assert_resumable_architecture(net_g, g_checkpoint_path)
 
             # Load the model and optim states
-            generator_strict_load = strict_load and not refinegan_active
+            generator_strict_load = strict_load and not chouwagan_stack_active
             _, _, _, epoch_str, _ = load_checkpoint(
                 g_checkpoint_path,
                 net_g,
@@ -2695,19 +3144,61 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                 "architecture_id",
                 None,
             )
+            checkpoint_architecture = checkpoint.get("architecture_id")
+            # An *absent* id is not a mismatch here.  The resume guard treats it
+            # as one on purpose -- a `G_*.pth` in the experiment folder that
+            # predates the key is one of this fork's own old runs, and those are
+            # exactly the layouts that have since changed.  A pretrain is the
+            # opposite case: it comes from upstream, where the key never
+            # existed.  Every stock RVC v2 checkpoint carries `iteration` and
+            # `learning_rate` and nothing else, the bundled
+            # `hifi-gan/f0G{32,40,48}k.pth` included, so this branch rejected
+            # the shipped pretrains for the shipped vocoder -- HiFi-GAN
+            # fine-tuning could not start at all.
+            #
+            # It went unnoticed because HiFi-GAN is the only architecture the
+            # check can actually reach: the VITS-latent vocoders both report
+            # `vits_gaussian_v1`, and that opt-out exists for *precisely* this
+            # reason (an Applio checkpoint carries no id either).  HiFi-GAN, the
+            # oldest path, was the one left out of it.
+            #
+            # What verifies an id-less pretrain instead is the load below, which
+            # is strict for everything but the ChouwaGAN stack: a state dict
+            # from another architecture raises on its missing and unexpected
+            # keys.  An id that is present and disagrees is still refused --
+            # that is a checkpoint making a claim about itself.
             if (
                 expected_architecture
                 and expected_architecture != "vits_gaussian_v1"
-                and checkpoint.get("architecture_id") != expected_architecture
+                and checkpoint_architecture is not None
+                and checkpoint_architecture != expected_architecture
             ):
                 raise ValueError(
-                    f"Pretrained generator architecture mismatch: expected '{expected_architecture}'."
+                    f"Pretrained generator architecture mismatch: this run builds "
+                    f"'{expected_architecture}' and "
+                    f"'{os.path.basename(pretrainG)}' was written for "
+                    f"'{checkpoint_architecture}'."
                 )
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
+            # ``verify_spk_dim`` decided this pretrain's speaker table belongs
+            # to other speakers, so ``emb_g`` was sized for *this* dataset and
+            # the pretrained rows would not even fit.  Substituting the model's
+            # own freshly initialised tensor rather than dropping the key keeps
+            # the load strict for the vocoders that load strictly -- a missing
+            # key would be an error there, and a silent one is exactly what
+            # this branch must not produce.
+            if reset_pretrained_embeddings and "emb_g.weight" in state_dict:
+                state_dict = substitute_speaker_embeddings(state_dict, net_g)
+                if rank == 0:
+                    print(
+                        "[ ] Pretrained speaker embeddings discarded: "
+                        f"starting {state_dict['emb_g.weight'].shape[0]} fresh ones."
+                    )
+
             net_g.load_state_dict(
                 state_dict,
-                strict=not refinegan_active,
+                strict=not chouwagan_stack_active,
             )
 
         # Loading the pretrained Discriminator model
@@ -2940,6 +3431,38 @@ def get_reference_sample(train_loader, device, config):
         phone_lengths = torch.LongTensor([phone.shape[1]]).to(device)
         sid = torch.LongTensor([0]).to(device)
 
+        # ---- Optional ground truth for the preview -------------------------
+        # Without it the preview degrades to the generated waveform alone: the
+        # three-panel figure needs something to subtract, so a custom reference
+        # used to cost exactly the comparison it was set up to make stable.
+        # The wav is resampled on load, so it can be at any rate; what has to
+        # line up is the *time span*, and it does by construction -- one f0
+        # frame is one hop at every configured sample rate, both being 10 ms.
+        audio_path = os.path.join(reference_path, "ref_audio.wav")
+        if os.path.isfile(audio_path):
+            from rvc.lib.utils import load_audio
+
+            wave = load_audio(audio_path, config.data.sample_rate)
+            wanted = min_len * config.data.hop_length
+            if wave.shape[0] < wanted:
+                # Short is survivable -- the figure crops both mels to the
+                # frames they share -- but silently comparing less than the
+                # reference renders is not, so it is said out loud.
+                print(
+                    "[REFERENCE] ref_audio.wav is "
+                    f"{wave.shape[0] / config.data.sample_rate:.2f}s, short of the "
+                    f"{wanted / config.data.sample_rate:.2f}s the features render; "
+                    "the preview will compare only the overlap."
+                )
+            reference_audio = (
+                torch.FloatTensor(wave[:wanted]).view(1, 1, -1).to(device)
+            )
+        else:
+            print(
+                "[REFERENCE] No ref_audio.wav; the preview will show the "
+                "generated audio without the mel comparison."
+            )
+
     else:
         print("[REFERENCE] No custom reference found. Fetching from train_loader.")
         info = next(iter(train_loader))
@@ -2968,29 +3491,8 @@ def get_reference_sample(train_loader, device, config):
         print(f"[REFERENCE] Origin of the ref: {file_name}")
         reference_source = file_name
 
-    # The preview must run the same path the holdout scores and the pipeline
-    # ships, which means supplying the spectrogram the frame features are
-    # measured from.  A custom reference in ``logs/reference`` carries only
-    # features and f0, so there is no audio to measure and the model falls back
-    # to its pre-feature behaviour -- correct, but worth saying out loud,
-    # because the preview then stops matching the holdout.
-    reference_spec = None
-    if reference_audio is not None:
-        reference_spec = spectrogram_for_features(
-            reference_audio.reshape(1, -1),
-            int(config.data.filter_length),
-            int(config.data.hop_length),
-        )
-    elif getattr(config.model, "use_periodicity", False) or getattr(
-        config.model, "use_frame_energy", False
-    ):
-        print(
-            "[REFERENCE] Custom reference has no audio, so the preview runs "
-            "without the measured frame features. The holdout still uses them."
-        )
-
     return (
-        (phone, phone_lengths, pitch, pitchf, sid, config.train.seed, reference_spec),
+        (phone, phone_lengths, pitch, pitchf, sid, config.train.seed),
         reference_audio,
         reference_source,
     )
@@ -3140,11 +3642,13 @@ def run(
     setup_env_and_distr(rank, n_gpus, device, device_id, config)
 
     # Dataloading and loaders preparation
-    train_loader, holdout_batches = prepare_dataloaders(config, n_gpus, rank, batch_size)
+    train_loader, holdout_set, probe_set = prepare_dataloaders(
+        config, n_gpus, rank, batch_size
+    )
 
     # Spk dim verif
-    spk_dim = verify_spk_dim(config, model_info_path, experiment_dir, latest_checkpoint_path, rank, pretrainG)
-    config.model.spk_embed_dim = spk_dim
+    speaker_layout = verify_spk_dim(config, model_info_path, experiment_dir, latest_checkpoint_path, rank, pretrainG)
+    config.model.spk_embed_dim = speaker_layout.embed_dim
 
     if rank == 0 and warmup_active():
         warmup_tag = "Manual control" if warmup_steps > 0 else f"per epoch x{warmup_duration}"
@@ -3177,8 +3681,8 @@ def run(
     )
 
     def _make_mel_distance():
-        if not refinegan_active or mel_distance in ("l1", "mae"):
-            base, weighted = torch.nn.L1Loss, refinegan_active
+        if not chouwagan_stack_active or mel_distance in ("l1", "mae"):
+            base, weighted = torch.nn.L1Loss, chouwagan_stack_active
         elif mel_distance == "huber":
             base, weighted = (
                 lambda **kw: torch.nn.SmoothL1Loss(beta=mel_huber_beta, **kw)
@@ -3218,7 +3722,7 @@ def run(
 
     if spectral_loss == "L1 Mel Loss":
         fn_spectral_loss = _make_mel_distance()
-        if rank == 0 and refinegan_active:
+        if rank == 0 and chouwagan_stack_active:
             print(
                 f"[INIT] Mel distance: {mel_distance}"
                 + (f" (beta={mel_huber_beta})" if mel_distance == "huber" else "")
@@ -3226,7 +3730,7 @@ def run(
         if swap_l1_to_ms:
             fn_spectral_loss_ms = MultiScaleMelSpectrogramLoss(
                 sample_rate=sample_rate,
-                safe_log=refinegan_active,
+                safe_log=chouwagan_stack_active,
                 loss_fn=_make_mel_distance(),
             )
     elif spectral_loss == "Multi-Scale Mel Loss":
@@ -3240,10 +3744,10 @@ def run(
         # identical, so beta is a slightly different L2/L1 crossover here.
         fn_spectral_loss = MultiScaleMelSpectrogramLoss(
             sample_rate=sample_rate,
-            safe_log=refinegan_active,
+            safe_log=chouwagan_stack_active,
             loss_fn=_make_mel_distance(),
         )
-        if rank == 0 and refinegan_active:
+        if rank == 0 and chouwagan_stack_active:
             print(
                 f"[INIT] Multi-scale mel distance: {mel_distance}"
                 + (f" (beta={mel_huber_beta})" if mel_distance == "huber" else "")
@@ -3274,7 +3778,8 @@ def run(
         device,
         device_id,
         n_gpus,
-        rank
+        rank,
+        speaker_layout.reset_pretrained,
     )
 
     enable_vocoder_compile(net_g, device, rank)
@@ -3491,10 +3996,12 @@ def run(
     # The turn from "still learning" to "memorising" happens on the scale of a
     # run, not an epoch.
     overtrain_monitor = None
-    if holdout_batches:
+    if holdout_set is not None and len(holdout_set):
         overtrain_monitor = _OvertrainMonitor(
             patience=int(getattr(config.train, "overtrain_patience", 8)),
             min_delta=float(getattr(config.train, "overtrain_min_delta", 0.001)),
+            smoothing=int(getattr(config.train, "overtrain_smoothing", 3)),
+            noise_window=int(getattr(config.train, "overtrain_noise_window", 6)),
         )
         interval = int(getattr(config.train, "holdout_interval", 0))
         if interval <= 0:
@@ -3545,7 +4052,8 @@ def run(
             n_gpus,
             fn_spectral_loss2,
             fn_spectral_loss_ms,
-            holdout_batches=holdout_batches,
+            holdout_set=holdout_set,
+            probe_set=probe_set,
             overtrain_monitor=overtrain_monitor,
             holdout_interval=interval,
             ema=ema,
@@ -3624,7 +4132,8 @@ def training_loop(
     n_gpus,
     fn_spectral_loss2=None,
     fn_spectral_loss_ms=None,
-    holdout_batches=None,
+    holdout_set=None,
+    probe_set=None,
     overtrain_monitor=None,
     holdout_interval=0,
     ema=None,
@@ -3711,8 +4220,6 @@ def training_loop(
         "loss_gen_total": deque(maxlen=rolling_loss_steps),
         "loss_fm": deque(maxlen=rolling_loss_steps),
         "loss_spectral": deque(maxlen=rolling_loss_steps),
-        "loss_prior": deque(maxlen=rolling_loss_steps),
-        "loss_prior_fast": deque(maxlen=rolling_loss_steps),
         "prior_kl_fast": deque(maxlen=rolling_loss_steps),
         "prior_std_fast": deque(maxlen=rolling_loss_steps),
         "posterior_std_fast": deque(maxlen=rolling_loss_steps),
@@ -3723,21 +4230,16 @@ def training_loop(
         "posterior_detail_rms": deque(maxlen=rolling_loss_steps),
         "prior_detail_rms": deque(maxlen=rolling_loss_steps),
     }
-    if refinegan_active:
+    if chouwagan_stack_active:
         # Waveform-domain reconstruction terms, logged unweighted so the series
         # stay readable when their weights change.
         for key in ("loss_envelope", "loss_rms", "loss_peak", "loss_waveform"):
             avg_rolling_cache[key] = deque(maxlen=rolling_loss_steps)
-    else:
-        # ``loss_kl`` is the Gaussian VITS ELBO term; the RefineGAN frontend
-        # reports its divergence through ``loss_prior_*`` instead and leaves
-        # this at a constant zero.
-        avg_rolling_cache["loss_kl"] = deque(maxlen=rolling_loss_steps)
+    avg_rolling_cache["loss_kl"] = deque(maxlen=rolling_loss_steps)
     kl_std_cache = deque(maxlen=rolling_loss_steps)
     kl_mean_cache = deque(maxlen=rolling_loss_steps)
     kl_active_cache = deque(maxlen=rolling_loss_steps)
     last_kl_per_dim = None
-    discrete_vector_cache = {}
 
     r1_interval = max(1, int(getattr(config.train, "r1_interval", 16)))
     r1_gamma = float(getattr(config.train, "r1_gamma", 1.0))
@@ -3765,7 +4267,7 @@ def training_loop(
     # would dominate forever.
     amp_skip_cache = deque(maxlen=rolling_loss_steps)
     disc_branch_names = ()
-    if refinegan_active:
+    if chouwagan_stack_active:
         disc_branch_names = tuple(
             getattr(net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ())
         )
@@ -3775,38 +4277,6 @@ def training_loop(
         int(getattr(config.train, "diagnostics_interval", 256)),
     )
 
-    # Same correction for everything sourced from ``discrete_diagnostics``.
-    # Those are produced once every ``diagnostics_interval`` steps, so
-    # a deque sized in *steps* holds `maxlen * interval` steps of history: at the
-    # defaults that is 50 x 256 = 12800 steps, which made the KL/prior series a
-    # near-cumulative average of the whole run rather than a recent one. They
-    # read low for thousands of steps after the underlying value had moved.
-    diagnostic_window = max(
-        2, rolling_loss_steps // max(1, diagnostics_interval)
-    )
-    for key in (
-        "prior_kl_fast",
-        "prior_std_fast",
-        "posterior_std_fast",
-        "scale_anchor",
-        "prior_replacement",
-        # Share of the replaced items decoded from the prior mean.  Without it
-        # the mean/sample split is invisible and ``prior_replacement`` alone
-        # reads identically whether or not the inference operating point is
-        # being trained at all.
-        "prior_replacement_mean",
-        "content_rms",
-        "posterior_detail_rms",
-        "prior_detail_rms",
-        "kl_beta_fast",
-        # Collapse detectors.  The rate controller targets the per-dim *mean*,
-        # which a collapsed latent satisfies exactly, so none of the series
-        # above can show the latent concentrating into a handful of dimensions.
-        "kl_effective_dims_fast",
-        "kl_above_floor_fast",
-        "kl_median_fast",
-    ):
-        avg_rolling_cache[key] = deque(maxlen=diagnostic_window)
     r1_segment_size = max(
         1,
         int(getattr(config.train, "r1_segment_size", config.train.segment_size)),
@@ -3834,63 +4304,6 @@ def training_loop(
     )
     adv_warmup_steps = 0 if finetune_phase else max(
         0, int(getattr(config.train, "adv_warmup_steps", 2000))
-    )
-    chouwa_latent = None
-    if refinegan_active:
-        model_g = net_g.module if hasattr(net_g, "module") else net_g
-        chouwa_latent = getattr(model_g, "chouwa_latent", None)
-    prior_loss_weight = max(
-        0.0,
-        float(getattr(config.train, "prior_loss_weight", PRIOR_LOSS_WEIGHT_DEFAULT)),
-    )
-    prior_warmup_steps = 0 if finetune_phase else max(
-        0,
-        int(getattr(config.train, "prior_warmup_steps", PRIOR_WARMUP_STEPS_DEFAULT)),
-    )
-    # When ``kl_target_*`` is set, the rate controller owns the
-    # KL weight and discards both settings above (see the
-    # ``kl_rate_control_active`` test at the loss site).  Silently ignored
-    # config is worse than no config: a run tuned by turning these knobs would
-    # have produced identical training, and the lever that actually moves the
-    # prior/posterior balance is the KL target.
-    #
-    # Only when they differ from their defaults, though.  The shipped config
-    # carries both keys at their default values, so testing for the key's
-    # presence fired this on every RefineGAN run and warned about a choice
-    # nobody made -- which is how a warning becomes something people scroll
-    # past.  A value equal to the default says nothing about intent.
-    if (
-        rank == 0
-        and chouwa_latent is not None
-        and chouwa_latent.kl_rate_control_active
-    ):
-        overridden = []
-        if prior_loss_weight != PRIOR_LOSS_WEIGHT_DEFAULT:
-            overridden.append(f"prior_loss_weight={prior_loss_weight}")
-        if (
-            not finetune_phase
-            and prior_warmup_steps != PRIOR_WARMUP_STEPS_DEFAULT
-        ):
-            overridden.append(f"prior_warmup_steps={prior_warmup_steps}")
-        if overridden:
-            warning(
-                f"KL rate control is active (target "
-                f"{chouwa_latent.kl_target_fast}), so it sets the KL weight "
-                f"itself and ignores {', '.join(overridden)}. Change "
-                "kl_target to move the prior/posterior balance.",
-                tag="[INIT]",
-            )
-    ablation_interval = 0 if finetune_phase else max(
-        0,
-        int(getattr(config.train, "ablation_interval", 0)),
-    )
-    ablation_weight = max(
-        0.0,
-        float(getattr(config.train, "ablation_loss_weight", 0.0)),
-    )
-    ablation_margin = max(
-        0.0,
-        float(getattr(config.train, "ablation_margin", 0.01)),
     )
     kl_active_threshold = max(
         0.0,
@@ -3928,6 +4341,17 @@ def training_loop(
     adaptive_fm_min = max(
         0.0,
         float(getattr(config.train, "fm_balance_min", 0.1)),
+    )
+    # The ceiling on the feature-matching weight.  1.0 -- the historical value,
+    # and still the default -- means the governor can only ever *reduce*
+    # ``fm_weight``, because the failure it was written for was overgrowth.
+    # That makes ``fm_balance_target`` unreachable from below: a run whose
+    # feature matching sits under target has the governor pinned at the ceiling
+    # asking for more and unable to take it.  Raise this to let the rule work
+    # in both directions.
+    adaptive_fm_max = max(
+        adaptive_fm_min,
+        float(getattr(config.train, "fm_balance_max", 1.0)),
     )
     # 8.0 is a judgement call, not a derived constant: it is roughly a quarter
     # of the balance the rule currently requests, an ~8x increase on the old
@@ -4007,6 +4431,10 @@ def training_loop(
         getattr(config.train, "peak_headroom_threshold", 0.85)
     )
 
+    # Counts refreshes whose gradient probe had no representable measurement.
+    # Logged, because the failure it guards against was invisible from the
+    # losses: every component reads finite and only the weights are NaN.
+    adaptive_probe_failures = 0
     cached_adaptive_adv = None
     cached_rec_grad = None
     cached_adv_grad = None
@@ -4046,7 +4474,7 @@ def training_loop(
             else:
                 grad_clip_value_g = grad_clip_value_d = float("inf")
 
-            if refinegan_active and global_clip_g > 0:
+            if chouwagan_stack_active and global_clip_g > 0:
                 grad_clip_value_g = min(grad_clip_value_g, global_clip_g)
                 grad_clip_value_d = min(grad_clip_value_d, global_clip_g)
 
@@ -4061,8 +4489,6 @@ def training_loop(
             (phone, phone_lengths, pitch, pitchf, spec, spec_lengths, y, y_lengths, sid) = info
 
             model_g = net_g.module if hasattr(net_g, "module") else net_g
-            if hasattr(model_g, "set_training_step"):
-                model_g.set_training_step(global_step)
 
             # Generator main forward pass:
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
@@ -4070,15 +4496,8 @@ def training_loop(
 
                 y_hat, ids_slice, x_mask, z_mask, vae_parts = model_output
 
-                discrete_parts = None
-                if chouwa_latent is not None:
-                    discrete_parts = vae_parts
-                    z = z_p = m_q = logs_q = None
-                    m_p = None
-                    logs_p = None
-                else:
-                    # Gaussian latent samples and parameters used by the VITS ELBO.
-                    z, z_p, m_p, logs_p, m_q, logs_q = vae_parts
+                # Gaussian latent samples and parameters used by the VITS ELBO.
+                z, z_p, m_p, logs_p, m_q, logs_q = vae_parts
 
                 # Slice the original waveform ( y ) to match the generated slice:
                 y = commons.slice_segments(y, ids_slice * config.data.hop_length, config.train.segment_size, dim=3)
@@ -4087,7 +4506,7 @@ def training_loop(
 
             # Discriminator update
             main_real_spectrograms = None
-            if refinegan_active:
+            if chouwagan_stack_active:
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
                 )
@@ -4108,7 +4527,7 @@ def training_loop(
 
             for y_d_real, y_d_fake, real_spectrograms in d_updates:
                 with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    if refinegan_active:
+                    if chouwagan_stack_active:
                         y_d_hat_r, y_d_hat_g, _, _ = net_d(
                             y_d_real,
                             y_d_fake,
@@ -4130,7 +4549,7 @@ def training_loop(
                         y_d_hat_r,
                         y_d_hat_g,
                         san_direction_weight=san_direction_weight,
-                        normalize=refinegan_active,
+                        normalize=chouwagan_stack_active,
                         per_branch=bool(disc_branch_names),
                     )
                     loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
@@ -4179,7 +4598,7 @@ def training_loop(
                         r1_controller.observe_discriminator(name, norm)
 
             if (
-                refinegan_active
+                chouwagan_stack_active
                 and r1_gamma > 0
                 and global_step % r1_interval == 0
             ):
@@ -4242,7 +4661,7 @@ def training_loop(
             discriminator_parameter_states = None
             branchwise_generator = False
             branch_terms = None
-            if refinegan_active:
+            if chouwagan_stack_active:
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
                 )
@@ -4289,9 +4708,30 @@ def training_loop(
 
 
             # Compute generator losses:
-            loss_ablation = torch.zeros((), device=y.device)
-            ablation_delta = None
-            ablation_dimension = None
+            prior_gap_delta = None
+            prior_gap_error = None
+            if (
+                rank == 0
+                and m_p is not None
+                and diagnostics_interval > 0
+                and global_step % diagnostics_interval == 0
+                # The flow runs at the prior's frame rate; a batch where the
+                # two rates disagree is not comparable and is skipped rather
+                # than silently trimmed.
+                and m_p.shape[-1] == z.shape[-1]
+            ):
+                prior_gap_delta, prior_gap_error = _prior_gap(
+                    model_g,
+                    m_p,
+                    x_mask,
+                    ids_slice,
+                    config.train.segment_size // config.data.hop_length,
+                    pitchf,
+                    sid,
+                    y,
+                    y_hat,
+                    config,
+                )
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
 
                 # Spectral loss.  The component terms are logged separately
@@ -4302,11 +4742,11 @@ def training_loop(
                 if spectral_loss == "L1 Mel Loss":
                     y_mel = wave_to_mel(
                         config, y, num_mels=None,
-                        for_loss=refinegan_active,
+                        for_loss=chouwagan_stack_active,
                     )
                     y_hat_mel = wave_to_mel(
                         config, y_hat, num_mels=None,
-                        for_loss=refinegan_active,
+                        for_loss=chouwagan_stack_active,
                     )
                     if swap_l1_to_ms and fn_spectral_loss_ms is not None:
                         # Loss swap: L1 mel fades out, Multi-Scale mel fades in over swap_duration_steps
@@ -4330,11 +4770,11 @@ def training_loop(
                     # L1 Mel
                     y_mel = wave_to_mel(
                         config, y, num_mels=None,
-                        for_loss=refinegan_active,
+                        for_loss=chouwagan_stack_active,
                     )
                     y_hat_mel = wave_to_mel(
                         config, y_hat, num_mels=None,
-                        for_loss=refinegan_active,
+                        for_loss=chouwagan_stack_active,
                     )
                     loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel # * 45
                     # MS-STFT.  Weighted, because the mel term it sits beside
@@ -4359,7 +4799,7 @@ def training_loop(
                 loss_envelope = torch.zeros((), device=y.device)
                 loss_rms = torch.zeros((), device=y.device)
                 loss_peak = torch.zeros((), device=y.device)
-                if refinegan_active:
+                if chouwagan_stack_active:
                     if envelope_loss_weight > 0.0:
                         loss_envelope = envelope_loss(
                             y.float(),
@@ -4385,40 +4825,6 @@ def training_loop(
                     + peak_headroom_weight * loss_peak
                 )
 
-                # The probe is instrumentation first and a loss second, so it
-                # is gated on the interval alone.  It used to also require
-                # ``ablation_weight > 0``, which meant the only way to
-                # stop paying for a term that does nothing was to also go blind
-                # to the one measurement that says whether a latent dimension is
-                # load-bearing.  ``loss_ablation`` is still scaled by the weight
-                # below, so a weight of zero costs exactly the forward pass.
-                if (
-                    chouwa_latent is not None
-                    and ablation_interval > 0
-                    and global_step % ablation_interval == 0
-                ):
-                    ablation_dimension = int(
-                        torch.randint(
-                            len(chouwa_latent.fast_levels),
-                            (),
-                            device=y.device,
-                        ).item()
-                    )
-                    ablation_raw, ablation_delta, _ = _ablation_margin(
-                        model_g,
-                        chouwa_latent,
-                        discrete_parts,
-                        ids_slice,
-                        config.train.segment_size // config.data.hop_length,
-                        pitchf,
-                        sid,
-                        y,
-                        y_hat,
-                        ablation_dimension,
-                        ablation_margin,
-                    )
-                    loss_ablation = ablation_raw * ablation_weight
-
                 # Feature Matching loss.  Branchwise, both this and the
                 # adversarial term below were already summed over branches
                 # inside the loop that differentiated them; only the configured
@@ -4429,8 +4835,8 @@ def training_loop(
                     loss_fm = feature_loss(
                         fmap_r,
                         fmap_g,
-                        normalize=refinegan_active,
-                    ) * (fm_weight if refinegan_active else 2.0)
+                        normalize=chouwagan_stack_active,
+                    ) * (fm_weight if chouwagan_stack_active else 2.0)
 
                 # Generator loss.  ``y_d_hat_g`` comes from the *generator*
                 # update's forward, which never sets ``san_training``, so these
@@ -4446,67 +4852,37 @@ def training_loop(
                 else:
                     loss_adv = generator_loss(
                         y_d_hat_g,
-                        normalize=refinegan_active,
+                        normalize=chouwagan_stack_active,
                         san_direction_weight=san_direction_weight,
                         use_softplus=san_active,
                     )
 
-                loss_prior_fast = torch.zeros((), device=y.device)
-                loss_prior = torch.zeros((), device=y.device)
-                discrete_diagnostics = {}
-                if chouwa_latent is not None:
-                    loss_prior_fast, raw_prior_loss = chouwa_latent.prior_losses(
-                        discrete_parts, x_mask
-                    )
-                    # ``kl_beta`` is a *ceiling* multiplier now: it sits at
-                    # ``kl_beta_min`` until the measured rate exceeds
-                    # ``kl_target`` and only ever rises from there, so below the
-                    # cap the weight really is ``prior_loss_weight`` and the
-                    # startup ramp is not fighting a feedback loop -- the rate
-                    # climbs from ~0, which is the region where the controller
-                    # is pinned and inert.  It used to be skipped here because
-                    # ``kl_beta_min`` was 1e-4 and the controller was a
-                    # two-sided target that owned the magnitude outright.
-                    if prior_warmup_steps:
-                        prior_progress = min(1.0, global_step / prior_warmup_steps)
-                    else:
-                        prior_progress = 1.0
-                    loss_prior = raw_prior_loss * prior_loss_weight * prior_progress
-                    if global_step % diagnostics_interval == 0:
-                        discrete_diagnostics = chouwa_latent.diagnostics(
-                            discrete_parts,
-                            x_mask,
-                        )
-                    loss_kl = torch.zeros((), device=y.device)
-                else:
-                    loss_kl = kl_loss(
-                        z_p,
-                        logs_q,
-                        m_p,
-                        logs_p,
-                        z_mask,
-                    ) * config.train.c_kl
+                loss_kl = kl_loss(
+                    z_p,
+                    logs_q,
+                    m_p,
+                    logs_p,
+                    z_mask,
+                ) * config.train.c_kl
 
-                    # KL diagnostic: per-dimension raw divergence for the
-                    # Gaussian VITS path.  The discrete Refine path does not
-                    # enter this branch.
-                    with torch.no_grad():
-                        raw_kl = logs_p - logs_q - 0.5 + 0.5 * (
-                            (z_p - m_p) ** 2
-                        ) * torch.exp(-2 * logs_p)
-                        raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
-                            dim=(0, 2)
-                        ).clamp(min=1)
-                        diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
-                        kl_std_cache.append(diagnostic_kl.std().item())
-                        kl_mean_cache.append(diagnostic_kl.mean().item())
-                        kl_active_cache.append(
-                            (diagnostic_kl > kl_active_threshold)
-                            .float()
-                            .mean()
-                            .item()
-                        )
-                        last_kl_per_dim = diagnostic_kl
+                # KL diagnostic: per-dimension raw divergence.
+                with torch.no_grad():
+                    raw_kl = logs_p - logs_q - 0.5 + 0.5 * (
+                        (z_p - m_p) ** 2
+                    ) * torch.exp(-2 * logs_p)
+                    raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
+                        dim=(0, 2)
+                    ).clamp(min=1)
+                    diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
+                    kl_std_cache.append(diagnostic_kl.std().item())
+                    kl_mean_cache.append(diagnostic_kl.mean().item())
+                    kl_active_cache.append(
+                        (diagnostic_kl > kl_active_threshold)
+                        .float()
+                        .mean()
+                        .item()
+                    )
+                    last_kl_per_dim = diagnostic_kl
 
                 adaptive_adv = torch.ones((), device=y.device)
                 adaptive_fm = torch.ones((), device=y.device)
@@ -4520,9 +4896,9 @@ def training_loop(
                 # is this step's, since the discriminator update ran above.
                 adaptive_adv_ceiling = adversarial_ceiling_governor.update(
                     phase_step if finetune_phase else global_step,
-                    loss_disc.item() if refinegan_active else None,
+                    loss_disc.item() if chouwagan_stack_active else None,
                 )
-                if refinegan_active:
+                if chouwagan_stack_active:
                     # Each refresh costs two extra autograd traversals (one of
                     # them through the whole discriminator), measured at +16% of
                     # step time.  The weight is a slowly-varying scalar that is
@@ -4556,10 +4932,10 @@ def training_loop(
                                 last_layer,
                             )
                         (
-                            cached_adaptive_adv,
-                            cached_rec_grad,
-                            cached_adv_grad,
-                            cached_adv_requested,
+                            probe_adaptive_adv,
+                            probe_rec_grad,
+                            probe_adv_grad,
+                            probe_adv_requested,
                         ) = _adaptive_adversarial_weight(
                             # The waveform terms are part of the reconstruction
                             # objective, so the GAN balance has to see them too.
@@ -4574,19 +4950,85 @@ def training_loop(
                         # Shares the reconstruction gradient that call just
                         # measured, so governing the second half of the GAN
                         # objective costs one traversal, not three.
+                        probe_adaptive_fm = None
+                        probe_fm_grad = None
+                        probe_fm_requested = None
                         if adaptive_fm_balance > 0.0:
                             (
-                                cached_adaptive_fm,
-                                cached_fm_grad,
-                                cached_fm_requested,
+                                probe_adaptive_fm,
+                                probe_fm_grad,
+                                probe_fm_requested,
                             ) = _adaptive_feature_match_weight(
                                 loss_fm,
                                 last_layer,
-                                cached_rec_grad,
+                                probe_rec_grad,
                                 balance_target=adaptive_fm_balance,
                                 minimum=adaptive_fm_min,
+                                maximum=adaptive_fm_max,
                                 feature_gradient=branch_fm_parameter_grad,
                             )
+                        # ``_probe_gradient`` returns its last attempt rather
+                        # than raising, so a term with no representable
+                        # measurement still arrives here -- and a weight is not
+                        # one bad step, it is reused for
+                        # ``adaptive_adv_interval`` steps and multiplied into
+                        # ``loss_gen_total``.  One non-finite value reaching
+                        # the cache is a run that never takes another generator
+                        # step: the loss is NaN, every step is skipped, and no
+                        # amount of scaler backoff recovers it because the probe
+                        # does not go through the scaler.  So the cache only
+                        # ever takes finite values, and a failed probe keeps the
+                        # last good ones instead.
+                        probe_finite = bool(
+                            torch.isfinite(
+                                torch.stack(
+                                    [
+                                        value.detach().float().reshape(())
+                                        for value in (
+                                            probe_adaptive_adv,
+                                            probe_rec_grad,
+                                            probe_adv_grad,
+                                            probe_adv_requested,
+                                            probe_adaptive_fm,
+                                            probe_fm_grad,
+                                            probe_fm_requested,
+                                        )
+                                        if value is not None
+                                    ]
+                                )
+                            )
+                            .all()
+                            .item()
+                        )
+                        if probe_finite:
+                            cached_adaptive_adv = probe_adaptive_adv
+                            cached_rec_grad = probe_rec_grad
+                            cached_adv_grad = probe_adv_grad
+                            cached_adv_requested = probe_adv_requested
+                            if probe_adaptive_fm is not None:
+                                cached_adaptive_fm = probe_adaptive_fm
+                                cached_fm_grad = probe_fm_grad
+                                cached_fm_requested = probe_fm_requested
+                        else:
+                            adaptive_probe_failures += 1
+                            if cached_adaptive_adv is None:
+                                # Nothing good to fall back to yet.  The floor
+                                # is the conservative end of the rule's own
+                                # range, so the step still happens and the next
+                                # refresh can correct it.
+                                zero_probe = loss_adv.detach().float().new_zeros(())
+                                cached_adaptive_adv = zero_probe + adaptive_adv_min
+                                cached_rec_grad = zero_probe
+                                cached_adv_grad = zero_probe
+                                cached_adv_requested = zero_probe
+                            if (
+                                adaptive_fm_balance > 0.0
+                                and cached_adaptive_fm is None
+                            ):
+                                zero_probe = loss_fm.detach().float().new_zeros(())
+                                cached_adaptive_fm = zero_probe + adaptive_fm_max
+                                cached_fm_grad = zero_probe
+                                cached_fm_requested = zero_probe
                     # The cached weight was clamped against the ceiling in force
                     # when it was computed; re-clamp so a ceiling that moved in
                     # between takes effect on the very next step.
@@ -4612,17 +5054,20 @@ def training_loop(
                     loss_spectral
                     + loss_waveform
                     + loss_kl
-                    + loss_prior
-                    + loss_ablation
                 )
                 loss_gan = (
                     adaptive_adv * loss_adv + adaptive_fm * loss_fm
                 ) * gan_weight
                 loss_gen_total = loss_core + loss_gan
-                if rank == 0 and ablation_delta is not None:
+                if rank == 0 and prior_gap_delta is not None:
                     writer.add_scalar(
-                        f"diag/ablation_delta/dim_{ablation_dimension}",
-                        ablation_delta.item(),
+                        "diag/prior_gap_mel_l1",
+                        prior_gap_delta.item(),
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        "diag/prior_mel_l1",
+                        prior_gap_error.item(),
                         global_step,
                     )
 
@@ -4630,7 +5075,7 @@ def training_loop(
             optim_g.zero_grad(set_to_none=True)
             module_grad_metrics = {}
             if (
-                refinegan_active
+                chouwagan_stack_active
                 and rank == 0
                 and global_step % grad_source_probe_interval == 0
             ):
@@ -4692,7 +5137,7 @@ def training_loop(
                         wave_gradient.detach().float().norm().item(),
                         global_step,
                     )
-            if refinegan_active:
+            if chouwagan_stack_active:
                 # Branchwise, ``loss_gan`` is a number rather than a graph; the
                 # gradient it stands for was accumulated in wave space and is
                 # already carrying the AMP scale, exactly like the scaled
@@ -4747,7 +5192,7 @@ def training_loop(
                     # the difference visible -- when `requested` sits far above
                     # `ceiling`, the balance rule is being overruled, and
                     # `saturation` is the fraction of it that survives.
-                    if refinegan_active:
+                    if chouwagan_stack_active:
                         writer.add_scalar(
                             "GAN/adaptive_adv_requested",
                             adaptive_adv_requested.item(),
@@ -4756,6 +5201,15 @@ def training_loop(
                         writer.add_scalar(
                             "GAN/adaptive_adv_ceiling",
                             adaptive_adv_ceiling,
+                            global_step,
+                        )
+                        # Flat at zero on a healthy run.  Anything else means
+                        # the balance rule is running on a stale weight because
+                        # its gradient probe had no representable measurement --
+                        # which under FP16 used to be a silent NaN instead.
+                        writer.add_scalar(
+                            "GAN/adaptive_probe_failures",
+                            float(adaptive_probe_failures),
                             global_step,
                         )
                         writer.add_scalar(
@@ -4948,24 +5402,61 @@ def training_loop(
             # which is exactly what makes it the overtrain signal.
             if (
                 overtrain_monitor is not None
+                and holdout_set is not None
                 and holdout_interval > 0
                 and global_step > 0
-                and global_step % holdout_interval == 0
+                and global_step % (holdout_interval * overtrain_monitor.interval_scale)
+                == 0
             ):
-                # With an EMA, both halves of the detector get better and for
-                # different reasons.  The curve it scores is the average rather
-                # than a single oscillating step, so the minimum is far better
-                # localised and ``patience`` stops being mostly a noise margin.
-                # And the weights it keeps are the average, which for a GAN
-                # vocoder is normally better than any step it was made from --
-                # so the thing being measured is also the thing worth keeping.
+                # The latent diagnostic answers a question about the *shape* of
+                # the model rather than about this step, and it costs a second
+                # decode of every excerpt; the selection metric is what has to
+                # be measured every time.
+                evaluation_index = len(overtrain_monitor.history)
+                latent_every = max(
+                    1, int(getattr(config.train, "holdout_latent_interval", 4))
+                )
+                want_latent = evaluation_index % latent_every == 0
+                noise_scale = float(
+                    getattr(config.train, "holdout_noise_scale", 0.0)
+                )
+                probe_score = float("nan")
+
+                # Everything is scored inside the same weight-swap block, so
+                # the metric, the probe and the latent diagnostic all describe
+                # one set of weights.  They used to disagree: the metric ran
+                # under the EMA and the diagnostic under the live model, which
+                # put two versions of the same number side by side in
+                # TensorBoard.
                 if ema is not None:
+                    # With an EMA, both halves of the detector get better and
+                    # for different reasons.  The curve it scores is the
+                    # average rather than a single oscillating step, so the
+                    # minimum is far better localised and ``patience`` stops
+                    # being mostly a noise margin.  And the weights it keeps
+                    # are the average, which for a GAN vocoder is normally
+                    # better than any step it was made from -- so the thing
+                    # being measured is also the thing worth keeping.
                     with ema.applied(net_g) as averaged:
-                        holdout_loss = _holdout_spectral_loss(
-                            averaged, holdout_batches, config, device
+                        metrics = _holdout_metrics_resilient(
+                            averaged,
+                            holdout_set,
+                            config,
+                            device,
+                            want_latent=want_latent,
+                            noise_scale=noise_scale,
                         )
+                        if probe_set is not None:
+                            probe_score = _holdout_metrics_resilient(
+                                averaged,
+                                probe_set,
+                                config,
+                                device,
+                                want_latent=False,
+                                noise_scale=noise_scale,
+                            )["mel_l1"]
                     improved = overtrain_monitor.update(
-                        ema, holdout_loss, global_step
+                        ema, metrics["mel_l1"], global_step
                     )
                 else:
                     # Under a schedule-free optimizer the live weights are the
@@ -4976,40 +5467,100 @@ def training_loop(
                     # bug the "keep the weights that were actually scored"
                     # contract in ``update`` exists to prevent.
                     with averaged_weights((optimizer_choice_g, optim_g)):
-                        holdout_loss = _holdout_spectral_loss(
-                            net_g, holdout_batches, config, device
+                        metrics = _holdout_metrics_resilient(
+                            net_g,
+                            holdout_set,
+                            config,
+                            device,
+                            want_latent=want_latent,
+                            noise_scale=noise_scale,
                         )
+                        if probe_set is not None:
+                            probe_score = _holdout_metrics_resilient(
+                                net_g,
+                                probe_set,
+                                config,
+                                device,
+                                want_latent=False,
+                                noise_scale=noise_scale,
+                            )["mel_l1"]
                         improved = overtrain_monitor.update(
                             net_g.module if hasattr(net_g, "module") else net_g,
-                            holdout_loss,
+                            metrics["mel_l1"],
                             global_step,
                         )
+
+                holdout_loss = metrics["mel_l1"]
                 if rank == 0 and math.isfinite(holdout_loss):
                     writer.add_scalar("holdout/mel_l1", holdout_loss, global_step)
                     writer.add_scalar("holdout/best", overtrain_monitor.best, global_step)
                     writer.add_scalar(
-                        "holdout/evals_since_best",
-                        overtrain_monitor.since_best,
+                        "holdout/smoothed", overtrain_monitor.smoothed, global_step
+                    )
+                    # What the run itself says a real change looks like.  Read
+                    # every other movement on these curves against it.
+                    writer.add_scalar(
+                        "holdout/noise_sigma", overtrain_monitor.sigma, global_step
+                    )
+                    writer.add_scalar(
+                        "holdout/evals_since_progress",
+                        overtrain_monitor.since_progress,
                         global_step,
                     )
+                    for name in ("latent_gap", "latent_posterior"):
+                        if name in metrics and math.isfinite(metrics[name]):
+                            writer.add_scalar(
+                                f"holdout/{name}", metrics[name], global_step
+                            )
                     marker = "*" if improved else " "
                     print(
                         f"[HOLDOUT]{marker} step {global_step}: {holdout_loss:.5f}  "
-                        f"(best {overtrain_monitor.best:.5f} @ {overtrain_monitor.best_step}, "
-                        f"{overtrain_monitor.since_best}/{overtrain_monitor.patience} since)"
+                        f"(smoothed {overtrain_monitor.smoothed:.5f}, best "
+                        f"{overtrain_monitor.best:.5f} @ {overtrain_monitor.best_step}, "
+                        f"noise {overtrain_monitor.sigma:.5f}, "
+                        f"{overtrain_monitor.since_progress}/"
+                        f"{overtrain_monitor.patience} since progress)"
                     )
+                    if math.isfinite(probe_score):
+                        # The gap, not the two numbers: both sides carry the
+                        # same "still learning" trend and only their difference
+                        # is generalisation.
+                        writer.add_scalar(
+                            "holdout/train_probe", probe_score, global_step
+                        )
+                        writer.add_scalar(
+                            "holdout/generalization_gap",
+                            holdout_loss - probe_score,
+                            global_step,
+                        )
+                        print(
+                            f"[HOLDOUT]  train probe {probe_score:.5f}, "
+                            f"generalisation gap {holdout_loss - probe_score:+.5f}"
+                        )
+                    if "latent_gap" in metrics:
+                        print(
+                            f"[HOLDOUT]  latent gap {metrics['latent_gap']:.5f}  "
+                            f"(posterior {metrics['latent_posterior']:.5f}, "
+                            f"prior {holdout_loss:.5f})"
+                        )
                 if overtrain_monitor.overtrained and not overtrain_flagged:
                     overtrain_flagged = True
                     if rank == 0:
                         print(
                             f"\n[OVERTRAIN] Held-out loss has not improved for "
-                            f"{overtrain_monitor.since_best} evaluations. "
+                            f"{overtrain_monitor.since_progress} evaluations. "
                             f"The last good weights are step "
                             f"{overtrain_monitor.best_step} ({overtrain_monitor.best:.5f}); "
                             f"they will be the ones exported."
                         )
                         if stop_on_overtrain:
                             print("[OVERTRAIN] Stopping (stop_on_overtrain is on).")
+                        else:
+                            scale = overtrain_monitor.backoff()
+                            print(
+                                f"[OVERTRAIN] Continuing; scoring every "
+                                f"{holdout_interval * scale} steps from here."
+                            )
 
 
             # Per step exp lr decay for both optimizers.
@@ -5049,46 +5600,12 @@ def training_loop(
                 avg_rolling_cache.setdefault(
                     part_key, deque(maxlen=rolling_loss_steps)
                 ).append(part_value.detach())
-            avg_rolling_cache["loss_prior"].append(loss_prior.detach())
-            avg_rolling_cache["loss_prior_fast"].append(loss_prior_fast.detach())
-            if refinegan_active:
+            if chouwagan_stack_active:
                 avg_rolling_cache["loss_envelope"].append(loss_envelope.detach())
                 avg_rolling_cache["loss_rms"].append(loss_rms.detach())
                 avg_rolling_cache["loss_peak"].append(loss_peak.detach())
                 avg_rolling_cache["loss_waveform"].append(loss_waveform.detach())
-            else:
-                avg_rolling_cache["loss_kl"].append(loss_kl.detach())
-            if discrete_diagnostics:
-                for key in (
-                    "prior_kl_fast",
-                    "prior_std_fast",
-                    "posterior_std_fast",
-                    "scale_anchor",
-                    "prior_replacement",
-                    "prior_replacement_mean",
-                    "content_rms",
-                    "posterior_detail_rms",
-                    "prior_detail_rms",
-                    "kl_effective_dims_fast",
-                    "kl_above_floor_fast",
-                    "kl_median_fast",
-                ):
-                    if key in discrete_diagnostics:
-                        avg_rolling_cache[key].append(
-                            discrete_diagnostics[key].detach()
-                        )
-                for key in ("kl_beta_fast",):
-                    if key in discrete_diagnostics:
-                        avg_rolling_cache.setdefault(
-                            key,
-                            deque(maxlen=rolling_loss_steps),
-                        ).append(discrete_diagnostics[key].detach())
-                for key, value in discrete_diagnostics.items():
-                    if key.endswith("_per_dim"):
-                        discrete_vector_cache.setdefault(
-                            key,
-                            deque(maxlen=rolling_loss_steps),
-                        ).append(value.detach())
+            avg_rolling_cache["loss_kl"].append(loss_kl.detach())
 
             # D Grads:
             if grad_norm_d is not None:
@@ -5207,7 +5724,7 @@ def training_loop(
 
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
 
-                if refinegan_active:
+                if chouwagan_stack_active:
                     source_scalars = collect_source_path_metrics(net_g)
                     if source_scalars:
                         summarize(
@@ -5215,18 +5732,6 @@ def training_loop(
                             global_step=global_step,
                             scalars=source_scalars,
                         )
-
-                for key, values in discrete_vector_cache.items():
-                    if not values:
-                        continue
-                    vector = torch.stack(list(values)).mean(dim=0)
-                    for dimension, value in enumerate(vector):
-                        writer.add_scalar(
-                            f"diag/{key}/dim_{dimension}",
-                            value.item(),
-                            global_step,
-                        )
-                discrete_vector_cache.clear()
 
                 # KL diagnostics (diag tab)
                 if len(kl_std_cache) > 0:

@@ -65,6 +65,7 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
         "index_power": 2.0,
         "index_continuity": 0.5,
         "volume_envelope": 1.0,
+        "silence_gate_db": -60.0,
         "protect": 0.33,
         "filter_radius": 0.006,
         "filter_radius_range": (0.0, 1.0, 0.001, 3),
@@ -76,8 +77,6 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
         "f0_autotune_strength": 1.0,
         "formant_shifting": False,
         "seed": 0,
-        "deterministic": True,
-        "latent_temperature": 1.0,
     },
     "batch": {
         "pitch": 0,
@@ -86,6 +85,7 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
         "index_power": 2.0,
         "index_continuity": 0.5,
         "volume_envelope": 1.0,
+        "silence_gate_db": -60.0,
         "protect": 0.3,
         "filter_radius": 3,
         "filter_radius_range": (0, 7, 1, 0),
@@ -97,8 +97,6 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
         "f0_autotune_strength": 1.0,
         "formant_shifting": False,
         "seed": 0,
-        "deterministic": True,
-        "latent_temperature": 1.0,
     },
     "tts": {
         "pitch": 0,
@@ -107,6 +105,7 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
         "index_power": 2.0,
         "index_continuity": 0.5,
         "volume_envelope": 1.0,
+        "silence_gate_db": -60.0,
         "protect": 0.5,
         "filter_radius": 3,
         "filter_radius_range": (0, 7, 1, 0),
@@ -118,8 +117,6 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
         "f0_autotune_strength": 1.0,
         "formant_shifting": False,
         "seed": 0,
-        "deterministic": True,
-        "latent_temperature": 1.0,
     },
 }
 

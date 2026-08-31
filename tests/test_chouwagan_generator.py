@@ -8,9 +8,6 @@ source rather than in the trunk, and none of it is visible in a loss curve:
   was handed, which looks exactly like a decoder that is merely undertrained;
 * it is normalised by that mask, so it leaves ``render`` at a scale that does
   not move with f0 or with the harmonic count;
-* ``deterministic`` inference draws *seeded* phase offsets and noise rather than
-  zeroing them, because zero is not a draw from the training distribution -- it
-  is its extreme.
 
 The rest pins the shapes the synthesizer and the exporter rely on.
 """
@@ -30,7 +27,6 @@ sys.path.insert(0, str(ROOT))
 torch = pytest.importorskip("torch", reason="the decoder needs torch", exc_type=ImportError)
 
 from rvc.lib.algorithm.generators.chouwagan import (  # noqa: E402
-    DETERMINISTIC_PHASE_SEED,
     BandLimitedNSFSource,
     ChouwaGANGenerator,
     soft_clip,
@@ -165,12 +161,16 @@ def test_harmonics_past_nyquist_contribute_nothing():
 
     Seeded, because the phase offsets are drawn per call and the leading 64 only
     match across the two banks if both draws start from the same generator.
+    The noise term is switched off rather than seeded along with them: the two
+    banks draw a different *number* of offsets, so the noise that follows starts
+    from a different generator position however the seed is set, and it is not
+    what this measures.
     """
     f0 = torch.full((1, 8), 600.0)
     excitations = []
     for count in (64, 128):
-        source = _source(harmonic_count=count).eval()
-        source.deterministic = True
+        source = _source(harmonic_count=count, noise_std=0.0).eval()
+        torch.manual_seed(0)
         excitations.append(source(f0, 4410, 44100.0))
 
     assert torch.allclose(excitations[0], excitations[1], atol=2e-3)
@@ -189,8 +189,9 @@ def test_the_top_harmonic_keeps_its_phase_once_the_accumulator_is_large():
     harmonic of that is the same 4.8e6 rad.  The bank ``prepare`` returns is
     unmasked, so the harmonic is there whatever Nyquist says about it.
 
-    The deterministic offsets are reproduced from the same seed, which is what
-    lets this compare against float64 term by term rather than in aggregate.
+    The phase offsets are redrawn out of the global generator on every call, so
+    the reference below re-seeds and repeats that draw -- it is the first one
+    ``prepare`` makes -- rather than reproducing it from a constant.
     """
     sample_rate = 44100.0
     length = int(sample_rate)
@@ -198,15 +199,12 @@ def test_the_top_harmonic_keeps_its_phase_once_the_accumulator_is_large():
     f0 = torch.full((1, 16), 6000.0)
 
     source = _source(harmonic_count=harmonic_count).eval()
-    source.deterministic = True
+    torch.manual_seed(0)
     resampled, _, _, harmonic_wave, _, _ = source.prepare(f0, length)
 
-    generator = torch.Generator()
-    generator.manual_seed(DETERMINISTIC_PHASE_SEED)
+    torch.manual_seed(0)
     offsets = torch.zeros(1, 1, harmonic_count)
-    offsets[..., 1:] = torch.rand(
-        (1, 1, harmonic_count - 1), generator=generator
-    ) * (2.0 * math.pi)
+    offsets[..., 1:] = torch.rand((1, 1, harmonic_count - 1)) * (2.0 * math.pi)
 
     phase = torch.cumsum(2.0 * math.pi * resampled.double() / sample_rate, dim=-1)
     for harmonic in (1, harmonic_count):
@@ -229,36 +227,6 @@ def test_the_excitation_scale_does_not_move_with_the_harmonic_count():
     ]
 
     assert max(levels) < 1.6 * min(levels)
-
-
-def test_unvoiced_frames_keep_their_noise_under_deterministic_inference():
-    """Zeroing it there is not "reproducible", it is silence: the noise term is
-    the *entire* excitation on an unvoiced frame, and the decoder never trained
-    on a silent one.  The symptom is a hard cut at the end of every utterance."""
-    source = _source().eval()
-    source.deterministic = True
-    f0 = torch.zeros(1, 8)
-
-    excitation = source(f0, 4410, 44100.0)
-
-    assert float(excitation.abs().max()) > 0.0
-    # ...and reproducible, which is what ``deterministic`` was asked for.
-    assert torch.equal(excitation, source(f0, 4410, 44100.0))
-
-
-def test_deterministic_phase_offsets_are_drawn_rather_than_aligned():
-    """Aligning every harmonic maximises the crest factor -- the one excitation
-    shape training never produced."""
-    source = _source(harmonic_count=32).eval()
-    source.deterministic = True
-    f0 = torch.full((1, 8), 200.0)
-
-    _f0, _voiced, _envelope, harmonic_wave, _noise, _harmonicity = source.prepare(
-        f0, 4410
-    )
-    offsets_at_zero = harmonic_wave[:, 0, 1:]
-
-    assert float(offsets_at_zero.abs().max()) > 1e-3
 
 
 def test_the_voiced_boundary_is_crossfaded_rather_than_stepped():
@@ -317,14 +285,15 @@ def test_the_additive_path_is_the_other_design_not_a_degraded_one():
 
 def test_remove_weight_norm_preserves_the_output():
     decoder = _generator().eval()
-    # The excitation is redrawn on every call unless this is set, so without it
-    # the comparison below would be measuring the RNG.
-    decoder.source.deterministic = True
     latent, f0, g = _inputs()
 
+    # The excitation is redrawn on every call, so both sides are seeded --
+    # otherwise the comparison below would be measuring the RNG.
     with torch.no_grad():
+        torch.manual_seed(0)
         before = decoder(latent, f0, g)
         decoder.remove_weight_norm()
+        torch.manual_seed(0)
         after = decoder(latent, f0, g)
 
     assert torch.allclose(before, after, atol=1e-4)
@@ -346,6 +315,15 @@ def test_the_shipped_config_builds_the_decoder_it_describes():
 
     assert decoder.total_upsample == 441, "one frame per hop at 44.1 kHz"
     assert decoder.channels == tuple(model["chouwagan_channels"])
+    # The time-domain stack covers the hop only up to the iSTFT head, and the
+    # two have to multiply back to the whole hop or the decoder would emit a
+    # waveform of the wrong length for the frame count it was given.
+    hop = model.get("chouwagan_istft_hop", 0)
+    assert decoder.body_upsample * max(1, hop) == 441
+    assert len(decoder.blocks) == len(model["chouwagan_channels"])
+    if hop:
+        assert decoder.conv_post is None, "the iSTFT head replaces it"
+        assert decoder.istft_head.hop == hop
     assert decoder.excitation_unet is model["chouwagan_excitation_unet"]
     assert decoder.source.harmonic_count == model["chouwagan_harmonics"]
 
@@ -456,3 +434,71 @@ def test_the_two_styles_do_not_share_a_state_dict():
 def test_an_unknown_unit_style_fails_at_construction():
     with pytest.raises(ValueError):
         _generator(chouwagan_unit_style="depthwise")
+
+
+def test_a_scalar_filter_width_still_means_the_same_everywhere():
+    """The per-stage form is additive: a scalar must build what it always did.
+
+    Bit-identical, not merely close -- the resamplers are fixed buffers, so any
+    difference here would be a silently different model on every existing config.
+    The seed is reset before each forward because the excitation draws fresh
+    phase offsets per call.
+    """
+    scalar = _generator(chouwagan_filter_width=4).eval()
+    listed = _generator(chouwagan_filter_width=[4, 4, 4, 4]).eval()
+    listed.load_state_dict(scalar.state_dict())
+    latent, f0, g = _inputs()
+
+    with torch.no_grad():
+        torch.manual_seed(0)
+        a = scalar(latent, f0, g)
+        torch.manual_seed(0)
+        b = listed(latent, f0, g)
+
+    assert torch.equal(a, b)
+
+
+def test_the_filter_width_list_reaches_each_stage_and_the_output_head():
+    """Heavy where the fold is audible, light where it is not.
+
+    ``post_activation`` and the output pair run at the output rate, so they
+    follow the *last* stage rather than the first -- reading them off the head
+    of the list would put the cheap filter exactly where the expensive one is
+    needed.
+    """
+    decoder = _generator(chouwagan_filter_width=[4, 4, 8, 16])
+    taps = [
+        block.branches[0].units[0].activation.downsample.kernel.shape[-1]
+        for block in decoder.blocks
+    ]
+    assert taps == [17, 17, 33, 65], taps
+    assert decoder.post_activation.downsample.kernel.shape[-1] == 65
+    assert decoder.output_downsample.kernel.shape[-1] == 65
+
+
+def test_a_filter_width_list_that_does_not_match_the_stages_is_refused():
+    for bad in ([4, 4], [4, 4, 4, 4, 4], [4, 4, 0, 4]):
+        with pytest.raises(ValueError):
+            _generator(chouwagan_filter_width=bad)
+
+
+def test_the_kaiser_beta_is_configurable_and_changes_only_the_window():
+    """It was pinned at 14.0, which is a design for a filter far longer than the
+    17 taps ``filter_width = 4`` builds: measured, it gave 11.9 dB of alias
+    rejection at 19 kHz against 34.4 dB at beta 1.5, for identical arithmetic.
+
+    The kernels are non-persistent buffers, so this moves no checkpoint key --
+    which is exactly why it needs a test rather than a shape mismatch to catch
+    a config that means to set it and does not reach it.
+    """
+    from rvc.lib.algorithm.generators.chouwagan import DEFAULT_FILTER_BETA
+
+    assert DEFAULT_FILTER_BETA == 14.0, "changing this silently changes every config"
+    sharp = _generator(chouwagan_filter_beta=1.5)
+    blunt = _generator(chouwagan_filter_beta=14.0)
+    a = sharp.post_activation.downsample.kernel
+    b = blunt.post_activation.downsample.kernel
+    assert a.shape == b.shape
+    assert not torch.allclose(a, b)
+    # A window only reshapes the taps; both stay unit-gain at DC.
+    assert torch.allclose(a.sum(), b.sum(), atol=1e-6)

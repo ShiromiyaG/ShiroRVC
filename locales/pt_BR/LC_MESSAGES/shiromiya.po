@@ -46,21 +46,6 @@ msgstr "## Misturador de vozes"
 msgid "### Language"
 msgstr "### Idioma"
 
-msgid ""
-"### Precision\n"
-"The default is **FP32** master weights with **TF32** tensor cores - no autocast, no loss scaler. TF32 is toggled per run in the Training tab.\n"
-"\n"
-"**FP16** adds `torch.autocast` plus a `GradScaler` on top. It keeps the same 11-bit mantissa as TF32 (gradient cosine 0.99 against a true-FP32 reference, where BF16's 8-bit mantissa measured only 0.77-0.82), but its narrow exponent range can overflow, which is what the scaler is for. Distribution math and the NSF source stay in FP32; the convolutional backbone - the dominant cost - runs in FP16.\n"
-"\n"
-"Turn it on for the memory and speed, turn it off if a run shows the scaler backing off repeatedly or losses going non-finite. BF16 is not offered: it loses too much mantissa for this model, whose oscillatory NSF source and L1-on-log-mel loss produce heavily cancelling sums."
-msgstr ""
-"### Precisão\n"
-"O padrão são pesos mestres em **FP32** com tensor cores **TF32** - sem autocast e sem loss scaler. O TF32 é ligado por execução na aba de treinamento.\n"
-"\n"
-"O **FP16** acrescenta `torch.autocast` e um `GradScaler` por cima. Ele mantém a mesma mantissa de 11 bits do TF32 (cosseno de gradiente de 0,99 contra uma referência FP32 real, enquanto a mantissa de 8 bits do BF16 mediu apenas 0,77-0,82), mas sua faixa de expoente estreita pode estourar, e é para isso que serve o scaler. A matemática das distribuições e a fonte NSF permanecem em FP32; o backbone convolucional - o custo dominante - roda em FP16.\n"
-"\n"
-"Ligue para ganhar memória e velocidade; desligue se uma execução mostrar o scaler recuando repetidamente ou perdas ficando não finitas. BF16 não é oferecido: perde mantissa demais neste modelo, cuja fonte NSF oscilatória e perda L1 sobre log-mel produzem somas com forte cancelamento."
-
 msgid "**Architecture id in config.json:** `{}`"
 msgstr "**Id de arquitetura no config.json:** `{}`"
 
@@ -221,7 +206,7 @@ msgid "Auto picks by dataset size."
 msgstr "Automático escolhe pelo tamanho do dataset."
 
 msgid "Autocast needs a CUDA GPU, so the setting would do nothing."
-msgstr "O autocast precisa de uma GPU CUDA, então a opção não faria nada."
+msgstr ""
 
 msgid "Automatic detects silence; Simple cuts on a fixed grid."
 msgstr "Automático detecta silêncio; Simples corta em uma grade fixa."
@@ -356,11 +341,8 @@ msgstr "Escolha o método de normalização de volume."
 msgid "Choose which GPUs to train on, and enable multi-GPU training."
 msgstr "Escolha em quais GPUs treinar e ative o treinamento multi-GPU."
 
-msgid "ChouwaGAN and Wavehax are 44.1 kHz only."
-msgstr "ChouwaGAN e Wavehax funcionam apenas a 44,1 kHz."
-
-msgid "ChouwaGAN and Wavehax only. Above 1 adds variation, below 1 flattens it."
-msgstr "Somente ChouwaGAN e Wavehax. Acima de 1 adiciona variação, abaixo de 1 achata."
+msgid "ChouwaGAN and RefineGAN are 44.1 kHz only."
+msgstr "ChouwaGAN e RefineGAN são apenas 44,1 kHz."
 
 msgid "Chunk length (s)"
 msgstr "Duração do bloco (s)"
@@ -529,9 +511,6 @@ msgstr "Detectar overtraining"
 
 msgid "Detected GPU information."
 msgstr "Informações da GPU detectada."
-
-msgid "Deterministic"
-msgstr "Determinístico"
 
 msgid "Diagnostics"
 msgstr "Diagnóstico"
@@ -733,6 +712,12 @@ msgstr "Treinamento em FP16 desativado. As execuções a partir de agora começa
 
 msgid "FP16 training enabled. Runs started from now on use autocast with a GradScaler."
 msgstr "Treinamento em FP16 ativado. As execuções iniciadas a partir de agora usam autocast com um GradScaler."
+
+msgid "Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."
+msgstr "Silencia a saída onde a entrada está mais baixa que isto, em dBFS. Silêncio não tem nível para o codificador de conteúdo, então o modelo o preenche com chiado. -120 desliga o gate."
+
+msgid "Fades out the output where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."
+msgstr "Silencia a saída onde a entrada está mais baixa que isto, em dBFS. Silêncio não tem nível para o codificador de conteúdo, então o modelo o preenche com chiado. -120 desliga o gate."
 
 msgid "Faiss index. Picked automatically when there is only one next to the model."
 msgstr "Index Faiss. Escolhido automaticamente quando há apenas um ao lado do modelo."
@@ -1069,9 +1054,6 @@ msgstr "Idioma: {name}"
 
 msgid "Larger batches need more VRAM. Reduce the value if training runs out of memory."
 msgstr "Batches maiores exigem mais VRAM. Reduza o valor se o treinamento ficar sem memória."
-
-msgid "Latent temperature"
-msgstr "Temperatura latente"
 
 msgid "Latest"
 msgstr "Mais recente"
@@ -1493,9 +1475,6 @@ msgstr "Atualize a lista para usar o arquivo pré-treinado enviado."
 msgid "Remove DC offset and low-frequency noise."
 msgstr "Remove o offset DC e o ruído de baixa frequência."
 
-msgid "Reproducible output for a given seed."
-msgstr "Saída reproduzível para uma dada seed."
-
 msgid "Resampler"
 msgstr "Reamostrador"
 
@@ -1684,6 +1663,12 @@ msgstr "Mostrar na pasta"
 
 msgid "Show the unsmoothed trace behind each line."
 msgstr "Mostra o traço sem suavização atrás de cada linha."
+
+msgid "Silence Gate"
+msgstr "Gate de Silêncio"
+
+msgid "Silence gate"
+msgstr "Gate de silêncio"
 
 msgid "Silent ( 'mute' ) files for training."
 msgstr "Arquivos silenciosos ( 'mute' ) para o treinamento."
@@ -1973,6 +1958,9 @@ msgstr "Os dois discordam. Regerar escreve os dois, que é como isso se resolve.
 
 msgid "There is no converted file to save yet."
 msgstr "Ainda não há arquivo convertido para salvar."
+
+msgid "This GPU has no FP16 tensor cores: autocast still halves activation memory, but it may not make the steps any faster."
+msgstr ""
 
 msgid "This GPU has no TF32 units, so the setting would do nothing."
 msgstr "Esta GPU não tem unidades TF32, então a opção não faria nada."

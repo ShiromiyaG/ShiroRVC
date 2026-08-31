@@ -10,16 +10,8 @@ from rvc.configs.vocoders import (
     get_architecture_id,
     get_vocoder_spec,
     normalize_vocoder,
-    uses_vits_latent,
 )
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
-from rvc.lib.algorithm.chouwa_vits import ATTENTION_WINDOW, RefineVitsLatent
-from rvc.lib.algorithm.frame_features import (
-    conditioning_channels,
-    frame_conditioning,
-    frame_periodicity,
-    template_amplitude,
-)
 from rvc.lib.terminal import get_console, info, warning
 from rvc.train.messages import (
     VOCODER_COMPILE_ENABLE_FAILED,
@@ -94,11 +86,6 @@ class Synthesizer(torch.nn.Module):
         self.vocoder = vocoder_id
         self.sr = sr
         self.architecture_id = "vits_gaussian_v1"
-        # The VITS latent frontend, the discrete prior and every latent option
-        # below belong to the frontend rather than to the decoder, so they are
-        # shared by every vocoder the registry marks as using it -- RefineGAN
-        # and Wavehax both do.  Only the ``dec`` module differs.
-        vits_latent = uses_vits_latent(vocoder_id)
 
         # Every model key beyond this constructor's own signature is vocoder
         # configuration -- the frontend's, the decoder's or the discriminator's.
@@ -107,29 +94,6 @@ class Synthesizer(torch.nn.Module):
         # ``kwargs`` wins if they somehow do.  See ``vocoder_config_from_model``,
         # which is the exporter's side of the same split.
         vocoder_options = {**(vocoder_config or {}), **kwargs}
-
-        # ---- Measured frame conditioning and segment sampling -------------
-        # All three default to off, so a config that predates them builds the
-        # previous model exactly.
-        self.use_periodicity = vits_latent and bool(
-            vocoder_options.get("use_periodicity", False)
-        )
-        self.use_frame_energy = vits_latent and bool(
-            vocoder_options.get("use_frame_energy", False)
-        )
-        self.segment_energy_floor = (
-            float(vocoder_options.get("segment_energy_floor", 0.0))
-            if vits_latent
-            else 0.0
-        )
-        # ``spec_channels`` is ``filter_length // 2 + 1``; the frame features
-        # need the FFT size back to turn bin indices into frequencies.
-        self.spec_n_fft = 2 * (int(spec_channels) - 1)
-        # Must match the decoder's own nominal template amplitude, since it is
-        # what the measured envelope is expressed relative to.
-        self.template_wave_amp = float(
-            vocoder_options.get("wave_amp", 0.1)
-        )
 
 
         # ------   [ Decoder / Vocoder ] Reconstructs audio from latents (z)   ------------------------------------------------------
@@ -156,134 +120,56 @@ class Synthesizer(torch.nn.Module):
         generator_id = vocoder_spec["generator"]
         if generator_id == "hifi_nsf":
             self.dec = generators.HiFiGANNSFGenerator(**dec_kwargs)
-        elif generator_id in ("chouwagan", "wavehax"):
+        elif generator_id == "chouwagan":
             if int(sr) != 44100:
                 raise ValueError(
                     f"{vocoder_spec['label']} only supports 44.1 kHz configurations."
                 )
-            decoder_class = (
-                generators.ChouwaGANGenerator
-                if generator_id == "chouwagan"
-                else generators.WavehaxGenerator
+            self.dec = generators.ChouwaGANGenerator(**dec_kwargs, **decoder_config)
+        elif generator_id == "refinegan":
+            # Applio's RefineGAN, unchanged.  It takes neither the ResBlock
+            # schedule nor the upsample kernels -- its blocks are fixed at
+            # ``(3, 7, 11) x (1, 3, 5)`` and it upsamples by interpolation --
+            # so ``dec_kwargs`` is filtered down to what the constructor names
+            # rather than passed through.
+            #
+            # Nothing in this decoder is tied to a rate: the excitation reads
+            # ``sample_rate`` and the trunk is built from ``upsample_rates``,
+            # whose product is the hop.  So the registry decides which rates
+            # ship, rather than a constant here -- ChouwaGAN keeps its own
+            # check because *it* really is 44.1 kHz only.
+            supported = tuple(int(rate) for rate in vocoder_spec["sample_rates"])
+            if int(sr) not in supported:
+                raise ValueError(
+                    f"{vocoder_spec['label']} supports {supported}, not {int(sr)}."
+                )
+            self.dec = generators.RefineGANGenerator(
+                sample_rate=int(sr),
+                downsample_rates=tuple(upsample_rates[::-1]),
+                upsample_rates=tuple(upsample_rates),
+                upsample_initial_channel=upsample_initial_channel,
+                num_mels=inter_channels,
+                start_channels=int(
+                    decoder_config.get("refinegan_start_channels", 16)
+                ),
+                leaky_relu_slope=float(
+                    decoder_config.get("refinegan_leaky_relu_slope", 0.2)
+                ),
+                gin_channels=gin_channels,
+                checkpointing=checkpointing,
             )
-            self.dec = decoder_class(**dec_kwargs, **decoder_config)
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
 
-        self.chouwa_latent = None
-        if vits_latent:
-            # The architecture id travels with the checkpoint and is checked
-            # before loading.  ``net_g`` loads non-strictly, so without it a
-            # checkpoint from a different latent layout would load with every
-            # latent module silently left at its init.
-            self.architecture_id = str(
-                vocoder_options.get(
-                    "architecture_id",
-                    get_architecture_id(vocoder_id),
-                )
+        # ``net_g`` loads non-strictly, so the id is the only thing that stops
+        # a checkpoint built for a different decoder layout from loading with
+        # the mismatched modules left at their init.
+        self.architecture_id = str(
+            vocoder_options.get(
+                "architecture_id",
+                get_architecture_id(vocoder_id, vocoder_options),
             )
-            self.chouwa_latent = RefineVitsLatent(
-                input_channels=inter_channels,
-                # Deliberately *not* the decoder's ``checkpointing``: the two
-                # stacks are separately profitable, so each gets its own key.
-                checkpointing=bool(
-                    vocoder_options.get("latent_checkpointing", False)
-                ),
-                spec_channels=spec_channels,
-                content_channels=int(
-                    vocoder_options.get("content_channels", 128)
-                ),
-                detail_channels=int(
-                    vocoder_options.get("detail_channels", 64)
-                ),
-                gin_channels=gin_channels,
-                posterior_channels=int(
-                    vocoder_options.get("posterior_channels", 192)
-                ),
-                prior_hidden_channels=int(
-                    vocoder_options.get("prior_hidden_channels", 192)
-                ),
-                latent_channels=int(
-                    vocoder_options.get("vits_latent_channels", 192)
-                ),
-                posterior_layers=int(
-                    vocoder_options.get("vits_posterior_layers", 16)
-                ),
-                flow_blocks=int(vocoder_options.get("vits_flow_blocks", 4)),
-                flow_layers=int(vocoder_options.get("vits_flow_layers", 4)),
-                prior_blocks=int(
-                    vocoder_options.get("prior_blocks", 4)
-                ),
-                prior_heads=int(vocoder_options.get("prior_heads", 4)),
-                flow_dilation_rate=int(
-                    vocoder_options.get("vits_flow_dilation_rate", 2)
-                ),
-                flow_coupling=str(
-                    vocoder_options.get("vits_flow_coupling", "wavenet")
-                ),
-                flow_filter_channels=int(
-                    vocoder_options.get("vits_flow_filter_channels", 384)
-                ),
-                flow_heads=int(vocoder_options.get("vits_flow_heads", 2)),
-                cond_rank=int(vocoder_options.get("cond_rank", 128)),
-                prior_attention_window=int(
-                    vocoder_options.get(
-                        "prior_attention_window", ATTENTION_WINDOW
-                    )
-                ),
-                prior_kernel_size=int(
-                    vocoder_options.get("prior_kernel_size", 31)
-                ),
-                kl_free_bits=float(
-                    vocoder_options.get("vits_free_bits", 0.03)
-                ),
-                kl_target=float(vocoder_options.get("vits_kl_target", 0.15)),
-                kl_beta_lr=float(
-                    vocoder_options.get("kl_beta_lr", 0.01)
-                ),
-                kl_beta_min=float(
-                    vocoder_options.get("kl_beta_min", 1e-4)
-                ),
-                kl_beta_max=float(
-                    vocoder_options.get("kl_beta_max", 10.0)
-                ),
-                kl_rate_momentum=float(
-                    vocoder_options.get("kl_rate_momentum", 0.01)
-                ),
-                kl_scale_anchor=float(
-                    vocoder_options.get("kl_scale_anchor", 1.0)
-                ),
-                feature_scale_anchor=float(
-                    vocoder_options.get("feature_scale_anchor", 1.0)
-                ),
-                content_feature_channels=(
-                    int(text_enc_hidden_dim)
-                    if bool(
-                        vocoder_options.get("prior_direct_content", True)
-                    )
-                    else 0
-                ),
-                frame_conditioning_channels=conditioning_channels(
-                    self.use_periodicity, self.use_frame_energy
-                ),
-                prior_uses_logs=bool(
-                    vocoder_options.get("prior_uses_logs", False)
-                ),
-                prior_replacement_max=float(
-                    vocoder_options.get("prior_replacement_max", 0.0)
-                ),
-                prior_replacement_start=int(
-                    vocoder_options.get("prior_replacement_start", 5000)
-                ),
-                prior_replacement_ramp=int(
-                    vocoder_options.get("prior_replacement_ramp", 20000)
-                ),
-                prior_replacement_mean_share=float(
-                    vocoder_options.get(
-                        "prior_replacement_mean_share", 0.5
-                    )
-                ),
-            )
+        )
         info(f"Vocoder: {vocoder_spec['label']}", tag="[INIT]")
 
 
@@ -302,33 +188,26 @@ class Synthesizer(torch.nn.Module):
 
 
         # ------   [ Posterior Encoder ] Extracts latents (z) from target audio (training only)   -----------------------------------
-        if self.chouwa_latent is None:
-            self.enc_q = PosteriorEncoder(
-                in_channels=spec_channels,
-                out_channels=inter_channels,
-                hidden_channels=hidden_channels,
-                gin_channels=gin_channels,
-                kernel_size=5,
-                dilation_rate=1,
-                n_layers=16,
-            )
+        self.enc_q = PosteriorEncoder(
+            in_channels=spec_channels,
+            out_channels=inter_channels,
+            hidden_channels=hidden_channels,
+            gin_channels=gin_channels,
+            kernel_size=5,
+            dilation_rate=1,
+            n_layers=16,
+        )
 
-            # ------   [ Flow ] Reversible transformation between content priors (p) and speaker-conditioned latents (z)   --------------
-            self.flow = ResidualCouplingBlock(
-                channels=inter_channels,
-                hidden_channels=hidden_channels,
-                n_flows=4,
-                n_layers=3,
-                kernel_size=5,
-                dilation_rate=1,
-                gin_channels=gin_channels,
-            )
-        else:
-            # The discrete RefineGAN frontend owns its training-only posterior
-            # and intentionally has no Gaussian posterior or normalizing flow.
-            self.enc_q = None
-            self.flow = None
-
+        # ------   [ Flow ] Reversible transformation between content priors (p) and speaker-conditioned latents (z)   --------------
+        self.flow = ResidualCouplingBlock(
+            channels=inter_channels,
+            hidden_channels=hidden_channels,
+            n_flows=4,
+            n_layers=3,
+            kernel_size=5,
+            dilation_rate=1,
+            gin_channels=gin_channels,
+        )
 
         # ------   [ Speaker Embedding ] Maps identity to global conditioning (g)   -------------------------------------------------
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
@@ -349,56 +228,22 @@ class Synthesizer(torch.nn.Module):
 
     def remove_weight_norm(self):
         """Removes weight normalization from the model."""
-        for module in [self.dec, self.flow, self.enc_q, self.chouwa_latent]:
+        for module in [self.dec, self.flow, self.enc_q]:
             if module is not None:
                 self._remove_weight_norm_from(module)
 
-    def _prior_content_stats(
-        self, m_p: torch.Tensor, logs_p: torch.Tensor
-    ) -> torch.Tensor:
-        """Assemble the tensor the RefineGAN prior consumes from ``enc_p``.
-
-        ``enc_p`` projects to ``2 * inter_channels`` and the RefineGAN path used
-        to discard the ``logs_p`` half entirely, leaving those weights untrained
-        and throwing away the encoder's uncertainty estimate.
-        """
-        if self.chouwa_latent is not None and getattr(
-            self.chouwa_latent, "prior_uses_logs", False
-        ):
-            return torch.cat((m_p, logs_p), dim=1)
-        return m_p
-
-    def _template_amplitude(
-        self, conditioning: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        """Extract RefineGAN's intensity envelope from the frame conditioning.
-
-        Returns ``None`` when frame energy is not measured, which makes the
-        template fall back to its constant nominal amplitude -- the vocoder then
-        has to infer loudness from the latent, which is the behaviour of every
-        implementation that has no intensity input at all.
-        """
-        if conditioning is None or not self.use_frame_energy:
-            return None
-        # ``frame_conditioning`` stacks periodicity first when it is enabled, so
-        # energy is always the last channel.
-        return template_amplitude(conditioning[:, -1:], self.template_wave_amp)
-
-    def set_training_step(self, step: int) -> None:
-        """Update the discrete prior replacement schedule for the next batch."""
-        if self.chouwa_latent is not None:
-            self.chouwa_latent.set_training_step(step)
-
     def remove_training_modules(self) -> None:
-        """Drop training-only posterior modules before exporting/inference."""
-        if self.chouwa_latent is not None:
-            self.chouwa_latent.remove_posterior()
+        """Drop training-only posterior modules before exporting/inference.
+
+        Only the *posterior* is training-only.  On the Gaussian path the flow is
+        what inference runs in reverse to get ``z`` from ``z_p``, so dropping it
+        here would leave the decoder with nothing to decode.
+        """
         self.enc_q = None
-        self.flow = None
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "chouwagan", "wavehax"}:
+        if self.vocoder not in {"hifi", "chouwagan", "refinegan"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode
@@ -474,60 +319,6 @@ class Synthesizer(torch.nn.Module):
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
         if spec is not None:
-            if self.chouwa_latent is not None:
-                conditioning = frame_conditioning(
-                    spec,
-                    pitchf,
-                    self.sr,
-                    self.spec_n_fft,
-                    self.use_periodicity,
-                    self.use_frame_energy,
-                    x_mask,
-                )
-                discrete_parts = self.chouwa_latent.forward_train(
-                    self._prior_content_stats(m_p, logs_p),
-                    spec,
-                    g,
-                    x_mask,
-                    pitchf=pitchf,
-                    content=phone.transpose(1, 2),
-                    frame_conditioning=conditioning,
-                )
-                content = discrete_parts["content"]
-                detail = discrete_parts["detail"]
-                content_slice, ids_slice = rand_slice_segments(
-                    content,
-                    spec_lengths,
-                    self.segment_size,
-                    frame_energy=(
-                        spec.detach().float().square().mean(dim=1)
-                        if self.segment_energy_floor > 0.0
-                        else None
-                    ),
-                    energy_floor=self.segment_energy_floor,
-                )
-                detail_slice = slice_segments(
-                    detail,
-                    ids_slice,
-                    self.segment_size,
-                    dim=3,
-                )
-                if self.use_f0:
-                    pitchf_slice = slice_segments(pitchf, ids_slice, self.segment_size, 2)
-                z_slice = torch.cat((content_slice, detail_slice), dim=1)
-                amplitude = self._template_amplitude(conditioning)
-                if amplitude is not None:
-                    amplitude = slice_segments(
-                        amplitude, ids_slice, self.segment_size, dim=3
-                    )
-                o = self.dec(
-                    z_slice,
-                    pitchf_slice,
-                    g=g,
-                    template_amplitude=amplitude,
-                )
-                return o, ids_slice, x_mask, x_mask, discrete_parts
-
             # Posterior
             z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
             # Flow
@@ -557,9 +348,6 @@ class Synthesizer(torch.nn.Module):
         nsff0: Optional[torch.Tensor] = None,
         sid: torch.Tensor = None,
         seed: int = 0,
-        spec: Optional[torch.Tensor] = None,
-        deterministic: bool = True,
-        temperature: float = 1.0,
     ):
         """
         Inference of the model.
@@ -571,9 +359,6 @@ class Synthesizer(torch.nn.Module):
             nsff0 (torch.Tensor, optional): Fine-grained pitch sequence.
             sid (torch.Tensor): Speaker embedding.
             seed (int, optional): Seed for randomization of noise.
-            spec (torch.Tensor, optional): Precomputed spectrogram.
-            deterministic (bool, optional): Use argmax FSQ codes and deterministic NSF excitation.
-            temperature (float, optional): Sampling temperature for non-deterministic FSQ inference.
 
         """
 
@@ -588,45 +373,12 @@ class Synthesizer(torch.nn.Module):
         # TextEncoder
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
-        if self.chouwa_latent is not None:
-            temperature = max(1e-3, float(temperature))
-            # Measured from the *source* spectrogram, by the same code the
-            # trainer uses.  ``frame_conditioning`` returns None when the
-            # caller supplies no spectrogram, and every consumer then falls
-            # back to its pre-feature behaviour rather than to zeros.
-            conditioning = frame_conditioning(
-                spec,
-                nsff0,
-                self.sr,
-                self.spec_n_fft,
-                self.use_periodicity,
-                self.use_frame_energy,
-                x_mask,
-            )
-            content, detail, _, _ = self.chouwa_latent.infer(
-                self._prior_content_stats(m_p, logs_p),
-                g,
-                x_mask,
-                pitchf=nsff0,
-                deterministic=deterministic,
-                temperature=temperature,
-                content=phone.transpose(1, 2),
-                frame_conditioning=conditioning,
-            )
-            o = self.dec(
-                torch.cat((content, detail), dim=1),
-                nsff0,
-                g,
-                template_amplitude=self._template_amplitude(conditioning),
-            )
-            return o, x_mask, (content, detail, m_p, logs_p)
-        else:
-            # Flow
-            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
-            z = self.flow(z_p, x_mask, g=g, reverse=True)
-            o = self.dec(z * x_mask, nsff0, g)
+        # Flow
+        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+        z = self.flow(z_p, x_mask, g=g, reverse=True)
+        o = self.dec(z * x_mask, nsff0, g)
 
-            return o, x_mask, (z, z_p, m_p, logs_p)
+        return o, x_mask, (z, z_p, m_p, logs_p)
 
 
 #: Everything ``Synthesizer.__init__`` consumes by name.  Anything else a config

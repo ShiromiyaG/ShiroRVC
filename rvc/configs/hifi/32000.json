@@ -22,9 +22,16 @@
         "holdout_min_slices": 16,
         "holdout_max_slices": 96,
         "holdout_max_seconds": 120.0,
+        "holdout_crop_seconds": 3.0,
+        "holdout_batch_size": 4,
+        "holdout_latent_interval": 4,
+        "holdout_noise_scale": 0.0,
+        "holdout_train_probe": true,
         "holdout_interval": 0,
         "overtrain_patience": 8,
         "overtrain_min_delta": 0.001,
+        "overtrain_smoothing": 3,
+        "overtrain_noise_window": 6,
         "ema_decay": 0.999
     },
     "data": {

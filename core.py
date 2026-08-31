@@ -103,11 +103,10 @@ def run_infer_script(
     sid: int = 0,
     seed: int = 0,
     bundle_submodel: str = None,
-    deterministic: bool = True,
-    latent_temperature: float = 1.0,
     index_k: int = 8,
     index_power: float = 2.0,
     index_continuity: float = 0.5,
+    silence_gate_db: float = -60.0,
 ):
     kwargs = {
         "audio_input_path": input_path,
@@ -118,6 +117,7 @@ def run_infer_script(
         "filter_radius": filter_radius,
         "index_rate": index_rate,
         "volume_envelope": volume_envelope,
+        "silence_gate_db": silence_gate_db,
         "protect": protect,
         "f0_method": f0_method,
         "pth_path": pth_path,
@@ -136,8 +136,6 @@ def run_infer_script(
         "formant_timbre": formant_timbre,
         "sid": sid,
         "seed": seed,
-        "deterministic": deterministic,
-        "latent_temperature": latent_temperature,
         "bundle_submodel": bundle_submodel,
         "index_k": index_k,
         "index_power": index_power,
@@ -188,11 +186,10 @@ def run_batch_infer_script(
     formant_timbre: float = 1.0,
     sid: int = 0,
     seed: int = 0,
-    deterministic: bool = True,
-    latent_temperature: float = 1.0,
     index_k: int = 8,
     index_power: float = 2.0,
     index_continuity: float = 0.5,
+    silence_gate_db: float = -60.0,
 ):
     kwargs = {
         "audio_input_paths": input_folder,
@@ -203,6 +200,7 @@ def run_batch_infer_script(
         "filter_radius": filter_radius,
         "index_rate": index_rate,
         "volume_envelope": volume_envelope,
+        "silence_gate_db": silence_gate_db,
         "protect": protect,
         "f0_method": f0_method,
         "pth_path": pth_path,
@@ -221,8 +219,6 @@ def run_batch_infer_script(
         "formant_timbre": formant_timbre,
         "sid": sid,
         "seed": seed,
-        "deterministic": deterministic,
-        "latent_temperature": latent_temperature,
         "index_k": index_k,
         "index_power": index_power,
         "index_continuity": index_continuity,
@@ -265,6 +261,7 @@ def run_tts_script(
     index_k: int = 8,
     index_power: float = 2.0,
     index_continuity: float = 0.5,
+    silence_gate_db: float = -60.0,
 ):
 
     tts_script_path = os.path.join("rvc", "lib", "tools", "tts.py")
@@ -293,6 +290,7 @@ def run_tts_script(
         filter_radius=filter_radius,
         index_rate=index_rate,
         volume_envelope=volume_envelope,
+        silence_gate_db=silence_gate_db,
         protect=protect,
         f0_method=f0_method,
         audio_input_path=output_tts_path,
@@ -877,6 +875,13 @@ def inference_options(overrides: dict | None = None) -> list:
             default=1,
             show_default=True,
             help="Control the blending of the output's volume envelope. A value of 1 means the output envelope is fully used.",
+        ),
+        click.option(
+            "--silence_gate_db",
+            type=click.FloatRange(-120, 0),
+            default=-60.0,
+            show_default=True,
+            help="Input level, in dBFS, under which the output is faded out. The content encoder gives digital silence a full-magnitude embedding that the decoder renders as hiss, so passages the input says are empty come back noisy; this gates them. -120 disables it.",
         ),
         click.option(
             "--protect",

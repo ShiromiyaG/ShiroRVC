@@ -23,13 +23,6 @@ from rvc.lib.model_bundle import (
     walk_models,
 )
 from tabs.settings.sections.restart import stop_infer
-from rvc.infer.messages import (
-    DISCRETE_INFERENCE_MODE_INFO,
-    DISCRETE_INFERENCE_MODE_LABEL,
-    DISCRETE_TEMPERATURE_INFO,
-    DISCRETE_TEMPERATURE_LABEL,
-)
-
 from rvc.lib.i18n import _
 
 now_dir = os.getcwd()
@@ -421,8 +414,9 @@ def inference_tab():
             clean_audio, clean_strength, export_format,
             embedder_model, embedder_model_custom,
             formant_shifting, formant_qfrency, formant_timbre,
-            sid, seed, discrete_deterministic, latent_temperature, bundle_submodel,
+            sid, seed, bundle_submodel,
             index_k, index_power, index_continuity,
+            silence_gate_db,
         ):
             if not output_path or not output_path.strip():
                 output_path = output_path_fn(audio)
@@ -448,8 +442,9 @@ def inference_tab():
                 None,
                 embedder_model, embedder_model_custom,
                 formant_shifting, formant_qfrency, formant_timbre,
-                sid, seed, bundle_submodel, discrete_deterministic, latent_temperature,
+                sid, seed, bundle_submodel,
                 index_k, index_power, index_continuity,
+                silence_gate_db,
             )
 
         def on_model_change(model_path):
@@ -532,21 +527,6 @@ def inference_tab():
                     label=_("Inference Seed"),
                     info=_("Seed for reproducible output. Use 0 for random output."),
                     value=0,
-                    interactive=True,
-                )
-                discrete_deterministic = gr.Checkbox(
-                    label=DISCRETE_INFERENCE_MODE_LABEL,
-                    info=DISCRETE_INFERENCE_MODE_INFO,
-                    value=True,
-                    interactive=True,
-                )
-                latent_temperature = gr.Slider(
-                    minimum=0.1,
-                    maximum=2.0,
-                    step=0.05,
-                    label=DISCRETE_TEMPERATURE_LABEL,
-                    info=DISCRETE_TEMPERATURE_INFO,
-                    value=1.0,
                     interactive=True,
                 )
                 sid = gr.Dropdown(
@@ -743,6 +723,15 @@ def inference_tab():
                     value=0.33,
                     interactive=True,
                 )
+                silence_gate_db = gr.Slider(
+                    minimum=-120,
+                    maximum=0,
+                    step=1,
+                    label=_("Silence Gate"),
+                    info=_("Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."),
+                    value=-60,
+                    interactive=True,
+                )
                 preset_dropdown.change(
                     update_sliders,
                     inputs=preset_dropdown,
@@ -856,21 +845,6 @@ def inference_tab():
                     info=_("Speaker ID for conversion."),
                     choices=[0],
                     value=0,
-                    interactive=True,
-                )
-                discrete_deterministic_batch = gr.Checkbox(
-                    label=DISCRETE_INFERENCE_MODE_LABEL,
-                    info=DISCRETE_INFERENCE_MODE_INFO,
-                    value=True,
-                    interactive=True,
-                )
-                latent_temperature_batch = gr.Slider(
-                    minimum=0.1,
-                    maximum=2.0,
-                    step=0.05,
-                    label=DISCRETE_TEMPERATURE_LABEL,
-                    info=DISCRETE_TEMPERATURE_INFO,
-                    value=1.0,
                     interactive=True,
                 )
                 split_audio_batch = gr.Checkbox(
@@ -1030,6 +1004,15 @@ def inference_tab():
                     label=_("Protect Voiceless Consonants"),
                     info=_("Protect voiceless consonants. Higher values reduce index influence."),
                     value=0.3,
+                    interactive=True,
+                )
+                silence_gate_db_batch = gr.Slider(
+                    minimum=-120,
+                    maximum=0,
+                    step=1,
+                    label=_("Silence Gate"),
+                    info=_("Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."),
+                    value=-60,
                     interactive=True,
                 )
                 preset_dropdown.change(
@@ -1336,12 +1319,11 @@ def inference_tab():
             formant_timbre,
             sid,
             seed,
-            discrete_deterministic,
-            latent_temperature,
             bundle_submodel,
             index_k,
             index_power,
             index_continuity,
+            silence_gate_db,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -1372,11 +1354,10 @@ def inference_tab():
             formant_timbre_batch,
             sid_batch,
             seed,
-            discrete_deterministic_batch,
-            latent_temperature_batch,
             index_k_batch,
             index_power_batch,
             index_continuity_batch,
+            silence_gate_db_batch,
         ],
         outputs=[vc_output3],
     )

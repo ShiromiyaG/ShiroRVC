@@ -52,7 +52,7 @@ logs/*
 !logs/mute/
 !logs/mute_spin_v1/
 !logs/mute_spin_v2/
-!logs/reference/
+logs/reference/
 rvc/models/pretraineds/
 rvc/models/pretraineds/hifi-gan
 rvc/models/pretraineds/custom
