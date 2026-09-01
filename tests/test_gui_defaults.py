@@ -39,6 +39,10 @@ NOT_A_DEFAULT = {
     "vocoder_arch", "custom_lr_g", "custom_lr_d",
     # Chosen from what the hardware reports.
     "use_tf32", "use_checkpointing",
+    # The valid ids come from the selected model's extracted features, so there
+    # is nothing for three interfaces to agree on until one is picked.  The
+    # default that *is* shared -- ``index_single_speaker``, off -- is compared.
+    "index_speaker",
 }
 
 

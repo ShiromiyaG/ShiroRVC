@@ -5,7 +5,7 @@ import requests
 from rvc.lib.terminal import info, progress_handle, progress_task
 
 RESOURCE_BASE = "https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/main"
-SMARTCUTTER_BASE = "https://huggingface.co/shiromiya/SmartCutter/resolve/main/SmartCutter-v3"
+FIREREDVAD_BASE = "https://huggingface.co/FireRedTeam/FireRedVAD/resolve/main/VAD"
 url_base = RESOURCE_BASE
 
 pretraineds_hifigan_list = [
@@ -23,23 +23,15 @@ pretraineds_hifigan_list = [
     )
 ]
 
-smartcutter_list = [
-    (
-        "smartcutter/",
-        [
-            "v3_model_32000.pth",
-            "v3_model_40000.pth",
-            "v3_model_48000.pth",
-        ],
-        SMARTCUTTER_BASE,
-    )
-]
-
 models_list = [
     # Both live under ``predictors/`` in the resource repo, so both go through
     # the default path.  ``fcpe_ddsp.pt`` used to carry an override pointing at
     # ``f0_predictors/``, which does not exist and 404'd on every run.
     ("predictors/", ["rmvpe.pt", "fcpe_ddsp.pt"]),
+    # FireRedVAD, for the "New Automatic" cutter.  Pulled straight from the
+    # upstream repo rather than mirrored: it is Apache-2.0 and 2.3 MB, so there
+    # is nothing to gain by copying it and a stale mirror to lose.
+    ("fireredvad/VAD/", ["model.pth.tar", "cmvn.ark"], FIREREDVAD_BASE),
 ]
 
 embedders_list = [
@@ -58,8 +50,8 @@ folder_mapping_list = {
     "embedders/spin_v1": "rvc/models/embedders/spin_v1/",
     "embedders/spin_v2": "rvc/models/embedders/spin_v2/",
     "predictors/": "rvc/models/predictors/",
+    "fireredvad/VAD/": "rvc/models/fireredvad/VAD/",
     "formant/": "rvc/models/formant/",
-    "smartcutter/": "rvc/models/smartcutter/"
 }
 
 
@@ -193,7 +185,6 @@ def calculate_total_size(
     pretraineds_hifigan,
     models,
     exe,
-    smartcutter,
 ):
     total_size = 0
 
@@ -204,9 +195,6 @@ def calculate_total_size(
     if exe and os.name == "nt":
         total_size += get_file_size_if_missing(executables_list)
 
-    if smartcutter:
-        total_size += get_file_size_if_missing(smartcutter_list)
-
     total_size += get_file_size_if_missing(pretraineds_hifigan)
     return total_size
 
@@ -215,13 +203,11 @@ def prequisites_download_pipeline(
     pretraineds_hifigan,
     models,
     exe,
-    smartcutter,
 ):
     total_size = calculate_total_size(
         pretraineds_hifigan_list if pretraineds_hifigan else [],
         models,
         exe,
-        smartcutter,
     )
 
     if total_size > 0:
@@ -240,8 +226,6 @@ def prequisites_download_pipeline(
                     download_mapping_files(executables_list, global_bar)
                 else:
                     info("No executables needed.", tag="[DOWNLOAD]")
-            if smartcutter:
-                download_mapping_files(smartcutter_list, global_bar)
             if pretraineds_hifigan:
                 download_mapping_files(pretraineds_hifigan_list, global_bar)
     else:

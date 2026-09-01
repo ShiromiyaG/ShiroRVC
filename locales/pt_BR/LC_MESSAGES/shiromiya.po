@@ -208,12 +208,6 @@ msgstr "Automático escolhe pelo tamanho do dataset."
 msgid "Autocast needs a CUDA GPU, so the setting would do nothing."
 msgstr ""
 
-msgid "Automatic detects silence; Simple cuts on a fixed grid."
-msgstr "Automático detecta silêncio; Simples corta em uma grade fixa."
-
-msgid "Automatic silence trimming with short gaps preserved."
-msgstr "Corte automático de silêncio, preservando pausas curtas."
-
 msgid "Autotune"
 msgstr "Autotune"
 
@@ -421,6 +415,9 @@ msgstr "Convertendo…"
 
 msgid "Copy"
 msgstr "Copiar"
+
+msgid "Could not read that preset file: {}"
+msgstr "Não foi possível ler esse arquivo de predefinição: {}"
 
 msgid "Could not read the event file: {error}"
 msgstr "Não foi possível ler o arquivo de eventos: {error}"
@@ -962,6 +959,9 @@ msgstr "Influência do index. Valores mais baixos podem reduzir artefatos."
 msgid "Index method for large datasets."
 msgstr "Método de index para datasets grandes."
 
+msgid "Index one speaker only"
+msgstr "Indexar apenas um speaker"
+
 msgid "Inference"
 msgstr "Inferência"
 
@@ -1148,9 +1148,6 @@ msgstr "Modelo usado para as características do locutor."
 msgid "Model used to extract speaker-independent content features."
 msgstr "Modelo usado para extrair características de conteúdo independentes do locutor."
 
-msgid "Model-guided slicing. Not available at 44.1 kHz."
-msgstr "Fatiamento guiado por modelo. Indisponível em 44,1 kHz."
-
 msgid "Move existing checkpoints aside"
 msgstr "Mover os checkpoints existentes para o lado"
 
@@ -1208,11 +1205,11 @@ msgstr "Normalização"
 msgid "Off means training from scratch, which needs far more data."
 msgstr "Desligado significa treinar do zero, o que exige muito mais dados."
 
+msgid "On a multispeaker model, keeps one voice's articulation out of another's. Saved as <model>_spk<id>.index, beside the full one."
+msgstr "Em um modelo multispeaker, evita que a articulação de uma voz entre na de outra. Salvo como <model>_spk<id>.index, ao lado do índice completo."
+
 msgid "Only used by the RMS modes."
 msgstr "Usado apenas pelos modos RMS."
-
-msgid "Only used by the SmartCutter slicer."
-msgstr "Usado apenas pelo fatiador SmartCutter."
 
 msgid "Only worth it on genuinely noisy source material."
 msgstr "Só vale a pena em material de origem realmente ruidoso."
@@ -1315,6 +1312,9 @@ msgstr "Desempenho"
 
 msgid "Pick a preset above, or tick metrics below."
 msgstr "Escolha uma predefinição acima ou marque métricas abaixo."
+
+msgid "Pick a speaker, or turn off 'Index one speaker only'."
+msgstr "Escolha um speaker, ou desmarque 'Indexar apenas um speaker'."
 
 msgid "Pick one close to your target accent; conversion handles timbre."
 msgstr "Escolha uma próxima ao sotaque desejado; a conversão cuida do timbre."
@@ -1429,6 +1429,12 @@ msgstr "Proporção"
 
 msgid "Raw"
 msgstr "Bruto"
+
+msgid "Read from the extracted features."
+msgstr "Lido das features extraídas."
+
+msgid "Read from the extracted features. Refresh after extracting."
+msgstr "Lido das features extraídas. Atualize depois de extrair."
 
 msgid "Reading checkpoint…"
 msgstr "Lendo checkpoint…"
@@ -1676,14 +1682,17 @@ msgstr "Referências silenciosas que ensinam o modelo a ficar em silêncio."
 msgid "Similarity"
 msgstr "Similaridade"
 
+msgid "Simple cuts on a fixed grid; Automatic detects silence by level, New Automatic by neural VAD."
+msgstr "Simple corta em uma grade fixa; Automatic detecta o silêncio por nível, New Automatic por VAD neural."
+
 msgid "Single index"
 msgstr "Index único"
 
 msgid "Single input infer"
 msgstr "Inferência de entrada única"
 
-msgid "Skip existing slices, use fixed chunks, or detect silence automatically."
-msgstr "Pular trechos existentes, usar blocos fixos ou detectar o silêncio automaticamente."
+msgid "Skip existing slices, use fixed chunks, or detect silence automatically. New Automatic uses a neural VAD instead of an energy threshold."
+msgstr "Pular trechos existentes, usar blocos fixos ou detectar o silêncio automaticamente. New Automatic usa uma VAD neural em vez de um limiar de energia."
 
 msgid "Slice and normalise the dataset."
 msgstr "Fatia e normaliza o dataset."
@@ -1693,12 +1702,6 @@ msgstr "Fatiamento"
 
 msgid "Slow first epoch, faster afterwards."
 msgstr "Primeiro epoch lento, mais rápido depois."
-
-msgid "SmartCutter"
-msgstr ""
-
-msgid "SmartCutter model"
-msgstr "Modelo do SmartCutter"
 
 msgid "Smooth the extracted pitch curve. Default: 0.006."
 msgstr "Suaviza a curva de pitch extraída. Padrão: 0,006."
@@ -1732,6 +1735,9 @@ msgstr "ID do locutor para modelos multi-locutor."
 
 msgid "Speaker id inside a multi-speaker model."
 msgstr "ID do locutor dentro de um modelo multi-locutor."
+
+msgid "Speaker to index"
+msgstr "Speaker a indexar"
 
 msgid "Speaking rate"
 msgstr "Velocidade da fala"

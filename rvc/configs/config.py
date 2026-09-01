@@ -3,7 +3,7 @@ import os
 import json
 
 from rvc.configs.vocoders import get_vocoder_config_paths, normalize_vocoder
-from rvc.lib.terminal import get_console
+from rvc.lib.terminal import info
 
 
 arch_config_paths = get_vocoder_config_paths()
@@ -115,11 +115,18 @@ class Config:
         # come after ``self.device`` and before anything reports the precision.
         initial_precision = self.get_precision()
 
-        get_console().log(
-            f"[CONFIG] Running on {'CPU' if self.device == 'cpu' else 'CUDA'}, "
-            f"training precision: {initial_precision}",
-            markup=False,
-        )
+        # Worker processes are spawned, so they re-import this module and would
+        # each announce the same device again -- three or four identical banners
+        # interleaved with whatever progress bar is running.  The flag rides the
+        # environment into every child, so only the first process to build a
+        # Config says it.
+        if not os.environ.get("SHIROMIYA_CONFIG_BANNER"):
+            os.environ["SHIROMIYA_CONFIG_BANNER"] = "1"
+            info(
+                f"Running on {'CPU' if self.device == 'cpu' else 'CUDA'}, "
+                f"precision: {initial_precision}",
+                tag="[CONFIG]",
+            )
         self.gpu_name = (
             torch.cuda.get_device_name(int(self.device.split(":")[-1]))
             if self.device.startswith("cuda")

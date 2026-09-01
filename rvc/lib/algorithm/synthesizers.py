@@ -12,7 +12,7 @@ from rvc.configs.vocoders import (
     normalize_vocoder,
 )
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
-from rvc.lib.terminal import get_console, info, warning
+from rvc.lib.terminal import info, warning
 from rvc.train.messages import (
     VOCODER_COMPILE_ENABLE_FAILED,
     VOCODER_COMPILE_RUNTIME_FAILED,
@@ -252,12 +252,7 @@ class Synthesizer(torch.nn.Module):
                 mode=mode,
             )
         except Exception as error:
-            get_console().print(
-                VOCODER_COMPILE_ENABLE_FAILED,
-                str(error),
-                style="yellow",
-                markup=False,
-            )
+            warning(f"{VOCODER_COMPILE_ENABLE_FAILED} {error}", tag="[INIT]")
             return False
         compile_failed = False
 
@@ -269,12 +264,7 @@ class Synthesizer(torch.nn.Module):
                 return compiled_forward(*args, **kwargs)
             except Exception as error:
                 compile_failed = True
-                get_console().print(
-                    VOCODER_COMPILE_RUNTIME_FAILED,
-                    str(error),
-                    style="yellow",
-                    markup=False,
-                )
+                warning(f"{VOCODER_COMPILE_RUNTIME_FAILED} {error}", tag="[TRAIN]")
                 return eager_forward(*args, **kwargs)
 
         decoder.forward = training_forward

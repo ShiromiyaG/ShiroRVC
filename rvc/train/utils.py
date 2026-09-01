@@ -271,8 +271,12 @@ def assert_periods_match(model, checkpoint_dict, origin="checkpoint"):
 
     ``None`` means "written before the key existed", and every such checkpoint
     is one of the un-scaled runs -- so it is compared against the stock set
-    rather than waved through.  See ``PERIODS_BY_RATE`` for why the scaling
-    reaches a run through its config and not through code.
+    rather than waved through.  Which stock set is the one belonging to *this*
+    run's discriminator version: ``v2``'s eight periods are Applio's and the
+    HiFi-GAN pretrains shipped with this fork are trained against exactly them,
+    so charging an unkeyed checkpoint with ``v3``'s five would reject every
+    bundled pretrained D on a stock HiFi-GAN run.  See ``PERIODS_BY_RATE`` for
+    why the scaling reaches a run through its config and not through code.
     """
     expected = discriminator_periods(model)
     if expected is None:
@@ -283,7 +287,12 @@ def assert_periods_match(model, checkpoint_dict, origin="checkpoint"):
             DISCRIMINATOR_VERSIONS,
         )
 
-        found = list(DISCRIMINATOR_VERSIONS["v3"][0])
+        target = getattr(model, "module", model)
+        version = getattr(target, "version", "v3")
+        stock, _resolutions, _strides = DISCRIMINATOR_VERSIONS.get(
+            version, DISCRIMINATOR_VERSIONS["v3"]
+        )
+        found = list(stock)
     found = [int(p) for p in found]
     if found != expected:
         raise ValueError(

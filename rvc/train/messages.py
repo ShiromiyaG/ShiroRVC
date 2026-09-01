@@ -1,37 +1,37 @@
 VOCODER_COMPILE_NOT_SUPPORTED = (
-    "[INIT] Decoder compilation ignored: the selected vocoder does not support it."
+    "Decoder compilation ignored: the selected vocoder does not support it."
 )
 VOCODER_COMPILE_NO_CUDA = (
-    "[INIT] Decoder compilation ignored: CUDA is unavailable."
+    "Decoder compilation ignored: CUDA is unavailable."
 )
 VOCODER_COMPILE_ENABLED = (
-    "[INIT] Vocoder decoder compilation enabled with mode '{mode}'. "
+    "Vocoder decoder compilation enabled with mode '{mode}'. "
     "The first training batch builds the graph."
 )
 VOCODER_COMPILE_ENABLE_FAILED = (
-    "[WARNING] Vocoder decoder compilation could not be enabled:"
+    "Vocoder decoder compilation could not be enabled:"
 )
 VOCODER_COMPILE_RUNTIME_FAILED = (
-    "[WARNING] Vocoder decoder compilation failed; "
+    "Vocoder decoder compilation failed; "
     "continuing in eager mode:"
 )
 
 DISCRIMINATOR_COMPILE_NOT_SUPPORTED = (
-    "[INIT] Discriminator compilation ignored: the selected vocoder does not "
+    "Discriminator compilation ignored: the selected vocoder does not "
     "support it."
 )
 DISCRIMINATOR_COMPILE_NO_CUDA = (
-    "[INIT] Discriminator compilation ignored: CUDA is unavailable."
+    "Discriminator compilation ignored: CUDA is unavailable."
 )
 DISCRIMINATOR_COMPILE_ENABLED = (
-    "[INIT] Discriminator compilation enabled with mode '{mode}'. "
+    "Discriminator compilation enabled with mode '{mode}'. "
     "The first training batch builds the graph."
 )
 DISCRIMINATOR_COMPILE_ENABLE_FAILED = (
-    "[WARNING] Discriminator compilation could not be enabled:"
+    "Discriminator compilation could not be enabled:"
 )
 DISCRIMINATOR_COMPILE_RUNTIME_FAILED = (
-    "[WARNING] Discriminator compilation failed; continuing in eager mode:"
+    "Discriminator compilation failed; continuing in eager mode:"
 )
 
 VOCODER_COMPILE_CLI_HELP = "Compile the selected vocoder decoder during training."

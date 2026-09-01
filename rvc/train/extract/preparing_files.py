@@ -2,7 +2,7 @@ import os
 import shutil
 from random import shuffle
 from rvc.configs.config import Config
-from rvc.lib.terminal import info, warning
+from rvc.lib.terminal import info, success, warning
 import json
 import librosa
 import soundfile as sf
@@ -88,7 +88,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     config_save_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_save_path):
         shutil.copyfile(config_path, config_save_path)
-        info(f"Config saved at {config_save_path}", tag="[EXTRACT]")
+        success(f"Config saved at {config_save_path}", tag="[EXTRACT]")
         return
 
     # Keep the experiment's own config (it carries whatever was tuned), but

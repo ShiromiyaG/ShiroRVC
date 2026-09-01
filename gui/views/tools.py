@@ -260,8 +260,7 @@ class ToolsPage(Page):
         self.pre_pretrained = Toggle(_("HiFi-GAN pretrained models"), _("Needed to fine-tune rather than train from scratch."), checked=True)
         self.pre_models = Toggle(_("Embedders and pitch models"), _("contentvec, RMVPE, FCPE."), checked=True)
         self.pre_exe = Toggle(_("ffmpeg and ffprobe"), "", checked=True)
-        self.pre_smartcutter = Toggle(_("SmartCutter model"), _("Only used by the SmartCutter slicer."))
-        card.add(self.pre_pretrained, self.pre_models, self.pre_exe, self.pre_smartcutter)
+        card.add(self.pre_pretrained, self.pre_models, self.pre_exe)
 
         self.pre_button = primary_button(_("Download selected"))
         self.pre_button.clicked.connect(self._prerequisites)
@@ -278,7 +277,6 @@ class ToolsPage(Page):
                 "pretraineds_hifigan": self.pre_pretrained.isChecked(),
                 "models": self.pre_models.isChecked(),
                 "exe": self.pre_exe.isChecked(),
-                "smartcutter": self.pre_smartcutter.isChecked(),
             },
             busy_text=_("Downloading prerequisites…"),
             buttons=[self.pre_button],

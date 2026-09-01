@@ -288,7 +288,7 @@ def uninterruptible_save(description):
         with _saving_lock:
             _saving_depth -= 1
         if _stop_requested.is_set():
-            print(f"[TRAIN] {description} finished; the stop can proceed now.")
+            info(f"{description} finished; the stop can proceed now.", tag="[TRAIN]")
 
 
 def _handle_stop_signal(signum, frame):
@@ -299,13 +299,13 @@ def _handle_stop_signal(signum, frame):
     with _saving_lock:
         mid_write = _saving_depth > 0
     if mid_write:
-        print(
-            "[TRAIN] Stop requested while writing a checkpoint - "
+        warning(
+            "Stop requested while writing a checkpoint - "
             "finishing the write first, then exiting.",
-            flush=True,
+            tag="[TRAIN]",
         )
     else:
-        print("[TRAIN] Stop requested - exiting at the next safe point.", flush=True)
+        warning("Stop requested - exiting at the next safe point.", tag="[TRAIN]")
 
 
 def install_stop_handlers():
@@ -323,7 +323,7 @@ def install_stop_handlers():
 
 def finish_stop(writer=None):
     """Leave once nothing is being written."""
-    print("[TRAIN] Stopping cleanly.", flush=True)
+    info("Stopping cleanly.", tag="[TRAIN]")
     if writer is not None:
         try:
             writer.flush()
@@ -550,9 +550,10 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
             train_dataset.lengths = [lengths[i] for i in train_indices]
             if rank == 0:
                 sources = len({r[0].rsplit("_", 1)[0] for r in holdout_dataset.audiopaths_and_text})
-                print(
-                    f"[HOLDOUT] {len(holdout_indices)} slices from {sources} source "
-                    f"recordings held out of {len(rows)} ~ never trained on."
+                info(
+                    f"{len(holdout_indices)} slices from {sources} source "
+                    f"recordings held out of {len(rows)} - never trained on.",
+                    tag="[HOLDOUT]",
                 )
         elif rank == 0:
             warning(
@@ -611,10 +612,11 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
                 tag="[HOLDOUT]",
             )
         else:
-            print(
-                f"[HOLDOUT] Scoring {len(holdout_set)} excerpts of "
+            info(
+                f"Scoring {len(holdout_set)} excerpts of "
                 f"{holdout_set.seconds(config):.1f}s each, batched "
-                f"{holdout_set.batch_size} at a time."
+                f"{holdout_set.batch_size} at a time.",
+                tag="[HOLDOUT]",
             )
 
         # The same measurement on slices the model *has* been trained on.  The
@@ -1325,7 +1327,7 @@ def apply_frontend_freeze(net_g, rank):
     """
     if not freeze_vae:
         if rank == 0:
-            print("[INIT] Frontend: nothing frozen")
+            info("Frontend: nothing frozen.", tag="[INIT]")
         return
 
     model = net_g.module if hasattr(net_g, "module") else net_g
@@ -1336,7 +1338,7 @@ def apply_frontend_freeze(net_g, rank):
             frozen_params += param.numel()
 
     if rank == 0:
-        print(f"[INIT] Frontend frozen: everything but dec/emb_g ({frozen_params:,} params)")
+        info(f"Frontend frozen: everything but dec/emb_g ({frozen_params:,} params).", tag="[INIT]")
 
 
 def apply_training_freezes(net_g, rank):
@@ -1372,7 +1374,7 @@ def apply_resume_lr_override(optim_g, optim_d=None):
     for optim, label in optims:
         lrs = ", ".join("{:.2e}".format(g["lr"]) for g in optim.param_groups)
         parts.append(f"{label}: {lrs}")
-    print(f"[OVERRIDE] Resume LR override: base {resume_lr:.2e} -> " + " | ".join(parts))
+    info(f"Resume LR override: base {resume_lr:.2e} -> " + " | ".join(parts), tag="[OVERRIDE]")
 
 
 def setup_models_for_training(net_g, net_d, device, device_id, n_gpus):
@@ -1397,7 +1399,7 @@ def enable_vocoder_compile(net_g, device, rank):
         return False
     if device.type != "cuda":
         if rank == 0:
-            print(VOCODER_COMPILE_NO_CUDA)
+            info(VOCODER_COMPILE_NO_CUDA, tag="[INIT]")
         return False
 
     cache_dir = os.path.join(current_dir, "logs", ".torchinductor")
@@ -1408,9 +1410,9 @@ def enable_vocoder_compile(net_g, device, rank):
     model = net_g.module if hasattr(net_g, "module") else net_g
     enabled = model.enable_decoder_compile(mode=mode)
     if not enabled and rank == 0:
-        print(VOCODER_COMPILE_NOT_SUPPORTED)
+        info(VOCODER_COMPILE_NOT_SUPPORTED, tag="[INIT]")
     if enabled and rank == 0:
-        print(VOCODER_COMPILE_ENABLED.format(mode=mode))
+        info(VOCODER_COMPILE_ENABLED.format(mode=mode), tag="[INIT]")
     return enabled
 
 
@@ -1425,7 +1427,7 @@ def enable_discriminator_compile(net_d, config, device, rank):
         return False
     if device.type != "cuda":
         if rank == 0:
-            print(DISCRIMINATOR_COMPILE_NO_CUDA)
+            info(DISCRIMINATOR_COMPILE_NO_CUDA, tag="[INIT]")
         return False
 
     cache_dir = os.path.join(current_dir, "logs", ".torchinductor")
@@ -1436,11 +1438,11 @@ def enable_discriminator_compile(net_d, config, device, rank):
     enable = getattr(model, "enable_compile", None)
     if enable is None:
         if rank == 0:
-            print(DISCRIMINATOR_COMPILE_NOT_SUPPORTED)
+            info(DISCRIMINATOR_COMPILE_NOT_SUPPORTED, tag="[INIT]")
         return False
     enabled = enable(mode="default")
     if enabled and rank == 0:
-        print(DISCRIMINATOR_COMPILE_ENABLED.format(mode="default"))
+        info(DISCRIMINATOR_COMPILE_ENABLED.format(mode="default"), tag="[INIT]")
     return enabled
 
 
@@ -1488,7 +1490,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
     # the key existed -- all three of which mean "start the controller cold".
     resumed_extra_d = {}
     try:
-        print("[INIT] Starting the training ...")
+        info("Starting the training ...", tag="[INIT]")
 
         # Get latest G and D based on the highest steps count in the filename
         def get_highest_checkpoint(prefix):
@@ -1546,14 +1548,14 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             if not reset_optimizer_for_run:
                 apply_resume_lr_override(optim_g, optim_d)
             elif rank == 0:
-                print("[INIT] Fine-tune optimizer state reset.")
+                info("Fine-tune optimizer state reset.", tag="[INIT]")
 
             #epoch_str += 1
             #global_step = (epoch_str - 1) * len(train_loader)
 
             global_step = int(os.path.basename(g_checkpoint_path).split("_")[-1].split(".")[0])
             epoch_str = (global_step // len(train_loader)) + 1
-            print(f"[RESUMING] (G) & (D) at global_step: {global_step} and epoch count: {epoch_str - 1}")
+            success(f"(G) & (D) resumed at global_step {global_step}, epoch {epoch_str - 1}.", tag="[RESUME]")
 
         else:
             raise FileNotFoundError("No checkpoints found.")
@@ -1570,7 +1572,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         # Loading the pretrained Generator model
         if pretrainG not in ["", "None"]:
             if rank == 0:
-                print(f"[ ] Loading pretrained (G) '{pretrainG}'")
+                info(f"Loading pretrained (G) '{pretrainG}'", tag="[INIT]")
             checkpoint = torch.load(pretrainG, map_location="cpu", weights_only=True)
             expected_architecture = getattr(
                 net_g.module if hasattr(net_g, "module") else net_g,
@@ -1605,9 +1607,10 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             if reset_pretrained_embeddings and "emb_g.weight" in state_dict:
                 state_dict = substitute_speaker_embeddings(state_dict, net_g)
                 if rank == 0:
-                    print(
-                        "[ ] Pretrained speaker embeddings discarded: "
-                        f"starting {state_dict['emb_g.weight'].shape[0]} fresh ones."
+                    info(
+                        "Pretrained speaker embeddings discarded: "
+                        f"starting {state_dict['emb_g.weight'].shape[0]} fresh ones.",
+                        tag="[INIT]",
                     )
 
             # A pretrain predating this key is a stock upstream sine, so an
@@ -1627,7 +1630,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         # Loading the pretrained Discriminator model
         if pretrainD not in ["", "None"]:
             if rank == 0:
-                print(f"[ ] Loading pretrained (D) '{pretrainD}'")
+                info(f"Loading pretrained (D) '{pretrainD}'", tag="[INIT]")
             checkpoint = torch.load(pretrainD, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
@@ -1679,13 +1682,14 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                 blob.get("ema"), net_g.module if hasattr(net_g, "module") else net_g
             )
         if rank == 0:
-            print(
-                f"[EMA] decay {ema.decay}"
+            info(
+                f"Decay {ema.decay}"
                 + (
                     f", resumed at {ema.updates} updates."
                     if restored
                     else ", starting from the current weights."
-                )
+                ),
+                tag="[EMA]",
             )
 
     return net_g, net_d, optim_g, optim_d, epoch_str, global_step, ema, resumed_extra_d
@@ -1822,7 +1826,7 @@ def get_reference_sample(train_loader, device, config):
     ])
 
     if use_custom_ref:
-        print("[REFERENCE] Using custom reference input from 'logs\\reference\\'")
+        info("Using custom reference input from 'logs/reference/'.", tag="[REFERENCE]")
         reference_audio = None
         reference_source = reference_path
 
@@ -1855,26 +1859,28 @@ def get_reference_sample(train_loader, device, config):
                 # Short is survivable -- the figure crops both mels to the
                 # frames they share -- but silently comparing less than the
                 # reference renders is not, so it is said out loud.
-                print(
-                    "[REFERENCE] ref_audio.wav is "
+                warning(
+                    "ref_audio.wav is "
                     f"{wave.shape[0] / config.data.sample_rate:.2f}s, short of the "
                     f"{wanted / config.data.sample_rate:.2f}s the features render; "
-                    "the preview will compare only the overlap."
+                    "the preview will compare only the overlap.",
+                    tag="[REFERENCE]",
                 )
             reference_audio = (
                 torch.FloatTensor(wave[:wanted]).view(1, 1, -1).to(device)
             )
         else:
-            print(
-                "[REFERENCE] No ref_audio.wav; the preview will show the "
-                "generated audio without the mel comparison."
+            warning(
+                "No ref_audio.wav; the preview will show the "
+                "generated audio without the mel comparison.",
+                tag="[REFERENCE]",
             )
 
     else:
-        print("[REFERENCE] No custom reference found. Fetching from train_loader.")
-        info = next(iter(train_loader))
+        info("No custom reference found; fetching from train_loader.", tag="[REFERENCE]")
+        batch = next(iter(train_loader))
         # Unpack everything from the loader
-        phone, phone_lengths, pitch, pitchf, _, _, reference_audio, _, sid = info
+        phone, phone_lengths, pitch, pitchf, _, _, reference_audio, _, sid = batch
 
         # Move only the first sample of the batch to device
         phone = phone[0:1].to(device)
@@ -1895,7 +1901,7 @@ def get_reference_sample(train_loader, device, config):
             file_paths = train_loader.dataset.get_file_paths(batch_indices)
 
         file_name = os.path.basename(file_paths[0])
-        print(f"[REFERENCE] Origin of the ref: {file_name}")
+        info(f"Origin of the ref: {file_name}", tag="[REFERENCE]")
         reference_source = file_name
 
     return (
@@ -2005,7 +2011,7 @@ def run(
     global phase_start_step, phase_step, phase_limit_reached
 
     if rank == 0:
-        configure_logging()
+        configure_logging(tag="[TRAIN]")
 
     install_stop_handlers()
 
@@ -2043,7 +2049,7 @@ def run(
 
     if rank == 0 and warmup_active():
         warmup_tag = "Manual control" if warmup_steps > 0 else f"per epoch x{warmup_duration}"
-        print(f"[INIT] linear warmup: {effective_warmup_steps(train_loader)} steps  -  ({warmup_tag})")
+        info(f"Linear warmup: {effective_warmup_steps(train_loader)} steps ({warmup_tag}).", tag="[INIT]")
 
     # Spectral loss init
     fn_spectral_loss2 = None
@@ -2196,7 +2202,7 @@ def run(
     if swap_l1_to_ms:
         swap_start_step = global_step
         swap_completed = False
-        print(f"[TRAIN] LOSS SWAP: L1 mel -> Multi-Scale mel over {swap_duration_steps} steps (starting step {swap_start_step})")
+        info(f"Loss swap: L1 mel -> multi-scale mel over {swap_duration_steps} steps (starting at step {swap_start_step}).", tag="[TRAIN]")
 
     # Tensorboard handling
     if rank == 0:
@@ -2208,22 +2214,23 @@ def run(
         block_tensorboard_flush_on_exit(writer_eval)
 
         if global_step != 0:
-            print(f"[INIT] TensorBoard writer initialized. Purging logs after step: {global_step}")
+            info(f"TensorBoard writer initialized; purging logs after step {global_step}.", tag="[INIT]")
         else:
-            print(f"[INIT] TensorBoard writer initialized.")
+            info("TensorBoard writer initialized.", tag="[INIT]")
 
     # from-scratch checker ( disables average loss )
     if finetune_phase:
         from_scratch = False
         if rank == 0:
-            print(
-                f"[INIT] Fine-tune phase active: max steps={max_steps or 'epoch limit'}, "
-                f"starting global step={global_step}."
+            info(
+                f"Fine-tune phase active: max steps={max_steps or 'epoch limit'}, "
+                f"starting global step={global_step}.",
+                tag="[INIT]",
             )
     elif (pretrainG in ["", "None"] or pretrainD in ["", "None"]) or force_from_scratch:
         from_scratch = True
         if rank == 0:
-            print("[INIT] No pretrains used: Average loss disabled!")
+            warning("No pretrains used: average loss disabled.", tag="[INIT]")
     else:
         from_scratch = False
 
@@ -2296,17 +2303,19 @@ def run(
         fitted = fit_eval_interval(interval, planned_steps, overtrain_monitor.patience)
         evaluations = planned_steps // fitted if planned_steps else 0
         if fitted != interval:
-            print(
-                f"[HOLDOUT] Interval {interval} -> {fitted} steps: at {interval} "
+            info(
+                f"Interval {interval} -> {fitted} steps: at {interval} "
                 f"this {planned_steps}-step run would fit "
                 f"{planned_steps // interval} evaluations against a patience of "
-                f"{overtrain_monitor.patience}, and the detector could never fire."
+                f"{overtrain_monitor.patience}, and the detector could never fire.",
+                tag="[HOLDOUT]",
             )
         interval = fitted
-        print(
-            f"[HOLDOUT] Evaluating every {interval} steps, "
+        info(
+            f"Evaluating every {interval} steps, "
             f"patience {overtrain_monitor.patience} evaluations"
-            + (f" ({evaluations} evaluations planned)." if evaluations else ".")
+            + (f" ({evaluations} evaluations planned)." if evaluations else "."),
+            tag="[HOLDOUT]",
         )
     else:
         interval = 0
@@ -2536,7 +2545,7 @@ def training_loop(
     ) as (progress, task_id):
         progress_metrics = ""
         metrics_update_interval = max(1, min(rolling_loss_steps, 8))
-        for batch_idx, info in data_iterator:
+        for batch_idx, batch in data_iterator:
 
             global_step += 1
             phase_step = max(0, global_step - phase_start_step)
@@ -2560,12 +2569,12 @@ def training_loop(
 
             # Device handling
             if device.type == "cuda":
-                info = [tensor.cuda(device_id, non_blocking=True) for tensor in info]
+                batch = [tensor.cuda(device_id, non_blocking=True) for tensor in batch]
             elif device.type != "cuda":
-                info = [tensor.to(device) for tensor in info]
+                batch = [tensor.to(device) for tensor in batch]
 
             # Batch unpacking
-            (phone, phone_lengths, pitch, pitchf, spec, spec_lengths, y, y_lengths, sid) = info
+            (phone, phone_lengths, pitch, pitchf, spec, spec_lengths, y, y_lengths, sid) = batch
 
             model_g = net_g.module if hasattr(net_g, "module") else net_g
 
@@ -2720,7 +2729,7 @@ def training_loop(
                         }
                         if swap_progress >= 1.0 and not swap_completed:
                             swap_completed = True
-                            print(f"[TRAIN] LOSS SWAP complete at step {global_step} - now using Multi-Scale mel loss")
+                            success(f"Loss swap complete at step {global_step}; now using multi-scale mel loss.", tag="[TRAIN]")
                     else:
                         loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
                 elif spectral_loss == "Multi-Scale Mel Loss":
@@ -2974,14 +2983,18 @@ def training_loop(
                             writer.add_scalar(
                                 f"holdout/{name}", metrics[name], global_step
                             )
-                    marker = "*" if improved else " "
-                    print(
-                        f"[HOLDOUT]{marker} step {global_step}: {holdout_loss:.5f}  "
+                    # ``improved`` earns a success glyph rather than a marker
+                    # character: the line is already dense, and the glyph column
+                    # is where every other stage puts its outcome.
+                    emit = success if improved else info
+                    emit(
+                        f"step {global_step}: {holdout_loss:.5f}  "
                         f"(smoothed {overtrain_monitor.smoothed:.5f}, best "
                         f"{overtrain_monitor.best:.5f} @ {overtrain_monitor.best_step}, "
                         f"noise {overtrain_monitor.sigma:.5f}, "
                         f"{overtrain_monitor.since_progress}/"
-                        f"{overtrain_monitor.patience} since progress)"
+                        f"{overtrain_monitor.patience} since progress)",
+                        tag="[HOLDOUT]",
                     )
                     if math.isfinite(probe_score):
                         # The gap, not the two numbers: both sides carry the
@@ -2995,33 +3008,37 @@ def training_loop(
                             holdout_loss - probe_score,
                             global_step,
                         )
-                        print(
-                            f"[HOLDOUT]  train probe {probe_score:.5f}, "
-                            f"generalisation gap {holdout_loss - probe_score:+.5f}"
+                        info(
+                            f"train probe {probe_score:.5f}, "
+                            f"generalisation gap {holdout_loss - probe_score:+.5f}",
+                            tag="[HOLDOUT]",
                         )
                     if "latent_gap" in metrics:
-                        print(
-                            f"[HOLDOUT]  latent gap {metrics['latent_gap']:.5f}  "
+                        info(
+                            f"latent gap {metrics['latent_gap']:.5f} "
                             f"(posterior {metrics['latent_posterior']:.5f}, "
-                            f"prior {holdout_loss:.5f})"
+                            f"prior {holdout_loss:.5f})",
+                            tag="[HOLDOUT]",
                         )
                 if overtrain_monitor.overtrained and not overtrain_flagged:
                     overtrain_flagged = True
                     if rank == 0:
-                        print(
-                            f"\n[OVERTRAIN] Held-out loss has not improved for "
+                        warning(
+                            f"Held-out loss has not improved for "
                             f"{overtrain_monitor.since_progress} evaluations. "
                             f"The last good weights are step "
                             f"{overtrain_monitor.best_step} ({overtrain_monitor.best:.5f}); "
-                            f"they will be the ones exported."
+                            f"they will be the ones exported.",
+                            tag="[OVERTRAIN]",
                         )
                         if stop_on_overtrain:
-                            print("[OVERTRAIN] Stopping (stop_on_overtrain is on).")
+                            warning("Stopping (stop_on_overtrain is on).", tag="[OVERTRAIN]")
                         else:
                             scale = overtrain_monitor.backoff()
-                            print(
-                                f"[OVERTRAIN] Continuing; scoring every "
-                                f"{holdout_interval * scale} steps from here."
+                            info(
+                                f"Continuing; scoring every "
+                                f"{holdout_interval * scale} steps from here.",
+                                tag="[OVERTRAIN]",
                             )
 
 
@@ -3299,7 +3316,7 @@ def training_loop(
             if preview_label != "live weights":
                 live_sd_g = {k: v.detach().clone() for k, v in model_g.state_dict().items()}
                 model_g.load_state_dict(preview_sd)
-                print(f"[PREVIEW] epoch {epoch}: rendering from {preview_label}")
+                info(f"Epoch {epoch}: rendering from {preview_label}.", tag="[PREVIEW]")
 
             # Inferencing on reference sample
 
@@ -3423,9 +3440,10 @@ def training_loop(
             done = True
 
         if phase_limit_reached:
-            print(
+            info(
                 f"Training phase limit reached at {phase_step} local steps "
-                f"({global_step} global steps)."
+                f"({global_step} global steps).",
+                tag="[TRAIN]",
             )
 
         # Emitted once, by name, at the first epoch boundary after the turn is
@@ -3453,7 +3471,7 @@ def training_loop(
                 ckpt, ckpt_label = _deliverable_weights(
                     overtrain_monitor, ema, model_g
                 )
-            print(f"[EXPORT] weights: {ckpt_label}")
+            success(f"Weights: {ckpt_label}", tag="[EXPORT]")
 
             for m in model_add:
                 if not os.path.exists(m):

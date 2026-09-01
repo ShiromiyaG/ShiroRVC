@@ -24,15 +24,15 @@ from rvc.lib.terminal import (
     configure_logging,
     install_rich_print,
     progress_task,
+    success,
     track,
 )
 
 install_rich_print()
-configure_logging()
+configure_logging(tag="[PREPROCESS]")
 
-from rvc.lib.utils import load_audio, load_audio_ffmpeg
+from rvc.lib.audio_io import load_audio, load_audio_ffmpeg
 from rvc.train.preprocess.slicer import Slicer
-from rvc.train.preprocess.smartcutter.inference import SmartCutterInterface
 
 import logging
 logger = logging.getLogger(__name__)
@@ -209,6 +209,37 @@ class PreProcess:
             if start + chunk_len_smpl >= total:
                 break
 
+    def chunk_segments(
+        self,
+        audio_segments,
+        sid: int,
+        idx0: int,
+        loading_resampling: str,
+        dataset_format: str,
+    ):
+        """Cut each voiced segment into overlapping ``PERCENTAGE``-second slices.
+
+        Shared by ``Automatic`` and ``New Automatic``: the two differ only in
+        how the voiced segments were found, and the slice geometry downstream
+        has to stay identical either way.  Segments arrive as an iterable so a
+        slicer can stay a generator.
+        """
+        idx1 = 0
+        for audio_segment in audio_segments:
+            i = 0
+            while True:
+                start = int(self.sr * (PERCENTAGE - OVERLAP) * i)
+                i += 1
+                if len(audio_segment[start:]) > (PERCENTAGE + OVERLAP) * self.sr:
+                    tmp_audio = audio_segment[start : start + int(PERCENTAGE * self.sr)]
+                    self.process_audio_segment(tmp_audio, sid, idx0, idx1, loading_resampling, dataset_format)
+                    idx1 += 1
+                else:
+                    tmp_audio = audio_segment[start:]
+                    self.process_audio_segment(tmp_audio, sid, idx0, idx1, loading_resampling, dataset_format)
+                    idx1 += 1
+                    break
+
     def process_audio(
         self,
         path: str,
@@ -244,21 +275,16 @@ class PreProcess:
             elif cut_preprocess == "Simple":
                 self.simple_cut(audio, sid, idx0, chunk_len, overlap_len, loading_resampling, dataset_format)
             elif cut_preprocess == "Automatic":
-                idx1 = 0
-                for audio_segment in self.slicer.slice(audio):
-                    i = 0
-                    while True:
-                        start = int(self.sr * (PERCENTAGE - OVERLAP) * i)
-                        i += 1
-                        if len(audio_segment[start:]) > (PERCENTAGE + OVERLAP) * self.sr:
-                            tmp_audio = audio_segment[start : start + int(PERCENTAGE * self.sr)]
-                            self.process_audio_segment(tmp_audio, sid, idx0, idx1, loading_resampling, dataset_format)
-                            idx1 += 1
-                        else:
-                            tmp_audio = audio_segment[start:]
-                            self.process_audio_segment(tmp_audio, sid, idx0, idx1, loading_resampling, dataset_format)
-                            idx1 += 1
-                            break
+                self.chunk_segments(
+                    self.slicer.slice(audio), sid, idx0, loading_resampling, dataset_format
+                )
+            elif cut_preprocess == "New Automatic":
+                from rvc.train.preprocess import vad
+
+                self.chunk_segments(
+                    (audio[start:end] for start, end in vad.segments(audio, self.sr)),
+                    sid, idx0, loading_resampling, dataset_format,
+                )
         except Exception as e:
             logger.error(f"Error processing {path}: {e}")
             raise e
@@ -334,7 +360,7 @@ def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_pr
 
     gain_dbs, peak_dbs, crest_dbs, safe_maxs = [], [], [], []
 
-    with multiprocessing.Pool(processes=num_processes) as pool:
+    with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
         for result in pool.imap_unordered(_dry_run_check_file, arg_list):
             if result:
                 gain_dbs.append(result["gain_db"])
@@ -484,54 +510,62 @@ def save_dataset_duration(file_path, dataset_duration, normalization_mode, rms_n
     with open(file_path, "w") as f:
         json.dump(data, f, indent=4)
 
+def pool_size(requested, work_items):
+    """Workers to actually start: never more than there are items to hand out.
+
+    Every worker is a fresh process that re-imports this module, because
+    ``multiprocessing`` spawns rather than forks on Windows.  An idle worker is
+    therefore not free -- it is a second or so of interpreter startup bought
+    for nothing -- which is how raising the thread setting used to make a stage
+    slower instead of faster.
+    """
+    return max(1, min(int(requested), max(1, int(work_items))))
+
+
+def _duration_seconds(audio_path, loading_resampling):
+    """Length of one file in seconds, read from its header where possible.
+
+    This runs serially in the parent for every file in the dataset before any
+    work starts, purely to print the total, so it has to be a header read and
+    not a decode.  It was neither: ``librosa.get_duration(path=...)`` decoded
+    the file (1.87 s for 30 files against 0.01 s here, and it grows with the
+    dataset), and the ffmpeg branch spawned an ``ffprobe`` process per file.
+
+    Both remain as fallbacks -- ``soundfile`` cannot open every container the
+    loaders accept -- but they are now the exception rather than the path every
+    file takes.  A file whose length cannot be read at all contributes nothing:
+    this total is a log line, and failing the run over it would be absurd.
+    """
+    try:
+        info = sf.info(audio_path)
+        if info.samplerate:
+            return info.frames / info.samplerate
+    except Exception:
+        pass
+
+    try:
+        if loading_resampling == "librosa":
+            return librosa.get_duration(path=audio_path)
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0
+
+
 def cleanup_dirs(exp_dir):
     gt_wavs_dir = os.path.join(exp_dir, "sliced_audios")
     wavs16k_dir = os.path.join(exp_dir, "sliced_audios_16k")
-    logger.info("Cleaning up partially processed audio directories if they exist...")
-    if os.path.exists(gt_wavs_dir):
-        shutil.rmtree(gt_wavs_dir)
-        logger.info(f"Deleted directory: {gt_wavs_dir}")
-    if os.path.exists(wavs16k_dir):
-        shutil.rmtree(wavs16k_dir)
-        logger.info(f"Deleted directory: {wavs16k_dir}")
-
-
-def run_smart_cutter_stage(input_root, exp_dir, sr):
-    """Sequential GPU pass; returns the new input root (the temp folder it writes to)."""
-    ckpt_dir = os.path.join(now_directory, r"rvc/models/smartcutter")
-    output_root = os.path.join(exp_dir, "smart_cut_temp")
-    os.makedirs(output_root, exist_ok=True)
-
-    logger.info("[SmartCutter] Starting .. this may take a bit ...")
-    logger.info(f"[SmartCutter] Original Input: {input_root}")
-    logger.info(f"[SmartCutter] Temp Output: {output_root}")
-
-    engine = SmartCutterInterface(sr, ckpt_dir)
-    engine.load_model()
-
-    files_to_process = []
-    for root, _, filenames in os.walk(input_root):
-        for f in filenames:
-            if f.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
-                full_path = os.path.join(root, f)
-                rel_path = os.path.relpath(full_path, input_root)
-                out_path = os.path.join(output_root, rel_path)
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-                files_to_process.append((full_path, out_path))
-
-    with progress_task(
-        len(files_to_process),
-        "SmartCutting",
-    ) as (progress, task_id):
-        for in_p, out_p in files_to_process:
-            engine.process_file(in_p, out_p)
-            progress.advance(task_id)
-
-    engine.unload()
-    logger.info("SmartCutter Stage Complete. Proceeding to Slicing...")
-
-    return output_root
+    removed = []
+    for directory in (gt_wavs_dir, wavs16k_dir):
+        if os.path.exists(directory):
+            shutil.rmtree(directory)
+            removed.append(os.path.basename(directory))
+    if removed:
+        logger.info(f"Discarded previously sliced audio: {', '.join(removed)}.")
 
 
 def preprocess_training_set(
@@ -547,29 +581,25 @@ def preprocess_training_set(
     overlap_len: float,
     normalization_mode: str,
     loading_resampling: str,
-    use_smart_cutter: bool,
     dataset_format: str,
     rms_norm_db: float = -18.0
 ):
     start_time = time.time()
-    sc_engine = None
-    if use_smart_cutter:
-        try:
-            ckpt_dir = os.path.join(now_directory, r"rvc/models/smartcutter")
-            sc_engine = SmartCutterInterface(sr, ckpt_dir)
-            sc_engine.load_model()
-            logger.info("SmartCutter model loaded successfully.")
-        except Exception as e:
-            # Returning here aborted the whole run while still exiting 0, so the
-            # caller saw "success" and an empty sliced_audios/. Fail loudly: the
-            # user explicitly asked for SmartCutter, so silently dropping it (or
-            # the entire dataset) is worse than stopping.
-            logger.error(f"Failed to load SmartCutter: {e}")
-            raise RuntimeError(
-                f"SmartCutter was enabled but could not be loaded: {e}. "
-                f"Disable SmartCutter, or use a sample rate that has a checkpoint "
-                f"in rvc/models/smartcutter."
-            ) from e
+
+    if cut_preprocess == "New Automatic":
+        # Checked here rather than in the worker: the pool would otherwise
+        # raise the same error once per file, after the run had already
+        # written part of a dataset with nothing usable in it.
+        from rvc.train.preprocess import vad
+
+        reason = vad.unavailable_reason()
+        if reason:
+            raise RuntimeError(f"'New Automatic' cutting is unavailable: {reason}")
+        # Announced from here rather than from the workers: each of them builds
+        # its own engine, so saying it there would repeat the line once per
+        # worker.  This is the intent; a worker that cannot get the GPU says so
+        # itself when it falls back.
+        logger.info(f"Cutting with FireRedVAD on {vad.preferred_device()}.")
 
     speaker_map = {}
 
@@ -598,35 +628,23 @@ def preprocess_training_set(
                     sid = int(folder_name.split('_')[0])
                     detected_sids.add(sid)
                 except (ValueError, IndexError):
-                    logger.error(f"FATAL: Folder '{folder_name}' is invalid for multi-speaker. "
+                    logger.error(f"Folder '{folder_name}' is invalid for multi-speaker. "
                                  f"Folders must start with an integer (e.g., '0_name').")
                     sys.exit(1)
 
         expected_sids = set(range(speaker_count))
         if detected_sids != expected_sids:
             missing = sorted(list(expected_sids - detected_sids))
-            logger.error(f"FATAL: Speaker IDs are not contiguous or missing 0. "
+            logger.error(f"Speaker IDs are not contiguous or missing 0. "
                          f"Detected: {sorted(list(detected_sids))}. Missing: {missing}")
             sys.exit(1)
         else:
-            logger.info("Contiguity check passed.")
+            logger.info(f"Speaker IDs 0-{speaker_count - 1} are contiguous.")
 
     total_dataset_duration = 0
     for audio_paths in speaker_map.values():
         for audio_path in audio_paths:
-            try:
-                if loading_resampling == "librosa":
-                    audio_info = librosa.get_duration(path=audio_path, sr=sr)
-                else:
-                    result = subprocess.run(
-                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-                        capture_output=True, text=True
-                    )
-                    audio_info = float(result.stdout.strip())
-                total_dataset_duration += audio_info
-            except Exception:
-                pass
+            total_dataset_duration += _duration_seconds(audio_path, loading_resampling)
 
     logger.info(f"Total dataset length: {format_duration_human(total_dataset_duration)}")
     logger.info(f"Total speakers count: {speaker_count} Speaker{'s' if speaker_count != 1 else ''}")
@@ -638,15 +656,18 @@ def preprocess_training_set(
     total_audio_length = 0
 
     logger.info("Stage 1: Slicing & Resampling")
-    with multiprocessing.Pool(processes=num_processes) as pool:
+    # Never more workers than there is work.  Every worker is a fresh process
+    # that re-imports this module (Windows spawns rather than forks), so an
+    # idle one is not free -- it is a second or so of startup bought for
+    # nothing, and a three-file dataset was paying for twelve of them.
+    stage1_workers = pool_size(num_processes, max(len(p) for p in speaker_map.values()))
+    with multiprocessing.Pool(processes=stage1_workers) as pool:
         for speaker_dir, audio_paths in track(
             speaker_map.items(),
             total=len(speaker_map),
             description="Processing Speakers",
         ):
 
-            temp_speaker_dir = None
-            current_batch_paths = []
             try:
                 if speaker_dir == input_root:
                     sid = 0
@@ -658,18 +679,7 @@ def preprocess_training_set(
                 logger.warning(f"Folder '{os.path.basename(speaker_dir)}' does not start with a valid integer ID. Using SID 0.")
                 sid = 0
 
-            if use_smart_cutter and sc_engine:
-                temp_speaker_dir = os.path.join(exp_dir, "smart_cut_temp", str(sid))
-                os.makedirs(temp_speaker_dir, exist_ok=True)
-
-                for file_path in audio_paths:
-                    filename = os.path.basename(file_path)
-                    out_path = os.path.join(temp_speaker_dir, filename)
-
-                    sc_engine.process_file(file_path, out_path)
-                    current_batch_paths.append(out_path)
-            else:
-                current_batch_paths = audio_paths
+            current_batch_paths = audio_paths
 
             arg_list = [
                 (
@@ -694,16 +704,6 @@ def preprocess_training_set(
             for result in pool.imap_unordered(_process_audio_worker, arg_list):
                 if result:
                     total_audio_length += result
-
-            if temp_speaker_dir and os.path.exists(temp_speaker_dir):
-                shutil.rmtree(temp_speaker_dir)
-
-    main_temp_dir = os.path.join(exp_dir, "smart_cut_temp")
-    if os.path.exists(main_temp_dir):
-        shutil.rmtree(main_temp_dir)
-        
-    if use_smart_cutter and sc_engine:
-        sc_engine.unload()
 
     POST_NORM_MODES = {
         "post_rms":      "RMS Normalization",
@@ -734,7 +734,7 @@ def preprocess_training_set(
         logger.info(f"Post Normalization: {POST_NORM_MODES[normalization_mode]}. Initiating...")
         arg_list = [(f, gt_wavs_dir, wavs16k_dir, normalization_mode, rms_norm_db) for f in audio_files]
 
-        with multiprocessing.Pool(processes=num_processes) as pool:
+        with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
             with progress_task(
                 len(audio_files),
                 POST_NORM_MODES[normalization_mode],
@@ -745,13 +745,16 @@ def preprocess_training_set(
     save_dataset_duration(os.path.join(exp_dir, "model_info.json"), total_audio_length, normalization_mode, rms_norm_db)
 
     elapsed_time = time.time() - start_time
-    logger.info(f"Preprocessing finish: {datetime.now().strftime('%Y-%m-%d, %H:%M:%S')}")
-    logger.info(f"Preprocessing completed in {elapsed_time:.2f} seconds on {format_duration(total_audio_length)} of audio.")
+    success(
+        f"Finished at {datetime.now().strftime('%Y-%m-%d, %H:%M:%S')} "
+        f"in {elapsed_time:.2f}s on {format_duration(total_audio_length)} of audio.",
+        tag="[PREPROCESS]",
+    )
 
 if __name__ == "__main__":
-    configure_logging()
-    if len(sys.argv) < 15:
-        print("Usage: python preprocess.py <experiment_directory> <input_root> <sample_rate> <num_processes or 'none'> <cut_preprocess> <process_effects> <noise_reduction> <reduction_strength> <chunk_len> <overlap_len> <normalization_mode> <loading_resampling> <use_smart_cutter> <dataset_format> [rms_norm_db]")
+    configure_logging(tag="[PREPROCESS]")
+    if len(sys.argv) < 14:
+        print("Usage: python preprocess.py <experiment_directory> <input_root> <sample_rate> <num_processes or 'none'> <cut_preprocess> <process_effects> <noise_reduction> <reduction_strength> <chunk_len> <overlap_len> <normalization_mode> <loading_resampling> <dataset_format> [rms_norm_db]")
         sys.exit(1)
     experiment_directory = str(sys.argv[1])
     input_root = str(sys.argv[2])
@@ -771,9 +774,8 @@ if __name__ == "__main__":
     overlap_len = float(sys.argv[10])
     normalization_mode = str(sys.argv[11])
     loading_resampling = str(sys.argv[12])
-    use_smart_cutter = bool(strtobool(sys.argv[13]))
-    dataset_format = str(sys.argv[14])
-    rms_norm_db = float(sys.argv[15]) if len(sys.argv) >= 16 else -18.0
+    dataset_format = str(sys.argv[13])
+    rms_norm_db = float(sys.argv[14]) if len(sys.argv) >= 15 else -18.0
 
     preprocess_training_set(
         input_root,
@@ -788,7 +790,6 @@ if __name__ == "__main__":
         overlap_len,
         normalization_mode,
         loading_resampling,
-        use_smart_cutter,
         dataset_format,
         rms_norm_db,
     )

@@ -21,10 +21,12 @@ sys.path.append(now_dir)
 
 from rvc.lib.terminal import (
     DEFAULT_CPU_THREADS,
+    info,
     install_rich_print,
     print_error_panel,
     print_settings_panel,
     success,
+    warning,
 )
 
 install_rich_print()
@@ -335,13 +337,9 @@ def run_preprocess_script(
     overlap_len: float,
     normalization_mode: str = "post_rms",
     loading_resampling: str = "librosa",
-    use_smart_cutter: bool = False,
     dataset_format: str = "WAV",
     rms_norm_db: float = -18.0
 ):
-    if int(sample_rate) == 44100 and use_smart_cutter:
-        raise ValueError("SmartCutter is not available for the 44.1 kHz vocoder configuration.")
-
     preprocess_script_path = os.path.join("rvc", "train", "preprocess", "preprocess.py")
     command = [
         python,
@@ -361,7 +359,6 @@ def run_preprocess_script(
                 overlap_len,
                 normalization_mode,
                 loading_resampling,
-                use_smart_cutter,
                 dataset_format,
                 rms_norm_db,
             ],
@@ -659,12 +656,12 @@ def stop_train_script():
     try:
         _request_graceful_stop(training_process)
     except (OSError, psutil.Error) as error:
-        print(f"[TRAINING] Graceful stop failed ({error}); killing instead.")
+        warning(f"Graceful stop failed ({error}); killing instead.", tag="[TRAINING]")
     else:
-        print(f"[TRAINING] Asked PID {pid} to stop, waiting up to {TRAINING_STOP_GRACE_SECONDS}s...")
+        info(f"Asked PID {pid} to stop, waiting up to {TRAINING_STOP_GRACE_SECONDS}s...", tag="[TRAINING]")
         if _wait_for_exit(training_process, TRAINING_STOP_GRACE_SECONDS):
             return f"Training stopped (PID {pid})."
-        print(f"[TRAINING] PID {pid} did not exit in time; killing the tree.")
+        warning(f"PID {pid} did not exit in time; killing the tree.", tag="[TRAINING]")
 
     alive = _kill_process_tree(pid)
     if alive:
@@ -675,7 +672,7 @@ def stop_train_script():
 def _stop_training_at_exit():
     """Take the trainer down when this interface exits normally."""
     if training_process is not None and training_process.poll() is None:
-        print("[TRAINING] Interface is exiting; stopping the training run.")
+        info("Interface is exiting; stopping the training run.", tag="[TRAINING]")
         stop_train_script()
 
 
@@ -683,16 +680,32 @@ atexit.register(_stop_training_at_exit)
 
 
 # Index
+def list_experiment_speakers(model_name: str):
+    """Speaker ids with extracted features in ``logs/<model_name>/``.
+
+    Imported lazily: the module reaches faiss and scikit-learn at import time,
+    and this is called to populate a dropdown.
+    """
+    from rvc.train.process.extract_index import available_speakers
+
+    return available_speakers(os.path.join(logs_path, model_name))
+
+
 def run_index_script(
-    model_name: str, index_algorithm: str, index_metric: str = "l2"
+    model_name: str, index_algorithm: str, index_metric: str = "l2",
+    index_speaker: int | str | None = None,
 ):
     index_script_path = os.path.join("rvc", "train", "process", "extract_index.py")
+    # "all" travels as a word rather than as an empty argument, which a shell
+    # can drop and which would otherwise be read back as speaker 0.
+    speaker = "all" if index_speaker in (None, "", "all") else str(int(index_speaker))
     command = [
         python,
         index_script_path,
         os.path.join(logs_path, model_name),
         index_algorithm,
         index_metric,
+        speaker,
     ]
 
     # Checked, because it has not always succeeded: the script's ``rvc.``
@@ -751,13 +764,11 @@ def run_prerequisites_script(
     pretraineds_hifigan: bool,
     models: bool,
     exe: bool,
-    smartcutter: bool,
 ):
     prequisites_download_pipeline(
         pretraineds_hifigan,
         models,
         exe,
-        smartcutter,
     )
     return "Prerequisites installed successfully."
 
@@ -1154,13 +1165,6 @@ PREPROCESS_OWN = [
         show_default=True,
         help="Librosa's using SoXr, FFmpeg's using Windowed Sinc filter with Blackman-Nuttall window.",
     ),
-    click.option(
-        "--use_smart_cutter",
-        type=click.BOOL,
-        default=False,
-        show_default=True,
-        help="Enable SmartCutter silence-truncation during preprocessing.",
-    ),
 ]
 
 # ---- extract ----
@@ -1473,6 +1477,13 @@ INDEX_OWN = [
         show_default=True,
         help="Similarity used to find neighbours. l2 reproduces what upstream RVC builds; cosine ranks by direction alone, which suits embeddings whose magnitude tracks loudness.",
     ),
+    click.option(
+        "--index_speaker",
+        type=str,
+        default="all",
+        show_default=True,
+        help="Build the index from one speaker's features instead of the whole dataset. 'all', or a speaker id. A per-speaker index is written as <model>_spk<id>.index alongside the full one.",
+    ),
 ]
 
 # ---- model_information ----
@@ -1546,13 +1557,6 @@ PREREQUISITES_OWN = [
         default=True,
         show_default=True,
         help="Download required executables.",
-    ),
-    click.option(
-        "--smartcutter",
-        type=click.BOOL,
-        default=True,
-        show_default=True,
-        help="Download required SmartCutter models.",
     ),
 ]
 

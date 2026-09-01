@@ -175,7 +175,7 @@ class TrainingPage(Page):
 
         row = QHBoxLayout()
         row.setSpacing(12)
-        row.addWidget(Field(_("Slicing"), self.cut_preprocess, _("Automatic detects silence; Simple cuts on a fixed grid.")))
+        row.addWidget(Field(_("Slicing"), self.cut_preprocess, _("Simple cuts on a fixed grid; Automatic detects silence by level, New Automatic by neural VAD.")))
         row.addWidget(Field(_("Chunk length (s)"), self.chunk_len, ""))
         row.addWidget(Field(_("Overlap (s)"), self.overlap_len, ""))
         card.body.addLayout(row)
@@ -205,10 +205,8 @@ class TrainingPage(Page):
         self.process_effects = Toggle(_("Trim and de-click"), _("Standard cleanup pass on each slice."), checked=True)
         self.noise_reduction = Toggle(_("Noise reduction"), _("Only worth it on genuinely noisy source material."))
         self.clean_strength = SliderSpin(0, 1, 0.01, decimals=2, value=0.5)
-        self.smart_cutter = Toggle(_("SmartCutter"), _("Model-guided slicing. Not available at 44.1 kHz."))
         advanced.add(self.process_effects, self.noise_reduction,
-                     Field(_("Noise reduction strength"), self.clean_strength, ""),
-                     self.smart_cutter)
+                     Field(_("Noise reduction strength"), self.clean_strength, ""))
 
         self.dataset_format = SearchableCombo(editable=False)
         self.dataset_format.refresh_button.hide()
@@ -493,10 +491,41 @@ class TrainingPage(Page):
                 "so a quiet and a loud take of the same sound match equally."),
             ),
         )
+        self.index_single_speaker = Toggle(
+            _("Index one speaker only"),
+            _("On a multispeaker model, keeps one voice's articulation out of "
+            "another's. Saved as <model>_spk<id>.index, beside the full one."),
+        )
+        self.index_speaker = SearchableCombo(editable=False)
+        self.index_speaker.refresh_button.hide()
+        self.index_speaker_field = Field(
+            _("Speaker"), self.index_speaker,
+            _("Read from the extracted features."),
+        )
+        # Hidden rather than greyed out: with the toggle off there is nothing
+        # to choose, and an empty disabled combo just asks to be clicked.
+        self.index_speaker_field.setVisible(False)
+        self.index_single_speaker.toggled.connect(self._on_index_speaker_toggled)
+        card.add(self.index_single_speaker, self.index_speaker_field)
+
         self.index_button = primary_button(_("Generate index"))
         self.index_button.clicked.connect(self._build_index)
         card.add(self.index_button)
         return card
+
+    def _on_index_speaker_toggled(self, enabled: bool) -> None:
+        self.index_speaker_field.setVisible(enabled)
+        if enabled:
+            self._refresh_index_speakers()
+
+    def _refresh_index_speakers(self) -> None:
+        """Fill the picker from the selected model's own features.
+
+        Follows the model name: leaving the previous model's ids in the combo
+        would build against a speaker that has nothing behind it.
+        """
+        speakers = catalog.list_experiment_speakers(self.model_name.text().strip())
+        self.index_speaker.set_items([str(sid) for sid in speakers])
 
     # -- monitor column ----------------------------------------------------
 
@@ -583,15 +612,12 @@ class TrainingPage(Page):
         vocoder = self.vocoder.value()
         rates = catalog.sample_rates_for(vocoder)
         self.sample_rate.set_items([str(rate) for rate in rates])
-        supported = catalog.supports_smartcutter(vocoder)
-        self.smart_cutter.setEnabled(supported)
-        if not supported:
-            self.smart_cutter.setChecked(False)
-            self.smart_cutter.setToolTip(
-                f"SmartCutter has no {vocoder} configuration; the backend refuses this combination."
-            )
 
     def _on_model_changed(self, name: str) -> None:
+        # The speaker list belongs to the model, so it follows it whichever way
+        # the metrics panel goes below.
+        if self.index_single_speaker.isChecked():
+            self._refresh_index_speakers()
         # Follow the model being configured, but only until the user picks a
         # run explicitly -- after that, changing the model name here must not
         # yank the chart away from what they chose to watch.
@@ -730,7 +756,6 @@ class TrainingPage(Page):
                 "overlap_len": self.overlap_len.value(),
                 "normalization_mode": self.normalization.text(),
                 "loading_resampling": self.resampling.text(),
-                "use_smart_cutter": self.smart_cutter.isChecked(),
                 "dataset_format": self.dataset_format.text(),
                 "rms_norm_db": self.rms_db.value(),
             },
@@ -891,12 +916,18 @@ class TrainingPage(Page):
     def _build_index(self) -> None:
         if not self.require(**{"A model name": self.model_name.text().strip()}):
             return
+        speaker = "all"
+        if self.index_single_speaker.isChecked():
+            speaker = self.index_speaker.text().strip()
+            if not self.require(**{"A speaker to index": speaker}):
+                return
         self.run(
             "index",
             {
                 "model_name": self.model_name.text().strip(),
                 "index_algorithm": self.index_algorithm.text(),
                 "index_metric": self.index_metric.text(),
+                "index_speaker": speaker,
             },
             busy_text=_("Building index…"),
             buttons=[self.index_button],

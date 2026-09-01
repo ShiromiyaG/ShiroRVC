@@ -44,7 +44,13 @@ _torch_warmup.start()
 
 import gradio as gr
 
-from rvc.lib.terminal import install_rich_print, print_error_panel, warning
+from rvc.lib.terminal import (
+    info,
+    install_rich_print,
+    print_error_panel,
+    success,
+    warning,
+)
 
 install_rich_print()
 
@@ -131,7 +137,6 @@ run_prerequisites_script(
     pretraineds_hifigan=True,
     models=True,
     exe=True,
-    smartcutter=True,
 )
 
 # Check installation
@@ -207,7 +212,16 @@ with gr.Blocks(title=APP_TITLE) as interface:
 
 
 def launch_gradio(port):
-    interface.launch(
+    """Start the interface and report it the way every other stage reports.
+
+    ``quiet`` silences Gradio's own ``* Running on local URL:`` banner, which is
+    the one line in a session that does not follow the ``glyph [TAG] message``
+    shape used by preprocessing, extraction and training.  ``prevent_thread_lock``
+    hands the URLs back so they can be printed in that shape instead; blocking
+    then happens explicitly below.
+    """
+
+    _app, local_url, share_url = interface.launch(
         favicon_path="assets/logo.png",
         share="--share" in sys.argv,
         inbrowser="--open" in sys.argv,
@@ -215,7 +229,16 @@ def launch_gradio(port):
         theme=APP_THEME,
         css_paths=GUI_CSS_PATH,
         footer_links=[],
+        quiet=True,
+        prevent_thread_lock=True,
     )
+    success(f"Interface ready at {local_url}", tag="[APP]")
+    if share_url:
+        success(f"Public link: {share_url}", tag="[APP]")
+    elif "--share" in sys.argv:
+        warning("The public link could not be created.", tag="[APP]")
+    info("Press Ctrl+C to stop.", tag="[APP]")
+    interface.block_thread()
 
 
 def get_port_from_args():

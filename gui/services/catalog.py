@@ -37,7 +37,7 @@ FEATURE_PRECISIONS = ["fp32", "fp16"]
 TORCH_COMPILE_MODES = [
     "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",
 ]
-CUT_PREPROCESS = ["Skip", "Simple", "Automatic"]
+CUT_PREPROCESS = ["Skip", "Simple", "Automatic", "New Automatic"]
 NORMALIZATION_MODES = ["none", "post_peak", "post_peak_rvc", "post_rms"]
 LOADING_RESAMPLING = ["librosa", "ffmpeg"]
 DATASET_FORMATS = ["WAV", "FLAC", "MP3", "OGG", "M4A"]
@@ -229,6 +229,32 @@ def list_training_models() -> list[str]:
     return sorted(names)
 
 
+def list_experiment_speakers(model_name: str) -> list[int]:
+    """Speaker ids with extracted features in ``logs/<model_name>/``.
+
+    Read from the feature filenames -- preprocessing names every slice
+    ``<sid>_<file>_<slice>`` -- rather than from the backend, which would pull
+    faiss and scikit-learn in just to fill a dropdown.  Mirrors
+    ``rvc.train.process.extract_index.available_speakers``; the test suite pins
+    the two together.
+    """
+    if not model_name:
+        return []
+    feature_dir = paths.LOGS_DIR / model_name / "extracted"
+    if not feature_dir.is_dir():
+        return []
+    found = set()
+    for entry in feature_dir.iterdir():
+        if entry.suffix != ".npy":
+            continue
+        head = entry.name.split("_", 1)[0]
+        try:
+            found.add(int(head))
+        except ValueError:
+            continue
+    return sorted(found)
+
+
 def list_custom_embedders() -> list[str]:
     """Folders holding a user-supplied embedder."""
     root = paths.CUSTOM_EMBEDDER_DIR
@@ -288,10 +314,6 @@ def sample_rates_for(vocoder: str) -> list[int]:
     """Sample rates a vocoder actually ships a config for."""
     spec = _vocoder_registry().get(vocoder, {})
     return [int(rate) for rate in spec.get("sample_rates", [])]
-
-
-def supports_smartcutter(vocoder: str) -> bool:
-    return bool(_vocoder_registry().get(vocoder, {}).get("supports_smartcutter"))
 
 
 def _vocoder_registry() -> dict:

@@ -43,6 +43,18 @@ def process_input(file_path):
         return None, None
 
 
+def _refresh_choices(model):
+    """``change_choices`` trimmed to the three dropdowns this tab actually has.
+
+    It was written for the inference tab and returns five updates, the third of
+    which lists input audio files -- something TTS has no dropdown for.  Wiring
+    its five values onto four outputs put that audio list into the speaker-ID
+    dropdown and dropped the last update with a warning.
+    """
+    models, indexes, _audio, speaker_id, _speaker_id_batch = change_choices(model)
+    return models, indexes, speaker_id
+
+
 def tts_tab():
     with gr.Column():
         with gr.Row():
@@ -357,9 +369,9 @@ def tts_tab():
         show_progress="hidden",
     )
     refresh_button.click(
-        fn=change_choices,
+        fn=_refresh_choices,
         inputs=[model_file],
-        outputs=[model_file, index_file, sid, sid],
+        outputs=[model_file, index_file, sid],
     )
     txt_file.upload(
         fn=process_input,

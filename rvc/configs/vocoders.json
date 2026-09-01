@@ -9,7 +9,6 @@
             48000
         ],
         "pretrained_dir": "hifi-gan",
-        "supports_smartcutter": true,
         "generator": "hifi_nsf",
         "discriminator": "mpd_msd",
         "architecture_id": "hifi_gan_nsf_v1"
@@ -23,7 +22,6 @@
             44100
         ],
         "pretrained_dir": "refinegan",
-        "supports_smartcutter": false,
         "generator": "refinegan",
         "discriminator": "mpd_msd_v3",
         "architecture_id": "vits_gaussian_v1"

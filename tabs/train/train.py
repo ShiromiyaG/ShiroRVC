@@ -14,6 +14,7 @@ import gradio as gr
 
 from core import (
     run_extract_script,
+    list_experiment_speakers,
     run_index_script,
     run_preprocess_script,
     run_prerequisites_script,
@@ -370,9 +371,8 @@ initial_sample_rate_choices = [
 initial_sample_rate = "48000"
 
 
-def update_vocoder_settings(vocoder_id, current_sample_rate, use_smartcutter):
+def update_vocoder_settings(vocoder_id, current_sample_rate):
     vocoder_id = normalize_vocoder(vocoder_id)
-    spec = get_vocoder_spec(vocoder_id)
     sample_rate_choices = [
         str(rate) for rate in get_vocoder_sample_rates(vocoder_id)
     ]
@@ -382,19 +382,11 @@ def update_vocoder_settings(vocoder_id, current_sample_rate, use_smartcutter):
         if current_sample_rate in sample_rate_choices
         else sample_rate_choices[0]
     )
-    smartcutter_enabled = bool(spec.get("supports_smartcutter", False))
-    return (
-        {
-            "choices": sample_rate_choices,
-            "value": selected_sample_rate,
-            "__type__": "update",
-        },
-        {
-            "interactive": smartcutter_enabled,
-            "value": use_smartcutter if smartcutter_enabled else False,
-            "__type__": "update",
-        },
-    )
+    return {
+        "choices": sample_rate_choices,
+        "value": selected_sample_rate,
+        "__type__": "update",
+    }
 
 initial_optimizer = "AdamW"
 # Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES.
@@ -516,15 +508,6 @@ def train_tab():
                         key='loading_resampling'
                     )
                 with gr.Column(min_width=0):
-                    use_smart_cutter = gr.Checkbox(
-                        label=_("SmartCutter"),
-                        info=_(SMARTCUTTER_INFO),
-                        value=False,
-                        interactive=True,
-                        visible=True,
-                        key='use_smart_cutter'
-                    )
-                with gr.Column(min_width=0):
                     normalization_mode = gr.Radio(
                         label=_("Loudness Normalization"),
                         info=_(NORMALIZATION_INFO),
@@ -543,15 +526,20 @@ def train_tab():
                     visible=False,
                     key='rms_norm_db'
                 )
+            # The radio gets a row to itself: sharing one with the sliders below
+            # left it a sliver of the width (they carry scale=46 and 57 against
+            # its default 1), so its four choices stacked into a column three
+            # rows tall and dragged the whole section down with them.
             with gr.Row():
                 cut_preprocess = gr.Radio(
                     label=_("Audio cutting"),
                     info=_(AUDIO_FILE_SLICING_INFO),
-                    choices=["Skip", "Simple", "Automatic"],
+                    choices=["Skip", "Simple", "Automatic", "New Automatic"],
                     value="Simple",
                     interactive=True,
                     key='cut_preprocess'
                 )
+            with gr.Row():
                 chunk_len = gr.Slider(
                     0.5,
                     30.0,
@@ -627,7 +615,6 @@ def train_tab():
                     overlap_len,
                     normalization_mode,
                     loading_resampling,
-                    use_smart_cutter,
                     dataset_format,
                     rms_norm_db,
                 ],
@@ -1058,6 +1045,31 @@ def train_tab():
                         interactive=True,
                         key="index_metric",
                     )
+            with gr.Row():
+                with gr.Column(min_width=0):
+                    index_single_speaker = gr.Checkbox(
+                        label=_("Index one speaker only"),
+                        info=_(INDEX_SINGLE_SPEAKER_INFO),
+                        value=False,
+                        interactive=True,
+                        key="index_single_speaker",
+                    )
+                # The container carries the visibility, not the dropdown.
+                # Toggling a component's own ``visible`` alongside its
+                # ``choices`` did not take effect until the checkbox was
+                # cycled a second time; every other conditional control in
+                # this tab wraps its widgets and shows the wrapper, so this
+                # one does too.
+                with gr.Column(min_width=0, visible=False) as index_speaker_row:
+                    index_speaker = gr.Dropdown(
+                        label=_("Speaker to index"),
+                        info=_("Read from the extracted features. Refresh after extracting."),
+                        choices=[],
+                        value=None,
+                        interactive=True,
+                        allow_custom_value=True,
+                        key="index_speaker",
+                    )
 
         train_output_info = gr.Textbox(
             label=_("Output Information"),
@@ -1133,10 +1145,55 @@ def train_tab():
                 show_progress="hidden",
             )
 
+            def fill_index_speakers(name):
+                """The picker's contents, from the selected model's features.
+
+                Kept separate from showing it, and run whether or not the
+                checkbox is on: one update that both reveals a component and
+                repopulates it is what failed to apply on the first click.
+                """
+                speakers = [str(sid) for sid in list_experiment_speakers(name)] if name else []
+                return gr.update(
+                    choices=speakers,
+                    value=speakers[0] if speakers else None,
+                )
+
+            def toggle_index_speaker(enabled):
+                return gr.update(visible=bool(enabled))
+
+            def generate_index(name, algorithm, metric, single, speaker):
+                if not single:
+                    return run_index_script(name, algorithm, metric, "all")
+                if speaker in (None, ""):
+                    return _("Pick a speaker, or turn off 'Index one speaker only'.")
+                return run_index_script(name, algorithm, metric, speaker)
+
+            index_single_speaker.change(
+                fn=toggle_index_speaker,
+                inputs=[index_single_speaker],
+                outputs=[index_speaker_row],
+            ).then(
+                # Refilled on reveal too, so a model whose features were
+                # extracted while this tab was open is not missing from a list
+                # built before they existed.
+                fn=fill_index_speakers,
+                inputs=[model_name],
+                outputs=[index_speaker],
+            )
+            # The list belongs to the selected model, so it has to follow it;
+            # otherwise switching models leaves the previous one's speakers in
+            # the dropdown and the build fails on an id that is not there.
+            model_name.change(
+                fn=fill_index_speakers,
+                inputs=[model_name],
+                outputs=[index_speaker],
+            )
+
             index_button = gr.Button(_("Generate Index"))
             index_button.click(
-                fn=run_index_script,
-                inputs=[model_name, index_algorithm, index_metric],
+                fn=generate_index,
+                inputs=[model_name, index_algorithm, index_metric,
+                        index_single_speaker, index_speaker],
                 outputs=[train_output_info],
             )
 
@@ -1220,7 +1277,7 @@ def train_tab():
                 vocoder, sampling_rate, cpu_threads, extract_gpu,
 
                 # Preprocessing
-                dataset_path, dataset_format, loading_resampling, use_smart_cutter,
+                dataset_path, dataset_format, loading_resampling,
                 normalization_mode, rms_norm_db, cut_preprocess, chunk_len, overlap_len,
                 process_effects, noise_reduction, clean_strength,
 
@@ -1238,7 +1295,7 @@ def train_tab():
                 d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
                 warmup_duration, use_custom_lr, custom_lr_g,
                 custom_lr_d,
-                index_algorithm, index_metric,
+                index_algorithm, index_metric, index_single_speaker,
                 overtrain_detector, stop_on_overtrain, use_ema
             ])
 
@@ -1331,8 +1388,8 @@ def train_tab():
             )
             vocoder.change(
                 fn=update_vocoder_settings,
-                inputs=[vocoder, sampling_rate, use_smart_cutter],
-                outputs=[sampling_rate, use_smart_cutter],
+                inputs=[vocoder, sampling_rate],
+                outputs=[sampling_rate],
             )
             refresh.click(
                 fn=refresh_models_and_datasets,

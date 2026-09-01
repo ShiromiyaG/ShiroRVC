@@ -145,13 +145,51 @@ def _frame_energy_mask(audio_path, frames):
     return keep
 
 
-def _load_features(feature_dir, audio_dir):
+def speaker_of(name):
+    """The speaker id a feature file belongs to, or ``None``.
+
+    Preprocessing names every slice ``<sid>_<file>_<slice>``, so the speaker is
+    the leading integer.  Anything else is treated as unattributable rather
+    than guessed at.
+    """
+    head = os.path.basename(name).split("_", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def available_speakers(exp_dir):
+    """Speaker ids present in an experiment's extracted features, sorted.
+
+    Read from the feature filenames rather than from ``config.json``: the index
+    can only be built from frames that actually exist, and a run whose
+    extraction covered part of the dataset would otherwise offer a speaker with
+    nothing behind it.
+    """
+    feature_dir = os.path.join(exp_dir, "extracted")
+    if not os.path.isdir(feature_dir):
+        return []
+    found = {
+        speaker_of(name)
+        for name in os.listdir(feature_dir)
+        if name.endswith(".npy")
+    }
+    return sorted(sid for sid in found if sid is not None)
+
+
+def _load_features(feature_dir, audio_dir, speaker_id=None):
     """Concatenate the extracted features, tagging each frame with its origin.
 
     ``utt``/``pos`` are what makes the continuity bonus possible at inference.
     ``pos`` counts frames in the *original* stream, before the silence mask
     removes any, so a candidate is only credited as "the next frame" when it
     genuinely was one.
+
+    ``speaker_id`` restricts the index to one speaker's frames.  On a
+    multispeaker model the whole-dataset index is a pool of every voice, so
+    retrieval can hand a frame of speaker 2's articulation to a conversion
+    targeting speaker 0; an index built from one speaker cannot.
     """
     features, utts, positions = [], [], []
     dropped_silence = 0
@@ -159,6 +197,8 @@ def _load_features(feature_dir, audio_dir):
 
     for utt_id, name in enumerate(sorted(os.listdir(feature_dir))):
         if not name.endswith(".npy"):
+            continue
+        if speaker_id is not None and speaker_of(name) != speaker_id:
             continue
         array = np.load(os.path.join(feature_dir, name), allow_pickle=False)
         if array.ndim != 2 or array.shape[0] == 0:
@@ -449,7 +489,7 @@ def _build_index(features, metric):
     return index, searchable, n_ivf
 
 
-def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2):
+def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2, speaker_id=None):
     feature_dir = os.path.join(exp_dir, "extracted")
     model_name = os.path.basename(exp_dir)
 
@@ -465,7 +505,24 @@ def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2):
         warning(f"Unknown metric {index_metric!r}; using l2.", tag="[INDEX]")
         index_metric = index_meta.METRIC_L2
 
-    index_filepath = os.path.join(exp_dir, f"{model_name}.index")
+    if speaker_id is not None:
+        speaker_id = int(speaker_id)
+        present = available_speakers(exp_dir)
+        if speaker_id not in present:
+            print_error(
+                f"Speaker {speaker_id} has no extracted features in "
+                f"{feature_dir}. Present: {present or 'none'}.",
+                tag="[INDEX]",
+            )
+            return 1
+        info(f"Building from speaker {speaker_id} only.", tag="[INDEX]")
+
+    # A per-speaker index gets its own name so it sits beside the whole-dataset
+    # one instead of replacing it: both are listed by the inference picker, and
+    # which one suits a conversion is the user's call at that point, not this
+    # script's.
+    suffix = "" if speaker_id is None else f"_spk{speaker_id}"
+    index_filepath = os.path.join(exp_dir, f"{model_name}{suffix}.index")
     if os.path.exists(index_filepath):
         # This used to be a silent no-op, so changing the algorithm and
         # regenerating quietly handed back the previous index.
@@ -476,7 +533,7 @@ def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2):
         audio_dir = None
         warning("No 16 kHz slices to measure; keeping silent frames.", tag="[INDEX]")
 
-    features, utts, positions = _load_features(feature_dir, audio_dir)
+    features, utts, positions = _load_features(feature_dir, audio_dir, speaker_id)
     info(f"{features.shape[0]} frames of {features.shape[1]} dims.", tag="[INDEX]")
 
     rng = np.random.default_rng(SEED)
@@ -499,13 +556,20 @@ def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2):
         recall=recall,
         utt=utts,
         pos=positions,
-        extra={"n_ivf": int(n_ivf), "algorithm": index_algorithm},
+        extra={
+            "n_ivf": int(n_ivf),
+            "algorithm": index_algorithm,
+            # -1 rather than absent, so an older reader that expects a number
+            # gets one and "every speaker" stays distinguishable from "unknown".
+            "speaker_id": -1 if speaker_id is None else int(speaker_id),
+        },
     )
     index_meta.write(index_filepath, meta)
 
     print_settings_panel(
         [
             ("Vectors", f"{count:,}"),
+            ("Speaker", "all" if speaker_id is None else str(speaker_id)),
             ("Metric", index_metric),
             ("Structure", f"IVF{n_ivf}, nprobe {nprobe}"),
             ("Selection", selection),
@@ -533,7 +597,11 @@ def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2):
 if __name__ == "__main__":
     try:
         metric = str(sys.argv[3]) if len(sys.argv) > 3 else index_meta.METRIC_L2
-        sys.exit(main(str(sys.argv[1]), str(sys.argv[2]), metric))
+        # "all" rather than an empty argument: an empty string in argv is easy
+        # to lose through a shell and would read as speaker 0 if it were.
+        speaker = sys.argv[4] if len(sys.argv) > 4 else "all"
+        speaker = None if speaker in ("", "all", "None") else int(speaker)
+        sys.exit(main(str(sys.argv[1]), str(sys.argv[2]), metric, speaker))
     except Exception as error:
         # The old handler blamed GPU memory, which this script never touches --
         # it is faiss and scikit-learn on the CPU.

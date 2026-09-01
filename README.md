@@ -100,7 +100,8 @@ Put clean audio in a folder under `assets/datasets/`, then pick it in the
 Training tab.
 
 - Keep the recordings consistent — same microphone, same room, same tone.
-- Cut the silence off the start and end. **SmartCutter** can do it for you.
+- Cut the silence off the start and end, or let **New Automatic** cutting do it
+  for you — it detects voice with a neural VAD rather than a loudness threshold.
 - Twenty clean minutes beats two noisy hours. Quality matters far more than
   quantity.
 
@@ -221,10 +222,10 @@ only signal able to see overtraining.
 ## Credits
 
 - **[Applio](https://github.com/IAHispano/Applio)** - The base for this fork.
-- **[codename0og](https://github.com/codename0og/)** — SmartCutter, the learned
-  silence-detection model used to trim dataset audio.
 - **[dr87 / spin-for-rvc](https://github.com/dr87/spin-for-rvc)** — the `spin_v1`
   and `spin_v2` content embedders.
+- **[FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)** (Apache-2.0) — the
+  neural voice-activity detector behind the **New Automatic** cutting mode.
 - [Retrieval-based Voice Conversion WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
   — the original RVC project this fork descends from.
 

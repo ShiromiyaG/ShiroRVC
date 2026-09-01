@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import traceback
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from multiprocessing import cpu_count
@@ -12,7 +13,6 @@ from typing import Any
 
 from rich.box import ROUNDED
 from rich.console import Console
-from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -36,7 +36,7 @@ _console: Console | None = None
 #: swaps the stream out from under us gets a new console instead of writes to a
 #: closed file.  See :func:`get_console`.
 _console_stream: Any = None
-_rich_handler: RichHandler | None = None
+_rich_handler: logging.Handler | None = None
 _rich_print_installed = False
 _builtin_print = builtins.print
 DEFAULT_CPU_THREADS = max(1, min(4, cpu_count()))
@@ -254,16 +254,58 @@ def print_error_panel(
     )
 
 
-def configure_logging(level: int = logging.INFO) -> None:
+class GlyphHandler(logging.Handler):
+    """Render log records the way :func:`info` and friends render theirs.
+
+    ``RichHandler`` prints its own ``[date time] LEVEL`` columns, which put two
+    different line shapes on screen in a single run: timestamped log rows from
+    the stages that use ``logging`` next to untimestamped ``glyph [TAG] text``
+    rows from the ones that call the helpers below.  Routing records through
+    :func:`_emit` gives every stage one shape, so a progress bar and the lines
+    around it line up.
+    """
+
+    _LEVELS_BY_NUMBER = (
+        (logging.ERROR, "error"),
+        (logging.WARNING, "warning"),
+        (logging.INFO, "info"),
+    )
+
+    def __init__(self, tag: str | None = None, level: int = logging.NOTSET):
+        super().__init__(level)
+        self.tag = tag
+
+    def _level_name(self, levelno: int) -> str:
+        for threshold, name in self._LEVELS_BY_NUMBER:
+            if levelno >= threshold:
+                return name
+        return "debug"
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # pragma: no cover - mirrors logging's own guard
+            self.handleError(record)
+            return
+        _emit(self._level_name(record.levelno), message, self.tag)
+        if record.exc_info:
+            print_error_panel(
+                message,
+                title=record.levelname.title(),
+                details="".join(traceback.format_exception(*record.exc_info)),
+            )
+
+
+def configure_logging(level: int = logging.INFO, tag: str | None = None) -> None:
+    """Point the root logger at the shared console with one consistent shape.
+
+    ``tag`` is the ``[STAGE]`` prefix every record picks up, so a stage that
+    logs through ``logging`` reads the same as one that calls :func:`info`.
+    """
+
     global _rich_handler
     root_logger = logging.getLogger()
-    if _rich_handler is None:
-        _rich_handler = RichHandler(
-            console=get_console(),
-            show_path=False,
-            markup=False,
-            rich_tracebacks=True,
-        )
+    _rich_handler = GlyphHandler(tag=tag)
     root_logger.handlers = [_rich_handler]
     root_logger.setLevel(level)
 

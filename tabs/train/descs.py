@@ -10,11 +10,10 @@ DATASET_FORMAT_INFO = N_("Output format for sliced audio. WAV is larger; FLAC is
 
 RESAMPLER_INFO = N_("librosa: high quality. ffmpeg: alternative resampler.")
 
-SMARTCUTTER_INFO = N_("Automatic silence trimming with short gaps preserved.")
 
 NORMALIZATION_INFO = N_("Choose the loudness normalization method.")
 
-AUDIO_FILE_SLICING_INFO = N_("Skip existing slices, use fixed chunks, or detect silence automatically.")
+AUDIO_FILE_SLICING_INFO = N_("Skip existing slices, use fixed chunks, or detect silence automatically. New Automatic uses a neural VAD instead of an energy threshold.")
 
 PITCH_EXTRACTION_INFO = N_("RMVPE is the recommended default. CREPE is an alternative for clean audio.")
 
@@ -62,4 +61,9 @@ USE_EMA_INFO = N_(
     "generator oscillates against its discriminator, so the average is usually better "
     "than any single step, and it makes the overtrain curve much cleaner. Costs one "
     "extra copy of the generator in VRAM."
+)
+
+INDEX_SINGLE_SPEAKER_INFO = N_(
+    "On a multispeaker model, keeps one voice's articulation out of another's. "
+    "Saved as <model>_spk<id>.index, beside the full one."
 )

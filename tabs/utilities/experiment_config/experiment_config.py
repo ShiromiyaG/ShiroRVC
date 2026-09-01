@@ -155,8 +155,13 @@ def describe_experiment(experiment: str | None):
             ).format(len(existing_checkpoints))
         )
 
-    return "\n\n".join(lines), gr.update(
-        value=current_vocoder if current_vocoder else gr.update()
+    # An unrecognised architecture has no vocoder to preselect, and the way to
+    # say "leave this dropdown alone" is a bare ``gr.update()`` for the
+    # component -- not one nested in ``value=``, which hands the dropdown the
+    # update dict itself as its value and warns that it is not among the
+    # choices.
+    return "\n\n".join(lines), (
+        gr.update(value=current_vocoder) if current_vocoder else gr.update()
     )
 
 

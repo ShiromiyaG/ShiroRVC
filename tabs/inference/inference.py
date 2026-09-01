@@ -155,14 +155,37 @@ def export_presets_button(
 
 
 def import_presets_button(file_path):
-    if file_path:
-        imported_presets = import_presets(file_path.name)
-        return (
-            list(imported_presets.keys()),
-            imported_presets,
-            "Presets imported successfully!",
-        )
-    return [], {}, "No file selected for import."
+    """Copy a preset file into ``PRESETS_DIR`` and reselect it in the dropdown.
+
+    The dropdown lists the *files* in ``PRESETS_DIR`` and ``update_sliders``
+    loads the selection back as ``PRESETS_DIR/<name>.json``, so an entry that
+    was never written there cannot be loaded.  This used to return three values
+    -- names, the parsed dict and a status string -- into a single dropdown
+    output, which handed the dropdown the whole tuple as its value; and it read
+    ``file_path.name`` although the picker is ``type="filepath"`` and hands
+    over a plain string.
+    """
+    if not file_path:
+        return gr.update()
+
+    name = format_title(os.path.basename(file_path))
+    if not name.endswith(".json"):
+        name = f"{name}.json"
+    try:
+        # Parsed before copying, so an unreadable file is refused rather than
+        # landing in the folder as a preset that breaks on selection.
+        import_presets(file_path)
+    except (OSError, ValueError) as error:
+        gr.Warning(_("Could not read that preset file: {}").format(error))
+        return gr.update()
+
+    target_path = os.path.join(PRESETS_DIR, name)
+    if os.path.abspath(target_path) != os.path.abspath(file_path):
+        shutil.copyfile(file_path, target_path)
+
+    return gr.update(
+        choices=list_json_files(PRESETS_DIR), value=name.rsplit(".", 1)[0]
+    )
 
 
 def list_json_files(directory):
@@ -241,7 +264,9 @@ def extract_model_and_epoch(path):
 
 def save_to_wav(record_button):
     if record_button is None:
-        pass
+        # Clearing a recording fires this with nothing; both outputs still need
+        # a value or Gradio rejects the response for being short.
+        return gr.skip(), gr.skip()
     else:
         path_to_file = record_button
         new_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".wav"

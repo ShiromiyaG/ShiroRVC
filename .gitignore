@@ -59,9 +59,9 @@ rvc/models/pretraineds/custom
 rvc/models/predictors/fcpe.pt
 rvc/models/predictors/fcpe_ddsp.pt
 rvc/models/predictors/rmvpe.pt
+rvc/models/fireredvad/
 rvc/models/embedders/spin_v1/pytorch_model.bin
 rvc/models/embedders/spin_v2/pytorch_model.bin
 rvc/models/embedders/contentvec/pytorch_model.bin
 rvc/models/embedders/spin_v1/config.json
 rvc/models/embedders/spin_v2/config.json
-rvc/models/smartcutter/

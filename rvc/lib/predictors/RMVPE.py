@@ -398,6 +398,35 @@ class RMVPE0Predictor:
             f0 = self.decode(hidden.squeeze(0), thred=thred)
         return f0.cpu().numpy()
 
+    def infer_from_audio_batch(self, audios, thred=0.03):
+        """F0 for several clips of *identical* length, in one pass.
+
+        A 3-second clip leaves this model launching kernels over a tensor far
+        too small to fill a GPU, so the extractor spent most of its time
+        between kernels rather than in them.  Equal length is required and not
+        merely convenient: padding a batch to a common length would change the
+        mel frames, the model's own 32-frame padding and every downstream
+        decode, whereas a batch of identical shapes is the same arithmetic the
+        one-at-a-time path does, just with a leading dimension.
+
+        Decoding is per frame -- ``to_local_average_cents`` reduces over the
+        class axis alone -- so flattening the batch into the frame axis and
+        reshaping back is exact rather than an approximation.
+        """
+        audio = torch.stack(
+            [
+                a.float() if torch.is_tensor(a) else torch.from_numpy(a).float()
+                for a in audios
+            ]
+        ).to(self.device)
+        mel = self.mel_extractor(audio, center=True)
+        hidden = self.mel2hidden(mel)
+        with torch.no_grad():
+            batch, frames, classes = hidden.shape
+            f0 = self.decode(hidden.reshape(batch * frames, classes), thred=thred)
+            f0 = f0.reshape(batch, frames)
+        return f0.cpu().numpy()
+
     def to_local_average_cents(self, salience, thred=0.05):
         """Weighted-average the +/-4 bin neighbourhood around each frame's peak.
 

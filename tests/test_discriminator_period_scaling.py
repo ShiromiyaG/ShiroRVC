@@ -225,6 +225,22 @@ def test_a_checkpoint_without_the_key_is_read_as_the_un_scaled_set():
     assert_periods_match(stock, {})
 
 
+def test_an_unkeyed_checkpoint_is_read_against_this_run_s_own_version():
+    """The un-scaled set to compare against is the *version's*, not v3's.
+
+    A stock HiFi-GAN run builds ``v2``, whose eight periods are Applio's, and
+    the bundled RVC v2 pretrained discriminators are trained against exactly
+    those and carry no ``discriminator_periods`` key.  Charging them with v3's
+    five rejected every default fine-tune before it began.
+    """
+
+    for version, stock in (("v2", DISCRIMINATOR_VERSIONS["v2"][0]),
+                           ("v3", DISCRIMINATOR_VERSIONS["v3"][0])):
+        model = MPD_MSD_Combined(False, version=version)
+        assert discriminator_periods(model) == list(stock)
+        assert_periods_match(model, {}, origin="pretrained discriminator")
+
+
 def test_a_model_with_no_periods_is_not_checked():
     """The ChouwaGAN stack and any period-less variant have nothing to compare,
     and the guard must not invent a mismatch for them."""
