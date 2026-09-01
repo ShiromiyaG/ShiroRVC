@@ -1,4 +1,3 @@
-import contextlib
 import math
 
 import torch
@@ -253,8 +252,8 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
         self.discriminators = torch.nn.ModuleList(branches)
 
-    def forward(self, y, y_hat, detach_real: bool = False):
-        """``detach_real`` runs the real branch under ``no_grad``.
+    def forward(self, y, y_hat, no_grad_real: bool = False):
+        """``no_grad_real`` runs the real branch under ``no_grad``.
 
         The generator update needs the real side only as a *target*: its logits
         are thrown away and its feature maps are the constant the feature
@@ -269,22 +268,24 @@ class MPD_MSD_Combined(torch.nn.Module):
         the pass whose gradient trains ``net_d``.
         """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
-        # ``nullcontext`` and not ``enable_grad``: an outer ``no_grad`` (the
-        # validation path) must stay in force.
-        real_grad = torch.no_grad if detach_real else contextlib.nullcontext
+        checkpointing = self.training and self.use_checkpointing
         for d in self.discriminators:
-            if self.training and self.use_checkpointing:
-                with real_grad():
-                    y_d_r, fmap_r = (
-                        d(y)
-                        if detach_real
-                        else checkpoint(d, y, use_reentrant=False)
-                    )
+            # The other two arms add no context manager at all, and not
+            # ``enable_grad``: an outer ``no_grad`` (the validation path) must
+            # stay in force.
+            if no_grad_real:
+                with torch.no_grad():
+                    y_d_r, fmap_r = d(y)
+            elif checkpointing:
+                y_d_r, fmap_r = checkpoint(d, y, use_reentrant=False)
+            else:
+                y_d_r, fmap_r = d(y)
+
+            if checkpointing:
                 y_d_g, fmap_g = checkpoint(d, y_hat, use_reentrant=False)
             else:
-                with real_grad():
-                    y_d_r, fmap_r = d(y)
                 y_d_g, fmap_g = d(y_hat)
+
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
             fmap_rs.append(fmap_r)

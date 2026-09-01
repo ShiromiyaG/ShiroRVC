@@ -651,10 +651,10 @@ def test_one_boolean_per_family_turns_it_off():
     )
 
 
-def test_detach_real_leaves_the_generator_gradient_untouched():
+def test_no_grad_real_leaves_the_generator_gradient_untouched():
     """The generator update's real pass is a target, not a term to train on.
 
-    ``detach_real`` skips its graph.  What must not move is the only gradient
+    ``no_grad_real`` skips its graph.  What must not move is the only gradient
     the generator update actually consumes -- the one that reaches ``y_hat``
     through the fake branch and through the feature matching loss's fake side.
     The real feature maps enter that loss as constants either way, so the two
@@ -670,11 +670,11 @@ def test_detach_real_leaves_the_generator_gradient_untouched():
     )
     real = torch.randn(2, 1, 4096)
 
-    def wave_gradient(detach_real):
+    def wave_gradient(no_grad_real):
         fake = torch.randn(2, 1, 4096, generator=torch.Generator().manual_seed(1))
         fake.requires_grad_(True)
         _, fake_logits, real_features, fake_features = model(
-            real, fake, detach_real=detach_real
+            real, fake, no_grad_real=no_grad_real
         )
         loss = generator_loss(fake_logits) + 2.0 * feature_loss(
             real_features, fake_features
@@ -691,7 +691,7 @@ def test_detach_real_leaves_the_generator_gradient_untouched():
     assert torch.allclose(joint, detached, atol=0, rtol=0)
 
 
-def test_detach_real_builds_no_real_side_graph():
+def test_no_grad_real_builds_no_real_side_graph():
     """The point of the flag: the real logits come back as constants."""
 
     torch.manual_seed(0)
@@ -699,15 +699,37 @@ def test_detach_real_builds_no_real_side_graph():
     real = torch.randn(2, 1, 4096)
     fake = torch.randn(2, 1, 4096, requires_grad=True)
 
-    real_logits, fake_logits, real_features, _ = model(real, fake, detach_real=True)
+    real_logits, fake_logits, real_features, _ = model(real, fake, no_grad_real=True)
     assert all(not logits.requires_grad for logits in real_logits)
     assert all(not f.requires_grad for branch in real_features for f in branch)
     # The fake side is untouched -- it is what carries the generator's gradient.
     assert all(logits.requires_grad for logits in fake_logits)
 
 
+def test_no_grad_real_under_checkpointing_skips_only_the_real_branch():
+    """Checkpointing and ``no_grad_real`` are one three-way choice.
+
+    The real branch has no graph to recompute, so it must run plain rather
+    than through ``checkpoint``; the fake branch must still be checkpointed,
+    since it is the one carrying the generator's gradient.
+    """
+
+    torch.manual_seed(0)
+    model = MPD_MSD_Combined(
+        False, version="v3", periods=[5], resolutions=[], use_checkpointing=True
+    )
+    model.train()
+    real = torch.randn(2, 1, 4096)
+    fake = torch.randn(2, 1, 4096, requires_grad=True)
+
+    real_logits, fake_logits, real_features, _ = model(real, fake, no_grad_real=True)
+    assert all(not logits.requires_grad for logits in real_logits)
+    assert all(not f.requires_grad for branch in real_features for f in branch)
+    assert all(logits.requires_grad for logits in fake_logits)
+
+
 def test_forward_still_differentiates_the_real_side_by_default():
-    """The discriminator update needs exactly what ``detach_real`` removes."""
+    """The discriminator update needs exactly what ``no_grad_real`` removes."""
 
     torch.manual_seed(0)
     model = MPD_MSD_Combined(False, version="v3", periods=[5], resolutions=[])
