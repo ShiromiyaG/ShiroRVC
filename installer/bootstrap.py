@@ -232,8 +232,6 @@ class ChoicePage(QWidget):
             # the user reads is exactly where the files will go.
             self.path_edit.setText(os.path.normpath(steps.suggest_target(Path(chosen))))
 
-    # -- location validation ----------------------------------------------
-
     def _revalidate(self) -> None:
         raw = self.path_edit.text().strip()
         state, explanation = steps.inspect_target(Path(raw))
@@ -356,8 +354,6 @@ class Installer(QWidget):
         layout.setSpacing(18)
         layout.addWidget(self.stack, 1)
         layout.addLayout(buttons)
-
-    # -- flow --------------------------------------------------------------
 
     def _on_primary(self) -> None:
         page = self.stack.currentIndex()
@@ -484,13 +480,10 @@ class Installer(QWidget):
 
 
 def main() -> int:
-    # ``--self-test`` builds the wizard and exits without showing it, which is
-    # what the packaging smoke test needs.  The failure worth catching there is
-    # a frozen bundle that cannot import its own package or is missing a Qt
-    # plugin, and both happen while the window is being constructed rather than
-    # while it is on screen.  Asserting on a *visible* window instead needs an
-    # interactive window station, which a CI runner does not reliably provide:
-    # the process stays alive and its ``MainWindowTitle`` simply stays empty.
+    # ``--self-test`` builds the wizard and exits without showing it: a CI
+    # runner has no display, so this is what the packaging smoke test uses to
+    # catch a frozen bundle that cannot import its own package or is missing a
+    # Qt plugin.
     self_test = "--self-test" in sys.argv
     if self_test:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -502,8 +495,6 @@ def main() -> int:
 
     window = Installer()
     if self_test:
-        # Imported, constructed, styled and laid out.  Nothing past this point
-        # exercises the bundle -- it exercises the desktop.
         return 0
     window.show()
     return application.exec()

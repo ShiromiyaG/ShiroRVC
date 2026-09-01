@@ -90,14 +90,23 @@
             10
         ],
         "d_version": "v3",
-        "d_periods": null,
+        "d_periods": [
+            3,
+            5,
+            7,
+            11,
+            17
+        ],
         "d_resolutions": null,
         "d_frequency_strides": null,
+        "d_use_univhd": false,
         "use_spectral_norm": false,
         "gin_channels": 256,
         "spk_embed_dim": 109,
         "refinegan_start_channels": 16,
         "refinegan_leaky_relu_slope": 0.2,
+        "refinegan_source": "sine",
+        "refinegan_harmonics": 64,
         "architecture_id": "vits_gaussian_v1"
     }
 }

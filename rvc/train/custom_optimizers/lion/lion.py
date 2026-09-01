@@ -1,21 +1,11 @@
 """Lion: EvoLved Sign Momentum (Chen et al., 2023).
 
-Lion keeps one momentum buffer where Adam keeps two, and its update is the
-*sign* of an interpolation between the gradient and that buffer.  Two
-consequences matter here:
-
-* **Optimizer state halves.**  For a GAN this is the generator, the
-  discriminator and (usually) a weight EMA sharing one card, so the saving is
-  real VRAM rather than a benchmark number.
-* **Every parameter moves by exactly ``lr``.**  The update is a sign, so its
-  magnitude carries no information about the gradient's scale.  That is why
-  Lion needs a learning rate several times smaller than AdamW's -- see
-  ``LR_SCALE`` -- and a correspondingly larger weight decay to keep the
-  decay-to-step ratio where AdamW had it.
-
-The two betas do different jobs and are deliberately not the AdamW pair: the
-update is formed with ``beta1`` (0.9, a short lookahead) while the buffer is
-tracked with the slower ``beta2`` (0.99).
+The update is the *sign* of an interpolation between the gradient and the
+single momentum buffer, so every parameter moves by exactly ``lr`` regardless
+of gradient magnitude -- hence the smaller ``LR_SCALE`` and larger
+``WEIGHT_DECAY_SCALE`` below. The two betas are deliberately not the AdamW
+pair: ``beta1`` (0.9) forms the update, the slower ``beta2`` (0.99) tracks
+the buffer.
 """
 
 from __future__ import annotations
@@ -24,14 +14,13 @@ import torch
 from torch.optim.optimizer import Optimizer
 
 
-#: Lion's learning rate relative to a tuned AdamW one.  The authors report 3-10x
-#: smaller; the conservative end of that range is the right default for a GAN,
-#: where the discriminator makes a too-large generator step expensive to undo.
+#: Lion's learning rate relative to a tuned AdamW one; authors report 3-10x
+#: smaller, conservative end chosen since a too-large generator step is
+#: expensive to undo against the discriminator.
 LR_SCALE = 1.0 / 3.0
 
-#: Weight decay relative to AdamW's.  ``lr * weight_decay`` is the quantity that
-#: sets how hard weights are pulled to zero, so raising decay by the same factor
-#: the learning rate fell keeps that pull unchanged.
+#: Weight decay relative to AdamW's, scaled up by the same factor LR_SCALE
+#: scales down, so lr * weight_decay (the pull to zero) stays unchanged.
 WEIGHT_DECAY_SCALE = 3.0
 
 
@@ -89,14 +78,11 @@ class Lion(Optimizer):
                 if weight_decay != 0:
                     parameter.mul_(1 - lr * weight_decay)
 
-                # The update looks one step ahead of the buffer, which is what
-                # separates Lion from plain signSGD with momentum.
                 update = exp_avg.lerp(grad, 1 - beta1).sign_()
                 parameter.add_(update, alpha=-lr)
 
-                # The buffer itself moves on the slower beta, and is updated
-                # after the step so this iteration's gradient is not counted in
-                # the direction it just produced.
+                # Buffer updates after the step so this gradient isn't counted
+                # in the direction it just produced.
                 exp_avg.lerp_(grad, 1 - beta2)
 
         return loss

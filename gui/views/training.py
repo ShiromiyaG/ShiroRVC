@@ -153,7 +153,7 @@ class TrainingPage(Page):
         row = QHBoxLayout()
         row.setSpacing(12)
         row.addWidget(Field(_("Model name"), self.model_name, _("Creates logs/<name>/. Reuse a name to continue a run.")), 2)
-        row.addWidget(Field(_("Vocoder"), self.vocoder, _("ChouwaGAN and RefineGAN are 44.1 kHz only.")), 1)
+        row.addWidget(Field(_("Vocoder"), self.vocoder, ""), 1)
         row.addWidget(Field(_("Sample rate"), self.sample_rate, ""), 1)
         card.body.addLayout(row)
 
@@ -627,12 +627,11 @@ class TrainingPage(Page):
         )
 
     def _attach_reader(self, run_dir: str) -> None:
-        # Keep the reader when the run has not changed.  It tails the event
-        # file from where it left off, so a poll costs a millisecond; building
-        # a new one re-reads the file from the start, which on a 36 MB pretrain
-        # is half a second.  This is called on every show of this page and on
-        # every keystroke in the model name, so throwing the reader away was
-        # most of what made switching to this tab feel like a hang.
+        # Keep the reader when the run has not changed. It tails the event
+        # file from where it left off (a poll costs a millisecond); building a
+        # new one re-reads from the start, which on a 36 MB pretrain is half a
+        # second and, called on every show and every keystroke, made switching
+        # to this tab feel like a hang.
         if self._same_run(self._reader, run_dir):
             self._poll_timer.start()
             self._poll_metrics()
@@ -926,24 +925,12 @@ class TrainingPage(Page):
     def _apply_fp16_support(self, devices: list[dict]) -> None:
         """Tick FP16 when the hardware has half-precision tensor cores.
 
-        Three states, not two, because "no tensor cores" and "no GPU" are
-        different answers and only one of them makes the setting pointless:
-
-        * **No CUDA device.** Autocast has nothing to do -- disabled.
-        * **CUDA below capability 7.0** (pre-Volta). No FP16 tensor cores, so
-          none of the speed below is on offer -- but the memory saving is a
-          property of the dtype and holds anyway, and whether the step ends up
-          slower is not something measured here.  A real trade, not a dead
-          setting, so the box stays available; it is only left unticked,
-          because an unmeasured trade should not be someone's default.
-        * **CUDA at 7.0 or better.** Ticked, so a first start runs under FP16
-          without anyone finding the box.  Measured on the full step at batch 8
-          over 0.4 s: RefineGAN 5.12 -> 3.78 GiB, ChouwaGAN 4.27 -> 2.61 GiB,
-          and both get slightly *faster* rather than slower.
-
-        ``_apply_tf32_support`` above has the same shape one capability higher
-        -- TF32 units arrive at 8.0 -- but there the two-state form is right,
-        since TF32 on hardware without the units really is a no-op.
+        Three states, not two: no CUDA device disables it outright; below
+        capability 7.0 (pre-Volta) the box stays available but unticked,
+        since the memory saving still holds without the speed and an
+        unmeasured trade should not be someone's default; at 7.0 or better
+        it is ticked. Measured at batch 8: RefineGAN 5.12 -> 3.78 GiB,
+        ChouwaGAN 4.27 -> 2.61 GiB, both slightly faster too.
         """
 
         best = -1

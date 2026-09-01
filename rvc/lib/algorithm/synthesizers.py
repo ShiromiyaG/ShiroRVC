@@ -96,7 +96,7 @@ class Synthesizer(torch.nn.Module):
         vocoder_options = {**(vocoder_config or {}), **kwargs}
 
 
-        # ------   [ Decoder / Vocoder ] Reconstructs audio from latents (z)   ------------------------------------------------------
+        # [Decoder/Vocoder] reconstructs audio from latents (z)
         dec_kwargs = {
             "resblock_kernel_sizes": resblock_kernel_sizes,
             "resblock_dilation_sizes": resblock_dilation_sizes,
@@ -120,14 +120,8 @@ class Synthesizer(torch.nn.Module):
         generator_id = vocoder_spec["generator"]
         if generator_id == "hifi_nsf":
             self.dec = generators.HiFiGANNSFGenerator(**dec_kwargs)
-        elif generator_id == "chouwagan":
-            if int(sr) != 44100:
-                raise ValueError(
-                    f"{vocoder_spec['label']} only supports 44.1 kHz configurations."
-                )
-            self.dec = generators.ChouwaGANGenerator(**dec_kwargs, **decoder_config)
         elif generator_id == "refinegan":
-            # Applio's RefineGAN, unchanged.  It takes neither the ResBlock
+            # Applio's RefineGAN.  It takes neither the ResBlock
             # schedule nor the upsample kernels -- its blocks are fixed at
             # ``(3, 7, 11) x (1, 3, 5)`` and it upsamples by interpolation --
             # so ``dec_kwargs`` is filtered down to what the constructor names
@@ -136,8 +130,7 @@ class Synthesizer(torch.nn.Module):
             # Nothing in this decoder is tied to a rate: the excitation reads
             # ``sample_rate`` and the trunk is built from ``upsample_rates``,
             # whose product is the hop.  So the registry decides which rates
-            # ship, rather than a constant here -- ChouwaGAN keeps its own
-            # check because *it* really is 44.1 kHz only.
+            # ship, rather than a constant here.
             supported = tuple(int(rate) for rate in vocoder_spec["sample_rates"])
             if int(sr) not in supported:
                 raise ValueError(
@@ -157,6 +150,12 @@ class Synthesizer(torch.nn.Module):
                 ),
                 gin_channels=gin_channels,
                 checkpointing=checkpointing,
+                source_type=str(
+                    decoder_config.get("refinegan_source", "sine")
+                ),
+                source_harmonics=int(
+                    decoder_config.get("refinegan_harmonics", 64)
+                ),
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
@@ -172,8 +171,7 @@ class Synthesizer(torch.nn.Module):
         )
         info(f"Vocoder: {vocoder_spec['label']}", tag="[INIT]")
 
-
-        # ------   [ TextEncoder ] Maps extracted features to latent space (p)   ----------------------------------------------------
+        # [TextEncoder] maps extracted features to latent space (p)
         self.enc_p = TextEncoder(
             out_channels=inter_channels,
             hidden_channels=hidden_channels,
@@ -187,7 +185,7 @@ class Synthesizer(torch.nn.Module):
         )
 
 
-        # ------   [ Posterior Encoder ] Extracts latents (z) from target audio (training only)   -----------------------------------
+        # [PosteriorEncoder] extracts latents (z) from target audio (training only)
         self.enc_q = PosteriorEncoder(
             in_channels=spec_channels,
             out_channels=inter_channels,
@@ -198,7 +196,7 @@ class Synthesizer(torch.nn.Module):
             n_layers=16,
         )
 
-        # ------   [ Flow ] Reversible transformation between content priors (p) and speaker-conditioned latents (z)   --------------
+        # [Flow] reversible transform between content priors (p) and speaker-conditioned latents (z)
         self.flow = ResidualCouplingBlock(
             channels=inter_channels,
             hidden_channels=hidden_channels,
@@ -209,12 +207,10 @@ class Synthesizer(torch.nn.Module):
             gin_channels=gin_channels,
         )
 
-        # ------   [ Speaker Embedding ] Maps identity to global conditioning (g)   -------------------------------------------------
+        # [Speaker Embedding] maps identity to global conditioning (g)
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
 
-
     def _remove_weight_norm_from(self, module):
-        """Utility to remove weight normalization from a module."""
         for child in list(module.modules()):
             if hasattr(child, "parametrizations") and hasattr(
                 child.parametrizations, "weight"
@@ -227,7 +223,6 @@ class Synthesizer(torch.nn.Module):
                 pass
 
     def remove_weight_norm(self):
-        """Removes weight normalization from the model."""
         for module in [self.dec, self.flow, self.enc_q]:
             if module is not None:
                 self._remove_weight_norm_from(module)
@@ -243,7 +238,7 @@ class Synthesizer(torch.nn.Module):
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "chouwagan", "refinegan"}:
+        if self.vocoder not in {"hifi", "refinegan"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode
@@ -301,30 +296,14 @@ class Synthesizer(torch.nn.Module):
         pitchf: Optional[torch.Tensor] = None,
         pitch: Optional[torch.Tensor] = None,
     ):
-        """
-        Forward pass of the model.
-
-        Args:
-            spec (torch.Tensor): Target linear spectrogram.
-            spec_lengths (torch.Tensor): Lengths of the target spectrograms.
-            ds (torch.Tensor): Speaker embedding.
-            phone (torch.Tensor, optional): Contentvec features.
-            phone_lengths (torch.Tensor, optional): Lengths of the contentvec features.
-            pitchf (torch.Tensor, optional): Fine-grained pitch sequence.
-            pitch (torch.Tensor, optional): Quantized pitch sequence.
-        """
         g = self.emb_g(ds).unsqueeze(-1)
 
-        # Full RVC / VAE-GAN path
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
         if spec is not None:
-            # Posterior
             z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
-            # Flow
             z_p = self.flow(z, spec_mask, g=g)
 
-            # Slicing operations
             z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
             if self.use_f0:
                 pitchf_slice = slice_segments(pitchf, ids_slice, self.segment_size, 2)
@@ -349,31 +328,14 @@ class Synthesizer(torch.nn.Module):
         sid: torch.Tensor = None,
         seed: int = 0,
     ):
-        """
-        Inference of the model.
-
-        Args:
-            phone (torch.Tensor): Contentvec features.
-            phone_lengths (torch.Tensor): Lengths of the contentvec features.
-            pitch (torch.Tensor, optional): Pitch sequence.
-            nsff0 (torch.Tensor, optional): Fine-grained pitch sequence.
-            sid (torch.Tensor): Speaker embedding.
-            seed (int, optional): Seed for randomization of noise.
-
-        """
-
-        # Seed handler
         if seed != 0:
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
-        # Embedding
         g = self.emb_g(sid).unsqueeze(-1)
 
-        # TextEncoder
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
-        # Flow
         z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)
         o = self.dec(z * x_mask, nsff0, g)

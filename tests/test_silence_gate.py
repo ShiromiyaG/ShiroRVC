@@ -3,14 +3,11 @@
 Digital silence has no level as far as the content encoder is concerned: its
 first conv layer is group-normalised over the whole chunk and its transformer
 attends across all of it, so silence comes out as a full-magnitude embedding
-whose direction depends on the rest of the chunk (measured on contentvec:
-cosine 0.54 to the same silence in other company, feature norm 9.65 against
-9.92).  The decoder renders that faithfully, as hiss.  On a 288 s stem it was
--56 dBFS of noise over passages where the input was exactly 0.0.
-
-The decoder is not the thing at fault -- handed training-scope features it
-tracks level to within 3 dB down to -120 dBFS frames -- so the gate lives at
-the end of the pipeline, the last place that still knows what the input was.
+whose direction depends on the rest of the chunk, and the decoder renders that
+faithfully -- as hiss over passages where the input was exactly 0.0. The
+decoder itself is not at fault (it tracks level accurately when handed
+training-scope features), so the gate lives at the end of the pipeline, the
+last place that still knows what the input was.
 
 What these pin is the part that is easy to get wrong: a gate that also touches
 quiet-but-real audio is just ``change_rms`` with extra steps, and a gate that

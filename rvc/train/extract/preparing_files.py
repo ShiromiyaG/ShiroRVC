@@ -10,26 +10,19 @@ import soundfile as sf
 config = Config()
 current_directory = os.getcwd()
 
-#: Everything the filelist points at lives under the application root, so paths
-#: are stored relative to it.  Absolute paths bake the machine that ran the
-#: extraction into the dataset: moving ``logs/<model>/`` to another drive, to
-#: another user's install, or into a container breaks every entry, and the
-#: failure surfaces as a FileNotFoundError thousands of steps into training.
-#:
-#: Derived from this file's location rather than from ``os.getcwd()`` -- the
-#: extractor is launched as a subprocess and must not depend on where from.
+#: Filelist paths are stored relative to this root so moving `logs/<model>/`
+#: to another drive/install/container doesn't break every entry. Derived from
+#: this file's location, not `os.getcwd()`, since the extractor runs as a
+#: subprocess and must not depend on the caller's cwd.
 APPLICATION_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
 
 def relative_to_root(path: str) -> str:
-    """Path relative to the application root, with forward slashes.
-
-    POSIX separators are written even on Windows: ``open()`` accepts them on
-    both platforms, and it makes a preprocessed ``logs/`` directory portable
-    between them.  A path outside the root is returned unchanged -- better an
-    absolute entry than a ``../../..`` chain that assumes a layout.
+    """Path relative to the application root, with forward slashes (portable
+    between Windows and POSIX; `open()` accepts either). A path outside the
+    root is returned unchanged (absolute) rather than as a `../../..` chain.
     """
     absolute = os.path.abspath(path)
     try:
@@ -98,22 +91,11 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
         info(f"Config saved at {config_save_path}", tag="[EXTRACT]")
         return
 
-    # Keeping the experiment's own config is the point -- it carries whatever
-    # was tuned for this run -- but it must not outlive the architecture it was
-    # written for.  ``train.py`` forces the architecture id to the current one
-    # and fills in only the keys that are *absent*, so a stale config survives
-    # every shape-defining value it happens to name: an id saying v3 over a
-    # latent still built to v2's width, with no error anywhere.  That is the
-    # silent half-migration this guard exists to prevent.
-    #
-    # A *missing* id counts as stale, not as "nothing to check".  The guard used
-    # to require both sides to name an id, which made it blind to exactly the
-    # case that motivates it: the 2026-08-26 ChouwaGAN -> RefineGAN change
-    # renamed the key itself, so every config written before it reads ``None``
-    # here.  Such a config would have been kept, and since ``train.py`` only
-    # fills in *absent* keys, the run would have silently lost every option
-    # whose name changed -- frame conditioning among them -- while looking
-    # perfectly ordinary in the log.
+    # Keep the experiment's own config (it carries whatever was tuned), but
+    # replace it if its architecture_id doesn't match the shipped config's --
+    # otherwise train.py only fills in absent keys, so a stale config could
+    # silently keep a v2-width latent under a v3 id. A missing id also counts
+    # as stale, since an id-less config predates the id existing.
     def _architecture(path, default=None):
         try:
             with open(path, encoding="utf-8") as handle:
@@ -224,7 +206,6 @@ def generate_filelist(
         mute_f0_path = os.path.join(mute_base_path, "f0", "mute.wav.npy")
         mute_f0nsf_path = os.path.join(mute_base_path, "f0_voiced", "mute.wav.npy")
 
-        # adding x files per sid
         mute_entry = "|".join(
             (
                 relative_to_root(mute_audio_path),

@@ -1,3 +1,6 @@
+import contextlib
+import math
+
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -41,6 +44,83 @@ from rvc.lib.algorithm.residuals import LRELU_SLOPE
 #: period, and only the 512-point branch's 50-sample hop (1.1 ms) resolves it;
 #: 4096/480 gives 10.9 ms per frame, which aliases the modulation to DC.  The
 #: fine-hop branch is the one that must not be touched.
+#: The rate HiFi-GAN's period set was designed at, and the reference every
+#: entry in ``PERIODS_BY_RATE`` is derived from.
+REFERENCE_SAMPLE_RATE = 22050
+
+
+def rate_scaled_periods(periods, sample_rate, reference_rate=REFERENCE_SAMPLE_RATE):
+    """The period set that keeps HiFi-GAN's *time scales* at another rate.
+
+    A period-``p`` branch folds the waveform onto a grid whose row rate is
+    ``sr / p``, so both things a period means -- the frequency it folds at
+    (``sr / p`` Hz) and the span its receptive field covers (647 rows, i.e.
+    ``647 * p / sr`` seconds) -- are invariant only if ``p`` scales *with* the
+    sample rate.  ``[2, 3, 5, 7, 11]`` was chosen at 22.05 kHz and has been
+    carried to every rate since unchanged, which quietly moves the whole set up
+    an octave at 44.1 kHz:
+
+        p    22.05 kHz              44.1 kHz
+        2    11025 Hz /  58.7 ms    22050 Hz /  29.3 ms
+        3     7350 Hz /  88.0 ms    14700 Hz /  44.0 ms
+        5     4410 Hz / 146.7 ms     8820 Hz /  73.4 ms
+        7     3150 Hz / 205.4 ms     6300 Hz / 102.7 ms
+        11    2005 Hz / 322.8 ms     4009 Hz / 161.4 ms
+
+    The set does not get *worse* at the top -- it gets emptier at the bottom.
+    Nothing is left looking at a span longer than 161 ms, which is where pitch
+    and its slow structure live, and that is the half of the range a converter
+    for singing can least afford to drop.
+
+    The scaled targets are not prime, and the periods have to stay pairwise
+    coprime or two branches fold onto overlapping sample subsets and become one
+    branch with twice the cost.  So each target is rounded to the nearest unused
+    prime *in log space*, which is the right metric because the quantity being
+    preserved is a ratio.  The worst residual is +25% (period 5 at 44.1 kHz
+    against a target of 4).
+
+    ``reference_rate`` returns the input unchanged, which is the property that
+    makes this readable as a derivation rather than as a new design.
+    """
+
+    def is_prime(value):
+        return value > 1 and all(value % f for f in range(2, int(value**0.5) + 1))
+
+    candidates = [value for value in range(2, 512) if is_prime(value)]
+    used, scaled = set(), []
+    for period in periods:
+        target = int(period) * float(sample_rate) / float(reference_rate)
+        best = min(
+            (value for value in candidates if value not in used),
+            key=lambda value: abs(math.log(value / target)),
+        )
+        used.add(best)
+        scaled.append(best)
+    return tuple(sorted(scaled))
+
+
+#: ``rate_scaled_periods(v3's periods, rate)``, frozen.
+#:
+#: The values live in ``rvc/configs/refinegan/*.json`` as explicit ``d_periods``
+#: rather than being applied here when ``d_periods`` is ``None``, and that is
+#: deliberate: an experiment keeps its own ``config.json``, so writing the
+#: numbers into the shipped configs changes only *new* experiments while a run
+#: in flight keeps the set its discriminator was trained with.  Applying it
+#: from code would have changed every existing run's periods on the next
+#: resume -- and silently, because a period never appears in a parameter shape
+#: (``DiscriminatorP``'s kernels are ``(k, 1)`` whatever ``p`` is), so five old
+#: branches load cleanly into five new ones.  ``assert_periods_match`` in
+#: ``rvc/train/utils.py`` is what closes that door for the future.
+#:
+#: This table is the reviewed artefact and the configs must agree with it; the
+#: tests pin both directions.  HiFi-GAN's ``v2`` is deliberately not in here:
+#: its eight periods are Applio's, its pretrains are trained against them, and
+#: the parity is worth more than the alignment.
+PERIODS_BY_RATE = {
+    32000: (3, 5, 7, 11, 17),
+    44100: (5, 7, 11, 13, 23),
+}
+
 DISCRIMINATOR_VERSIONS = {
     "v1": ([2, 3, 5, 7, 11, 17], [], (1, 1, 1)),
     "v2": ([2, 3, 5, 7, 11, 17, 23, 37], [], (1, 1, 1)),
@@ -58,18 +138,7 @@ DISCRIMINATOR_VERSIONS = {
 
 
 class MPD_MSD_Combined(torch.nn.Module):
-    """
-    Multi-period and Multi-scale discriminators combined.
-
-    This class implements a multi-period discriminator, which is used to
-    discriminate between real and fake audio signals. The discriminator
-    is composed of a series of convolutional layers that are applied to
-    the input signal at different periods.
-
-    Args:
-        use_spectral_norm (bool): Whether to use spectral normalization.
-            Defaults to False.
-    """
+    """Multi-period, multi-scale (and optionally multi-resolution / UnivHD) discriminators combined."""
 
     def __init__(
         self,
@@ -80,6 +149,15 @@ class MPD_MSD_Combined(torch.nn.Module):
         resolutions=None,
         frequency_strides=None,
         use_msd: bool = True,
+        sample_rate: int = 44100,
+        use_univhd: bool = False,
+        univhd_n_fft: int = 2048,
+        univhd_hop_length: int = 256,
+        univhd_harmonics: int = 10,
+        univhd_bins_per_octave: int = 24,
+        univhd_f_min: float = 80.0,
+        univhd_channels: int = 32,
+        univhd_half_harmonic: bool = True,
     ):
         """``version`` picks a preset; the four overrides edit it branch by branch.
 
@@ -92,6 +170,20 @@ class MPD_MSD_Combined(torch.nn.Module):
 
         ``None`` means "whatever the version says"; an empty list means "none of
         this family", which is the distinction a falsy check would lose.
+
+        ``use_univhd`` appends the harmonic branch (arXiv 2512.03486), off by
+        default and additive by design.  Measured on an RTX 5060 against ``v3``,
+        batch 8 over 0.4 s, both discriminator passes forward and backward:
+        317 ms / 3468 MiB becomes 346 ms / 3801 MiB, i.e. +9% on each for
+        +0.33 M parameters.  That is the number that makes it an addition
+        rather than a trade -- a period branch is ~11 M.  It is a flag and not
+        a ``d_version`` because the paper's own best configuration is MS-STFT
+        *plus* UnivHD; nothing here is meant to come out for it.  It is the one
+        branch here that needs ``sample_rate``: its filterbank is laid out in
+        Hz, and its ``f_max`` is ``sample_rate / (2 * harmonics)``.  Every other
+        branch reads samples and periods and is rate-agnostic, which is why the
+        argument did not exist until now and why it defaults rather than being
+        required.
         """
 
         super().__init__()
@@ -120,6 +212,8 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.resolutions = tuple(tuple(int(v) for v in r) for r in resolutions)
         self.frequency_strides = tuple(int(s) for s in frequency_strides)
         self.use_msd = bool(use_msd)
+        self.use_univhd = bool(use_univhd)
+        self.sample_rate = int(sample_rate)
         self.use_checkpointing = use_checkpointing
         branches = []
         if self.use_msd:
@@ -136,6 +230,22 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
             for r in self.resolutions
         ]
+        if self.use_univhd:
+            from rvc.lib.algorithm.discriminators.single import UnivHDDiscriminator
+
+            branches.append(
+                UnivHDDiscriminator(
+                    sample_rate=self.sample_rate,
+                    n_fft=int(univhd_n_fft),
+                    hop_length=int(univhd_hop_length),
+                    harmonics=int(univhd_harmonics),
+                    bins_per_octave=int(univhd_bins_per_octave),
+                    f_min=float(univhd_f_min),
+                    channels=int(univhd_channels),
+                    half_harmonic=bool(univhd_half_harmonic),
+                    use_spectral_norm=use_spectral_norm,
+                )
+            )
         if not branches:
             raise ValueError(
                 "A discriminator needs at least one branch; the scale branch, "
@@ -143,14 +253,37 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
         self.discriminators = torch.nn.ModuleList(branches)
 
-    def forward(self, y, y_hat):
+    def forward(self, y, y_hat, detach_real: bool = False):
+        """``detach_real`` runs the real branch under ``no_grad``.
+
+        The generator update needs the real side only as a *target*: its logits
+        are thrown away and its feature maps are the constant the feature
+        matching loss measures against.  Left differentiable it still builds a
+        full activation graph, and the feature loss then backwards through it
+        into discriminator weights whose gradients are zeroed before they are
+        ever stepped -- the generator update runs after the discriminator's,
+        and ``optim_d.zero_grad`` brackets it on both sides.  So the whole real
+        backward is work with no consumer.
+
+        Off by default because the discriminator update *does* need it: that is
+        the pass whose gradient trains ``net_d``.
+        """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+        # ``nullcontext`` and not ``enable_grad``: an outer ``no_grad`` (the
+        # validation path) must stay in force.
+        real_grad = torch.no_grad if detach_real else contextlib.nullcontext
         for d in self.discriminators:
             if self.training and self.use_checkpointing:
-                y_d_r, fmap_r = checkpoint(d, y, use_reentrant=False)
+                with real_grad():
+                    y_d_r, fmap_r = (
+                        d(y)
+                        if detach_real
+                        else checkpoint(d, y, use_reentrant=False)
+                    )
                 y_d_g, fmap_g = checkpoint(d, y_hat, use_reentrant=False)
             else:
-                y_d_r, fmap_r = d(y)
+                with real_grad():
+                    y_d_r, fmap_r = d(y)
                 y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
@@ -161,13 +294,7 @@ class MPD_MSD_Combined(torch.nn.Module):
 
 
 class DiscriminatorS(torch.nn.Module):
-    """
-    Discriminator for the short-term component.
-
-    This class implements a discriminator for the short-term component
-    of the audio signal. The discriminator is composed of a series of
-    convolutional layers that are applied to the input signal.
-    """
+    """Multi-scale discriminator branch, operating directly on the waveform."""
 
     def __init__(self, use_spectral_norm: bool = False):
         super().__init__()
@@ -198,20 +325,7 @@ class DiscriminatorS(torch.nn.Module):
 
 
 class DiscriminatorP(torch.nn.Module):
-    """
-    Discriminator for the long-term component.
-
-    This class implements a discriminator for the long-term component
-    of the audio signal. The discriminator is composed of a series of
-    convolutional layers that are applied to the input signal at a given
-    period.
-
-    Args:
-        period (int): Period of the discriminator.
-        kernel_size (int): Kernel size of the convolutional layers. Defaults to 5.
-        stride (int): Stride of the convolutional layers. Defaults to 3.
-        use_spectral_norm (bool): Whether to use spectral normalization. Defaults to False.
-    """
+    """Multi-period discriminator branch: reshapes the waveform onto a period-`p` grid."""
 
     def __init__(
         self,

@@ -498,12 +498,10 @@ class MainWindow(QMainWindow):
         """Attach or drop card shadows, according to the theme.
 
         Measured: 25 shadowed cards take a full-window repaint from 7.8 ms to
-        24.5 ms -- 3.1x -- because a graphics effect forces its widget through
-        an offscreen buffer every time.  On the light theme that buys visible
-        elevation and is worth it.  On the dark one a black shadow against a
-        near-black background is invisible, so it is pure cost; depth there
-        comes from the card's gradient sitting lighter than the window, which
-        is free.
+        24.5 ms, since a graphics effect forces its widget through an
+        offscreen buffer every time. Worth it on the light theme; on the dark
+        one a black shadow against near-black is invisible, so it is pure
+        cost -- depth there comes free from the card's gradient instead.
         """
         light = self._mode != "dark"
         for card in self.findChildren(QWidget, "Card"):
@@ -539,15 +537,13 @@ class MainWindow(QMainWindow):
         self.sidebar.set_translucent(translucent)
         self.status.set_translucent(translucent)
 
-        # The order is not symmetric, and the repaint is deliberately
-        # synchronous.  Dropping the extended frame while the window is still
-        # painted transparent leaves the compositor a frame with nothing to
-        # composite, and it fills that with black -- a flash that is obvious on
-        # the light theme.  So going out, paint the opaque fill first and tell
-        # the DWM after; going in, extend the frame before anything becomes
-        # transparent.  Re-applied on theme changes too: the DWM attributes do
-        # not survive every window state transition, and the backdrop has a
-        # light and a dark rendition that follows the title bar's.
+        # Order matters and the repaint is deliberately synchronous: dropping
+        # the extended frame while still painted transparent leaves the
+        # compositor nothing to composite, and it fills that with black -- an
+        # obvious flash on the light theme. So going out, paint the opaque
+        # fill first and tell the DWM after; going in, extend the frame first.
+        # Re-applied on theme changes too, since DWM attributes do not survive
+        # every window state transition.
         if translucent:
             native.apply_backdrop(self, self._backdrop)
             self.repaint()
@@ -586,10 +582,9 @@ class MainWindow(QMainWindow):
     def _cycle_language(self) -> None:
         """Step to the next shipped language and offer to apply it now.
 
-        The choice is written immediately, the way the theme is: it is a
-        deliberate decision, and losing it to a crash is a small betrayal.  It
-        is stored as an explicit tag rather than as "system", so switching
-        Windows to another language later will not silently undo it.
+        Written immediately, like the theme, rather than at close, and stored
+        as an explicit tag rather than as "system" so switching Windows to
+        another language later will not silently undo it.
         """
         codes = list(i18n.LANGUAGES)
         current = i18n.current_language()

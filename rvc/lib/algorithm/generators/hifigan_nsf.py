@@ -27,12 +27,6 @@ class SineGenerator(torch.nn.Module):
         self.waveform_dim = self.num_harmonics + 1  # fundamental + harmonics
 
     def _compute_voiced_unvoiced(self, f0: torch.Tensor):
-        """
-        Generates a binary mask indicating voiced/unvoiced frames based on the fundamental frequency.
-
-        Args:
-            f0 (torch.Tensor): Fundamental frequency tensor of shape (batch_size, length).
-        """
         uv_mask = (f0 > self.voiced_threshold).float()
         return uv_mask
 
@@ -40,12 +34,10 @@ class SineGenerator(torch.nn.Module):
 
         batch_size, length, _ = f0.shape
 
-        # Create an upsampling grid
         upsampling_grid = torch.arange(
             1, upsampling_factor + 1, dtype=f0.dtype, device=f0.device
         )
 
-        # Calculate phase increments
         phase_increments = (f0 / self.sampling_rate) * upsampling_grid
         phase_remainder = torch.fmod(phase_increments[:, :-1, -1:] + 0.5, 1.0) - 0.5
         cumulative_phase = phase_remainder.cumsum(dim=1).fmod(1.0).to(f0.dtype)
@@ -53,21 +45,31 @@ class SineGenerator(torch.nn.Module):
             cumulative_phase, (0, 0, 1, 0), mode="constant"
         )
 
-        # Reshape to match the sine wave shape
         phase_increments = phase_increments.reshape(batch_size, -1, 1)
 
-        # Scale for harmonics
-        harmonic_scale = torch.arange(
-            1, self.waveform_dim + 1, dtype=f0.dtype, device=f0.device
-        ).reshape(1, 1, -1)
-        phase_increments *= harmonic_scale
+        # Both of these are provably the identity when there are no overtones,
+        # which is the only way this module is ever built: ``SourceModuleHnNSF``
+        # is constructed with ``harmonic_num=0``, so ``waveform_dim`` is 1,
+        # ``harmonic_scale`` is exactly ``[1.0]`` and ``random_phase`` is
+        # exactly ``[0.0]`` -- its one element is the fundamental, which the
+        # next line zeroes.  Skipping them drops two full-tensor elementwise
+        # kernels over the output-rate tensor plus an RNG draw, per forward.
+        # The deterministic part of the output is bit-identical -- verified
+        # against the previous revision with the noise neutralised.  The output
+        # as a whole is not, and cannot be: dropping the ``torch.rand`` draw
+        # shifts the RNG stream, so the additive noise differs by ~1e-4.  That
+        # is a reseed, not a change of behaviour.  Kept behind the branch rather
+        # than deleted so raising ``harmonic_num`` still works.
+        if self.waveform_dim > 1:
+            harmonic_scale = torch.arange(
+                1, self.waveform_dim + 1, dtype=f0.dtype, device=f0.device
+            ).reshape(1, 1, -1)
+            phase_increments *= harmonic_scale
 
-        # Add random phase offset (except for the fundamental)
-        random_phase = torch.rand(1, 1, self.waveform_dim, device=f0.device)
-        random_phase[..., 0] = 0  # Fundamental frequency has no random offset
-        phase_increments += random_phase
+            random_phase = torch.rand(1, 1, self.waveform_dim, device=f0.device)
+            random_phase[..., 0] = 0  # fundamental has no random offset
+            phase_increments += random_phase
 
-        # Generate sine waves
         sine_waves = torch.sin(2 * np.pi * phase_increments)
         return sine_waves
 
@@ -84,52 +86,33 @@ class SineGenerator(torch.nn.Module):
         # ``BandLimitedNSFSource.prepare`` states it the same way with its own
         # ``f0.float()``.
         with torch.autocast(device_type=f0.device.type, enabled=False), torch.no_grad():
-            # Expand `f0` to include waveform dimensions
             f0 = f0.float().unsqueeze(-1)
 
-            # Generate sine waves
             sine_waves = (
                 self._generate_sine_wave(f0, upsampling_factor) * self.sine_amplitude
             )
 
-            # Compute voiced/unvoiced mask
             voiced_mask = self._compute_voiced_unvoiced(f0)
 
-            # Upsample voiced/unvoiced mask
             voiced_mask = torch.nn.functional.interpolate(
                 voiced_mask.transpose(2, 1),
                 scale_factor=float(upsampling_factor),
                 mode="nearest",
             ).transpose(2, 1)
 
-            # Compute noise amplitude
             noise_amplitude = voiced_mask * self.noise_stddev + (1 - voiced_mask) * (
                 self.sine_amplitude / 3
             )
 
-            # Add Gaussian noise
             noise = noise_amplitude * torch.randn_like(sine_waves)
 
-            # Combine sine waves and noise
             sine_waveforms = sine_waves * voiced_mask + noise
 
         return sine_waveforms, voiced_mask, noise
 
 
 class SourceModuleHnNSF(torch.nn.Module):
-    """
-    Source Module for generating harmonic and noise components for audio synthesis.
-
-    This module generates a harmonic source signal using sine waves and adds
-    optional noise. It's often used in neural vocoders as a source of excitation.
-
-    Args:
-        sample_rate (int): Sampling rate of the audio in Hz.
-        harmonic_num (int, optional): Number of harmonic overtones to generate above the fundamental frequency (F0). Defaults to 0.
-        sine_amp (float, optional): Amplitude of the sine wave components. Defaults to 0.1.
-        add_noise_std (float, optional): Standard deviation of the additive white Gaussian noise. Defaults to 0.003.
-        voiced_threshod (float, optional): Threshold for the fundamental frequency (F0) to determine if a frame is voiced. If F0 is below this threshold, it's considered unvoiced. Defaults to 0.
-    """
+    """Harmonic-plus-noise excitation source used by neural vocoders."""
 
     def __init__(
         self,
@@ -158,24 +141,7 @@ class SourceModuleHnNSF(torch.nn.Module):
 
 
 class HiFiGANNSFGenerator(torch.nn.Module):
-    """
-    Generator module based on the Neural Source Filter (NSF) architecture.
-
-    This generator synthesizes audio by first generating a source excitation signal
-    (harmonic and noise) and then filtering it through a series of upsampling and
-    residual blocks. Global conditioning can be applied to influence the generation.
-
-    Args:
-        initial_channel (int): Number of input channels to the initial convolutional layer.
-        resblock_kernel_sizes (list): List of kernel sizes for the residual blocks.
-        resblock_dilation_sizes (list): List of lists of dilation rates for the residual blocks, corresponding to each kernel size.
-        upsample_rates (list): List of upsampling factors for each upsampling layer.
-        upsample_initial_channel (int): Number of output channels from the initial convolutional layer, which is also the input to the first upsampling layer.
-        upsample_kernel_sizes (list): List of kernel sizes for the transposed convolutional layers used for upsampling.
-        gin_channels (int): Number of input channels for the global conditioning. If 0, no global conditioning is used.
-        sr (int): Sampling rate of the audio.
-        checkpointing (bool, optional): Whether to use gradient checkpointing to save memory during training. Defaults to False.
-    """
+    """NSF-HiFiGAN: filters a harmonic+noise excitation source through upsampling/residual blocks."""
 
     def __init__(
         self,
@@ -194,7 +160,11 @@ class HiFiGANNSFGenerator(torch.nn.Module):
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.checkpointing = checkpointing
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=math.prod(upsample_rates))
+        # ``f0_upsamp`` used to live here.  It was never called: ``SineGenerator``
+        # takes the upsampling factor as an argument and expands f0 itself.
+        # ``nn.Upsample`` holds no parameters and no buffers, so dropping it
+        # leaves the state dict byte-identical and every RVC v2 pretrain loads
+        # exactly as before.
         self.m_source = SourceModuleHnNSF(sample_rate=sr, harmonic_num=0)
 
         self.conv_pre = torch.nn.Conv1d(
@@ -214,9 +184,7 @@ class HiFiGANNSFGenerator(torch.nn.Module):
         ]
 
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
-            # handling odd upsampling rates
             if u % 2 == 0:
-                # old method
                 padding = (k - u) // 2
             else:
                 padding = u // 2 + u % 2
@@ -233,17 +201,6 @@ class HiFiGANNSFGenerator(torch.nn.Module):
                     )
                 )
             )
-            """ handling odd upsampling rates
-            #  s   k   p
-            # 40  80  20
-            # 32  64  16
-            #  4   8   2
-            #  2   3   1
-            # 63 125  31
-            #  9  17   4
-            #  3   5   1
-            #  1   1   0
-            """
             stride = stride_f0s[i]
             kernel = 1 if stride == 1 else stride * 2 - stride % 2
             padding = 0 if stride == 1 else (kernel - stride) // 2
@@ -279,30 +236,31 @@ class HiFiGANNSFGenerator(torch.nn.Module):
     ):
         har_source, _, _ = self.m_source(f0, self.upp)
         har_source = har_source.transpose(1, 2)
-        # new tensor
         x = self.conv_pre(x)
 
         if g is not None:
             x = x + self.cond(g)
 
         for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
+            # Slice the stage's blocks out once.  This used to walk all
+            # ``num_upsamples * num_kernels`` blocks per stage and filter with
+            # ``j in range(...)``, so 48 Python iterations did the work of 12.
+            # Same blocks, same order.
+            stage_resblocks = self.resblocks[
+                i * self.num_kernels : (i + 1) * self.num_kernels
+            ]
             x = torch.nn.functional.leaky_relu(x, self.lrelu_slope)
 
-            # Apply upsampling layer
             if self.training and self.checkpointing:
                 x = checkpoint(ups, x, use_reentrant=False)
                 x = x + noise_convs(har_source)
                 xs = sum([
                     checkpoint(resblock, x, use_reentrant=False)
-                    for j, resblock in enumerate(self.resblocks)
-                    if j in range(i * self.num_kernels, (i + 1) * self.num_kernels)])
+                    for resblock in stage_resblocks])
             else:
                 x = ups(x)
                 x = x + noise_convs(har_source)
-                xs = sum([
-                    resblock(x)
-                    for j, resblock in enumerate(self.resblocks)
-                    if j in range(i * self.num_kernels, (i + 1) * self.num_kernels)])
+                xs = sum([resblock(x) for resblock in stage_resblocks])
             x = xs / self.num_kernels
 
         x = torch.nn.functional.leaky_relu(x)

@@ -41,10 +41,6 @@ bh, ah = signal.butter(
 
 
 class AudioProcessor:
-    """
-    A class for processing audio signals, specifically for adjusting RMS levels.
-    """
-
     @staticmethod
     def gate_to_source(
         source_audio: np.ndarray,
@@ -58,31 +54,20 @@ class AudioProcessor:
     ):
         """Silence the output wherever the *input* carries nothing.
 
-        The content encoder has no absolute notion of level.  Its first conv
-        layer is group-normalised over the whole chunk and its transformer
-        attends across all of it, so digital silence does not come out as a
-        "nothing" vector: it gets a full-magnitude embedding whose direction
-        depends on whatever else is in the chunk.  Measured on contentvec, the
-        same silence embeds at cosine 0.54 to itself depending on the company it
-        keeps, at a feature norm of 9.65 against 9.92 -- and the decoder then
-        renders that faithfully, as broadband hiss.  On a 288 s stem this put
-        -56 dBFS of noise over passages where the input was exactly 0.0, and
-        only over the chunks that also contained singing: chunks that were
-        entirely silent came out at -107 dBFS.
+        The content encoder has no absolute notion of level: digital silence
+        gets a full-magnitude embedding whose direction depends on whatever else
+        is in the chunk (measured on contentvec: cosine 0.54 to itself, feature
+        norm 9.65 vs 9.92 depending on context), and the decoder renders that
+        faithfully as broadband hiss -- -56 dBFS of noise over passages the
+        input said were exactly 0.0. Fixed here, at the one place that still
+        knows what the input actually was, rather than in the decoder.
 
-        The decoder is not what is wrong.  Handed the features the *training*
-        extraction produces, it tracks level to within 3 dB down to -120 dBFS
-        frames.  So the fix belongs here, at the one place that still knows what
-        the input actually was.
-
-        Keyed on the input rather than the output, because that is the only
-        signal that knows the difference between silence and a quiet passage the
-        model rendered well.  Below ``threshold_db`` the gain fades to zero over
-        ``knee_db``; ``hold_ms`` keeps the gate open across short dips so a word
-        does not lose its tail, and ``release_ms`` closes it smoothly, since a
-        step in the gain is a click.  Nothing above the knee is touched at all,
-        which is what separates this from ``change_rms``: quiet-but-real audio
-        keeps whatever dynamics the model gave it.
+        Keyed on the input rather than the output, since only the input can
+        distinguish silence from a quiet passage the model rendered well. Below
+        threshold_db the gain fades to zero over knee_db; hold_ms keeps the gate
+        open across short dips so a word does not lose its tail; release_ms
+        closes it smoothly (an instant gain step would click). Nothing above the
+        knee is touched, unlike change_rms.
         """
         if threshold_db is None or not np.isfinite(threshold_db):
             return target_audio
@@ -138,17 +123,7 @@ class AudioProcessor:
         target_rate: int,
         rate: float,
     ):
-        """
-        Adjust the RMS level of target_audio to match the RMS of source_audio, with a given blending rate.
-
-        Args:
-            source_audio: The source audio signal as a NumPy array.
-            source_rate: The sampling rate of the source audio.
-            target_audio: The target audio signal to adjust.
-            target_rate: The sampling rate of the target audio.
-            rate: The blending rate between the source and target RMS levels.
-        """
-        # Calculate RMS of both audio data
+        """Blend target_audio's RMS toward source_audio's, weighted by rate."""
         rms1 = librosa.feature.rms(
             y=source_audio,
             frame_length=source_rate // 2 * 2,
@@ -160,7 +135,6 @@ class AudioProcessor:
             hop_length=target_rate // 2,
         )
 
-        # Interpolate RMS to match target audio length
         rms1 = F.interpolate(
             torch.from_numpy(rms1).float().unsqueeze(0),
             size=target_audio.shape[0],
@@ -173,7 +147,6 @@ class AudioProcessor:
         ).squeeze()
         rms2 = torch.maximum(rms2, torch.zeros_like(rms2) + 1e-6)
 
-        # Adjust target audio RMS based on the source audio RMS
         adjusted_audio = (
             target_audio
             * (torch.pow(rms1, 1 - rate) * torch.pow(rms2, rate - 1)).numpy()
@@ -182,14 +155,9 @@ class AudioProcessor:
 
 
 class Autotune:
-    """
-    A class for applying autotune to a given fundamental frequency (F0) contour.
-    """
+    """Snaps an F0 contour toward the nearest chromatic note."""
 
     def __init__(self):
-        """
-        Initializes the Autotune class with a set of reference frequencies.
-        """
         self.note_dict = [
             49.00,  # G1
             51.91,  # G#1 / Ab1
@@ -248,12 +216,6 @@ class Autotune:
         ]
 
     def autotune_f0(self, f0, f0_autotune_strength):
-        """
-        Autotunes a given F0 contour by snapping each frequency to the closest reference frequency.
-
-        Args:
-            f0: The input F0 contour as a NumPy array.
-        """
         autotuned_f0 = np.zeros_like(f0)
         for i, freq in enumerate(f0):
             closest_note = min(self.note_dict, key=lambda x: abs(x - freq))
@@ -262,19 +224,9 @@ class Autotune:
 
 
 class Pipeline:
-    """
-    The main pipeline class for performing voice conversion, including preprocessing, F0 estimation,
-    voice conversion using a model, and post-processing.
-    """
+    """Preprocessing, F0 estimation, model inference and post-processing for one conversion."""
 
     def __init__(self, tgt_sr, config):
-        """
-        Initializes the Pipeline class with target sampling rate and configuration parameters.
-
-        Args:
-            tgt_sr: The target sampling rate for the output audio.
-            config: A configuration object containing various parameters for the pipeline.
-        """
         self.x_pad = config.x_pad
         self.x_query = config.x_query
         self.x_center = config.x_center
@@ -301,15 +253,8 @@ class Pipeline:
         self._retriever_cache = {}
 
     def _get_f0_model(self, f0_method: str):
-        """
-        Returns the F0 predictor for the given method, loading it on first use.
-
-        The predictors are stateless between calls, so a single instance is kept
-        alive for the lifetime of the pipeline instead of reading the checkpoint
-        from disk and re-uploading it to the GPU for every audio file.
-
-        Args:
-            f0_method (str): One of "crepe", "crepe-tiny", "rmvpe", "fcpe".
+        """Loads the predictor for f0_method on first use and reuses it after,
+        instead of re-uploading the checkpoint to the GPU per audio file.
         """
         model = self._f0_models.get(f0_method)
         if model is not None:
@@ -334,9 +279,6 @@ class Pipeline:
         return model
 
     def unload_f0_models(self):
-        """
-        Drops the cached F0 predictors and frees their GPU memory.
-        """
         self._f0_models.clear()
         gc.collect()
         if torch.cuda.is_available():
@@ -353,19 +295,6 @@ class Pipeline:
         f0_autotune_strength: float = 1.0,
         inp_f0=None,
     ):
-        """
-        Estimates the fundamental frequency (F0) of a given audio signal using various methods.
-
-        Args:
-            input_audio_path: Path to the input audio file.
-            x: The input audio signal as a NumPy array.
-            p_len: Desired length of the F0 output.
-            pitch: Key to adjust the pitch of the F0 contour.
-            f0_method: Method to use for F0 estimation (e.g., "crepe").
-            filter_radius: Radius for median filtering the F0 contour.
-            f0_autotune: Whether to apply autotune to the F0 contour.
-            inp_f0: Optional input F0 contour to use instead of estimating.
-        """
         model = self._get_f0_model(f0_method)
         if f0_method == "crepe":
             f0 = model.get_f0(x, self.f0_min, self.f0_max, p_len, "full")
@@ -375,13 +304,11 @@ class Pipeline:
             f0 = model.get_f0(x, filter_radius=0.03)
         elif f0_method == "fcpe":
             f0 = model.get_f0(x, p_len, filter_radius=0.006, test_time_augmentation=True)
-        # f0 adjustments
         if f0_autotune is True:
             f0 = self.autotune.autotune_f0(f0, f0_autotune_strength)
         else:
             f0 *= pow(2, pitch / 12)
 
-        # Apply user-edited F0 if provided
         if inp_f0 is not None:
             replace_hz = inp_f0[:, 1].astype(np.float32)
             replace_hz_shifted = replace_hz * pow(2, pitch / 12)
@@ -390,7 +317,7 @@ class Pipeline:
             voiced = replace_hz[:n] > 0
             f0[offset : offset + n][voiced] = replace_hz_shifted[:n][voiced]
 
-        # quantizing f0 to 255 buckets to make coarse f0
+        # Quantize f0 to 255 buckets for the coarse pitch embedding.
         f0bak = f0.copy()
         f0_mel = 1127 * np.log(1 + f0 / 700)
         f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * 254 / (
@@ -418,29 +345,9 @@ class Pipeline:
         retrieval_config=None,
         do_normalize=False,
     ):
-        """
-        Performs voice conversion on a given audio segment.
-
-        Args:
-            model: The feature extractor model.
-            net_g: The generative model for synthesizing speech.
-            sid: Speaker ID for the target voice.
-            audio0: The input audio segment.
-            pitch: Quantized F0 contour for pitch guidance.
-            pitchf: Original F0 contour for pitch guidance.
-            retriever: IndexRetriever for speaker embedding retrieval, or None.
-            index_rate: Blending rate for speaker embedding retrieval.
-            version: Model version (Keep to support old models).
-            protect: Protection level for preserving the original pitch.
-            seed: Seed for randomization of noise.
-            retrieval_config: Neighbour count, weighting and continuity for the retrieval.
-            do_normalize: Whether the embedder wants its input layer-normalised.
-        """
-
         with torch.no_grad():
             pitch_guidance = pitch != None and pitchf != None
 
-            # prepare source audio
             feats = torch.from_numpy(audio0).float()
 
             feats = feats.mean(-1) if feats.dim() == 2 else feats
@@ -448,20 +355,17 @@ class Pipeline:
 
             feats = feats.view(1, -1).to(self.device)
 
-            # extract features with contentvec on audio0
             feats = extract_features(model, feats, version, do_normalize=do_normalize)
 
-            # make a copy for pitch guidance and protection
+            # Kept pre-retrieval for pitch protection blending below.
             feats0 = feats.clone() if pitch_guidance else None
             if retriever is not None and retriever.ready and index_rate > 0:
                 feats = retriever.retrieve(feats, index_rate, retrieval_config)
 
-            # feature upsampling
             feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
                 0, 2, 1
             )
 
-            # adjust the length if the audio is short
             p_len = min(audio0.shape[0] // self.window, feats.shape[1])
 
             if pitch_guidance:
@@ -469,7 +373,6 @@ class Pipeline:
                     0, 2, 1
                 )
                 pitch, pitchf = pitch[:, :p_len], pitchf[:, :p_len]
-                # Pitch protection blending
                 if protect < 0.5:
                     pitchff = pitchf.clone()
                     pitchff[pitchf > 0] = 1
@@ -482,15 +385,14 @@ class Pipeline:
                 pitch, pitchf = None, None
             p_len = torch.tensor([p_len], device=self.device).long()
 
-            # Inference
             audio1 = (
                 net_g.infer(
-                    phone=feats.float(),        # phone
-                    phone_lengths=p_len,        # phone_lengths
-                    pitch=pitch,                # quantized f0 curve
-                    nsff0=pitchf.float(),       # float f0 curve
-                    sid=sid,                    # speaker id
-                    seed=seed,                  # inference seed
+                    phone=feats.float(),
+                    phone_lengths=p_len,
+                    pitch=pitch,
+                    nsff0=pitchf.float(),
+                    sid=sid,
+                    seed=seed,
                 )[0][0, 0]
                 .detach()
                 .cpu()
@@ -498,7 +400,6 @@ class Pipeline:
                 .numpy()
             )
 
-            # clean up
             del feats, feats0, p_len
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -567,37 +468,9 @@ class Pipeline:
         do_normalize=False,
         silence_gate_db=-60.0,
     ):
+        """silence_gate_db: input level below which the output is faded out
+        (None or -inf disables it); see AudioProcessor.gate_to_source.
         """
-        The main pipeline function for performing voice conversion.
-
-        Args:
-            model: The feature extractor model.
-            net_g: The generative model for synthesizing speech.
-            sid: Speaker ID for the target voice.
-            audio: The input audio signal.
-            input_audio_path: Path to the input audio file.
-            pitch: Key to adjust the pitch of the F0 contour.
-            f0_method: Method to use for F0 estimation.
-            file_index: Path to the FAISS index file for speaker embedding retrieval.
-            index_rate: Blending rate for speaker embedding retrieval.
-            pitch_guidance: Whether to use pitch guidance during voice conversion.
-            filter_radius: Radius for median filtering the F0 contour.
-            tgt_sr: Target sampling rate for the output audio.
-            resample_sr: Resampling rate for the output audio.
-            volume_envelope: Blending rate for adjusting the RMS level of the output audio.
-            version: Model version.
-            protect: Protection level for preserving the original pitch.
-            f0_autotune: Whether to apply autotune to the F0 contour.
-            f0_file: Path to a file containing an F0 contour to use.
-            seed: Seed for randomization of noise.
-            loaded_index: A pre-loaded FAISS index object.
-            index_meta_payload: Serialised sidecar accompanying ``loaded_index``.
-            retrieval_config: Neighbour count, weighting and continuity for the retrieval.
-            do_normalize: Whether the embedder wants its input layer-normalised.
-            silence_gate_db: Input level below which the output is faded out.
-                None or -inf disables it.  See ``AudioProcessor.gate_to_source``.
-        """
-
         if seed == 0:
             seed = random.randint(1, 2**32 - 1)
 
@@ -630,7 +503,6 @@ class Pipeline:
         audio_opt = []
         t = None
 
-        # Padding for 16k audio
         audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
         p_len = audio_pad.shape[0] // self.window
         inp_f0 = None

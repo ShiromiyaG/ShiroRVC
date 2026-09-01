@@ -145,15 +145,9 @@ def run_pitch_extraction(files, devices, f0_method, threads):
     )
 
 
-#: How the extracted embeddings are stored on disk.  Not a free choice between
-#: "smaller" and "bigger": these features are both the training input and the
-#: source the retrieval index is built from, and half precision puts a
-#: quantisation floor under every stored index vector while inference queries
-#: with float32 ones.  float32 doubles the feature cache (a 2 h dataset goes
-#: from ~550 MB to ~1.1 GB) and is the better default; float16 stays available
-#: for anyone short on disk.  Either dtype loads unchanged -- training casts to
-#: float and the index builder upcasts -- so an existing cache never has to be
-#: re-extracted after changing this.
+#: fp16 puts a quantisation floor under the retrieval index vectors built from
+#: these features while inference queries with float32 ones; fp32 doubles the
+#: feature cache (~550MB -> ~1.1GB for 2h) but is the better default.
 FEATURE_PRECISIONS = {"fp32": np.float32, "fp16": np.float16}
 
 
@@ -236,14 +230,11 @@ def run_embedding_extraction(
 
 
 def discard_16k_slices(wav_path):
-    """
-    Delete the 16 kHz slices once the features derived from them exist.
+    """Delete the 16 kHz slices once the features derived from them exist.
 
-    Training reads `sliced_audios` at the target rate plus the `extracted`,
-    `f0` and `f0_voiced` features; the 16 kHz copies feed pitch and embedder
-    extraction only, so after this stage they are dead weight.  Re-extracting
-    with a different f0 method or embedder needs them back, which means running
-    preprocessing again.
+    They feed pitch and embedder extraction only, so are dead weight after
+    that; re-extracting with a different f0 method or embedder needs them
+    back, meaning preprocessing must run again.
     """
     if os.path.basename(os.path.normpath(wav_path)) != "sliced_audios_16k":
         return

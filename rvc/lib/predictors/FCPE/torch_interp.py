@@ -1,18 +1,8 @@
 import torch
-'''
-use from https://github.com/autumn-DL/TorchInterp
-it use MIT license
-'''
+# From https://github.com/autumn-DL/TorchInterp (MIT licensed).
 
 
 def torch_interp(x, xp, fp):
-    # if not isinstance(x, torch.Tensor):
-    #     x = torch.tensor(x)
-    # if not isinstance(xp, torch.Tensor):
-    #     xp = torch.tensor(xp)
-    # if not isinstance(fp, torch.Tensor):
-    #     fp = torch.tensor(fp)
-
     sort_idx = torch.argsort(xp)
     xp = xp[sort_idx]
     fp = fp[sort_idx]
@@ -37,11 +27,7 @@ def torch_interp(x, xp, fp):
 
 
 def batch_interp_with_replacement_detach(uv, f0):
-    '''
-    :param uv: B T
-    :param f0: B T
-    :return: f0 B T
-    '''
+    """Fill unvoiced frames (uv, B T) of f0 (B T) by interpolating from voiced ones."""
 
     result = f0.clone()
 
@@ -63,7 +49,6 @@ def unit_text():
         print('  [UNIT_TEST] torchfcpe.torch_interp: matplotlib not found, skip plotting.')
         exit(1)
 
-    # f0
     f0 = torch.tensor([1, 0, 3, 0, 0, 3, 4, 5, 0, 0]).float()
     uv = torch.tensor([0, 1, 0, 1, 1, 0, 0, 0, 1, 1]).bool()
 

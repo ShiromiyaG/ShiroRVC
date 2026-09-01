@@ -114,7 +114,6 @@ def run_create_model_bundle_script(
 
 
 def model_bundle_tab():
-    """Build the model bundle utility interface."""
     with gr.Column():
         gr.Markdown(
             _(

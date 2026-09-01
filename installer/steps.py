@@ -41,7 +41,7 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 class InstallError(RuntimeError):
-    """A failure the user can act on.  The message is shown verbatim."""
+    """The message is shown to the user verbatim."""
 
 
 @dataclass
@@ -72,7 +72,7 @@ def detect_gpu() -> dict:
     """What ``nvidia-smi`` says, if it is there at all.
 
     Only the driver matters: the CUDA wheels ship their own cuBLAS, cuDNN and
-    cuFFT, so a CUDA Toolkit install is not a prerequisite.
+    cuFFT, so a CUDA Toolkit install is not required.
     """
     executable = shutil.which("nvidia-smi")
     if not executable:
@@ -203,13 +203,10 @@ def suggest_target(chosen: Path) -> Path:
     """Where to install given a folder the user browsed to.
 
     A folder picker returns what the user thinks of as the *parent* -- "put it
-    on D:" -- so taking it literally is what turns a Downloads folder into a
-    refused install.  Appending the application name is what every Windows
-    installer does, and it means the common case lands in a folder that is
-    empty by construction.
-
-    Idempotent: browsing to a folder already named after the application
-    returns it unchanged, rather than nesting a second copy inside it.
+    on D:" -- so taking it literally would turn a Downloads folder into a
+    refused install; appending the application name avoids that. Idempotent:
+    browsing to a folder already named after the application returns it
+    unchanged rather than nesting a second copy inside it.
     """
     chosen = Path(os.path.expandvars(str(chosen).strip())).expanduser()
     if chosen.name.lower() == config.APP_NAME.lower():
@@ -226,7 +223,6 @@ def check_target(path: Path) -> None:
 
 
 def check_disk_space(target: Path) -> None:
-    """Refuse before downloading rather than half way through."""
     probe = target
     while not probe.exists() and probe.parent != probe:
         probe = probe.parent
@@ -288,7 +284,6 @@ def download(url: str, destination: Path, reporter: Reporter, label: str = "") -
 
 
 def ensure_uv(tools_dir: Path, reporter: Reporter) -> Path:
-    """Put ``uv.exe`` in place, reusing one already there."""
     name = "uv.exe" if sys.platform == "win32" else "uv"
     target = tools_dir / name
     if target.exists():
@@ -310,7 +305,6 @@ def ensure_uv(tools_dir: Path, reporter: Reporter) -> Path:
 
 
 def fetch_source(install_dir: Path, reporter: Reporter, options: Options) -> None:
-    """Download and unpack the application into the install directory."""
     if options.source_zip:
         archive = options.source_zip
         reporter.log(f"Using local source archive {archive}")
@@ -357,7 +351,6 @@ def fetch_source(install_dir: Path, reporter: Reporter, options: Options) -> Non
 
 
 def create_environment(uv: Path, install_dir: Path, reporter: Reporter) -> Path:
-    """Create ``env/`` with a standalone CPython that uv downloads for us."""
     # Absolute, because run() sets cwd to install_dir: a relative "env" would
     # be resolved against it a second time and land in install_dir/install_dir.
     env_dir = (install_dir / "env").resolve()
@@ -396,7 +389,6 @@ def torch_pins(install_dir: Path) -> dict[str, str]:
 
 def install_torch(uv: Path, python: Path, install_dir: Path, variant: str,
                   reporter: Reporter) -> None:
-    """Install the torch stack from the right wheel index."""
     index = config.TORCH_INDEXES.get(variant, config.TORCH_INDEXES["cpu"])
     pins = torch_pins(install_dir)
     packages = [f"{name}=={version}" for name, version in pins.items()]
@@ -414,7 +406,6 @@ def install_torch(uv: Path, python: Path, install_dir: Path, variant: str,
 
 def install_requirements(uv: Path, python: Path, install_dir: Path,
                          reporter: Reporter) -> None:
-    """Install the application's own dependencies, plus the Qt interface."""
     arguments = [str(uv), "pip", "install", "--python", str(python),
                  "-r", str(install_dir / "requirements.txt")]
 
@@ -495,7 +486,6 @@ def write_manifest(install_dir: Path, options: Options) -> None:
 
 
 def run(command: list[str], cwd: Path, reporter: Reporter) -> None:
-    """Run a command, streaming its output into the reporter."""
     reporter.log("$ " + " ".join(_quote(part) for part in command))
 
     environment = dict(os.environ)
@@ -557,7 +547,7 @@ PIPELINE: list[tuple[str, str]] = [
 
 
 def install(options: Options, reporter: Reporter | None = None) -> Path:
-    """Run the whole pipeline.  Returns the install directory."""
+    """Run the whole pipeline. Returns the install directory."""
     reporter = reporter or Reporter()
     total = len(PIPELINE)
     install_dir = options.install_dir

@@ -123,7 +123,6 @@ def _source_files() -> list[Path]:
 
 
 def extract() -> dict[str, dict]:
-    """Scan the sources and write ``locales/shiromiya.pot``."""
     messages: dict[str, dict] = {}
     for path in _source_files():
         relative = path.relative_to(ROOT).as_posix()
@@ -198,7 +197,7 @@ _PO_LINE = re.compile(r'^\s*(msgid_plural|msgid|msgstr(?:\[\d+\])?)\s+(.*)$')
 
 
 def parse_po(path: Path) -> dict[str, dict]:
-    """Read a ``.po`` into ``{msgid: {"msgstr": ..., "plurals": [...], "fuzzy": bool}}``."""
+    """Returns ``{msgid: {"msgstr": ..., "plurals": [...], "fuzzy": bool}}``."""
     entries: dict[str, dict] = {}
     if not path.is_file():
         return entries
@@ -298,7 +297,6 @@ DEFAULT_PLURAL_FORMS = "nplurals=2; plural=(n != 1);"
 
 
 def update(languages: list[str]) -> None:
-    """Regenerate each ``.po`` from the template, keeping existing translations."""
     if not POT_PATH.is_file():
         extract()
     template = parse_po(POT_PATH)
@@ -414,7 +412,6 @@ def _write_mo(entries: dict[str, dict], path: Path, language: str) -> int:
 
 
 def compile_catalogs(languages: list[str] | None = None) -> int:
-    """Compile every ``.po`` under ``locales/`` into its ``.mo``."""
     total = 0
     for po_path in sorted(LOCALE_DIR.glob(f"*/LC_MESSAGES/{DOMAIN}.po")):
         language = po_path.parents[1].name

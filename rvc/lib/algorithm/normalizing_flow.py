@@ -128,10 +128,8 @@ class TransformerCouplingNet(nn.Module):
 
 
 class Flip(nn.Module):
-    '''
-    torch.jit.script() Compiled functions can't take variable number of arguments
-    or use keyword-only arguments with defaults ~
-    '''
+    # A plain function wouldn't torch.jit.script(): compiled functions can't
+    # take a variable number of arguments or keyword-only args with defaults.
     def forward(
         self,
         x: torch.Tensor,

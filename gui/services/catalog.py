@@ -21,9 +21,7 @@ from . import paths
 F0_METHODS = ["rmvpe", "crepe", "crepe-tiny", "fcpe"]
 EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2", "custom"]
 EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
-#: Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES.  Duplicated rather than imported
-#: to keep the GUI's first paint free of backend imports; the first entry is the
-#: default the combo lands on.
+#: Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; first entry is the default.
 OPTIMIZERS = ["AdamW", "Sched-Free AdamW", "Muon", "Lion"]
 LR_SCHEDULERS = ["exp decay step", "exp decay epoch", "cosine annealing", "none"]
 INDEX_ALGORITHMS = ["Auto", "Faiss", "KMeans"]

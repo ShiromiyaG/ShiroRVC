@@ -3,15 +3,11 @@
 RefineGAN is Applio's architecture, and Applio does not train it the way it
 trains HiFi-GAN: ``train.py`` special-cases the vocoder and switches *two*
 things at once -- ``disc_version = "v3"`` and ``multiscale_mel_loss = True``.
-This fork shipped neither, so RefineGAN was being trained against the v2
-discriminator and a single-scale L1 mel.  Neither difference is visible in a
-checkpoint or a loss curve, only in what the run converges to, which is why it
-is pinned here.
-
-The reference numbers were taken from ``.tmp/Applio`` (a read-only checkout):
-v3 is 9 branches / 47.0 M parameters against v2's 71.4 M, and this fork's
-``MultiScaleMelSpectrogramLoss`` returns bit-identical values to Applio's on the
-same input.
+This fork used to ship neither, so RefineGAN was training against the v2
+discriminator and a single-scale L1 mel. Neither difference is visible in a
+checkpoint or a loss curve, only in what the run converges to, which is why
+it is pinned here against reference values taken from ``.tmp/Applio`` (a
+read-only checkout).
 """
 
 from __future__ import annotations
@@ -29,10 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 torch = pytest.importorskip("torch", reason="needs torch", exc_type=ImportError)
 
-from rvc.configs.vocoders import (  # noqa: E402
-    get_discriminator_id,
-    uses_chouwagan_stack,
-)
+from rvc.configs.vocoders import get_discriminator_id  # noqa: E402
 from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined  # noqa: E402
 from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (  # noqa: E402
     DISCRIMINATOR_VERSIONS,
@@ -77,9 +70,6 @@ def _inputs(batch=1, frames=8):
 def test_refinegan_selects_applios_v3_discriminator():
     assert get_discriminator_id("refinegan") == "mpd_msd_v3"
     assert get_discriminator_id("hifi") == "mpd_msd"
-    # v3 is a *discriminator* choice and must not drag in the ChouwaGAN loss
-    # stack: SAN, R1, the waveform terms and the band-weighted mel all stay off.
-    assert uses_chouwagan_stack("refinegan") is False
 
 
 def test_the_v3_layout_is_applios():
@@ -95,11 +85,9 @@ def test_v3_builds_the_branches_applio_builds():
     model = MPD_MSD_Combined(False, version="v3")
     kinds = [type(d) for d in model.discriminators]
     assert kinds == [DiscriminatorS] + [DiscriminatorP] * 5 + [DiscriminatorR] * 3
-    # v2 happens to hold the same *number* of tensors (165), so the count is
-    # not the check -- the key-to-shape map is.  Verified against Applio's own
-    # ``MultiPeriodDiscriminator(version="v3")``: identical keys, identical
-    # shapes.  Pinned here as the parameter total, which the layout determines
-    # and a silently different branch would move.
+    # v2 happens to hold the same *number* of tensors, so the count alone
+    # would not catch a wrong branch -- the parameter total, verified against
+    # Applio's own v3 layout, does.
     assert sum(p.numel() for p in model.parameters()) == 47_028_034
 
 
@@ -251,24 +239,15 @@ def test_remove_weight_norm_runs_and_preserves_the_output():
 
 
 def test_nothing_in_the_decoder_forces_a_cpu_kernel():
-    """``enable_decoder_compile`` fell back to eager for every RefineGAN step
-    with ``InvalidCxxCompiler: Compiler: cl is not found``.
-
-    Inductor was emitting a *CPU* C++ kernel, which on Windows needs MSVC.
-    Three independent sources, each sufficient on its own -- verified by
-    removing them one at a time on an RTX 5060 / torch 2.10+cu130 with no
-    compiler installed:
-
-    * ``self.upp`` was ``np.prod(...)``, an ``np.int64``.  Dynamo wraps a numpy
-      scalar used inside a traced function as a CPU tensor.
-    * ``SineGenerator.forward`` -- its cumsum lowers to a ``SplitScan`` whose
-      codegen raises ``TypeError: list indices must be integers or slices``.
-    * ``torchaudio.functional.resample`` -- it rebuilds its sinc kernel from
-      Python ints on every call.
-
-    Compiling on CUDA is too slow and too machine-dependent for a unit test, so
-    what is pinned here is the three properties, which is what actually
-    regresses.  Compiled, the step is 64.6 ms against 90.0 ms eager.
+    """``enable_decoder_compile`` used to fall back to eager on every RefineGAN
+    step because Inductor emitted a *CPU* C++ kernel (needing MSVC on
+    Windows), from three independent sources: ``self.upp`` being an
+    ``np.int64`` (Dynamo wraps a traced numpy scalar as a CPU tensor),
+    ``SineGenerator.forward``'s cumsum lowering to a codegen path that raises,
+    and ``torchaudio.functional.resample`` rebuilding its sinc kernel from
+    Python ints on every call. Compiling on CUDA is too slow and
+    machine-dependent for a unit test, so what is pinned here is the three
+    underlying properties instead.
     """
 
     generator = _generator()
@@ -279,9 +258,9 @@ def test_nothing_in_the_decoder_forces_a_cpu_kernel():
 
 def test_the_decimation_filter_is_unchanged():
     """``_decimate`` exists to keep torchaudio's resample out of the graph, not
-    to replace it: its kernel is 385/953 taps with a 135-156 dB stopband,
-    against 68-78 dB for a ``FixedLowPass1d`` of the shape the upsamplers use.
-    Swapping it would be a numerical change hidden inside a build fix."""
+    to replace it -- its stopband attenuation is well beyond what a
+    ``FixedLowPass1d`` of the shape the upsamplers use provides, so swapping
+    it would be a numerical change hidden inside a build fix."""
 
     import inspect
 
@@ -344,17 +323,13 @@ def test_the_upsampler_folds_its_gain_into_the_kernel():
 
 
 def test_v3l_is_v3s_layout_with_a_cheaper_frequency_stride():
-    """The fork's variant.  Applio's ``DiscriminatorR`` carries 257/513/1025
-    frequency bins at 32 channels through all five layers; striding frequency in
-    the last two was measured at 76.5% +- 4.4 held-out accuracy on the frame-rate
-    AM defect against Applio's 68.0% +- 12.5 over three seeds, 58.2% vs 57.8% on
-    an over-smoothed top end, and 81.1 ms / 342 MiB against 107.0 / 396.
-
-    Those branch numbers are why it exists; they are not why it would be the
-    default.  Re-measured end to end on an RTX 5060, ``v3l`` moved neither step
-    time nor peak VRAM against ``v3`` -- the discriminator is not the bound half
-    of the step -- so both configs ship ``v3`` and its exact Applio parity, and
-    this pins the variant as an override rather than as a shipped choice."""
+    """The fork's variant: striding frequency in the last two layers of
+    ``DiscriminatorR`` (which Applio keeps at full resolution throughout)
+    measurably improves detection of the frame-rate AM defect, but does not
+    move end-to-end step time or peak VRAM, since the discriminator is not
+    the bound half of the step. So both shipped configs keep exact Applio
+    parity (``v3``), and ``v3l`` is pinned here as an override, not a
+    default."""
 
     periods_v3, resolutions_v3, strides_v3 = DISCRIMINATOR_VERSIONS["v3"]
     periods_v3l, resolutions_v3l, strides_v3l = DISCRIMINATOR_VERSIONS["v3l"]
@@ -375,12 +350,11 @@ def test_v3l_is_v3s_layout_with_a_cheaper_frequency_stride():
 
 
 def test_the_fine_hop_branch_is_what_catches_the_frame_rate_defect():
-    """Pinned because two plausible "optimisations" both destroy it, measured:
-    reusing ChouwaGAN's spectrogram branch (hops 128/256/512) gives 54% on the
-    AM defect, and trading the 512-point branch for a 4096-point one gives
-    50.5% -- chance, both.  100 Hz is a 10 ms period, and only a 50-sample hop
-    (1.1 ms at 44.1 kHz) resolves it; 4096/480 is 10.9 ms per frame, which
-    aliases the modulation to DC.  The branch reads mirroring in *time*."""
+    """Pinned because two plausible "optimisations" both destroy detection of
+    the frame-rate AM defect: reusing a coarser spectrogram branch, or
+    trading the fine-hop branch for a larger FFT, both measured at chance.
+    100 Hz is a 10 ms period, and only the ~1 ms hop resolves it -- a coarser
+    hop aliases the modulation to DC. The branch reads mirroring in *time*."""
 
     _, resolutions, _ = DISCRIMINATOR_VERSIONS["v3l"]
     hops = sorted(hop for _n_fft, hop, _win in resolutions)
@@ -505,29 +479,31 @@ def _build(model):
         ),
         frequency_strides=setting("d_frequency_strides"),
         use_msd=bool(setting("d_use_msd", True)),
+        sample_rate=int(getattr(model, "sample_rate", 44100)),
+        use_univhd=bool(setting("d_use_univhd", False)),
     )
 
 
 @pytest.mark.parametrize("path", [CONFIG_32K, CONFIG])
 def test_the_branch_knobs_are_present_and_inert_by_default(path):
-    """``None`` means "whatever ``d_version`` says".  The content knobs are
-    written out rather than left absent so they are discoverable from the config
-    instead of only from the code.
-
-    The ``d_use_*`` switches are not, and deliberately: they default to on, so
-    writing ``true`` says nothing the absent key does not already say, and three
-    no-op lines read as if they were configuring something.  They only ever mean
-    anything as ``false``.  What this pins either way is the outcome -- the
-    config has to build the preset its ``d_version`` names."""
+    """``None`` means "whatever ``d_version`` says". The content knobs are
+    written out so they are discoverable from the config, not just the code;
+    the ``d_use_*`` switches are deliberately left absent when true, since
+    they only ever mean anything as ``false``. Either way, the config has to
+    build the preset its ``d_version`` names."""
 
     model = json.loads(path.read_text())["model"]
-    for key in ("d_periods", "d_resolutions", "d_frequency_strides"):
+    for key in ("d_resolutions", "d_frequency_strides"):
         assert key in model and model[key] is None
     for key in ("d_use_msd", "d_use_periods", "d_use_resolutions"):
         assert model.get(key, True) is True, f"{key} would change the preset"
 
-    built = _build(types.SimpleNamespace(**model))
+    built = _build(types.SimpleNamespace(**dict(model, d_use_univhd=False)))
     preset = MPD_MSD_Combined(model["use_spectral_norm"], version=model["d_version"])
+    # ``d_periods`` is the one content knob that is *not* inert any more -- see
+    # ``test_the_periods_are_scaled_to_the_rate`` -- so what is pinned here is
+    # the branch *layout*, which the scaling leaves alone: same families, same
+    # counts, same order, only different fold frequencies.
     assert [type(a) for a in built.discriminators] == [
         type(b) for b in preset.discriminators
     ]
@@ -537,7 +513,7 @@ def test_each_family_can_be_replaced_or_turned_off():
     model = json.loads(CONFIG.read_text())["model"]
 
     def variant(**overrides):
-        merged = dict(model)
+        merged = dict(model, d_use_univhd=False)
         merged.update(overrides)
         return _build(types.SimpleNamespace(**merged))
 
@@ -584,18 +560,17 @@ def test_the_branches_still_run_when_the_families_are_edited():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast needs CUDA")
 @pytest.mark.parametrize(
-    "vocoder,rate", [("refinegan", 32000), ("refinegan", 44100), ("chouwagan", 44100)]
+    "vocoder,rate", [("refinegan", 32000), ("refinegan", 44100)]
 )
 def test_a_step_survives_fp16_autocast(vocoder, rate):
     """``train.py`` has driven ``use_fp16`` through ``autocast`` and a
-    ``GradScaler`` for a while, but neither of these decoders had been run under
-    it.  The risk is not speed -- it is a branch that quietly refuses half
-    precision (``torch.stft``, the SAN heads, the resampling kernels) and takes
-    the loss to NaN on step one."""
+    ``GradScaler`` for a while, but this decoder had not been run under it.
+    The risk is not speed -- it is a branch that quietly refuses half
+    precision (``torch.stft``, the resampling kernels) and takes the loss to
+    NaN on step one."""
 
     from torch.amp import autocast
 
-    from rvc.lib.algorithm.discriminators.multi import chouwagan as chouwagan_d
     from rvc.lib.algorithm.synthesizers import Synthesizer
 
     config = json.loads(
@@ -619,11 +594,7 @@ def test_a_step_survives_fp16_autocast(vocoder, rate):
         .cuda()
         .train()
     )
-    net_d = (
-        chouwagan_d.ChouwaGANDiscriminator(sample_rate=rate, branchwise=False)
-        if vocoder == "chouwagan"
-        else MPD_MSD_Combined(False, version=model.get("d_version", "v3l"))
-    )
+    net_d = MPD_MSD_Combined(False, version=model.get("d_version", "v3l"))
     net_d = net_d.cuda().train()
 
     decoder = net_g.dec
@@ -663,7 +634,10 @@ def test_one_boolean_per_family_turns_it_off():
     model = json.loads(CONFIG.read_text())["model"]
 
     def kinds(**overrides):
-        merged = dict(model)
+        # UnivHD is not one of the families this is about, and it appends a
+        # branch that would show up in every expectation below; the config it
+        # ships in may have it on.
+        merged = dict(model, d_use_univhd=False)
         merged.update(overrides)
         return [type(d) for d in _build(types.SimpleNamespace(**merged)).discriminators]
 
@@ -675,3 +649,68 @@ def test_one_boolean_per_family_turns_it_off():
     assert kinds(d_use_periods=False, d_periods=[2, 3]) == (
         [DiscriminatorS] + [DiscriminatorR] * 3
     )
+
+
+def test_detach_real_leaves_the_generator_gradient_untouched():
+    """The generator update's real pass is a target, not a term to train on.
+
+    ``detach_real`` skips its graph.  What must not move is the only gradient
+    the generator update actually consumes -- the one that reaches ``y_hat``
+    through the fake branch and through the feature matching loss's fake side.
+    The real feature maps enter that loss as constants either way, so the two
+    paths are the same function of ``y_hat``; this pins that they are also the
+    same number.
+    """
+
+    from rvc.train.losses import feature_loss, generator_loss
+
+    torch.manual_seed(0)
+    model = MPD_MSD_Combined(
+        False, version="v3", periods=[5, 7], resolutions=[[512, 50, 240]]
+    )
+    real = torch.randn(2, 1, 4096)
+
+    def wave_gradient(detach_real):
+        fake = torch.randn(2, 1, 4096, generator=torch.Generator().manual_seed(1))
+        fake.requires_grad_(True)
+        _, fake_logits, real_features, fake_features = model(
+            real, fake, detach_real=detach_real
+        )
+        loss = generator_loss(fake_logits) + 2.0 * feature_loss(
+            real_features, fake_features
+        )
+        loss = loss[0] if isinstance(loss, tuple) else loss
+        (wave_grad,) = torch.autograd.grad(loss, fake)
+        parameter_grads = [
+            p.grad is not None for p in model.parameters() if p.requires_grad
+        ]
+        return wave_grad, any(parameter_grads)
+
+    joint, _ = wave_gradient(False)
+    detached, _ = wave_gradient(True)
+    assert torch.allclose(joint, detached, atol=0, rtol=0)
+
+
+def test_detach_real_builds_no_real_side_graph():
+    """The point of the flag: the real logits come back as constants."""
+
+    torch.manual_seed(0)
+    model = MPD_MSD_Combined(False, version="v3", periods=[5], resolutions=[])
+    real = torch.randn(2, 1, 4096)
+    fake = torch.randn(2, 1, 4096, requires_grad=True)
+
+    real_logits, fake_logits, real_features, _ = model(real, fake, detach_real=True)
+    assert all(not logits.requires_grad for logits in real_logits)
+    assert all(not f.requires_grad for branch in real_features for f in branch)
+    # The fake side is untouched -- it is what carries the generator's gradient.
+    assert all(logits.requires_grad for logits in fake_logits)
+
+
+def test_forward_still_differentiates_the_real_side_by_default():
+    """The discriminator update needs exactly what ``detach_real`` removes."""
+
+    torch.manual_seed(0)
+    model = MPD_MSD_Combined(False, version="v3", periods=[5], resolutions=[])
+    real = torch.randn(2, 1, 4096)
+    real_logits, _, _, _ = model(real, torch.randn(2, 1, 4096))
+    assert all(logits.requires_grad for logits in real_logits)

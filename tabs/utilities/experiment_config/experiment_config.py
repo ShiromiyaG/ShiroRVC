@@ -284,7 +284,7 @@ def experiment_config_tab():
             label=_("Vocoder / Architecture"),
             info=_("The architecture the rebuilt config will be written for."),
             choices=get_vocoder_choices(),
-            value="chouwagan",
+            value="refinegan",
             interactive=True,
         )
     refresh_button = gr.Button(_("Refresh"))

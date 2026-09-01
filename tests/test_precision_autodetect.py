@@ -1,20 +1,14 @@
 """Which precision a fresh install starts in.
 
-``assets/config.json`` shipped ``"use_fp16": false``, so every install began in
-FP32 and stayed there until someone found the settings tab.  That was the right
-default when AMP bought nothing; it is the wrong one now.  Measured on the full
-training step -- decoder plus discriminator, forward and backward, batch 8 over
-0.4 s -- FP16 takes RefineGAN from 5.12 to 3.78 GiB and ChouwaGAN from 4.27 to
-2.61 GiB, and both get *faster* rather than slower.  On an 8 GB card that is the
-difference between batch 8 fitting and not.
-
-So the key ships absent, which means *undecided*: the machine is asked instead.
-The answer is not written back -- the file records only what a person chose, so
-a read-only install works and a config carried between machines re-asks rather
-than importing the other one's answer.  "Supports FP16" is a capability check, not
-a CUDA-presence check -- every card back to Kepler can multiply half-precision
-numbers, but without tensor cores (below compute 7.0) autocast costs casts and
-buys only memory.
+``assets/config.json`` used to ship ``"use_fp16": false``, so every install
+began in FP32 and stayed there until someone found the settings tab. FP16 now
+lowers VRAM and is not slower on supported hardware, so the key ships absent
+instead -- meaning *undecided* -- and the machine is asked. The answer is
+never written back: the file only records what a person chose, so a
+read-only install still works and a config carried between machines re-asks
+rather than importing the other one's answer. "Supports FP16" is a tensor-core
+capability check (compute >= 7.0), not a CUDA-presence check -- older cards
+can run FP16 but only pay for the casts without the memory win.
 """
 
 from __future__ import annotations

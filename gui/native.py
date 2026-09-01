@@ -1,19 +1,14 @@
 """Platform window effects, where the platform offers real ones.
 
-Qt Widgets can fake depth with painted shadows, but it cannot blur what is
-*behind* a window -- only the compositor can.  On Windows 11 the DWM will do
-it for us, which is both better looking and free, since the desktop compositor
-is already sampling that region.
+Qt Widgets can fake depth with painted shadows but cannot blur what is
+*behind* a window; only the compositor can, so this leans on the Windows 11
+DWM and degrades to a no-op everywhere else (missing API, older build,
+non-Windows host).
 
-Everything here degrades to a no-op.  A missing API, an older build or a
-non-Windows host must cost nothing but the effect.  There is no equivalent to
-reach for elsewhere: a system backdrop is the compositor's to draw, and X11 and
-Wayland have no portable way to ask for one.
-
-Note the absence of ``ctypes.wintypes``.  Importing it on Linux raises -- it
-declares ``VARIANT_BOOL`` with a type code only the Windows build of ``_ctypes``
-knows -- and this module is imported unconditionally by ``gui.app``, so the
-whole interface would fail to start there.  ``HWND`` is a ``void *`` anyway.
+Note the absence of ``ctypes.wintypes``: importing it on Linux raises, since it
+declares ``VARIANT_BOOL`` with a type code only the Windows build of
+``_ctypes`` knows, and this module is imported unconditionally by ``gui.app``.
+``HWND`` is a ``void *`` anyway.
 """
 
 from __future__ import annotations
@@ -106,16 +101,11 @@ class _Margins(ctypes.Structure):
 def _extend_frame(handle: int, enable: bool) -> bool:
     """Extend the DWM frame across the client area, or put it back.
 
-    This is what actually makes a system backdrop visible.  Setting
-    ``DWMWA_SYSTEMBACKDROP_TYPE`` on its own does nothing: measured against a
-    window with a transparent client area, Mica and Acrylic both come out as
-    flat black until the frame is extended over that area.
-
-    Qt's ``WA_TranslucentBackground`` produces the same result as extending the
-    frame, but it is a creation-time attribute -- toggling it forces the window
-    to be destroyed and rebuilt, which on a window this size is seconds of
-    blank white.  This call works on a live window, so the backdrop can be
-    switched from the sidebar without a restart.
+    Setting ``DWMWA_SYSTEMBACKDROP_TYPE`` alone does nothing: with a
+    transparent client area, Mica and Acrylic both render flat black until the
+    frame is extended over it. Qt's ``WA_TranslucentBackground`` achieves the
+    same but is creation-time -- toggling it rebuilds the window. This call
+    works on a live window, so the backdrop can switch without a restart.
     """
     try:
         dwm = ctypes.windll.dwmapi
@@ -135,13 +125,10 @@ def _extend_frame(handle: int, enable: bool) -> bool:
 def apply_backdrop(window, backdrop: str) -> bool:
     """Ask the compositor to blur what is behind the window.
 
-    ``acrylic`` is a strong blur of whatever sits behind the window.  ``mica``
-    tints with the desktop wallpaper instead and is far subtler by design --
-    on a dark wallpaper in dark mode it is close to invisible, which is the
-    effect working, not failing.
-
-    The window's own background has to be transparent for either to show; the
-    main window paints it that way itself, in ``MainWindow.paintEvent``.
+    ``mica`` tints with the desktop wallpaper and is subtle by design -- on a
+    dark wallpaper in dark mode it is close to invisible, which is the effect
+    working, not failing. The window's own background has to be transparent
+    for either effect to show; ``MainWindow.paintEvent`` paints it that way.
     """
     if not supports_backdrop():
         return False

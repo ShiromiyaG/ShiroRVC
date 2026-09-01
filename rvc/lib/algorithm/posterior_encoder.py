@@ -6,13 +6,6 @@ from typing import Optional
 from rvc.lib.algorithm.wavenet import WaveNet
 
 def sequence_mask(length: torch.Tensor, max_length: Optional[int] = None):
-    """
-    Generate a sequence mask.
-
-    Args:
-        length: The lengths of the sequences.
-        max_length: The maximum length of the sequences.
-    """
     if max_length is None:
         max_length = length.max()
     x = torch.arange(max_length, dtype=length.dtype, device=length.device)
@@ -20,19 +13,6 @@ def sequence_mask(length: torch.Tensor, max_length: Optional[int] = None):
 
 
 class PosteriorEncoder(nn.Module):
-	"""
-	Posterior Encoder.
-
-	Args:
-		in_channels (int): Number of channels in the input.
-		out_channels (int): Number of channels in the output.
-		hidden_channels (int): Number of hidden channels in the encoder.
-		kernel_size (int): Kernel size of the convolutional layers.
-		dilation_rate (int): Dilation rate of the convolutional layers.
-		n_layers (int): Number of layers in the encoder.
-		gin_channels (int, optional): Number of channels for the global conditioning input. Defaults to 0.
-	"""
-
 	def __init__(
 		self,
 		in_channels: int,

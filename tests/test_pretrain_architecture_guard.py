@@ -1,28 +1,16 @@
 """A pretrain that carries no ``architecture_id`` is legacy, not wrong.
 
-HiFi-GAN fine-tuning could not start at all:
+The guard used to compare ``checkpoint.get("architecture_id")`` straight
+against the synthesizer's, which rejected every stock RVC v2 HiFi-GAN
+checkpoint: those predate the key entirely, so ``None != "hifi_gan_nsf_v1"``
+blocked fine-tuning outright. A pretrain comes from upstream, where the key
+never existed, which is different from the resume path, where a ``G_*.pth``
+missing the key is one of this fork's own old runs whose layout has since
+changed -- so the resume guard is deliberately kept strict.
 
-    [ ] Loading pretrained (G) 'rvc\\models\\pretraineds\\hifi-gan\\f0G32k.pth'
-    ValueError: Pretrained generator architecture mismatch: expected
-    'hifi_gan_nsf_v1'.
-
-The guard read ``checkpoint.get("architecture_id")`` and compared it straight
-against the synthesizer's.  Every stock RVC v2 checkpoint predates that key --
-the bundled ``hifi-gan/f0G{32,40,48}k.pth`` carry ``iteration`` and
-``learning_rate`` and nothing else -- so ``None != "hifi_gan_nsf_v1"`` rejected
-the shipped pretrains for the shipped vocoder.
-
-Two things hid it.  The resume guard treats an absent id as a mismatch *on
-purpose*, and correctly: a ``G_*.pth`` in the experiment folder that predates
-the key is one of this fork's own old runs, and those layouts have since
-changed.  A pretrain is the opposite case -- it comes from upstream, where the
-key never existed.  And HiFi-GAN is the only architecture the check can reach:
-both VITS-latent vocoders report ``vits_gaussian_v1``, whose opt-out exists for
-exactly this reason (an Applio checkpoint carries no id either).  The oldest
-path was the one left out of the exemption written for it.
-
-What this file pins: absent means unchecked on the pretrained path, present and
-disagreeing is still refused, and the resume path keeps its stricter rule.
+What this file pins: absent means unchecked on the pretrained path, present
+and disagreeing is still refused, and the resume path keeps its stricter
+rule.
 """
 
 from __future__ import annotations
@@ -61,7 +49,6 @@ def test_hifigan_is_the_only_architecture_the_guard_can_reach():
         return spec.get("gaussian_architecture_id") or spec["architecture_id"]
 
     assert architecture("hifi") == "hifi_gan_nsf_v1"
-    assert architecture("chouwagan") == "vits_gaussian_v1"
     assert architecture("refinegan") == "vits_gaussian_v1"
 
 

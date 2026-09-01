@@ -68,6 +68,8 @@ install_rich_print()
 
 from utils import (
     summarize,
+    assert_excitation_matches,
+    assert_periods_match,
     load_checkpoint,
     save_checkpoint,
     latest_checkpoint_path,
@@ -91,9 +93,6 @@ from losses import (
     generator_loss,
     feature_loss,
     kl_loss,
-    envelope_loss,
-    local_log_rms_loss,
-    peak_headroom_loss,
     mel_low_frequency_weights,
     BandWeightedSpectralLoss,
     MultiScaleSTFTLoss,
@@ -104,27 +103,15 @@ from mel_processing import MultiScaleMelSpectrogramLoss
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
 from rvc.configs.vocoders import (
-    get_architecture_id,
     get_discriminator_id,
-    get_vocoder_spec,
     normalize_vocoder,
-    uses_chouwagan_stack,
 )
 from rvc.train.run_spec import TrainRunSpec
 
-# ======== Run spec start region ===============================================
-#
-# argv[1] is the run spec written by the launcher.  Note this is *not* the same
-# indexing as ``core._find_trainer_processes``, which inspects the OS command
-# line -- that includes the interpreter, so the script sits at ``cmdline[1]``
-# and the spec at ``cmdline[2]``.  Inside the process the interpreter is absent
-# and ``sys.argv[0]`` is the script itself.
-#
-# Everything below is a plain module-level name so the rest of this file reads
-# exactly as it did when these came from positional argv -- only the source
-# changed.  The ``spawn`` start method re-executes this module in every DDP
-# child, so each rank re-reads the same file and arrives at identical values.
-
+# argv[1] is the run spec written by the launcher (not the same indexing as
+# ``core._find_trainer_processes``, which reads the OS command line and so
+# sees the interpreter at cmdline[0]).  DDP's ``spawn`` re-executes this
+# module in every child, so each rank re-reads the same file.
 spec = TrainRunSpec.load(sys.argv[1])
 
 model_name = spec.model_name
@@ -142,9 +129,8 @@ warmup_duration = spec.warmup_duration
 cleanup = spec.cleanup
 vocoder = normalize_vocoder(spec.vocoder)
 architecture = "RVC"
-# Generator and discriminator have always been given the same optimizer; the
-# launcher sent one value into two slots.  Kept as two names because the rest
-# of the file distinguishes them.
+# G and D always share one optimizer choice; kept as two names because the
+# rest of the file distinguishes them.
 optimizer_choice_g = optimizer_choice_d = spec.optimizer_choice
 use_checkpointing = spec.use_checkpointing
 use_tf32 = spec.use_tf32
@@ -161,17 +147,14 @@ torch_compile_mode = spec.torch_compile_mode
 overtrain_detector = spec.overtrain_detector
 stop_on_overtrain = spec.stop_on_overtrain
 use_ema = spec.use_ema
-# The UI intentionally has no manual phase or step controls.  A pretrained
-# source selects fine-tuning; no pretrained source selects pretraining.
+# No manual phase/step controls: a pretrained source selects fine-tuning,
+# its absence selects pretraining.
 training_phase = spec.training_phase
 max_steps = 0
 
-# Torch backend config -----
 cuda.matmul.allow_tf32 = use_tf32
 cudnn.allow_tf32 = use_tf32
 cudnn.benchmark = use_benchmark
-
-# Run spec end region ===============================================
 
 current_dir = os.getcwd()
 experiment_dir = os.path.join(current_dir, "logs", model_name)
@@ -179,39 +162,26 @@ config_save_path = os.path.join(experiment_dir, "config.json")
 dataset_path = os.path.join(experiment_dir, "sliced_audios")
 model_info_path = os.path.join(experiment_dir, "model_info.json")
 
-# Load the config from json
 config = load_config_from_json(config_save_path)
 config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
 
-# Tuning knobs that used to ride along as UI flags.  They live in the config
-# JSON now: neither is something to reach for per-run.  ``lr_decay`` was
-# already present in every shipped config (and unread); ``rolling_loss_steps``
-# is deliberately sticky because its value is baked into the TensorBoard tag
-# names -- changing it starts a fresh set of series.  Both are read with a
-# fallback so a config written before this change still loads.
 exp_decay_gamma = float(getattr(config.train, "lr_decay", 0.999875))
-# Which reconstruction term the run uses.  This belongs to the vocoder, not to
-# the run: a 128-band mel cannot resolve a harmonic comb above ~2 kHz (at 8 kHz
-# a bin spans four harmonics at f0=120), so RefineGAN needs the linear-frequency
-# MS-STFT term beside it and ships "Hybrid L1", while HiFi-GAN ships the plain
-# mel it was designed around.  Leaving it on the UI meant every run re-answered
-# a question the vocoder had already answered, and answered it wrong by default.
+# Belongs to the vocoder, not the run: a 128-band mel can't resolve a harmonic
+# comb above ~2 kHz, so RefineGAN needs the MS-STFT term ("Hybrid L1") while
+# HiFi-GAN uses the plain mel it was designed around.
 spectral_loss = str(getattr(config.train, "spectral_loss", "L1 Mel Loss"))
-# Horizon-derived decay, and the preferred way to set one: "end at this fraction
-# of the starting LR", with the per-epoch gamma derived from the run's real
-# length, so changing the epoch count restretches the schedule instead of
-# silently changing the decay.  A ratio rather than an absolute target LR
-# because G and D start at different rates and that balance is load-bearing.
-# ``None`` keeps the old ``lr_decay`` behaviour.
+# "End at this fraction of the starting LR"; the per-epoch gamma is derived
+# from the run's real length so changing the epoch count restretches the
+# schedule instead of silently changing the decay.  ``None`` keeps the old
+# ``lr_decay`` behaviour.
 lr_final_ratio = getattr(config.train, "lr_final_ratio", None)
 lr_final_ratio = None if lr_final_ratio is None else float(lr_final_ratio)
+# Sticky: baked into the TensorBoard tag names, so changing it starts a fresh
+# set of series.
 rolling_loss_steps = int(getattr(config.train, "rolling_loss_steps", 50))
 
-# Validation preview geometry.  ``dpi`` is the resolution knob and scales the
-# whole figure, text included; width/height are inches and change how much room
-# the panels get relative to the labels.  Pixel size is width * dpi by
-# height * dpi -- the defaults give 1608x388.  Every preview is embedded in the
-# event file at full size, so raising these grows the TensorBoard log too.
+# dpi scales the whole figure; width/height are inches.  Every preview is
+# embedded in the event file at full size, so raising these grows the log too.
 validation_preview_dpi = max(
     10.0, float(getattr(config.train, "validation_preview_dpi", 67))
 )
@@ -220,37 +190,10 @@ validation_preview_figsize = (
     max(1.0, float(getattr(config.train, "validation_preview_height", 5.8))),
 )
 
-# Two independent facts, kept apart because they used to be one flag.
-#
-# ``chouwagan_stack_active`` is about the *decoder stack*: it turns on the
-# per-branch SAN discriminator, the R1 strength controller, the waveform
-# reconstruction terms and the retain_graph backward pattern.  Only ChouwaGAN
-# uses those.  Applio's RefineGAN is registered with the plain MPD+MSD
-# discriminator and so leaves this False -- no SAN, no R1, no per-branch
-# driving, which is exactly why this is no longer called ``refinegan_active``.
-chouwagan_stack_active = uses_chouwagan_stack(vocoder)
-if chouwagan_stack_active and sample_rate != 44100:
-    raise ValueError(
-        f"{get_vocoder_spec(vocoder)['label']} requires the 44.1 kHz configuration."
-    )
-
-# AMP precision / dtype init
-# Default: FP32 + TF32 tensor cores, no autocast, no scaler.
-#
-# ``use_fp16`` enables ``torch.autocast`` at FP16 with ``GradScaler``.  The
-# generator, frontend and discriminator autocast-disable wrappers have been
-# narrowed to protect only distribution math and the NSF source, so the
-# convolutional backbone (the dominant cost) runs in FP16 without inserting
-# cast nodes that break Inductor fusions.
-#
-# BF16 carries FP32's exponent range, so it needs no GradScaler and cannot
-# overflow the way FP16 does in the periodic activations, the anti-aliased
-# resampling or the Gaussian latent statistics.
-#
-# History: an earlier measurement with blanket ``autocast(enabled=False)``
-# wrapping the entire forward showed FP16 at 0.93x of TF32.  That was cast
-# overhead; with the fencing narrowed to distribution math only, the compiled
-# decoder graph stays in one dtype end-to-end.
+# Default: FP32 + TF32, no autocast/scaler. ``use_fp16`` enables autocast at
+# FP16 with GradScaler; the autocast-disable wrappers are narrowed to protect
+# only distribution math and the NSF source, so the compiled decoder graph
+# stays in one dtype end-to-end.
 use_amp = bool(use_fp16)
 amp_dtype = torch.float16 if use_amp else None
 
@@ -266,11 +209,8 @@ overtrain_flagged = False
 overtrain_exported = False
 reset_optimizer_for_run = finetune_phase
 use_lr_scheduler = lr_scheduler != "none"
-# How many optimizer steps the GradScaler has thrown away because the gradients
-# came back non-finite.  Under FP16 a skipped step is the *expected* response to
-# an overflow, but a run that skips them in series is not training at all -- and
-# without this counter that looks exactly like a loss that stopped improving.
-# Cumulative across resumes: it rides in the D checkpoint's ``extra``.
+# Steps the GradScaler discarded for non-finite gradients. A steady run of
+# skips looks like a stalled loss otherwise. Cumulative across resumes.
 amp_skipped_steps = 0
 
 
@@ -282,13 +222,6 @@ pretrain_preview = True
 pretrain_preview_interval = 500  # Measured in steps.
 finetune_preview_interval = 100  # Measured in steps.
 
-# How often the per-loss `Grad_Source/*` probes fire, in steps.  Each firing
-# costs 8 extra `autograd.grad` calls, 4 of which are full decoder backwards,
-# so this is the most expensive diagnostic in the loop by a wide margin.  The
-# series it feeds moves on the scale of tens of thousands of steps, so a
-# coarser interval loses nothing and hands the time back to training.
-grad_source_probe_interval = 200
-
 force_from_scratch = False
 strict_load = True
 
@@ -299,10 +232,10 @@ clip_grad_norm_override_value_d = 100
 # linear-warmup in steps. 0 = disabled
 warmup_steps = 0
 
-# Loss swap: L1 mel -> multi-scale mel transition over N steps (kicks in at resume)
-swap_l1_to_ms = False  # Set True to swap from L1 mel loss to multi-scale mel loss
-swap_duration_steps = 500  # Steps over which the transition runs
-swap_start_step = 0  # Filled at resume: global_step when the swap was enabled
+# L1 mel -> multi-scale mel transition, over swap_duration_steps (kicks in at resume).
+swap_l1_to_ms = False
+swap_duration_steps = 500
+swap_start_step = 0  # Filled at resume: global_step when the swap was enabled.
 swap_completed = False
 
 # Freezes the whole frontend: everything outside `dec.` and `emb_g.`
@@ -445,23 +378,11 @@ def setup_env_and_distr(rank, n_gpus, device, device_id, config):
         torch.cuda.set_device(device_id)
 
 class _HoldoutSet:
-    """Fixed excerpts of a fixed length, kept in RAM and batched on demand.
+    """Fixed-length excerpts, kept in RAM and batched on demand.
 
-    The evaluation used to run through a ``DataLoader`` at batch size 1.  That
-    was not a throughput choice: the collate pads every item up to the longest
-    one in the batch, and padding silence into the mel puts a constant in the
-    metric that moves with whatever else lands beside it -- at batch 1 there is
-    nothing to pad against.
-
-    Cropping every excerpt to the same number of frames removes the padding
-    instead of the batching.  That matters because the step here is dispatch
-    bound rather than compute bound, so a batch of eight costs barely more than
-    a batch of one and the evaluation stops spending its wall clock in Python.
-
-    Holds the excerpts rather than the batches so :meth:`shrink` can re-form
-    them: the evaluation decodes several seconds per item where a training step
-    decodes a fraction of one, so it can be the largest allocation in the run
-    even though it stores no gradients.
+    Cropped to equal length rather than padded: padding silence into the mel
+    would put a batch-dependent constant into the metric. Held as excerpts
+    rather than pre-formed batches so :meth:`shrink` can re-batch them.
     """
 
     def __init__(self, items, batch_size, label="holdout"):
@@ -726,42 +647,6 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
 
 def get_g_model(config, sample_rate, vocoder, use_checkpointing):
     from rvc.lib.algorithm.synthesizers import Synthesizer
-    if chouwagan_stack_active:
-        # Decoder-specific defaults.  Only the selected decoder's are applied,
-        # so a run does not carry another decoder's channel schedule in its
-        # config, and only keys the config leaves *absent* are filled in.
-        decoder_defaults = {
-            # The decoder is depthwise-separable and its blocks narrow as the
-            # rate climbs, which is affordable because the excitation U-Net --
-            # not the trunk -- carries pitch phase up to the output rate.  The
-            # excitation is rendered once at full rate and band-limited down, so
-            # every stage sees one phase-consistent source rather than four
-            # independently re-rendered harmonic banks.
-            "chouwagan": {
-                "chouwagan_channels": [256, 160, 80, 40],
-                "chouwagan_block_kernels": [[3, 7], [3, 7], [7], [7]],
-                "chouwagan_dilations": [1, 3, 5],
-                "chouwagan_expansion": [2, 2, 1, 1],
-                "chouwagan_istft_hop": 0,
-                "chouwagan_harmonics": 128,
-                "chouwagan_excitation_unet": True,
-                "chouwagan_latent_source_gate": True,
-                "chouwagan_remove_output_dc": True,
-            },
-        }
-        decoder_config_defaults = dict(
-            decoder_defaults.get(get_vocoder_spec(vocoder)["generator"], {})
-        )
-        # The id is pinned rather than read from the config: ``net_g`` loads
-        # non-strictly, so a checkpoint whose latent or decoder layout differs
-        # would otherwise load with the mismatched modules left at their init
-        # instead of failing the guard.
-        config.model["architecture_id"] = get_architecture_id(
-            vocoder, config.model.__dict__
-        )
-        for key, value in decoder_config_defaults.items():
-            if key not in config.model:
-                config.model[key] = value
     model_config = config.model.__dict__.copy()
     return Synthesizer(
         config.data.filter_length // 2 + 1,
@@ -774,24 +659,6 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
     )
 
 def get_d_model(config, vocoder, use_checkpointing):
-    """Build the discriminator and apply the trainer's execution policy.
-
-    ``d_branchwise`` is architecture-adjacent -- it decides what R1 penalises
-    and how many ``loss_disc`` series exist -- so it is a constructor argument.
-    ``d_generator_branchwise`` is not: it only decides whether the generator
-    step walks the branches one at a time, which is a peak-memory-against-step-
-    time trade with identical losses and gradients either way.  Setting it here
-    keeps it out of every discriminator's signature, and keeps the two
-    decisions from being read as one.
-    """
-    model = _build_d_model(config, vocoder, use_checkpointing)
-    model.generator_branchwise = bool(
-        getattr(config.model, "d_generator_branchwise", True)
-    )
-    return model
-
-
-def _build_d_model(config, vocoder, use_checkpointing):
     vocoder = normalize_vocoder(vocoder)
     discriminator_id = get_discriminator_id(vocoder)
     # JSON has no tuples, so a configured schedule arrives as nested lists.  The
@@ -808,105 +675,19 @@ def _build_d_model(config, vocoder, use_checkpointing):
         value = getattr(config.model, name, None)
         return default if value is None else value
 
-    if discriminator_id == "chouwagan":
-        from rvc.lib.algorithm.discriminators.multi import chouwagan as chouwagan_d
-
-        return chouwagan_d.ChouwaGANDiscriminator(
-            use_spectral_norm=bool(
-                getattr(config.model, "use_spectral_norm", False)
-            ),
-            use_checkpointing=use_checkpointing,
-            sample_rate=config.data.sample_rate,
-            # Per-branch driving: R1 rotated one branch at a time under its own
-            # strength controller, plus a ``loss_disc`` series per branch.  Off
-            # collapses all of that onto one branch; see ``branchwise.py``.
-            # This is *not* the generator step's per-branch execution -- that is
-            # ``d_generator_branchwise``, applied in ``get_d_model``.
-            branchwise=bool(getattr(config.model, "d_branchwise", True)),
-            # Sliced-adversarial heads.  Off falls back to plain LSGAN logits,
-            # and ``_constant_discriminator_loss`` moves the governor's floor
-            # with it -- the two loss forms have different floors.
-            use_san=bool(getattr(config.model, "d_use_san", True)),
-            # Same two layers as the mpd_msd path below: ``d_use_periods`` /
-            # ``d_use_spectrogram`` switch a family off, ``d_periods`` /
-            # ``d_spectrogram_specs`` say which members it has when it is on.
-            # ``d_use_cqt`` and ``d_use_subband`` are already booleans because
-            # each is a single branch rather than a family.
-            periods=(
-                ()
-                if not setting("d_use_periods", True)
-                else tuple(setting("d_periods", chouwagan_d.PERIODS))
-            ),
-            spectrogram_channels=tuple(
-                setting("d_spectrogram_channels", chouwagan_d.SPECTROGRAM_CHANNELS)
-            ),
-            spectrogram_compression=float(
-                getattr(config.model, "d_spectrogram_compression", 0.3)
-            ),
-            spectrogram_specs=(
-                ()
-                if not setting("d_use_spectrogram", True)
-                else tuple(
-                    setting("d_spectrogram_specs", chouwagan_d.SPECTROGRAM_SPECS)
-                )
-            ),
-            use_cqt=bool(getattr(config.model, "d_use_cqt", False)),
-            cqt_bins_per_octave=int(
-                getattr(config.model, "d_cqt_bins_per_octave", 16)
-            ),
-            cqt_bins=int(getattr(config.model, "d_cqt_bins", 128)),
-            cqt_f_min=float(getattr(config.model, "d_cqt_f_min", 80.0)),
-            cqt_channels=tuple(setting("d_cqt_channels", chouwagan_d.CQT_CHANNELS)),
-            use_subband=bool(getattr(config.model, "d_use_subband", False)),
-            subband_bands=int(getattr(config.model, "d_subband_bands", 8)),
-            subband_channels=tuple(
-                setting("d_subband_channels", chouwagan_d.SUBBAND_CHANNELS)
-            ),
-        )
-
     from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined
 
-    # ``mpd_msd`` is Applio's ``v2``; ``mpd_msd_v3`` is the layout Applio picks
-    # for RefineGAN specifically -- five period branches instead of eight, plus
-    # three multi-resolution spectrogram branches.  The id carries the version
-    # so the registry stays the single place a vocoder's discriminator is
-    # chosen by default.
-    #
-    # ``d_version`` overrides it, because the choice is a VRAM decision as much
-    # as a quality one.  Measured on an 8 GB card, batch 8 over 0.4 s, decoder
-    # plus both discriminator passes:
-    #
-    #   v2         4.64 GiB    498 ms/step
-    #   v3         6.42 GiB   5912 ms/step   (does not fit; the allocator
-    #                                         thrashing is the 12x, not the
-    #                                         branches, which are worth 1.8x)
-    #   v3l        5.97 GiB   1282 ms/step
-    #   v3l + checkpointing
-    #              3.43 GiB   1024 ms/step
-    #   v3l, batch 6
-    #              4.72 GiB    640 ms/step
-    #
-    # ``v3`` is what both RefineGAN configs ship, and it is exact Applio parity.
-    #
-    # ``v3l`` -- v3's branches with the frequency axis downsampled in the last
-    # two layers -- was the default on the strength of the 24% above.  It did
-    # not survive re-measurement: on an RTX 5060 it moved neither step time nor
-    # peak VRAM against v3.  The branch microbenchmark it was chosen on
-    # (81.1 ms / 342 MiB against 107.0 / 396, see the parity tests) is real, but
-    # the discriminator is not the bound half of the step, so a saving there
-    # does not reach the step -- the same reason the eager step is dispatch- and
-    # not kernel-bound.  It stays available as an override; it is just not worth
-    # spending parity on by default.
-    # ``d_version: "v2"`` is the one that actually buys VRAM back.
+    # ``mpd_msd`` is Applio's v2 (8 periods); ``mpd_msd_v3`` is what it picks
+    # for RefineGAN (5 periods + 3 multi-resolution spectrogram branches).
+    # ``d_version`` overrides the default -- v3 does not fit an 8 GB card at
+    # batch 8 (6.42 GiB / 5912 ms/step vs v2's 4.64 GiB / 498 ms/step); v3l
+    # (v3 with the last two layers frequency-downsampled) was tried as a
+    # cheaper default but measured no improvement over v3 on newer hardware,
+    # so it stays available only as an explicit override.
     version = "v3" if discriminator_id == "mpd_msd_v3" else "v2"
     version = str(getattr(config.model, "d_version", None) or version)
-    # Branch-by-branch overrides on top of the preset, in two layers.
-    #
-    # ``d_use_*`` is the switch: one boolean per family, all defaulting to on.
-    # ``d_periods``/``d_resolutions`` are the *content* of a family that is on --
-    # ``None`` keeps the preset's, a list replaces it.  Two keys rather than one
-    # because "off" and "which ones" are different questions, and answering the
-    # first should not require writing out an empty list.
+    # ``d_use_*`` switches a whole family off; ``d_periods``/``d_resolutions``
+    # replace its content when it's on (``None`` keeps the preset's).
     return MPD_MSD_Combined(
         config.model.use_spectral_norm,
         use_checkpointing=use_checkpointing,
@@ -917,49 +698,22 @@ def _build_d_model(config, vocoder, use_checkpointing):
         ),
         frequency_strides=setting("d_frequency_strides"),
         use_msd=bool(setting("d_use_msd", True)),
+        # UnivHD (arXiv 2512.03486) is opt-in and *additive*: it appends a
+        # harmonic-order branch and removes nothing, which is how the paper
+        # runs it.  Off by default because it is unmeasured on this fork -- the
+        # gains it reports are on harmonic structure and F0RMSE for singing,
+        # not on the frame-rate mirroring, which its ERB bandwidths are too
+        # wide to separate above ~700 Hz.
+        sample_rate=int(config.data.sample_rate),
+        use_univhd=bool(setting("d_use_univhd", False)),
+        univhd_n_fft=int(setting("d_univhd_n_fft", 2048)),
+        univhd_hop_length=int(setting("d_univhd_hop_length", 256)),
+        univhd_harmonics=int(setting("d_univhd_harmonics", 10)),
+        univhd_bins_per_octave=int(setting("d_univhd_bins_per_octave", 24)),
+        univhd_f_min=float(setting("d_univhd_f_min", 80.0)),
+        univhd_channels=int(setting("d_univhd_channels", 32)),
+        univhd_half_harmonic=bool(setting("d_univhd_half_harmonic", True)),
     )
-
-
-def _lazy_r1_penalty(
-    net_d,
-    real_audio,
-    branch_index,
-    segment_size=None,
-):
-    """Compute an unbiased branch sample of the mean discriminator R1.
-
-    Sampling a window is this function's job; *what the penalty differentiates*
-    is the discriminator's, because only it knows what each branch consumes --
-    a spectrogram branch is penalised on its spectrogram rather than through
-    the divergent ``|X|**0.3`` Jacobian.  This used to differentiate the
-    waveform for every branch, which meant the model's own ``r1_penalty`` was
-    dead code that only the tests exercised.
-    """
-    if segment_size is not None and real_audio.shape[-1] > int(segment_size):
-        max_start = real_audio.shape[-1] - int(segment_size)
-        start = int(
-            torch.randint(
-                max_start + 1,
-                (),
-                device=real_audio.device,
-            ).item()
-        )
-        real_audio = real_audio[..., start : start + int(segment_size)]
-    model = net_d.module if hasattr(net_d, "module") else net_d
-    branch_penalty = getattr(model, "r1_penalty", None)
-    if branch_penalty is not None:
-        return branch_penalty(real_audio.detach().float(), int(branch_index))
-    real_audio = real_audio.detach().float().requires_grad_(True)
-    real_logits, _ = net_d(real_audio, branch_index=int(branch_index))
-    real_score = real_logits.float().mean()
-    real_grad = torch.autograd.grad(
-        outputs=real_score,
-        inputs=real_audio,
-        create_graph=True,
-        only_inputs=True,
-    )[0]
-    return real_grad.square().reshape(real_grad.shape[0], -1).sum(dim=1).mean()
-
 
 
 def _prior_gap(
@@ -976,24 +730,13 @@ def _prior_gap(
 ):
     """Is the Gaussian posterior carrying anything the prior does not have?
 
-    Decodes twice from the same batch -- once from the posterior sample ``z``
-    that produced ``full_output``, once from the prior mean pushed through the
-    flow -- and returns the mel L1 gap between them.  This is the measurement
-    ``diag/kl_*`` cannot make, and the distinction matters because the two
-    failure modes are indistinguishable in KL: a rate near zero means "the
-    prior predicts the posterior" exactly as often as it means "the posterior
-    stopped encoding anything", and only the second one is a problem.
-
-    A large gap with a small KL says the posterior is load-bearing and the flow
-    simply has not caught up -- training will close it.  A small gap says the
-    decoder would produce the same audio without ever seeing the spectrogram,
-    which is the collapse worth acting on.  The prior mean is used rather than
-    a sample so the number is not confounded by the prior's variance.
-
-    Diagnostic only: everything here runs under ``no_grad``.  A term of this
-    shape has no gradient toward its own stated purpose -- the cheapest way to
-    inflate it is to make the latent's scale destructive rather than
-    informative -- so it is measured and never optimised.
+    Decodes twice -- once from the posterior sample ``z`` that produced
+    ``full_output``, once from the prior mean pushed through the flow -- and
+    returns the mel L1 gap between them.  A rate near zero in ``diag/kl_*`` is
+    ambiguous between "prior predicts posterior" (fine) and "posterior
+    collapsed" (not); a large gap here means the former, a small one the
+    latter.  Diagnostic only, under ``no_grad``: optimising this gap directly
+    would reward a destructive latent rather than an informative one.
     """
     with torch.no_grad():
         speaker = model.emb_g(sid).unsqueeze(-1)
@@ -1025,346 +768,6 @@ def _clip_or_sample_grad_norm(
     return clip_grad_norm_(parameters, max_norm=max_norm)
 
 
-def _decoder_parameters(net_g):
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    return [parameter for parameter in model.dec.parameters() if parameter.requires_grad]
-
-
-def _add_decoder_only_gradients(loss, net_g):
-    decoder_parameters = _decoder_parameters(net_g)
-    if not decoder_parameters:
-        return
-
-    decoder_gradients = torch.autograd.grad(
-        loss,
-        decoder_parameters,
-        retain_graph=False,
-        allow_unused=True,
-    )
-    _accumulate_gradients(decoder_parameters, decoder_gradients)
-
-
-def _add_decoder_only_wave_gradients(y_hat, wave_gradient, net_g):
-    """The same accumulation, entered from the waveform instead of a scalar.
-
-    The branchwise generator step never builds a ``loss_gan`` graph -- each
-    discriminator branch is backwarded into the detached waveform and thrown
-    away -- so what reaches here is ``d loss_gan / d y_hat`` rather than
-    ``loss_gan``.  Every path from the GAN objective to the decoder runs
-    through ``y_hat``, so seeding the generator's backward with that gradient
-    is the chain rule, not an approximation: it produces the same decoder
-    gradients the joint path would have.
-    """
-    decoder_parameters = _decoder_parameters(net_g)
-    if not decoder_parameters or wave_gradient is None:
-        return
-
-    decoder_gradients = torch.autograd.grad(
-        y_hat,
-        decoder_parameters,
-        grad_outputs=wave_gradient,
-        retain_graph=False,
-        allow_unused=True,
-    )
-    _accumulate_gradients(decoder_parameters, decoder_gradients)
-
-
-def _branchwise_generator_terms(
-    discriminator_model,
-    y,
-    y_hat,
-    real_spectrograms,
-    *,
-    use_amp,
-    amp_dtype,
-    loss_scale=1.0,
-    san_direction_weight=1.0,
-    use_softplus=False,
-):
-    """Adversarial and feature-matching terms, one discriminator branch at a time.
-
-    The joint path holds every branch's feature maps and activation graph alive
-    at once, from the forward until the single ``loss_gan`` backward, which is
-    at the far end of the step: one copy of the largest intermediate tensors in
-    the step per branch, held across every reconstruction loss in between.
-    Here each branch is forwarded on a *detached* copy of the waveform,
-    differentiated immediately, and dropped before the next one starts, so the
-    peak holds one branch instead of all of them.  What survives
-    the loop is two waveform-shaped gradients, which are the same size as
-    ``y_hat``.
-
-    The two terms are differentiated separately because their weights
-    (``adaptive_adv`` and ``adaptive_fm``) are not known yet -- they are decided
-    downstream from these very losses -- and the wave gradient is linear in
-    both, so keeping them apart is what lets the governors stay exact rather
-    than lag a step.
-
-    Normalisation is applied after the loop rather than inside it: ``adv`` is a
-    mean over branches and ``fm`` a mean over *all* layer terms of all branches,
-    and neither denominator is known until every branch has been seen.  Both
-    are single scalars, so scaling the accumulated losses and gradients at the
-    end is identical to having divided each contribution as it arrived.
-
-    ``loss_scale`` is the AMP scaler's factor.  The returned gradients carry it
-    (they are handed to the optimizer, which unscales) while the returned
-    losses do not (they are reported and fed to the controllers).
-    """
-    branches = discriminator_model.discriminators
-    proxy = y_hat.detach().requires_grad_(True)
-    adv_wave_grad = torch.zeros_like(proxy)
-    fm_wave_grad = torch.zeros_like(proxy)
-    adv_total = None
-    fm_total = None
-    term_count = 0
-
-    for index in range(len(branches)):
-        branch = branches[index]
-        slot = discriminator_model._spectrogram_index(index)
-        real_spectrogram = (
-            real_spectrograms[slot]
-            if real_spectrograms is not None and slot is not None
-            else None
-        )
-        with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-            with torch.no_grad():
-                _, real_features = discriminator_model._forward_one(
-                    branch, y, real_spectrogram
-                )
-            fake_logit, fake_features = discriminator_model._forward_one(
-                branch, proxy
-            )
-            # ``normalize=False`` on both: the denominators are applied once,
-            # after the loop.
-            branch_adv = generator_loss(
-                [fake_logit],
-                normalize=False,
-                san_direction_weight=san_direction_weight,
-                use_softplus=use_softplus,
-            )
-            branch_fm = feature_loss([real_features], [fake_features])
-
-        term_count += min(len(real_features), len(fake_features))
-        adv_total = branch_adv.detach() if adv_total is None else adv_total + branch_adv.detach()
-        fm_total = branch_fm.detach() if fm_total is None else fm_total + branch_fm.detach()
-
-        # ``retain_graph`` on the first of the pair only: the second frees this
-        # branch's graph, which is the whole point of the loop.
-        adv_wave_grad += torch.autograd.grad(
-            branch_adv * loss_scale, proxy, retain_graph=True
-        )[0]
-        fm_wave_grad += torch.autograd.grad(branch_fm * loss_scale, proxy)[0]
-        del real_features, fake_features, fake_logit, branch_adv, branch_fm
-
-    branch_count = max(1, len(branches))
-    term_count = max(1, term_count)
-    zero = y_hat.detach().float().new_zeros(())
-    return {
-        "loss_scale": float(loss_scale),
-        "loss_adv": (adv_total / branch_count) if adv_total is not None else zero,
-        "loss_fm": (fm_total / term_count) if fm_total is not None else zero,
-        "adv_wave_grad": adv_wave_grad / branch_count,
-        "fm_wave_grad": fm_wave_grad / term_count,
-    }
-
-
-# The balance rule measures gradient norms with ``torch.autograd.grad``, and
-# that traversal runs *outside* the ``GradScaler`` -- the scaler only covers
-# what goes through ``scale(...).backward()``.  Under FP16 the probe therefore
-# has no overflow protection at all, and a reconstruction loss in the tens
-# overflows the half range on its way back through the decoder.  The overflow
-# becomes ``inf``, ``inf - inf`` becomes ``NaN``, and the ratio of two NaN
-# norms is NaN -- which is then cached for ``adaptive_adv_interval`` steps and
-# multiplied into ``loss_gen_total``.  Measured on the 44.1 kHz FP16 pretrain:
-# 50 of 50 generator steps skipped, every loss component finite and only the
-# weights NaN, the scaler halving its scale every step from 2**10 to 2**-40.
-#
-# What makes this free to fix is that the rule is a *ratio*: ``||d(s*L)/dp||/s``
-# is the same number for every ``s``, so each term can be measured through
-# whatever scale keeps it inside the half range -- smaller when it overflows,
-# larger when it underflows to nothing.  In FP32 the first attempt always
-# succeeds and ``s`` stays 1.0, so nothing about the existing behaviour moves.
-_PROBE_SCALE_ATTEMPTS = 6
-_PROBE_SCALE_STEP = 256.0
-
-
-def _probe_gradient(make_gradient):
-    """One balance-rule gradient, measured through a scale that survives FP16.
-
-    ``make_gradient(scale)`` returns ``d(scale * loss) / d(parameter)``, or
-    ``None`` where the term does not reach the parameter at all.  Returns
-    ``(gradient, norm)`` in FP32 and at unit scale, so callers see exactly the
-    numbers they saw before -- the scale exists only inside the measurement.
-
-    Returns the last attempt's values rather than raising when no scale works;
-    the caller decides what a failed probe means, because that decision belongs
-    where the cached weight lives.
-    """
-    scale = 1.0
-    direction = 0.0
-    gradient = None
-    norm = None
-    finite_gradient = None
-    finite_norm = None
-    for _ in range(_PROBE_SCALE_ATTEMPTS):
-        scaled = make_gradient(scale)
-        if scaled is None:
-            return None, None
-        gradient = scaled.detach().float() / scale
-        norm = gradient.norm()
-        value = float(norm)
-        if value == value and value != float("inf"):
-            finite_gradient = gradient
-            finite_norm = norm
-            if value > 0.0:
-                return gradient, norm
-            # Exactly zero: either the term genuinely does not move this
-            # parameter, or every element underflowed.  One measurement through
-            # a larger scale tells the two apart, and a term that is really
-            # zero stays zero at any scale.
-            step = _PROBE_SCALE_STEP
-        elif direction == _PROBE_SCALE_STEP:
-            # Growing the scale broke the measurement instead of rescuing it:
-            # ``scale`` itself has outgrown the half range, so the multiply
-            # that seeds the traversal is now ``inf`` and the zero it was
-            # chasing was a real zero.  Keep the zero.
-            break
-        else:
-            step = 1.0 / _PROBE_SCALE_STEP
-        if direction and step != direction:
-            # The two failure modes point opposite ways.  A term that overflows
-            # at one scale and vanishes at the next has no representable
-            # measurement, so stop rather than oscillate between them.
-            break
-        direction = step
-        scale *= step
-    if finite_norm is not None:
-        return finite_gradient, finite_norm
-    return gradient, norm
-
-
-def _wave_parameter_gradient(y_hat, wave_gradient, parameter):
-    """``d loss / d parameter`` for a loss that reaches it only through ``y_hat``.
-
-    Scaled like every other balance-rule probe -- this traversal crosses the
-    whole decoder in whatever dtype autocast recorded, so it overflows for the
-    same reason and is measured the same way.  See ``_probe_gradient``.
-    """
-    if wave_gradient is None:
-        return None
-    gradient, _ = _probe_gradient(
-        lambda scale: torch.autograd.grad(
-            y_hat,
-            parameter,
-            grad_outputs=wave_gradient * scale,
-            retain_graph=True,
-            allow_unused=True,
-        )[0]
-    )
-    return gradient
-
-
-def _accumulate_gradients(parameters, gradients):
-    # Accumulate with one multi-tensor kernel rather than one per parameter.
-    # The decoder has 332 of them, and the old `parameter.grad + gradient` was
-    # also out-of-place, so it allocated 332 tensors it immediately dropped:
-    # measured 5.15 ms per step against 0.30 ms here, bitwise identical, on a
-    # ~270 ms step.  This is the same in-place accumulation the autograd engine
-    # itself does, so it is safe on grads that `backward()` just populated.
-    existing_grads = []
-    incoming_grads = []
-    for parameter, gradient in zip(parameters, gradients):
-        if gradient is None:
-            continue
-        if parameter.grad is None:
-            parameter.grad = gradient
-        else:
-            existing_grads.append(parameter.grad)
-            incoming_grads.append(gradient)
-    if existing_grads:
-        torch._foreach_add_(existing_grads, incoming_grads)
-
-
-def _normalize_san_weights(net_d):
-    model = net_d.module if hasattr(net_d, "module") else net_d
-    for module in model.modules():
-        normalize_weight = getattr(module, "normalize_weight", None)
-        if normalize_weight is not None:
-            normalize_weight()
-
-
-def _gradient_norm(loss, targets):
-    gradients = torch.autograd.grad(
-        loss,
-        targets,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    terms = [
-        gradient.detach().float().square().sum()
-        for gradient in gradients
-        if gradient is not None
-    ]
-    if not terms:
-        return loss.detach().new_zeros(())
-    return torch.sqrt(torch.stack(terms).sum())
-
-
-def _tensor_gradient_norm(loss, tensor):
-    gradient = torch.autograd.grad(
-        loss,
-        tensor,
-        retain_graph=True,
-        allow_unused=True,
-    )[0]
-    if gradient is None:
-        return loss.detach().new_zeros(())
-    return gradient.detach().float().norm()
-
-
-def _last_layer_parameter(module):
-    """Return the differentiable leaf behind ``module.weight``.
-
-    ``weight_norm`` from ``torch.nn.utils.parametrizations`` turns ``weight``
-    into a property that is recomputed on every access, so the tensor handed
-    back is *not* the leaf the autograd graph was built on.  Asking
-    ``torch.autograd.grad`` for it silently yields ``None`` (with
-    ``allow_unused=True``), which would pin the adaptive adversarial weight to
-    its lower clamp forever.  Reach for the underlying ``original1`` (the
-    direction vector ``v``) instead, which has the same shape as ``weight``.
-    """
-    parametrizations = getattr(module, "parametrizations", None)
-    if parametrizations is not None and "weight" in parametrizations:
-        return parametrizations["weight"].original1
-    return module.weight
-
-
-#: Final projection of each decoder, in the order they are looked up.  The
-#: adaptive adversarial weight differentiates the reconstruction and adversarial
-#: losses with respect to this layer, so it has to be the *last* one that both
-#: reach.  Every decoder here is time-domain, so it is ``conv_post``;
-#: ``output_proj`` stays in the lookup for a decoder that emits a spectrogram.
-#: ``istft_head.proj`` is dotted because ChouwaGAN's iSTFT head keeps its
-#: projection inside the head module.  It comes first: with the head active
-#: ``conv_post`` is ``None``, and it is the head's projection that both the
-#: reconstruction and the adversarial loss actually reach last.
-_DECODER_OUTPUT_LAYERS = ("istft_head.proj", "conv_post", "output_proj")
-
-
-def _decoder_output_layer(decoder):
-    for name in _DECODER_OUTPUT_LAYERS:
-        layer = decoder
-        for part in name.split("."):
-            layer = getattr(layer, part, None)
-            if layer is None:
-                break
-        if layer is not None:
-            return layer
-    raise AttributeError(
-        f"{type(decoder).__name__} has none of {_DECODER_OUTPUT_LAYERS}; the "
-        "adaptive adversarial weight has no layer to differentiate."
-    )
-
-
 #: Wall-clock seconds between machine-readable progress lines.  Rich's bar is
 #: for a terminal; this is for whatever is reading the pipe.
 _MACHINE_PROGRESS_INTERVAL = 1.0
@@ -1374,17 +777,9 @@ _last_machine_progress = 0.0
 def _emit_machine_progress(
     epoch, total_epochs, batch, total_batches, step, metrics, rank
 ):
-    """Print one parseable progress line, for a front-end reading stdout.
-
-    Rich renders nothing at all when stdout is not a terminal -- a run driven
-    by a GUI produces no progress output whatsoever -- so there is no bar to
-    scrape.  This emits the same numbers in a fixed format instead, and only
-    when there is no terminal to clutter, so an interactive run still sees just
-    the bar.
-
-    Throttled by wall clock rather than by batch count: batch rate varies by
-    two orders of magnitude between configurations, and the reader wants a
-    steady update rate, not a steady batch stride.
+    """Print one parseable progress line for a GUI front-end, when stdout isn't
+    a terminal (Rich's bar renders nothing there). Throttled by wall clock
+    rather than batch count, since batch rate varies widely by configuration.
     """
     global _last_machine_progress
     if rank != 0:
@@ -1409,32 +804,14 @@ def _emit_machine_progress(
     )
 
 
-#: How fast ``loss_disc`` may drift upward, per 10k steps, while still counting
-#: as a healthy GAN rather than a generator running away from its critic.
-#:
-#: A GAN's discriminator loss rises as the generator improves -- that is the
-#: process working -- so this has to sit well clear of the normal case or noise
-#: decides.  It is a property of the run rather than of the model, which is why
-#: ``_increment`` scopes the trend gate by headroom instead of leaning on this
-#: constant alone.  Raising it is not the fix when the ramp stalls.
-HEALTHY_DISC_DRIFT_PER_10K = 0.03
-
-
 def planned_step_count(total_epoch_count: int, train_loader, max_steps: int = 0) -> int:
-    """How many optimizer steps this run will actually take.
+    """How many optimizer steps this run will take.
 
-    Every schedule below this line is denominated in steps, and a step count
-    only means something against the length of the run it is scheduling.  A
-    pretrain runs for hundreds of thousands of steps, so a 10k warmup is the
-    first 2% of it.  A fine-tune on one speaker's dataset is 8k steps or fewer,
-    where that same literal is the whole run: the warmup never reaches full
-    weight, the ramp never reaches its ceiling, and the holdout is scored too
-    few times for the patience to be reachable.  The values are not wrong, they
-    are stated in absolute units against a run length that varies by two orders
-    of magnitude.
-
-    Returns 0 when the budget cannot be known, which every caller treats as
-    "leave the configured value alone".
+    Every schedule below this line is step-denominated but stated as an
+    absolute literal, so it means something different on an 8k fine-tune than
+    on a hundred-thousand-step pretrain; this is what :func:`fit_schedule` and
+    :func:`fit_eval_interval` rescale against.  Returns 0 when the budget is
+    unknown, which every caller treats as "leave the configured value alone".
     """
     per_epoch = max(1, len(train_loader))
     planned = max(0, int(total_epoch_count)) * per_epoch
@@ -1447,10 +824,8 @@ def planned_step_count(total_epoch_count: int, train_loader, max_steps: int = 0)
 def fit_schedule(configured: int, planned_steps: int, fraction: float, minimum: int = 1) -> int:
     """Shrink a step-denominated schedule to fit inside the run.
 
-    Only ever shrinks.  On a run long enough for the configured value the
-    configured value comes back untouched, so pretraining is bit-for-bit
-    unaffected and this cannot quietly re-tune a recipe that already works.
-    ``fraction`` is the share of the run the schedule is allowed to occupy.
+    Only ever shrinks: a run long enough for the configured value gets it back
+    untouched.  ``fraction`` is the share of the run the schedule may occupy.
     """
     configured = max(0, int(configured))
     if planned_steps <= 0 or configured <= 0:
@@ -1461,280 +836,15 @@ def fit_schedule(configured: int, planned_steps: int, fraction: float, minimum: 
 def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int:
     """An evaluation interval that lets ``patience`` actually be reached.
 
-    The overtrain detector stops on ``patience`` consecutive evaluations
-    without a new best, so the interval and the run length together decide
-    whether it can fire at all.  At one evaluation per 2000 steps an 8k
-    fine-tune gets four of them against a patience of eight: the detector is
-    not strict there, it is *inert*, and a fine-tune is exactly where
-    overtraining is most likely because the dataset is smallest.
-
-    Sizing for ~3x patience is what makes it a detector again: enough
-    evaluations that the counter can run out with training still left to
-    discard, rather than arriving at the last step to report that the run is
-    over.  Only ever shrinks, for the same reason as :func:`fit_schedule`.
+    At one evaluation per 2000 steps, an 8k fine-tune only gets 4 evaluations
+    against a patience of 8, so the detector can never fire. Sizing for ~3x
+    patience keeps it a detector; only ever shrinks, like :func:`fit_schedule`.
     """
     configured = max(1, int(configured))
     if planned_steps <= 0:
         return configured
     wanted = planned_steps // max(1, 3 * max(1, int(patience)))
     return max(1, min(configured, wanted)) if wanted else configured
-
-
-#: ``loss_disc`` for a constant discriminator under the plain LSGAN objective.
-CONSTANT_DISCRIMINATOR_LOSS = 0.5
-
-
-def _constant_discriminator_loss(san_direction_weight: float, san_active: bool) -> float:
-    """``loss_disc`` for a discriminator that emits one constant for real and fake.
-
-    This is the operational definition of a dead discriminator: it has stopped
-    being a function of its input.  It is a fixed number for a given loss form,
-    so the distance to it is an absolute health measure that needs no baseline
-    and no reference run.  Both sides are symmetric about the midpoint of the
-    real and fake targets, so the best constant is always 0.5.
-
-    Mirrors the two branches of :func:`~rvc.train.losses.discriminator_loss`:
-    SAN heads use a squared-softplus surrogate and carry a direction term at
-    ``san_direction_weight``, which puts the floor near 2.2 rather than 0.5.
-    Leaving it at 0.5 under SAN would tell the adversarial governor that a
-    perfectly healthy discriminator had already collapsed, and it would clamp
-    the ceiling to its minimum for the whole run.
-    """
-    if not san_active:
-        return CONSTANT_DISCRIMINATOR_LOSS
-    per_side = math.log1p(math.exp(0.5)) ** 2
-    return (1.0 + max(0.0, float(san_direction_weight))) * 2.0 * per_side
-
-
-class _AdversarialCeilingGovernor:
-    """Advance the adversarial ceiling only while the discriminator holds.
-
-    The bound on the adaptive adversarial weight is raised gradually rather
-    than set once.  Early in a run the coarse spectral envelope is what
-    matters and adversarial pressure only adds variance; texture -- high
-    frequency detail and the aperiodic component -- is what the adversarial
-    term is uniquely able to teach, and it is worth little before there is a
-    signal to texture.  Ramping keeps the first phase reconstruction-driven
-    without capping the second phase forever.  It is cosine-eased, so the
-    ceiling never steps and the discriminator is never handed a sudden change
-    in the objective it is chasing.
-
-    The ceiling cannot be a pure function of ``global_step``, because the
-    balance rule asks for ``balance_target * rec_grad / adv_grad`` and
-    ``adv_grad`` *is* the discriminator's strength -- so a weakening
-    discriminator makes the rule request a *larger* weight, which weakens it
-    further.  The ceiling is the only thing bounding that loop.
-
-    So the schedule is driven by a counter that advances only while the
-    discriminator is holding its ground, and rewinds when it is not.  Two
-    signals gate it, because they fail in different places:
-
-    * ``loss_disc`` trending up -- fast EMA above slow -- means the generator
-      is currently pulling ahead.  This is the early warning, and it fires
-      while the discriminator is still useful.
-    * headroom -- the distance from ``loss_disc`` to the constant-discriminator
-      loss -- falling below an absolute floor.  This is the backstop for the
-      case the trend misses: a discriminator that already collapsed and now
-      sits flat, where the trend is zero precisely because there is nothing
-      left to lose.
-
-    The backstop is an *absolute* floor, not a fraction of the best headroom
-    seen.  Headroom peaks early, while the generator is still weak, and falls as
-    the generator improves -- which is the GAN working, not failing -- so a
-    peak-relative rule holds the ceiling down for the rest of a healthy run.  An
-    absolute floor answers the question actually being asked: is this
-    discriminator near useless.
-
-    Rewinding is deliberately faster than advancing.  The weight that causes
-    the damage stays applied for as long as it takes to notice, so unwinding
-    at the same rate would leave it there for twice that again.
-    """
-
-    def __init__(
-        self,
-        start_step: int,
-        ramp_steps: int,
-        ceiling_start: float,
-        ceiling_end: float,
-        floor_loss: float,
-        fast_momentum: float = 5e-4,
-        slow_momentum: float = 1e-4,
-        tolerance: float | None = None,
-        headroom_floor: float = 0.08,
-        collapse_ceiling: float = 0.01,
-        trend_gate_headroom: float = 2.0,
-    ):
-        self.start_step = max(0, int(start_step))
-        self.ramp_steps = max(0, int(ramp_steps))
-        self.ceiling_start = float(ceiling_start)
-        self.ceiling_end = float(ceiling_end)
-        self.floor_loss = float(floor_loss)
-        # Where the ceiling goes when the discriminator has actually collapsed.
-        # It has to be able to retreat *below* ``ceiling_start``: against a
-        # discriminator emitting one constant for real and fake the balance rule
-        # asks for a huge weight, so a hard bottom of 1.0 would keep full
-        # adversarial pressure on a dead discriminator forever.  Retreating to
-        # ``adaptive_adv_min`` lets the generator fall back on reconstruction
-        # until the discriminator recovers.
-        self.collapse_ceiling = min(float(collapse_ceiling), float(ceiling_start))
-        self.fast_momentum = float(fast_momentum)
-        self.slow_momentum = float(slow_momentum)
-        # Derived, not chosen.  Two EMAs following a linear drift of ``r`` per
-        # step settle at a fixed separation of ``r * (1/slow - 1/fast)``, because
-        # each lags the true value by its own time constant.  So a *healthy*
-        # upward drift produces a constant, predictable ``fast - slow``, and a
-        # fixed threshold that does not account for it spends most of its budget
-        # on the normal case and fires on noise.  Deriving it from a stated drift
-        # rate keeps the early warning -- a runaway is fast, not a creep -- while
-        # giving the healthy creep room to exist.
-        if tolerance is None:
-            tolerance = (HEALTHY_DISC_DRIFT_PER_10K / 10_000.0) * (
-                1.0 / self.slow_momentum - 1.0 / self.fast_momentum
-            )
-        self.tolerance = float(tolerance)
-        # ~0.055 of real/fake separation in score space: alive, but only just.
-        self.headroom_floor = float(headroom_floor)
-        # Above this the trend gate is not consulted at all.  The gate is an
-        # early warning for a discriminator *on its way* to the floor, and one
-        # sitting at several times the floor is not on its way anywhere -- so
-        # its drift carries no information the backstop does not already have.
-        # See ``_increment``.
-        self.trend_gate_headroom = float(trend_gate_headroom) * self.headroom_floor
-        # Long enough for the EMAs to mean something, short enough that a
-        # finetune's own ramp is not spent entirely inside it.
-        self.warmup_steps = min(2000, max(200, self.ramp_steps // 8))
-        # Negative progress is the retreat below ``ceiling_start``.  Sized so a
-        # sustained collapse (-4 per step) reaches ``collapse_ceiling`` in about
-        # 2500 steps: fast enough to matter, slow enough that a brief dip does
-        # not throw away the ramp.
-        self.retreat_span = max(1.0, self.ramp_steps / 8.0)
-        self.progress = 0.0
-        self.fast: float | None = None
-        self.slow: float | None = None
-        self.best_headroom = 0.0
-        self.holding = False
-        self.seeded = False
-        #: Steps *this governor* has observed, which is not ``global_step`` once
-        #: a run resumes.  Every guard below counts in these.
-        self.observations = 0
-
-    def _seed(self, step: int) -> None:
-        """Put the ramp where the *run* is, not where this process is.
-
-        ``progress`` is a counter that advances at most +1 per step and is built
-        fresh on every process start, so without this a resume would drop the
-        ceiling back to ``ceiling_start`` and make the run re-earn a ramp it had
-        already earned -- tens of thousands of steps under less adversarial
-        pressure than the step before the resume.
-
-        Seeding assumes the skipped steps were healthy, which forgets any holds
-        and retreats in the original run.  That is the right way to be wrong
-        here: a hold only pauses the ramp, so the worst case is a ceiling as
-        high as an unheld run would have had, and if the discriminator really is
-        in trouble the EMAs are seeded from the first ``loss_disc`` of the
-        resumed run, so the backstop starts retreating on this same call.
-        Starting from zero is wrong in every case including the healthy one.
-        """
-        self.seeded = True
-        if self.ramp_steps > 0 and step > self.start_step:
-            self.progress = min(float(self.ramp_steps), float(step - self.start_step))
-
-    def update(self, step: int, loss_disc: float | None) -> float:
-        if loss_disc is not None and math.isfinite(loss_disc):
-            self.observations += 1
-            if self.fast is None:
-                self.fast = self.slow = float(loss_disc)
-            elif self.observations <= self.warmup_steps:
-                # Running mean, not the EMA, until there are enough samples for
-                # the EMA to mean anything.  The slow EMA's time constant is
-                # 1/slow_momentum = 10k steps, so whatever the *first* batch
-                # produces would dominate ``slow`` for tens of thousands of
-                # steps -- and on a resume that reads as a false collapse and
-                # rewinds a ramp nothing was wrong with.  A running mean has no
-                # seed to shake off: after k samples it *is* the mean of those k.
-                self.fast += (loss_disc - self.fast) / self.observations
-                self.slow += (loss_disc - self.slow) / self.observations
-            else:
-                self.fast += self.fast_momentum * (loss_disc - self.fast)
-                self.slow += self.slow_momentum * (loss_disc - self.slow)
-            if self.observations >= self.warmup_steps:
-                self.best_headroom = max(self.best_headroom, self.headroom)
-        if not self.seeded:
-            # After the EMAs above, so the backstop is armed with a real
-            # headroom before the seeded progress can be acted on.  A fresh
-            # pretrain seeds at step 0 against ``start_step`` and a fresh
-            # fine-tune seeds at ``phase_step`` 0, so both are no-ops.
-            self._seed(step)
-        if self.ramp_steps > 0 and step > self.start_step:
-            self.progress = min(
-                float(self.ramp_steps),
-                max(-self.retreat_span, self.progress + self._increment(step)),
-            )
-        return self.ceiling
-
-    def _increment(self, step: int) -> float:
-        """+1 advance, 0 pause, -4 retreat.
-
-        The middle value is the fix for a measured stall.  A rising ``loss_disc``
-        has two causes that this trend check cannot tell apart: the generator
-        improving, which is the GAN working, and the generator running away,
-        which is what the ramp exists to catch.  Penalising both at -1 makes the
-        healthy case *cost* ramp progress, and since the counter only gains +1
-        the net rate is ``1 - 2h``: a discriminator merely holding a third of the
-        time cancels two thirds of the ramp.
-
-        Pausing instead of rewinding makes the trend gate what it is described
-        as -- an early warning that stops the ramp -- rather than a mechanism
-        that actively unwinds progress on healthy behaviour.  Retreat is left to
-        the headroom backstop, which fires on the operational definition of a
-        dead discriminator rather than on the sign of a noisy derivative.
-
-        The gate is additionally scoped to *where it can be right*.
-        ``tolerance`` comes from a stated healthy drift rate, and that rate is a
-        property of the run rather than of the model, so no constant fits every
-        run -- recalibrating it buys one run and loses the next.  This branch
-        only matters for a discriminator heading for the floor, so it is
-        consulted only while the discriminator is near enough for the answer to
-        change anything.  Above ``trend_gate_headroom`` the ramp advances on the
-        backstop alone, which is the check with an absolute meaning.
-        """
-        # Counted in observations, not in ``step``.  ``step`` is ``global_step``
-        # during pretraining, so on a resume it is already far past any warmup
-        # while these EMAs have seen a single batch -- which is exactly when
-        # their verdict is worthless and the guard is needed most.
-        if self.fast is None or self.slow is None or self.observations < self.warmup_steps:
-            self.holding = False
-            return 1.0
-        if self.headroom < self.headroom_floor:
-            self.holding = True
-            return -4.0
-        if (
-            self.headroom < self.trend_gate_headroom
-            and self.fast - self.slow > self.tolerance
-        ):
-            self.holding = True
-            return 0.0
-        self.holding = False
-        return 1.0
-
-    @property
-    def headroom(self) -> float:
-        """How far the discriminator is from being a constant.  Higher is better."""
-        return 0.0 if self.slow is None else self.floor_loss - self.slow
-
-    @property
-    def ceiling(self) -> float:
-        if self.ramp_steps <= 0:
-            return self.ceiling_end
-        if self.progress < 0.0:
-            # Retreat below the starting ceiling.  Linear rather than cosine:
-            # this branch is an emergency, and easing it would spend the first
-            # few hundred steps of a collapse barely moving.
-            retreat = min(1.0, -self.progress / self.retreat_span)
-            return self.ceiling_start + (self.collapse_ceiling - self.ceiling_start) * retreat
-        progress = min(1.0, self.progress / self.ramp_steps)
-        eased = 0.5 * (1.0 - math.cos(math.pi * progress))
-        return self.ceiling_start + (self.ceiling_end - self.ceiling_start) * eased
 
 
 def _cpu_state_dict(source):
@@ -1756,32 +866,19 @@ def _holdout_metrics(
     want_latent=True,
     noise_scale=0.0,
 ):
-    """Score held-out audio down the inference path, in a single pass.
+    """Score held-out audio down the *inference* path, in a single pass.
 
-    ``mel_l1`` is the mel distance between what a listener actually gets and
-    the ground truth: the prior path, not the training forward.  The training
-    path samples a posterior that has seen the target spectrogram, and a model
-    that is memorising scores well there long after it has stopped
-    generalising.
+    ``mel_l1`` scores the prior path, not the training forward: the training
+    path samples a posterior that has seen the target spectrogram, so a
+    memorising model would keep scoring well there after it stops
+    generalising.  Prior, posterior and their gap come from one pass over one
+    set of weights, so the numbers stay comparable.
 
-    Prior, posterior and the gap between them all come out of the same pass
-    over the same weights.  This used to be two functions -- one calling
-    ``Synthesizer.infer``, one rebuilding the prior path by hand -- which
-    decoded the prior twice per excerpt and, worse, did it under *different*
-    weights: the metric under the EMA, the diagnostic under the live model.  So
-    the two prior numbers sat side by side in TensorBoard without being
-    comparable.  ``latent_prior`` is gone for the same reason: it *is*
-    ``mel_l1``.
-
-    ``noise_scale`` is the prior draw.  ``Synthesizer.infer`` hardcodes
-    0.66666; at 0 this decodes the prior mean instead, which makes the metric a
-    pure function of the weights and removes a sampling floor that was eating
-    most of its dynamic range.
-
-    Plain L1 on the log-mel, with no adversarial, feature-matching or KL term:
-    those are scored against a discriminator and a schedule that keep moving,
-    and the only thing that may move between two evaluations here is the
-    generator.
+    ``noise_scale=0`` decodes the prior mean instead of ``infer``'s default
+    0.66666 draw, making the metric a pure function of the weights.  Plain L1
+    on the log-mel: the adversarial/feature-matching/KL terms are scored
+    against a discriminator and schedule that keep moving independently of
+    the generator.
     """
     model = net_g.module if hasattr(net_g, "module") else net_g
     # ``flow`` is what turns a prior draw into something the decoder can use;
@@ -1940,38 +1037,18 @@ def _holdout_metrics_resilient(net_g, excerpts, config, device, **kwargs):
 class _OvertrainMonitor:
     """Find the last point where held-out quality was still improving.
 
-    Overtraining is not visible in the training loss -- that is what the word
-    means.  The generator keeps getting better at reproducing the slices it is
-    shown while getting worse at everything else, so the only way to catch the
-    turn is to score audio it has never been trained on and watch for the
-    minimum.
+    Overtraining isn't visible in the training loss, so this scores audio the
+    model has never trained on and watches for the minimum. Two things are
+    judged against a *noise band* rather than a fixed threshold (which means
+    something different in every run): the score is median-filtered over
+    ``smoothing`` evaluations before anything is decided on it, and
+    ``min_delta`` is a floor under a band computed as the residual spread of
+    recent scores about a trend line, so a still-improving run gets a narrow
+    band and a flat noisy one gets a wide one.
 
-    Two things here are judged against a *noise band* rather than a fixed
-    threshold, because a fixed threshold means something different in every
-    run:
-
-    * The score is median-filtered over ``smoothing`` evaluations before
-      anything is decided on it.  A single-point argmin over a flat tail picks
-      the luckiest evaluation rather than the best weights: on the run that
-      motivated this, the last six scores spanned 0.4% and the winner beat its
-      neighbour by 0.1%.
-    * ``min_delta`` is only a floor now.  The band is the residual spread of
-      the recent scores about a straight line through them, so a curve that is
-      still falling fast has a narrow band while a flat noisy one has a wide
-      one.  It is what the run itself says a real change looks like.
-
-    The median filter is centred, so the point being judged is one evaluation
-    behind the newest and its weights have to still be around when it is
-    judged -- which is why this keeps a short window of state dicts rather than
-    a single snapshot.
-
-    There are still two questions here, and they still want different answers:
-
-    * *Which weights do we keep?*  The lowest smoothed score.  Ties inside the
-      band go to the earlier step: the same measured quality with less
-      memorisation behind it, and the later one only won on noise.
-    * *Has the run stopped improving?*  The counter ignores anything inside the
-      band, so noise cannot reset it forever.
+    Weights to keep: lowest smoothed score; ties inside the band favour the
+    earlier step. Has the run stopped improving: the patience counter ignores
+    anything inside the band, so noise can't reset it forever.
     """
 
     def __init__(self, patience=8, min_delta=0.001, smoothing=3, noise_window=6):
@@ -2006,13 +1083,9 @@ class _OvertrainMonitor:
         return max(self.sigma, self.min_delta * abs(reference))
 
     def _noise_sigma(self) -> float:
-        """Residual spread of the recent scores about a straight line.
-
-        A trend line and not a mean: a run that is genuinely improving has a
-        large spread about its mean and a small one about its slope, and it is
-        the second that says how much of an evaluation-to-evaluation
-        difference is real.  Returns 0 until there are enough points to fit,
-        which leaves ``min_delta`` as the floor in the meantime.
+        """Residual spread of recent scores about a trend line (not a mean: a
+        genuinely improving run has a large spread about its mean but a small
+        one about its slope). 0 until there are enough points to fit.
         """
         recent = [value for _, value in self.history[-self.noise_window :]]
         count = len(recent)
@@ -2032,25 +1105,19 @@ class _OvertrainMonitor:
         return math.sqrt(sum(r * r for r in residuals) / max(1, count - 2))
 
     def update(self, source, value: float, step: int) -> bool:
-        """``source`` is whatever produced ``value``: a model, or a ``WeightEMA``.
-
-        Returns whether this evaluation moved the best, which is what the
-        caller marks in the log.  Keeping the weights that were actually scored
-        is the whole contract -- snapshotting the live model while having
-        measured the average would deliver a model nobody evaluated -- and with
-        a centred filter that means keeping the weights of the middle of the
-        window, not of the newest evaluation.
+        """``source``: a model or a ``WeightEMA``. Returns whether this moved
+        the best. With a centred filter, the weights kept are the middle of
+        the window, not the newest evaluation -- otherwise a snapshot of the
+        live model would be credited with a score it never earned.
         """
         if not math.isfinite(value):
             return False
         self.history.append((int(step), float(value)))
         self.sigma = self._noise_sigma()
 
-        # A state dict per evaluation is a copy of the model per evaluation, so
-        # only evaluations close enough to the running best to still win one
-        # are cloned.  A window entry without weights can never be selected,
-        # which costs nothing: for it to have won, its neighbours would have to
-        # drag a score that far off the best back under it.
+        # Only clone weights for evaluations close enough to the running best
+        # to still win one; a window entry without weights can never be
+        # selected.
         competitive = (
             not math.isfinite(self.best_raw)
             or value <= self.best_raw + 2.0 * self._band(self.best_raw)
@@ -2061,10 +1128,8 @@ class _OvertrainMonitor:
         self.best_raw = min(self.best_raw, float(value))
 
         if len(self._window) < self.smoothing:
-            # Until the window fills there is nothing to filter with, so the
-            # detector behaves like the unsmoothed one rather than reporting a
-            # half-formed median -- which on an even window is not a median at
-            # all, it is whichever side the tie broke towards.
+            # Until the window fills, behave unsmoothed rather than report a
+            # half-formed median.
             self.smoothed = float(value)
             center_step, _center_value, center_state = self._window[-1]
         else:
@@ -2093,13 +1158,9 @@ class _OvertrainMonitor:
         return improved
 
     def backoff(self, factor: int = 4) -> int:
-        """Evaluate less often once the run has already been called.
-
-        The detector fires long before a 200-epoch run ends, and with
-        ``stop_on_overtrain`` off the run keeps going -- paying full price for
-        the evaluation every interval to keep confirming an answer it already
-        has.  It still evaluates, because a run can come back, just not as
-        often.
+        """Evaluate less often once overtraining has already been flagged
+        (with ``stop_on_overtrain`` off, the run keeps going and a run can
+        still come back, so evaluation continues, just less often).
         """
         self.interval_scale = max(1, int(self.interval_scale * max(1, int(factor))))
         return self.interval_scale
@@ -2110,17 +1171,9 @@ class _OvertrainMonitor:
 
 
 def _deliverable_weights(overtrain_monitor, ema, model_g):
-    """The weights this run would hand you if it stopped right now.
-
-    Ordered by how much each source knows.  The holdout monitor scored audio
-    the model was never trained on, so it wins outright; when an EMA is also
-    running its snapshot *is* the average at its best point.  The EMA comes
-    next because averaging the trajectory beats any single point on it, and it
-    needs no metric to be fooled by.  Live weights are whatever the last step
-    happened to leave behind.
-
-    Returns ``(state_dict, label)``; the label is what gets printed, so a run
-    always says which of these it handed over.
+    """The weights this run would hand you if it stopped right now: holdout
+    best, then EMA, then live weights, in order of how much each source
+    knows. Returns ``(state_dict, label)``.
     """
     if overtrain_monitor is not None and overtrain_monitor.state_dict is not None:
         return overtrain_monitor.state_dict, f"holdout best @ {overtrain_monitor.best_step}"
@@ -2134,468 +1187,18 @@ def _deliverable_weights(overtrain_monitor, ema, model_g):
     return _cpu_state_dict(model_g), "live weights"
 
 
-def _checkpoint_extra(r1_controller, grad_scaler, r1_grad_scaler=None):
+def _checkpoint_extra(grad_scaler):
     """Training-loop state that a resume cannot re-derive, for the D checkpoint.
 
-    Everything here is plain scalars and plain dicts on purpose: ``extra`` is
-    unpickled under ``weights_only=True``, and the ``GradScaler``'s own
-    ``state_dict`` is five floats and ints, so it stays inside that contract.
-    Returns ``None`` when there is nothing to carry, which is what
-    ``save_checkpoint`` already treats as "omit the key".
+    Plain scalars/dicts only: ``extra`` is unpickled under
+    ``weights_only=True``. Returns ``None`` when empty, which
+    ``save_checkpoint`` treats as "omit the key".
     """
     extra = {}
-    if r1_controller is not None:
-        extra["r1_controller"] = r1_controller.state_dict
     if grad_scaler is not None:
         extra["grad_scaler"] = grad_scaler.state_dict()
         extra["amp_skipped_steps"] = int(amp_skipped_steps)
-    if r1_grad_scaler is not None:
-        extra["r1_grad_scaler"] = r1_grad_scaler.state_dict()
     return extra or None
-
-
-class _R1StrengthController:
-    """Hold the lazy R1 penalty at a fixed share of the discriminator's own update.
-
-    ``r1_gamma`` is an absolute penalty weight, and the quantity that matters is
-    a *relative* one: how much of the discriminator's movement is the gradient
-    penalty flattening it, versus the discriminative loss sharpening it.  Those
-    two are only in a fixed relation if the discriminative gradient is constant,
-    and it is not -- it decays over a run as the generator improves.  So a fixed
-    gamma is a rising share, and the stabiliser grows into the thing it is
-    supposed to be stabilising.
-
-    The R1 step runs its own backward and its own ``optim_d.step()``, so one
-    step in ``r1_interval`` moves the discriminator on the penalty alone.  Under
-    a fixed gamma that share climbs as the run goes on, and the symptom is
-    ``loss_disc`` rising while ``grad_norm_d`` falls -- a converging
-    discriminator does the opposite, so that pattern is one being flattened.
-
-    Targeting the ratio directly makes the stabilisation constant in the units
-    that matter and removes the constant that has to be re-picked per run.  The
-    update is multiplicative on ``log scale`` and symmetric in relative error,
-    matching ``RefineGANSVAE._kl_beta`` -- the same controller shape for the same
-    reason, and overshooting by 2x costs what undershooting by 2x costs.
-
-    The scale applied to an R1 event is the one earned by the events before it:
-    the penalty's gradient norm is only known after its backward, and choosing
-    the strength before it is the whole point.
-
-    The default target of 1.0 is where a healthy run sat, not a round number.
-
-    Do not read the target as "smaller is safer".  R1 is a *stabiliser*, and
-    this model has already died once from a frozen discriminator (see the SAN
-    direction-loss fix), so driving the share toward zero trades one failure
-    mode for its opposite.  Lowering the *bounds* is a different change from
-    lowering the target; see ``minimum`` and ``maximum`` below.
-    """
-
-    def __init__(
-        self,
-        branch_names=(),
-        target_ratio: float = 1.0,
-        lr: float = 0.05,
-        momentum: float = 0.05,
-        minimum: float = 1e-4,
-        maximum: float = 10000.0,
-    ):
-        #: The bounds are wide because the *absolute* strength each branch needs
-        #: to hold the same share spans ~700x, and that spread is legitimate: it
-        #: tracks the transforms, not the regularisation.  A branch whose penalty
-        #: gradient is small against its own discriminative gradient needs a
-        #: large scale to carry the target share, and vice versa.  An absolute
-        #: scale is therefore never comparable across branches -- only the ratio
-        #: is -- which is the whole reason this controller targets one.
-        #:
-        #: Both bounds are places the controller loses authority, and neither is
-        #: visible in the aggregate ``GAN/r1_*`` series, which are means over the
-        #: branches.  So both are *detected* rather than merely bounded: see
-        #: ``newly_saturated`` and ``newly_floored``.  Read ``R1_Branch/scale_*``
-        #: to tell a branch that reached its target from one that ran to a bound
-        #: and stayed.
-        #:
-        #: The floor binds for the mirror-image reason the ceiling does: a branch
-        #: that separates real from fake easily has a *small* discriminative
-        #: gradient, and that gradient is the denominator of the share, so the
-        #: strength it needs falls with its own success.  The strongest branches
-        #: arrive there first.
-        #:
-        #: Widening a bound is not lowering the target -- at target the penalty
-        #: is still 100% of the branch's own movement.  The class docstring's
-        #: warning about the target still stands.
-        #:
-        #: Do **not** "fix" a branch that needs an outlying strength by making it
-        #: look like its neighbours.  For ``stft_2048`` in particular the stride,
-        #: kernel and width are deliberate -- it is the only branch that can
-        #: resolve a harmonic comb; see ``SPECTROGRAM_SPECS``.  Its large
-        #: absolute strength is that design working, not a symptom.
-        #:
-        #: One controller per branch, because ``uses_branchwise_r1`` means each
-        #: R1 event hits exactly one of them.  A single branch name (or none)
-        #: degrades to the global behaviour this class shipped with.
-        self.names = tuple(branch_names) or ("_global",)
-        self.target_ratio = max(0.0, float(target_ratio))
-        self.lr = max(0.0, float(lr))
-        # Faster than the KL controller's 0.01 because this one is fed once per
-        # ``r1_interval`` steps, not once per step: at interval 16 a momentum of
-        # 0.05 is a ~320-step window, close to the KL controller's 100.  Per
-        # branch that is 16x longer again -- a branch's own R1 fires once every
-        # ``r1_interval * num_branches`` steps -- which is the price of asking
-        # the question per branch rather than in aggregate.
-        self.momentum = min(1.0, max(1e-6, float(momentum)))
-        self.minimum = max(1e-6, float(minimum))
-        self.maximum = max(self.minimum, float(maximum))
-        self.log_scale = {name: 0.0 for name in self.names}
-        self.disc_ema: dict[str, float | None] = {name: None for name in self.names}
-        self.r1_ema: dict[str, float | None] = {name: None for name in self.names}
-        # Consecutive R1 events a branch has spent pinned at ``maximum`` while
-        # still short of target -- the state in which it has no authority left.
-        self._pinned: dict[str, int] = {name: 0 for name in self.names}
-        self._warned: set[str] = set()
-        # The same state at the other bound: pinned at ``minimum`` while still
-        # *over* target.  Counted separately because it is a separate failure
-        # with a separate remedy, and because ``newly_saturated`` is documented
-        # and tested as being about the ceiling alone.
-        self._floored: dict[str, int] = {name: 0 for name in self.names}
-        self._warned_floor: set[str] = set()
-
-    @property
-    def active(self) -> bool:
-        return self.target_ratio > 0.0
-
-    def _key(self, branch) -> str:
-        if isinstance(branch, int):
-            return self.names[branch % len(self.names)]
-        return branch if branch in self.log_scale else self.names[0]
-
-    def scale_for(self, branch) -> float:
-        return math.exp(self.log_scale[self._key(branch)])
-
-    def ratio_for(self, branch) -> float:
-        """The measured share for one branch, or 0.0 before both EMAs exist."""
-        key = self._key(branch)
-        disc, r1 = self.disc_ema[key], self.r1_ema[key]
-        return 0.0 if not disc or r1 is None else r1 / disc
-
-    @property
-    def scale(self) -> float:
-        """Mean strength, for the aggregate series only."""
-        values = [math.exp(v) for v in self.log_scale.values()]
-        return sum(values) / len(values)
-
-    @property
-    def ratio(self) -> float:
-        """Mean of the branches that have measured a share, or 0.0 before any has.
-
-        Branches with no R1 event yet are excluded rather than counted as zero,
-        which would drag the aggregate down for the first
-        ``r1_interval * num_branches`` steps of a run and read as a controller
-        that is failing.
-        """
-        live = [
-            value
-            for value in (self.ratio_for(name) for name in self.names)
-            if value > 0.0
-        ]
-        return sum(live) / len(live) if live else 0.0
-
-    def observe_discriminator(self, branch, grad_norm: float) -> None:
-        """The reference this branch's R1 is measured against.
-
-        Fed from the *discriminative* step and restricted to this branch's own
-        parameters.  Using the whole discriminator's norm -- which is what the
-        global version did -- compares a branch's penalty against a total it
-        contributes a fraction of, and the fractions differ by two orders of
-        magnitude across branch types.
-        """
-        if not math.isfinite(grad_norm) or grad_norm <= 0.0:
-            return
-        key = self._key(branch)
-        current = self.disc_ema[key]
-        self.disc_ema[key] = (
-            float(grad_norm)
-            if current is None
-            else current + self.momentum * (float(grad_norm) - current)
-        )
-
-    def observe_r1(self, branch, grad_norm: float) -> None:
-        """After the R1 backward: measure this branch's share, correct its strength."""
-        if not self.active or not math.isfinite(grad_norm) or grad_norm <= 0.0:
-            return
-        key = self._key(branch)
-        current = self.r1_ema[key]
-        self.r1_ema[key] = (
-            float(grad_norm)
-            if current is None
-            else current + self.momentum * (float(grad_norm) - current)
-        )
-        if not self.disc_ema[key]:
-            return
-        # Every branch starts at strength 1.0 and *walks*.  Seeding it from the
-        # branch's first measurement looks like the obvious speed-up -- the share
-        # is linear in the strength, so one sample appears to name the answer --
-        # but that linearity holds only at fixed weights, and the first R1 event
-        # lands with the discriminator still at its initialisation, where the
-        # gain has no relation to the trained one.  It was tried and it seeded
-        # every branch wrong, several by orders of magnitude and the one it
-        # existed for in the wrong direction.
-        #
-        # The asymmetry is the lesson: this controller exists because the gain
-        # *moves* over a run, so no single early measurement can name a
-        # strength.  Under-regularised early is mild and self-correcting;
-        # over-regularised early flattens the discriminator.  Walk.
-        #
-        # Relative error, clamped so a single outlying event -- the R1 series is
-        # spiky -- moves the strength by at most ``lr`` in log space rather than
-        # by its full excursion.
-        error = (self.ratio_for(key) - self.target_ratio) / self.target_ratio
-        error = max(-1.0, min(1.0, error))
-        self.log_scale[key] = max(
-            math.log(self.minimum),
-            min(math.log(self.maximum), self.log_scale[key] - self.lr * error),
-        )
-        # Pinned at a bound while the error still points past it is the one
-        # failure this controller cannot correct, and it is indistinguishable
-        # from health in every aggregate.  So it says so.  At the ceiling that
-        # is ``error < 0``: still short of target with no strength left to add.
-        if self.log_scale[key] >= math.log(self.maximum) - 1e-9 and error < 0.0:
-            self._pinned[key] += 1
-        else:
-            self._pinned[key] = 0
-            self._warned.discard(key)
-        # And at the floor, ``error > 0``: the branch is still asking to be
-        # regularised less than the bound allows.
-        if self.log_scale[key] <= math.log(self.minimum) + 1e-9 and error > 0.0:
-            self._floored[key] += 1
-        else:
-            self._floored[key] = 0
-            self._warned_floor.discard(key)
-
-    def newly_saturated(self, minimum_events: int = 200):
-        """Branches that have just run out of authority, reported once each.
-
-        Counted in the branch's *own* R1 events, not steps: a branch fires once
-        every ``r1_interval * num_branches`` steps, so 200 events is roughly
-        22k steps at interval 16 over 7 branches -- long enough that a branch
-        still climbing toward a reachable target does not trip it.
-        """
-        fresh = []
-        for name in self.names:
-            if self._pinned[name] >= minimum_events and name not in self._warned:
-                self._warned.add(name)
-                fresh.append((name, self.ratio_for(name)))
-        return fresh
-
-    def newly_floored(self, minimum_events: int = 200):
-        """Branches stuck at ``minimum`` and still over target, reported once each.
-
-        The floor's counterpart to ``newly_saturated``.  Both bounds are places
-        this controller loses authority, and neither is visible in
-        ``GAN/r1_scale`` or ``GAN/r1_to_disc_ratio``, which are means over the
-        branches.  Counted in the branch's own R1 events on the same budget as
-        the ceiling.
-        """
-        fresh = []
-        for name in self.names:
-            if self._floored[name] >= minimum_events and name not in self._warned_floor:
-                self._warned_floor.add(name)
-                fresh.append((name, self.ratio_for(name)))
-        return fresh
-
-    @property
-    def state_dict(self) -> dict:
-        return {
-            "version": 2,
-            "log_scale": dict(self.log_scale),
-            "disc_ema": dict(self.disc_ema),
-            "r1_ema": dict(self.r1_ema),
-        }
-
-    def load_state_dict(self, state: dict | None) -> bool:
-        """Restore across a resume.
-
-        Worth persisting rather than re-deriving: this controller is fed once
-        per ``r1_interval`` steps, so at interval 16 an unseeded resume spends
-        thousands of steps re-earning a strength it already had -- the same
-        mistake ``_AdversarialCeilingGovernor._seed`` exists to undo.
-
-        Accepts the flat, pre-per-branch layout as well.  Those checkpoints hold
-        one strength that *was* applied to every branch, so seeding every branch
-        from it restores exactly the state the run was in; the branches then
-        diverge from there.  The scalar EMAs are deliberately **not** carried
-        over: they were norms over the whole discriminator, and the per-branch
-        controller measures each branch's own parameters, so the two are not the
-        same quantity and reusing them would seed every ratio wrong.
-        """
-        if not isinstance(state, dict) or "log_scale" not in state:
-            return False
-        stored = state["log_scale"]
-        if not isinstance(stored, dict):
-            try:
-                seed = float(stored)
-            except (TypeError, ValueError):
-                return False
-            self.log_scale = {name: seed for name in self.names}
-            self.disc_ema = {name: None for name in self.names}
-            self.r1_ema = {name: None for name in self.names}
-            return True
-
-        def _restore(key: str, target: dict) -> None:
-            values = state.get(key) or {}
-            if not isinstance(values, dict):
-                return
-            for name in self.names:
-                if name in values:
-                    value = values[name]
-                    target[name] = None if value is None else float(value)
-
-        # A branch absent from the checkpoint -- ``periods`` changed, the
-        # sub-band branch was turned on -- keeps its cold default rather than
-        # inheriting an unrelated branch's strength.
-        for name in self.names:
-            if name in stored:
-                self.log_scale[name] = float(stored[name])
-        _restore("disc_ema", self.disc_ema)
-        _restore("r1_ema", self.r1_ema)
-        return True
-
-
-def _branch_discriminative_norms(net_d):
-    """Per-branch gradient norms of the discriminative loss, in branch order.
-
-    Called while ``loss_disc``'s gradients are still on the parameters, i.e.
-    after its backward and before ``optim_d.step()``.  ``max_norm=inf`` makes
-    ``clip_grad_norm_`` a pure measurement: the coefficient it computes is
-    infinite and then clamped to 1.0, so nothing is scaled.
-
-    Sampled rather than run every step -- see the call site.
-    """
-    model = net_d.module if hasattr(net_d, "module") else net_d
-    # The grouping is the discriminator's to state: with per-branch driving off
-    # it reports one group covering every branch, which is the aggregate the
-    # single controller is steering.  Zipping this against ``controller.names``
-    # would otherwise silently truncate to the first branch's norm.
-    groups = getattr(model, "branch_parameter_groups", None)
-    if groups is None:
-        groups = lambda: [branch.parameters() for branch in model.discriminators]
-    return [float(clip_grad_norm_(group, float("inf"))) for group in groups()]
-
-
-def _adaptive_adversarial_weight(
-    loss_reconstruction,
-    loss_adversarial,
-    parameter,
-    balance_target: float = 0.5,
-    minimum: float = 0.01,
-    maximum: float = 1.0,
-    adversarial_gradient=None,
-):
-    """Balance adversarial pressure against reconstruction on one decoder layer.
-
-    Returns ``(applied, reconstruction_norm, adversarial_norm, requested)``.
-    ``requested`` is the unclamped ratio: it is what the balance rule asked
-    for, and logging it is the only way to see that the ceiling is binding.
-    Reporting just the clamped value hides a saturated weight as a flat line at
-    the ceiling, which is indistinguishable from a healthy constant.
-    """
-    zero = loss_reconstruction.detach().float().new_zeros(())
-    _, reconstruction_norm = _probe_gradient(
-        lambda scale: torch.autograd.grad(
-            loss_reconstruction * scale,
-            parameter,
-            retain_graph=True,
-            create_graph=False,
-            allow_unused=True,
-        )[0]
-    )
-    if adversarial_gradient is None:
-        # ``None`` where the branchwise step has already produced this by the
-        # chain rule from the waveform: there the adversarial loss is a
-        # detached scalar with no graph left to differentiate.
-        _, adversarial_norm = _probe_gradient(
-            lambda scale: torch.autograd.grad(
-                loss_adversarial * scale,
-                parameter,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )[0]
-        )
-    else:
-        # Already measured through the probe scale by
-        # ``_wave_parameter_gradient``, which is where that traversal happens.
-        adversarial_norm = adversarial_gradient.detach().float().norm()
-
-    if reconstruction_norm is None:
-        reconstruction_norm = zero
-    if adversarial_norm is None:
-        adversarial_norm = zero
-    requested = (
-        balance_target * reconstruction_norm / (adversarial_norm + 1e-6)
-    ).detach()
-    adaptive_weight = requested.clamp(min=minimum, max=maximum).detach()
-    return adaptive_weight, reconstruction_norm, adversarial_norm, requested
-
-
-def _adaptive_feature_match_weight(
-    loss_feature_match,
-    parameter,
-    reconstruction_norm,
-    balance_target: float,
-    minimum: float = 0.1,
-    maximum: float = 1.0,
-    feature_gradient=None,
-):
-    """The same balance rule, applied to the other discriminator-derived loss.
-
-    ``_adaptive_adversarial_weight`` governs ``loss_adv`` and nothing else, but
-    ``loss_fm`` is also computed from the discriminator's feature maps and grows
-    with it -- and it was carrying a fixed weight.  So the balance rule held one
-    half of the GAN objective at target while the other half was free to grow,
-    which is the loophole rather than a second opinion.
-
-    Left ungoverned, feature matching grows into the largest single source of
-    gradient into the waveform -- larger than the adversarial term the governor
-    is busy restraining -- while the adversarial weight falls to hold its own
-    half at target.
-
-    ``balance_target`` is the fm-to-reconstruction gradient ratio to hold at the
-    last decoder layer, so it is directly comparable to
-    ``adv_balance_target``.  Its default is where a healthy run sat.
-
-    ``maximum`` is 1.0 on purpose, and it means this can only ever *reduce*
-    ``fm_weight``, never amplify it.  The configured weight stays the
-    ceiling because the observed failure is overgrowth; letting a controller
-    push feature matching above what the config asked for would be a second,
-    unproven change riding along with this one.
-    """
-    zero = loss_feature_match.detach().float().new_zeros(())
-    if feature_gradient is None:
-        # A detached loss with no supplied gradient means feature matching is
-        # not reaching the decoder at all; a detached loss *with* one is the
-        # branchwise step, which computed it from the waveform instead.
-        if not loss_feature_match.requires_grad:
-            return loss_feature_match.detach().new_ones(()), zero, zero
-
-        _, feature_match_norm = _probe_gradient(
-            lambda scale: torch.autograd.grad(
-                loss_feature_match * scale,
-                parameter,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )[0]
-        )
-        if feature_match_norm is None:
-            feature_match_norm = zero
-    else:
-        # Already measured through the probe scale by
-        # ``_wave_parameter_gradient``.
-        feature_match_norm = feature_gradient.detach().float().norm()
-    requested = (
-        balance_target * reconstruction_norm / (feature_match_norm + 1e-6)
-    ).detach()
-    return requested.clamp(min=minimum, max=maximum).detach(), feature_match_norm, requested
 
 
 def _generator_gradient_metrics(net_g):
@@ -2701,16 +1304,13 @@ def get_optimizers(
     g_param_groups = build_decoder_param_groups(net_g, lr_g)
 
     optim_g = _make_optimizer(net_g, optimizer_choice_g, lr_g, num_epochs=total_epoch_count, num_batches=num_batches, param_groups=g_param_groups)
-    lazy_reg_interval = None
-    if chouwagan_stack_active and float(getattr(config.train, "r1_gamma", 0.0)) > 0:
-        lazy_reg_interval = int(getattr(config.train, "r1_interval", 16))
     optim_d = _make_optimizer(
         net_d,
         optimizer_choice_d,
         lr_d,
         num_epochs=total_epoch_count,
         num_batches=num_batches,
-        lazy_reg_interval=lazy_reg_interval,
+        lazy_reg_interval=None,
     )
 
     return optim_g, optim_d
@@ -2744,16 +1344,11 @@ def apply_training_freezes(net_g, rank):
 
 
 def apply_resume_lr_override(optim_g, optim_d=None):
-    """Re-anchor G and/or D param groups to `resume_lr` after loading
-    optimizer state.
-
-    Must run AFTER load_checkpoint (so the saved lr / initial_lr are present)
-    and BEFORE prepare_schedulers (so the schedulers snapshot the new
-    initial_lr as their base). Each group's saved decay ratio ( current /
-    initial ) is preserved, so the LR schedule keeps its position while the
-    value restarts at resume_lr x its per-group lr_scale ( baked in by
-    build_decoder_param_groups; 1.0 fallback for the default single group ).
-    `resume_lr_target` picks which side(s) it applies to: "full", "g", or "d".
+    """Re-anchor G and/or D param groups to `resume_lr` after loading optimizer
+    state. Must run after load_checkpoint (needs the saved lr/initial_lr) and
+    before prepare_schedulers (which snapshots the new initial_lr). Each
+    group's saved decay ratio is preserved so the schedule keeps its position
+    while the value restarts at resume_lr x its per-group lr_scale.
     """
     if resume_lr is None:
         return
@@ -2810,32 +1405,6 @@ def enable_vocoder_compile(net_g, device, rank):
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
 
     mode = torch_compile_mode
-    if chouwagan_stack_active:
-        # The RefineGAN loop backwards through the decoder graph more than once
-        # per step: `loss_core.backward(retain_graph=True)` is followed by the
-        # decoder-only `autograd.grad` for the GAN term, plus the adaptive-adv
-        # and Grad_Source probes.  AOTAutograd's donated-buffer optimisation
-        # rejects `retain_graph=True` outright, so it must be off for every
-        # compiled mode.  The HiFi-GAN path does a single backward and keeps it.
-        import torch._functorch.config as functorch_config
-
-        functorch_config.donated_buffer = False
-    if chouwagan_stack_active and mode == "reduce-overhead":
-        # `reduce-overhead` records CUDA graphs, which cannot survive the extra
-        # backward passes above: the Grad_Source probes fire on step 50 and trip
-        # "graph recording observed an input tensor deallocate during graph
-        # recording".  No config flag fixes it, so fall back to the fastest
-        # cudagraph-free mode instead of crashing 50 steps in.  Measured on the
-        # real backward pattern, 'default' beats 'max-autotune-no-cudagraphs'
-        # (1.30x vs 1.26x) and warms up far quicker.
-        mode = "default"
-        if rank == 0:
-            print(
-                "[INIT] 'reduce-overhead' is incompatible with the VITS-latent "
-                "multi-backward loop (CUDA graphs); using "
-                f"'{mode}' instead."
-            )
-
     model = net_g.module if hasattr(net_g, "module") else net_g
     enabled = model.enable_decoder_compile(mode=mode)
     if not enabled and rank == 0:
@@ -2846,20 +1415,12 @@ def enable_vocoder_compile(net_g, device, rank):
 
 
 def enable_discriminator_compile(net_d, config, device, rank):
-    """Compile the discriminator, driven by ``compile_discriminator``.
-
-    Config-driven rather than a run-spec flag: it is a property of the
-    RefineGAN discriminator's shape contract, not a choice a user makes per
-    run.  It travels with the architecture that makes it valid.
-
-    ``torch_compile_mode`` is deliberately not consulted.  That option exists
-    for the decoder, and the one mode a user would reach for --
-    ``reduce-overhead`` -- records CUDA graphs, which this loop cannot support
-    (see :func:`enable_vocoder_compile`) and which an 8 GiB card has no room
-    for besides.  Plain fusion is the whole benefit here, so the mode is fixed.
+    """Compile the discriminator, driven by ``compile_discriminator`` in the
+    config (not a run-spec flag, since it travels with the architecture).
+    ``torch_compile_mode`` is not consulted: ``reduce-overhead`` records CUDA
+    graphs, which this loop can't support, so the mode is fixed to plain
+    fusion.
     """
-    if not chouwagan_stack_active:
-        return False
     if not bool(getattr(config.train, "compile_discriminator", False)):
         return False
     if device.type != "cuda":
@@ -2883,151 +1444,23 @@ def enable_discriminator_compile(net_d, config, device, rank):
     return enabled
 
 
-def collect_source_path_metrics(net_g):
-    """How hard the pitch template is pushed into each decoder stage.
-
-    Read off the weights, not the activations, so it costs nothing and can be
-    sampled at the rolling-log cadence.
-
-    Why this is worth a series of its own: dissecting the stock RVC v2 HiFi-GAN
-    pretrains showed that the one thing separating them from a short reproduction
-    was the *strength of the source injection at the high-rate stages*.  Their
-    `noise_convs` sit at 1.4-2.0x of init on the first (lowest-rate) stage and at
-    0.4-8% of init on the rest -- the harmonic source enters once, heavily
-    filtered, and the network synthesises the rest.
-
-    ChouwaGAN's excitation U-Net makes the same quantity directly readable.
-    Every decoder stage opens by concatenating its upsampled activation with the
-    excitation skip taken at that resolution, and that skip is a pure function of
-    the NSF source: the excitation encoder sees nothing else.  ``fusion_proj`` is
-    the 1x1 that decides the mix, so the ratio of its skip-half column norms to
-    its main-half column norms answers "how much of this stage's output is
-    excitation rather than latent".
-
-    With ``chouwagan_latent_source_gate`` on that ratio stops being the whole
-    answer: the skip is scaled by ``2 * sigmoid(gate(latent))`` before it
-    reaches ``fusion_proj``, so the mixing weight and the gate multiply, and
-    reporting the weight alone silently understates or overstates the share.
-    Four series come out of it, answering different questions:
-
-    ``inject_ratio_stage_i``
-        The raw ``fusion_proj`` ratio, unchanged, so a gated run stays
-        comparable against one without the gate.
-    ``latent_gate_mean_stage_i``
-        The gate's mean over the last forward's batch, read from the buffer the
-        decoder writes.  1.0 at initialisation.
-    ``latent_gate_saturation_stage_i``
-        The share of gate elements pinned at the ceiling.  A saturated gate is a
-        hard mask, not a multiplier, and this is what says which of the two is
-        being reported.
-    ``latent_gate_sensitivity_stage_i``
-        The norm of the gate's weight: how much the multiplier varies with the
-        latent.  Exactly 0.0 at initialisation, so this is the series that says
-        whether the pitch path has become conditional on ``z`` at all, which is
-        the whole point of the gate.
-    ``inject_ratio_effective_stage_i``
-        ``inject_ratio * latent_gate_mean``: the excitation share the stage
-        really sees.
-
-    The mean is measured rather than derived, and the reason is worth keeping
-    because the derivation looked convincing.  ``2 * sigmoid(bias)`` -- the
-    gate's value when the latent contributes nothing -- is free to compute here
-    and equals ``E[2*sigmoid(b + w.z)]`` to first order whenever ``w.z`` is
-    small and centred.  Neither condition survives training.  Measured on
-    ``G_8139`` of the first gated run, over 48 real clips: the logits are wide
-    enough to pin ~30% of the elements at the ceiling and 6-21% at the floor, so
-    the gate is a hard mask whose mean is set by the *shape* of that split, not
-    by its centre.  The bias-only estimate read 1.00 at the output-rate stage
-    where the true mean is 0.41 -- wrong by 2.4x, and wrong in the direction
-    that hid the result, since the real number says the gate closes the
-    excitation down at exactly the stage where spectral mirroring lives.
-
-    So the decoder measures it in ``forward`` and parks it in a non-persistent
-    buffer, and this function reads that buffer.  It costs two reductions per
-    stage and one stacked buffer write per forward, which is the price of a
-    series that is a measurement instead of a guess.
-
-    Only the U-Net excitation path is readable this way.  With
-    ``chouwagan_excitation_unet`` off the source is folded in additively through
-    ``source_gates`` instead of concatenated, and RefineGAN concatenates its
-    downsampled excitation straight into a ParallelResBlock, so in both cases
-    there is no mixing weight to split and ``{}`` is the honest answer.
-    """
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    decoder = getattr(model, "dec", None)
-    stages = getattr(decoder, "fusion_proj", None)
-    # Skips are built highest-rate first and consumed reversed, so reversing
-    # here puts index ``i`` on the stage that actually concatenates it.  Reading
-    # the width from the decoder rather than inferring it from the channel count
-    # is what keeps a changed schedule from attributing part of the main path to
-    # the excitation.
-    skip_widths = tuple(reversed(getattr(decoder, "exc_skip_channels", ()) or ()))
-    if not stages or not skip_widths:
-        return {}
-
-    gates = getattr(decoder, "latent_gates", None)
-    # Written by the decoder's last forward.  Absent only before the first one,
-    # where the initialised buffers already hold the right answer (an open gate
-    # that is not yet saturated).
-    measured_mean = getattr(decoder, "latent_gate_mean", None)
-    measured_saturation = getattr(decoder, "latent_gate_saturation", None)
-    if measured_mean is None or measured_saturation is None:
-        gates = None
-
-    metrics = {}
-    ratios = []
-    effective_ratios = []
-    for index, stage in enumerate(stages):
-        weight = stage.weight
-        # cat order is (upsampled, skip), so the main path owns the leading
-        # columns.
-        skip = int(skip_widths[index])
-        main = weight[:, :-skip].norm()
-        excitation = weight[:, -skip:].norm()
-        ratio = (excitation / main.clamp_min(1e-8)).item()
-        metrics[f"Source/inject_ratio_stage_{index}"] = ratio
-        ratios.append(ratio)
-
-        if gates is None or index >= len(gates):
-            continue
-        gate = gates[index]
-        with torch.no_grad():
-            sensitivity = float(gate.weight.norm())
-            gate_mean = float(measured_mean[index])
-            saturation = float(measured_saturation[index])
-        metrics[f"Source/latent_gate_mean_stage_{index}"] = gate_mean
-        metrics[f"Source/latent_gate_saturation_stage_{index}"] = saturation
-        metrics[f"Source/latent_gate_sensitivity_stage_{index}"] = sensitivity
-        effective = ratio * gate_mean
-        metrics[f"Source/inject_ratio_effective_stage_{index}"] = effective
-        effective_ratios.append(effective)
-
-    if ratios:
-        # The last stage runs at the output rate: it is the one whose excitation
-        # share lands directly in the top octave, so it gets a flat alias.
-        metrics["Source/inject_ratio_output_stage"] = ratios[-1]
-    if effective_ratios:
-        metrics["Source/inject_ratio_effective_output_stage"] = effective_ratios[-1]
-    return metrics
-
-
 def _assert_resumable_architecture(net_g, checkpoint_path):
     """Refuse to resume from a checkpoint built for a different architecture.
 
-    The equivalent guard already exists on the *pretrained* path and in
-    ``generate_config``; this is the third door into the same room and was the
-    one left open.  A checkpoint written before the id existed reports ``None``
-    and is treated as a mismatch rather than as "nothing to check", for the same
-    reason ``generate_config`` does: the runs that predate the key are exactly
-    the ones whose layout has since changed.
+    Unlike the pretrained-path guard, a missing id here counts as a mismatch:
+    a resumed run predating the id is one of this fork's own old runs, whose
+    layout has since changed.
     """
     model = net_g.module if hasattr(net_g, "module") else net_g
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    # The excitation is checked whatever the id says, because the id is pinned
+    # to ``vits_gaussian_v1`` for every RefineGAN source on purpose -- see
+    # ``get_architecture_id`` -- and this stack resumes non-strictly.
+    assert_excitation_matches(model, checkpoint, origin="checkpoint")
     expected = getattr(model, "architecture_id", None)
     if not expected or expected == "vits_gaussian_v1":
         return
-    found = torch.load(checkpoint_path, map_location="cpu", weights_only=True).get(
-        "architecture_id"
-    )
+    found = checkpoint.get("architecture_id")
     if found == expected:
         return
     raise ValueError(
@@ -3094,7 +1527,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             _assert_resumable_architecture(net_g, g_checkpoint_path)
 
             # Load the model and optim states
-            generator_strict_load = strict_load and not chouwagan_stack_active
+            generator_strict_load = strict_load
             _, _, _, epoch_str, _ = load_checkpoint(
                 g_checkpoint_path,
                 net_g,
@@ -3145,28 +1578,12 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                 None,
             )
             checkpoint_architecture = checkpoint.get("architecture_id")
-            # An *absent* id is not a mismatch here.  The resume guard treats it
-            # as one on purpose -- a `G_*.pth` in the experiment folder that
-            # predates the key is one of this fork's own old runs, and those are
-            # exactly the layouts that have since changed.  A pretrain is the
-            # opposite case: it comes from upstream, where the key never
-            # existed.  Every stock RVC v2 checkpoint carries `iteration` and
-            # `learning_rate` and nothing else, the bundled
-            # `hifi-gan/f0G{32,40,48}k.pth` included, so this branch rejected
-            # the shipped pretrains for the shipped vocoder -- HiFi-GAN
-            # fine-tuning could not start at all.
-            #
-            # It went unnoticed because HiFi-GAN is the only architecture the
-            # check can actually reach: the VITS-latent vocoders both report
-            # `vits_gaussian_v1`, and that opt-out exists for *precisely* this
-            # reason (an Applio checkpoint carries no id either).  HiFi-GAN, the
-            # oldest path, was the one left out of it.
-            #
-            # What verifies an id-less pretrain instead is the load below, which
-            # is strict for everything but the ChouwaGAN stack: a state dict
-            # from another architecture raises on its missing and unexpected
-            # keys.  An id that is present and disagrees is still refused --
-            # that is a checkpoint making a claim about itself.
+            # An *absent* id is not a mismatch here, unlike the resume guard: a
+            # pretrain comes from upstream, where the key never existed (every
+            # stock RVC v2 checkpoint has no id, the bundled HiFi-GAN pretrains
+            # included), while a resumed `G_*.pth` missing the key is one of
+            # this fork's own old runs whose layout has since changed.  An
+            # id-less pretrain is instead verified by the strict load below.
             if (
                 expected_architecture
                 and expected_architecture != "vits_gaussian_v1"
@@ -3182,12 +1599,9 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
             # ``verify_spk_dim`` decided this pretrain's speaker table belongs
-            # to other speakers, so ``emb_g`` was sized for *this* dataset and
-            # the pretrained rows would not even fit.  Substituting the model's
-            # own freshly initialised tensor rather than dropping the key keeps
-            # the load strict for the vocoders that load strictly -- a missing
-            # key would be an error there, and a silent one is exactly what
-            # this branch must not produce.
+            # to other speakers, so ``emb_g`` doesn't even fit; substitute a
+            # fresh tensor rather than dropping the key, since dropping it
+            # would fail the strict load below.
             if reset_pretrained_embeddings and "emb_g.weight" in state_dict:
                 state_dict = substitute_speaker_embeddings(state_dict, net_g)
                 if rank == 0:
@@ -3196,9 +1610,18 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                         f"starting {state_dict['emb_g.weight'].shape[0]} fresh ones."
                     )
 
+            # A pretrain predating this key is a stock upstream sine, so an
+            # absent key is read as "sine" rather than waved through --
+            # loading an RVC v2 pretrain into a comb or bank run is exactly
+            # the mismatch worth naming.
+            assert_excitation_matches(
+                net_g.module if hasattr(net_g, "module") else net_g,
+                checkpoint,
+                origin="pretrain",
+            )
             net_g.load_state_dict(
                 state_dict,
-                strict=not chouwagan_stack_active,
+                strict=True,
             )
 
         # Loading the pretrained Discriminator model
@@ -3208,6 +1631,16 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             checkpoint = torch.load(pretrainD, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
+            # The periods are the one thing a strict load cannot check -- they
+            # are in the ``view``, not in any weight -- and every pretrained D
+            # in circulation was trained on the un-scaled set.  Loading one
+            # into a rate-scaled discriminator succeeds and starts every branch
+            # folding at a frequency its weights never saw.
+            assert_periods_match(
+                net_d.module if hasattr(net_d, "module") else net_d,
+                checkpoint,
+                origin="pretrained discriminator",
+            )
             net_d.load_state_dict(state_dict, strict=True)
 
         # Load the models and optionally wrap with DDP
@@ -3219,16 +1652,13 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         # Init the optimizers
         optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
 
-    # Built after both branches so the shadow starts from whatever weights the
-    # run is actually beginning with -- resumed, pretrained, or fresh -- rather
-    # than from the initialisation ``get_g_model`` handed back.
+    # Built after both branches so the shadow starts from the weights the run
+    # is actually beginning with (resumed, pretrained, or fresh).
     ema = None
-    # Schedule-free already maintains an average of the trajectory -- that is
-    # what its x iterate is -- and the EMA would be built from the extrapolated
-    # y iterate, which is not a point the method claims is good.  Stacking a
-    # second average on top of the first also lengthens the effective horizon,
-    # and a long horizon is precisely what makes the overtrain detector worse
-    # (see the EMA decay choice).  So the two are mutually exclusive here.
+    # Schedule-free already averages the trajectory (its x iterate); an EMA
+    # here would be built from the extrapolated y iterate instead, and
+    # stacking a second average lengthens the effective horizon, which makes
+    # the overtrain detector worse. So the two are mutually exclusive.
     if use_ema and is_schedule_free(optimizer_choice_g):
         if rank == 0:
             warning(
@@ -3268,17 +1698,10 @@ def prepare_schedulers(
     fresh_start=False,
 ):
     def _horizon_decay(final_ratio, total_units):
-        """Multiplier that reaches ``final_ratio`` at the end of the run.
-
-        ``ratio ** (unit / total)`` is plain exponential decay written in terms
-        of where it lands rather than of its per-step gamma, so the same config
-        gives the same endpoint at any run length.
-
-        The progress term is clamped at 1.0, which gives the schedule a floor:
-        extending a run past its configured horizon holds the final LR instead
-        of decaying straight through it.  Exponential decay has no floor of its
-        own, and at these gammas a run continued well past its planned end
-        would otherwise drift into the 1e-6 range unnoticed.
+        """Exponential decay reaching ``final_ratio`` at the end of the run,
+        so the same config gives the same endpoint at any run length. Progress
+        is clamped at 1.0 so a run extended past its horizon holds the final
+        LR instead of decaying straight through it.
         """
         ratio = min(1.0, max(1e-6, float(final_ratio)))
         total = max(1, int(total_units))
@@ -3289,20 +1712,13 @@ def prepare_schedulers(
         return scale
 
     def _horizon_cosine(final_ratio, total_units):
-        """Cosine anneal from the starting LR down to ``final_ratio`` of it.
+        """Cosine anneal from the starting LR to ``final_ratio`` of it.
 
-        The stock ``CosineAnnealingLR`` takes ``eta_min`` -- one absolute floor
-        shared by every optimizer it is given.  G and D start at different
-        rates here, so a shared floor does not just decay them by different
-        factors (0.30x and 0.16x at the shipped 3e-5), it drives the ratio
-        between them to exactly 1.0 by the end of the run.  That ratio is the
-        thing that keeps the discriminator alive, so it has to survive the
-        schedule.  Expressing the endpoint as a fraction of each group's own
-        base LR is what makes that happen.
-
-        Clamped past the horizon for the same reason as ``_horizon_decay``:
-        continuing a run should hold the final LR, and an unclamped cosine
-        would turn back upward.
+        Unlike stock ``CosineAnnealingLR``'s shared absolute ``eta_min``,
+        the endpoint here is a fraction of each group's own base LR -- G and D
+        start at different rates, and a shared floor would drive their ratio
+        to 1.0 by the end of the run, which is what keeps the discriminator
+        alive. Clamped past the horizon like ``_horizon_decay``.
         """
         ratio = min(1.0, max(1e-6, float(final_ratio)))
         total = max(1, int(total_units))
@@ -3367,12 +1783,6 @@ def prepare_schedulers(
             scheduler_d = torch.optim.lr_scheduler.LambdaLR(
                 optim_d, shape, last_epoch=resume_at
             )
-            # No announcement here.  What this branch does -- decay to
-            # ``lr_final_ratio`` by the end of the run -- is what the settings
-            # panel already prints for the scheduler, and the half of the old
-            # line that named the superseded ``lr_decay``/``eta_min`` only had
-            # to exist because the panel was printing that dead number as though
-            # it were live.  It no longer is.
         elif scheduler_name == "exp decay epoch":
             scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
                 optim_g, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
@@ -3431,13 +1841,10 @@ def get_reference_sample(train_loader, device, config):
         phone_lengths = torch.LongTensor([phone.shape[1]]).to(device)
         sid = torch.LongTensor([0]).to(device)
 
-        # ---- Optional ground truth for the preview -------------------------
-        # Without it the preview degrades to the generated waveform alone: the
-        # three-panel figure needs something to subtract, so a custom reference
-        # used to cost exactly the comparison it was set up to make stable.
-        # The wav is resampled on load, so it can be at any rate; what has to
-        # line up is the *time span*, and it does by construction -- one f0
-        # frame is one hop at every configured sample rate, both being 10 ms.
+        # Optional ground truth for the preview; without it the preview
+        # degrades to the generated waveform alone. Resampled on load, so it
+        # can be at any rate -- one f0 frame is one hop at every configured
+        # sample rate, both being 10 ms.
         audio_path = os.path.join(reference_path, "ref_audio.wav")
         if os.path.isfile(audio_path):
             from rvc.lib.utils import load_audio
@@ -3593,22 +2000,6 @@ def run(
     device,
     device_id,
 ):
-    """
-    Runs the training loop on a specific GPU or CPU.
-
-    Args:
-        rank (int): The rank of the current process within the distributed training setup.
-        n_gpus (int): The total number of GPUs available for training.
-        experiment_dir (str): The directory where experiment logs and checkpoints will be saved.
-        pretrainG (str): Path to the pre-trained generator model.
-        pretrainD (str): Path to the pre-trained discriminator model.
-        total_epoch_count (int): The total number of epochs for training.
-        epoch_save_frequency (int): Frequency of saving epochs.
-        save_weight_models (int): Whether to save small weight models. 0 for no, 1 for yes.
-        save_only_latest_net_models (int): Whether to save only latest G/D or for each epoch.
-        config (object): Configuration object containing training parameters.
-        device (torch.device): The device to use for training (CPU or GPU).
-    """
     global global_step, warmup_completed, optimizer_choice_g, optimizer_choice_d
     global from_scratch, swap_start_step, swap_completed
     global phase_start_step, phase_step, phase_limit_reached
@@ -3681,19 +2072,12 @@ def run(
     )
 
     def _make_mel_distance():
-        if not chouwagan_stack_active or mel_distance in ("l1", "mae"):
-            base, weighted = torch.nn.L1Loss, chouwagan_stack_active
-        elif mel_distance == "huber":
-            base, weighted = (
-                lambda **kw: torch.nn.SmoothL1Loss(beta=mel_huber_beta, **kw)
-            ), True
-        elif mel_distance in ("mse", "l2"):
-            base, weighted = torch.nn.MSELoss, True
-        else:
-            raise ValueError(
-                f"Unknown mel_distance {mel_distance!r}: "
-                "expected 'huber', 'l1' or 'mse'."
-            )
+        # ``mel_distance``/``mel_low_emphasis`` were only ever wired up for the
+        # ChouwaGAN stack; every other vocoder always took this branch
+        # regardless of the configured value.  Preserved exactly rather than
+        # generalised, since making Huber/MSE/weighting actually apply here
+        # would be a behaviour change to what RefineGAN/HiFi-GAN train on.
+        base, weighted = torch.nn.L1Loss, False
         if not weighted or mel_low_emphasis == 1.0:
             return base()
 
@@ -3722,36 +2106,18 @@ def run(
 
     if spectral_loss == "L1 Mel Loss":
         fn_spectral_loss = _make_mel_distance()
-        if rank == 0 and chouwagan_stack_active:
-            print(
-                f"[INIT] Mel distance: {mel_distance}"
-                + (f" (beta={mel_huber_beta})" if mel_distance == "huber" else "")
-            )
         if swap_l1_to_ms:
             fn_spectral_loss_ms = MultiScaleMelSpectrogramLoss(
                 sample_rate=sample_rate,
-                safe_log=chouwagan_stack_active,
+                safe_log=False,
                 loss_fn=_make_mel_distance(),
             )
     elif spectral_loss == "Multi-Scale Mel Loss":
-        # Uses the same configured distance as the single-scale mel loss.  It
-        # used to hardcode L1, which silently ignored ``mel_distance``
-        # -- selecting this mode quietly discarded the Huber setting.
-        #
-        # One caveat worth knowing: ``mel_huber_beta`` was tuned
-        # against ``wave_to_mel(for_loss=True)``, while this operates on
-        # ``log1p(mel * log_scale)``.  The two scales are similar but not
-        # identical, so beta is a slightly different L2/L1 crossover here.
         fn_spectral_loss = MultiScaleMelSpectrogramLoss(
             sample_rate=sample_rate,
-            safe_log=chouwagan_stack_active,
+            safe_log=False,
             loss_fn=_make_mel_distance(),
         )
-        if rank == 0 and chouwagan_stack_active:
-            print(
-                f"[INIT] Multi-scale mel distance: {mel_distance}"
-                + (f" (beta={mel_huber_beta})" if mel_distance == "huber" else "")
-            )
     elif spectral_loss == "Hybrid L1":
         fn_spectral_loss = _make_mel_distance()
         fn_spectral_loss2 = MultiScaleSTFTLoss()
@@ -3795,22 +2161,6 @@ def run(
         if use_amp
         else None
     )
-    # The lazy R1 step is a *second* optimizer iteration on ``optim_d`` inside
-    # the same training step, and a GradScaler tracks its state per optimizer
-    # per iteration: once ``step(optim_d)`` has been called, a further
-    # ``unscale_(optim_d)`` before ``update()`` raises "unscale_() is being
-    # called after step()".  It did, on the first R1 step of every FP16 run.
-    #
-    # A second scaler is the fix rather than an extra ``update()`` because the
-    # two backwards genuinely want different loss scales: R1 is a double
-    # backward of a squared gradient norm, so its magnitude has no relation to
-    # the discriminative loss's, and forcing them to share one scale means
-    # whichever overflows first drags the other down with it.
-    r1_grad_scaler = (
-        torch.amp.GradScaler("cuda", init_scale=2.0 ** 10, growth_interval=2000)
-        if use_amp
-        else None
-    )
     # The scaler carries real state: the current scale and how far it is into the
     # growth interval.  Restarting it at ``init_scale`` on every resume replays
     # the initial overflow-and-back-off search, which throws away a handful of
@@ -3827,11 +2177,6 @@ def run(
                     f"({amp_skipped_steps} steps skipped so far).",
                     tag="[RESUME]",
                 )
-    if r1_grad_scaler is not None:
-        r1_scaler_state = resumed_extra_d.get("r1_grad_scaler")
-        if r1_scaler_state:
-            r1_grad_scaler.load_state_dict(r1_scaler_state)
-
     phase_start_step = global_step
     phase_step = 0
     phase_limit_reached = False
@@ -3930,68 +2275,6 @@ def run(
     # time and is worth at most a fifth of a run, while the ramp is the
     # transition itself and can have half of one.
     planned_steps = planned_step_count(total_epoch_count, train_loader, max_steps)
-    adv_ramp_start = fit_schedule(
-        0
-        if finetune_phase
-        else max(0, int(getattr(config.train, "adaptive_adv_ramp_start", 20000))),
-        planned_steps,
-        0.2,
-    )
-    adv_ramp_steps = fit_schedule(
-        max(
-            0,
-            int(
-                getattr(config.train, "adaptive_adv_ramp_steps_finetune", 2000)
-                if finetune_phase
-                else getattr(config.train, "adaptive_adv_ramp_steps", 80000)
-            ),
-        ),
-        planned_steps,
-        0.5 if not finetune_phase else 0.25,
-    )
-    # Read off the built discriminator rather than off the config: the config
-    # key only *requests* SAN heads, and a discriminator that does not implement
-    # them would leave the governor's floor describing a loss form nothing
-    # computes.
-    san_active = bool(
-        getattr(net_d.module if hasattr(net_d, "module") else net_d, "supports_san", False)
-    )
-    san_direction_weight = max(
-        0.0,
-        min(1.0, float(getattr(config.train, "san_direction_weight", 0.25))),
-    )
-    adversarial_ceiling_governor = _AdversarialCeilingGovernor(
-        start_step=adv_ramp_start,
-        ramp_steps=adv_ramp_steps,
-        ceiling_start=1.0,
-        ceiling_end=max(
-            max(0.0, float(getattr(config.train, "adaptive_adv_min", 0.01))),
-            float(getattr(config.train, "adaptive_adv_max", 8.0)),
-        ),
-        floor_loss=_constant_discriminator_loss(san_direction_weight, san_active),
-        collapse_ceiling=max(
-            0.0, float(getattr(config.train, "adaptive_adv_min", 0.01))
-        ),
-    )
-
-    # Built here rather than in ``training_loop``, which is re-entered once per
-    # epoch: a controller rebuilt there would throw away its strength and both
-    # EMAs every 8141 steps and spend the next epoch re-earning them.
-    r1_controller = _R1StrengthController(
-        branch_names=getattr(
-            net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ()
-        ),
-        target_ratio=float(getattr(config.train, "r1_target_ratio", 1.0)),
-        maximum=float(getattr(config.train, "r1_max_scale", 10000.0)),
-        minimum=float(getattr(config.train, "r1_min_scale", 1e-4)),
-    )
-    if r1_controller.load_state_dict(resumed_extra_d.get("r1_controller")):
-        info(
-            f"Restored the R1 strength controller over {len(r1_controller.names)} "
-            f"branches (mean scale {r1_controller.scale:.3f}, "
-            f"mean share {r1_controller.ratio:.3f}).",
-            tag="[RESUME]",
-        )
 
     # The turn from "still learning" to "memorising" happens on the scale of a
     # run, not an epoch.
@@ -4057,10 +2340,7 @@ def run(
             overtrain_monitor=overtrain_monitor,
             holdout_interval=interval,
             ema=ema,
-            adversarial_ceiling_governor=adversarial_ceiling_governor,
-            r1_controller=r1_controller,
             grad_scaler=grad_scaler,
-            r1_grad_scaler=r1_grad_scaler,
         )
         if use_lr_scheduler and (not warmup_active() or warmup_completed):
             if lr_scheduler in ["exp decay epoch", "cosine annealing", "cosine annealing epoch"]:
@@ -4137,33 +2417,9 @@ def training_loop(
     overtrain_monitor=None,
     holdout_interval=0,
     ema=None,
-    adversarial_ceiling_governor=None,
-    r1_controller=None,
     grad_scaler=None,
-    r1_grad_scaler=None,
 ):
-    """
-    Trains and evaluates the model for one epoch.
-
-    Args:
-        rank (int): Rank of the current process.
-        epoch (int): Current epoch number.
-        config (object): Configuration object containing training parameters.
-        nets (list): List of models [net_g, net_d].
-        optims (list): List of optimizers [optim_g, net_d].
-        train_loader: training dataloader.
-        writers (list): List of TensorBoard writers [writer_eval].
-        cache (list): List to cache data in GPU memory.
-        total_epoch_count (int): The total number of epochs for training.
-        epoch_save_frequency (int): Frequency of saving epochs.
-        save_weight_models (int): Whether to save small weight models. 0 for no, 1 for yes.
-        save_only_latest_net_models (int): Whether to save only latest G/D or for each epoch.
-        device (torch.device): The device to use for training (CPU or GPU).
-        reference (list): Contains reference sample. Either custom or from train loader.
-        reference_audio (torch.Tensor): Original waveform for the evaluation reference, when available.
-        fn_spectral_loss: spectral loss;  can be l1, multi-scale or ms-stft.
-        fn_spectral_loss2: 2nd spectral loss
-    """
+    """Trains and evaluates the model for one epoch."""
     global global_step, warmup_completed, use_lr_scheduler, lr_scheduler, use_warmup, swap_completed
     global phase_step, phase_limit_reached, overtrain_flagged, overtrain_exported
     global amp_skipped_steps
@@ -4230,65 +2486,22 @@ def training_loop(
         "posterior_detail_rms": deque(maxlen=rolling_loss_steps),
         "prior_detail_rms": deque(maxlen=rolling_loss_steps),
     }
-    if chouwagan_stack_active:
-        # Waveform-domain reconstruction terms, logged unweighted so the series
-        # stay readable when their weights change.
-        for key in ("loss_envelope", "loss_rms", "loss_peak", "loss_waveform"):
-            avg_rolling_cache[key] = deque(maxlen=rolling_loss_steps)
     avg_rolling_cache["loss_kl"] = deque(maxlen=rolling_loss_steps)
     kl_std_cache = deque(maxlen=rolling_loss_steps)
     kl_mean_cache = deque(maxlen=rolling_loss_steps)
     kl_active_cache = deque(maxlen=rolling_loss_steps)
     last_kl_per_dim = None
 
-    r1_interval = max(1, int(getattr(config.train, "r1_interval", 16)))
-    r1_gamma = float(getattr(config.train, "r1_gamma", 1.0))
-    # Only fires once every ``r1_interval`` steps, so its window is scaled down
-    # to cover the same wall-clock span as the per-step series.
-    avg_rolling_cache["grad_norm_d_r1"] = deque(
-        maxlen=max(2, rolling_loss_steps // r1_interval)
-    )
-
-    if r1_controller is None:
-        # Inert stand-in rather than a guard at each call site: a zero target
-        # makes ``active`` false, every ``scale_for`` exactly 1.0 and
-        # ``observe_r1`` a no-op, so the R1 step behaves as it did before the
-        # controller existed.
-        r1_controller = _R1StrengthController(target_ratio=0.0)
-
-    # Per-head discriminator losses.  Kept out of ``avg_rolling_cache`` because
-    # that dict is keyed by scalar name and auto-namespaced by prefix, while
-    # this is one ``(heads, 2)`` tensor per step -- stacking it whole means the
-    # 50-step window costs a single mean and a single device transfer instead
-    # of 2 * heads of each.
-    disc_branch_cache = deque(maxlen=rolling_loss_steps)
     # One 0/1 per step, so the logged rate is "how much of the recent window did
     # FP16 throw away" rather than a lifetime average that a bad first epoch
     # would dominate forever.
     amp_skip_cache = deque(maxlen=rolling_loss_steps)
-    disc_branch_names = ()
-    if chouwagan_stack_active:
-        disc_branch_names = tuple(
-            getattr(net_d.module if hasattr(net_d, "module") else net_d, "branch_names", ())
-        )
 
     diagnostics_interval = max(
         1,
         int(getattr(config.train, "diagnostics_interval", 256)),
     )
 
-    r1_segment_size = max(
-        1,
-        int(getattr(config.train, "r1_segment_size", config.train.segment_size)),
-    )
-    # The generator's gradient norm is dominated by ``dec.conv_post`` (a 40->1
-    # output conv that sums the waveform-domain loss gradient over B*T samples),
-    # so its natural operating point sits in the hundreds.  The clip is a spike
-    # guard, not a per-step rescaler -- keep the ceiling well above that range.
-    global_clip_g = max(
-        0.0,
-        float(getattr(config.train, "global_clip_norm_g", 500.0)),
-    )
     # SAN's direction term, weighted well below the function term: it trains
     # only the unit-norm projection, and at 1.0 it doubles ``loss_disc`` for a
     # quantity the generator never sees.  Clamped to [0, 1] because a negative
@@ -4302,91 +2515,9 @@ def training_loop(
             net_d.module if hasattr(net_d, "module") else net_d, "supports_san", False
         )
     )
-    adv_warmup_steps = 0 if finetune_phase else max(
-        0, int(getattr(config.train, "adv_warmup_steps", 2000))
-    )
     kl_active_threshold = max(
         0.0,
         float(getattr(config.train, "kl_active_threshold", 0.01)),
-    )
-    adaptive_adv_interval = max(
-        1,
-        int(getattr(config.train, "adaptive_adv_interval", 8)),
-    )
-
-    # ---- Adversarial balance --------------------------------------------
-    # The adaptive weight equalises the adversarial and reconstruction
-    # gradients measured on the decoder's last layer, scaled by the balance
-    # target.  The ceiling has to sit well above 1.0 or it is a cap rather than
-    # a balance: with c_mel at 45 the reconstruction gradient runs one to two
-    # orders of magnitude above the adversarial one, so the rule asks for tens.
-    # Adversarial pressure is the only term that teaches high-frequency detail
-    # and aperiodic texture -- a mel distance is nearly blind to both -- so
-    # capping it there caps the ceiling on final quality.
-    adaptive_adv_balance = max(
-        0.0,
-        float(getattr(config.train, "adv_balance_target", 0.5)),
-    )
-    adaptive_adv_min = max(
-        0.0,
-        float(getattr(config.train, "adaptive_adv_min", 0.01)),
-    )
-    # The same rule for the other discriminator-derived loss -- see
-    # ``_adaptive_feature_match_weight`` for the measurements that motivate it.
-    # 0.0 disables the governor and restores the fixed ``fm_weight``.
-    adaptive_fm_balance = max(
-        0.0,
-        float(getattr(config.train, "fm_balance_target", 0.33)),
-    )
-    adaptive_fm_min = max(
-        0.0,
-        float(getattr(config.train, "fm_balance_min", 0.1)),
-    )
-    # The ceiling on the feature-matching weight.  1.0 -- the historical value,
-    # and still the default -- means the governor can only ever *reduce*
-    # ``fm_weight``, because the failure it was written for was overgrowth.
-    # That makes ``fm_balance_target`` unreachable from below: a run whose
-    # feature matching sits under target has the governor pinned at the ceiling
-    # asking for more and unable to take it.  Raise this to let the rule work
-    # in both directions.
-    adaptive_fm_max = max(
-        adaptive_fm_min,
-        float(getattr(config.train, "fm_balance_max", 1.0)),
-    )
-    # 8.0 is a judgement call, not a derived constant: it is roughly a quarter
-    # of the balance the rule currently requests, an ~8x increase on the old
-    # ceiling, and bounded so a collapsing discriminator cannot run the weight
-    # away.  Raise it if the high-frequency deficit persists once the ramp has
-    # finished; lower it if loss_disc_real starts falling well below 1.0.
-    adaptive_adv_max = max(
-        adaptive_adv_min,
-        float(getattr(config.train, "adaptive_adv_max", 8.0)),
-    )
-    adaptive_adv_ramp_start = max(
-        0,
-        int(getattr(config.train, "adaptive_adv_ramp_start", 20000)),
-    )
-    adaptive_adv_ramp_steps = max(
-        0,
-        int(getattr(config.train, "adaptive_adv_ramp_steps", 80000)),
-    )
-    # A fine-tune never reaches the pretraining ramp's horizon -- a few thousand
-    # steps is typical -- so it gets its own, short one.  It still gets a ramp
-    # rather than the full ceiling at once: the loaded G and D were equilibrated
-    # under whatever weight trained them, and an 8x step change in the objective
-    # on the first batch is how a fine-tune picks up artefacts it never had.
-    adaptive_adv_ramp_steps_finetune = max(
-        0,
-        int(getattr(config.train, "adaptive_adv_ramp_steps_finetune", 2000)),
-    )
-
-    # Feature matching is the other channel that carries texture, and it was
-    # hardcoded to 1.0 while being normalised by branch count -- roughly half
-    # of HiFi-GAN's convention of 2.0 unnormalised, on a term already three
-    # orders of magnitude below the spectral loss.
-    fm_weight = max(
-        0.0,
-        float(getattr(config.train, "fm_weight", 2.0)),
     )
 
     # Only read by the "Hybrid L1" spectral loss.  Left at 1.0 so the option
@@ -4395,53 +2526,6 @@ def training_loop(
         0.0,
         float(getattr(config.train, "ms_stft_weight", 1.0)),
     )
-
-    # ---- Waveform-domain reconstruction terms ---------------------------
-    # The compressed-mel loss constrains magnitude per frame but says nothing
-    # about the local level envelope, which is where a bounded output head
-    # tends to drift.  Both terms below are relative (log ratios / max-pool
-    # differences), so neither assumes a particular dataset normalisation.
-    envelope_loss_weight = max(
-        0.0, float(getattr(config.train, "envelope_loss_weight", 3.0))
-    )
-    envelope_kernel = max(
-        2, int(getattr(config.train, "envelope_kernel", 100))
-    )
-    envelope_stride = max(
-        1, int(getattr(config.train, "envelope_stride", 50))
-    )
-    # Amplitude below which the companded envelope stops resolving detail.
-    # 1e-3 is about -60 dBFS, under any decay tail worth reproducing.
-    envelope_floor = max(
-        1e-8, float(getattr(config.train, "envelope_floor", 1e-3))
-    )
-    rms_loss_weight = max(
-        0.0, float(getattr(config.train, "rms_loss_weight", 5.0))
-    )
-    rms_window_size = max(
-        16, int(getattr(config.train, "rms_window", 1024))
-    )
-    rms_hop_size = max(1, int(getattr(config.train, "rms_hop", 256)))
-    # One-sided and absolute: only useful when the dataset is peak-normalised
-    # below the head's threshold.  Off by default.
-    peak_headroom_weight = max(
-        0.0, float(getattr(config.train, "peak_headroom_weight", 0.0))
-    )
-    peak_headroom_threshold = float(
-        getattr(config.train, "peak_headroom_threshold", 0.85)
-    )
-
-    # Counts refreshes whose gradient probe had no representable measurement.
-    # Logged, because the failure it guards against was invisible from the
-    # losses: every component reads finite and only the weights are NaN.
-    adaptive_probe_failures = 0
-    cached_adaptive_adv = None
-    cached_rec_grad = None
-    cached_adv_grad = None
-    cached_adv_requested = None
-    cached_adaptive_fm = None
-    cached_fm_grad = None
-    cached_fm_requested = None
 
     with progress_task(
         len(train_loader),
@@ -4474,11 +2558,6 @@ def training_loop(
             else:
                 grad_clip_value_g = grad_clip_value_d = float("inf")
 
-            if chouwagan_stack_active and global_clip_g > 0:
-                grad_clip_value_g = min(grad_clip_value_g, global_clip_g)
-                grad_clip_value_d = min(grad_clip_value_d, global_clip_g)
-
-
             # Device handling
             if device.type == "cuda":
                 info = [tensor.cuda(device_id, non_blocking=True) for tensor in info]
@@ -4505,143 +2584,44 @@ def training_loop(
 
 
             # Discriminator update
-            main_real_spectrograms = None
-            if chouwagan_stack_active:
-                discriminator_model = (
-                    net_d.module if hasattr(net_d, "module") else net_d
-                )
-                with torch.no_grad(), autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    main_real_spectrograms = (
-                        discriminator_model.prepare_spectrograms(y)
-                    )
-
-            d_updates = [(y, y_hat.detach(), main_real_spectrograms)]
-
-            # The lazy R1 step runs its own backward and its own optimizer step
-            # with a penalty scaled by ``r1_gamma * r1_interval``.  Averaging its
-            # gradient norm into the adversarial one hides which of the two is
-            # actually growing, so they are tracked as separate series.
             _loss_disc_acc, _loss_disc_real_acc, _loss_disc_fake_acc, _grad_norm_d_acc = [], [], [], []
-            _disc_branch_acc = []
-            grad_norm_d_r1 = None
 
-            for y_d_real, y_d_fake, real_spectrograms in d_updates:
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    if chouwagan_stack_active:
-                        y_d_hat_r, y_d_hat_g, _, _ = net_d(
-                            y_d_real,
-                            y_d_fake,
-                            real_spectrograms=real_spectrograms,
-                            pair_batches=True,
-                            # Only the *discriminator* update splits the heads:
-                            # the direction output exists to train the
-                            # projection against this loss, and a discriminator
-                            # without SAN heads ignores the flag.
-                            san_training=True,
-                        )
-                    else:
-                        y_d_hat_r, y_d_hat_g, _, _ = net_d(
-                            y_d_real, y_d_fake
-                        )
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    disc_loss_parts = discriminator_loss(
-                        y_d_hat_r,
-                        y_d_hat_g,
-                        san_direction_weight=san_direction_weight,
-                        normalize=chouwagan_stack_active,
-                        per_branch=bool(disc_branch_names),
-                    )
-                    loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
-                    if disc_branch_names:
-                        _disc_branch_acc.append(disc_loss_parts[3])
-
-                optim_d.zero_grad(set_to_none=True)
-                if grad_scaler is not None:
-                    grad_scaler.scale(loss_disc).backward()
-                    grad_scaler.unscale_(optim_d)
-                else:
-                    loss_disc.backward()
-                grad_norm_d = _clip_or_sample_grad_norm(
-                    net_d.parameters(),
-                    grad_clip_value_d,
-                    global_step,
-                    metrics_update_interval,
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                disc_loss_parts = discriminator_loss(
+                    y_d_hat_r,
+                    y_d_hat_g,
+                    san_direction_weight=san_direction_weight,
+                    normalize=False,
+                    per_branch=False,
                 )
-                if grad_scaler is not None:
-                    grad_scaler.step(optim_d)
-                else:
-                    optim_d.step()
-                _normalize_san_weights(net_d)
+                loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
 
-                # Temp accumulation
-                _loss_disc_acc.append(loss_disc.detach())
-                _loss_disc_real_acc.append(loss_disc_real.detach())
-                _loss_disc_fake_acc.append(loss_disc_fake.detach())
-                if grad_norm_d is not None:
-                    _grad_norm_d_acc.append(grad_norm_d)
-                # The reference each branch's R1 share is measured against.  Read
-                # here because ``optim_d.step()`` leaves the gradients in place --
-                # only the next iteration's ``zero_grad`` clears them -- and they
-                # are the *discriminative* ones, so the penalty cannot move its
-                # own denominator.
-                #
-                # Sampled at ``r1_interval`` rather than every step: nine extra
-                # norm reductions per sample is ~0.3% of a 7127-launch step at
-                # this cadence, and every branch is measured on each sample, so
-                # each EMA still advances 16x more often than the branch's own R1
-                # fires.
-                if r1_controller.active and global_step % r1_interval == 0:
-                    for name, norm in zip(
-                        r1_controller.names, _branch_discriminative_norms(net_d)
-                    ):
-                        r1_controller.observe_discriminator(name, norm)
+            optim_d.zero_grad(set_to_none=True)
+            if grad_scaler is not None:
+                grad_scaler.scale(loss_disc).backward()
+                grad_scaler.unscale_(optim_d)
+            else:
+                loss_disc.backward()
+            grad_norm_d = _clip_or_sample_grad_norm(
+                net_d.parameters(),
+                grad_clip_value_d,
+                global_step,
+                metrics_update_interval,
+            )
+            if grad_scaler is not None:
+                grad_scaler.step(optim_d)
+            else:
+                optim_d.step()
 
-            if (
-                chouwagan_stack_active
-                and r1_gamma > 0
-                and global_step % r1_interval == 0
-            ):
-                discriminator_model = (
-                    net_d.module if hasattr(net_d, "module") else net_d
-                )
-                r1_event = max(0, global_step // r1_interval - 1)
-                r1_branch = r1_event % discriminator_model.num_branches
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    r1_penalty = _lazy_r1_penalty(
-                        net_d,
-                        y,
-                        r1_branch,
-                        r1_segment_size,
-                    )
-                    loss_r1 = r1_penalty * (
-                        r1_gamma * r1_interval * 0.5
-                        * r1_controller.scale_for(r1_branch)
-                    )
-
-                optim_d.zero_grad(set_to_none=True)
-                if r1_grad_scaler is not None:
-                    r1_grad_scaler.scale(loss_r1).backward()
-                    r1_grad_scaler.unscale_(optim_d)
-                else:
-                    loss_r1.backward()
-                grad_norm_d_r1 = _clip_or_sample_grad_norm(
-                    net_d.parameters(),
-                    grad_clip_value_d,
-                    global_step,
-                    metrics_update_interval,
-                )
-                if grad_norm_d_r1 is not None:
-                    r1_controller.observe_r1(r1_branch, float(grad_norm_d_r1))
-                if r1_grad_scaler is not None:
-                    r1_grad_scaler.step(optim_d)
-                    # Closed here rather than with the main scaler at the end of
-                    # the step: this is a complete iteration of its own, and it
-                    # only runs every ``r1_interval`` steps.
-                    r1_grad_scaler.update()
-                else:
-                    optim_d.step()
-                _normalize_san_weights(net_d)
+            # Temp accumulation
+            _loss_disc_acc.append(loss_disc.detach())
+            _loss_disc_real_acc.append(loss_disc_real.detach())
+            _loss_disc_fake_acc.append(loss_disc_fake.detach())
+            if grad_norm_d is not None:
+                _grad_norm_d_acc.append(grad_norm_d)
 
             # Stack + mean
             loss_disc = torch.stack(_loss_disc_acc).mean()
@@ -4652,59 +2632,38 @@ def training_loop(
                 if _grad_norm_d_acc
                 else None
             )
-            if _disc_branch_acc:
-                disc_branch_cache.append(torch.stack(_disc_branch_acc).mean(dim=0))
-
             optim_d.zero_grad(set_to_none=True)
 
             # Run discriminator on generated output
-            discriminator_parameter_states = None
-            branchwise_generator = False
-            branch_terms = None
-            if chouwagan_stack_active:
-                discriminator_model = (
-                    net_d.module if hasattr(net_d, "module") else net_d
+            discriminator_model = net_d.module if hasattr(net_d, "module") else net_d
+            # The generator update reads the discriminator; it never trains it.
+            # Its backward still computes a weight gradient for every branch,
+            # and that gradient is thrown away -- ``optim_d.zero_grad`` above
+            # and the next iteration's discriminator update bracket it, and no
+            # ``optim_d.step`` runs in between.  Freezing the parameters skips
+            # the weight-gradient half of the discriminator backward while the
+            # gradient that *is* wanted, the one flowing back into ``y_hat``,
+            # is unchanged.  Paired with ``detach_real`` below, measured on an
+            # RTX 5060 at batch 8 over 0.4 s (v3 + UnivHD, both passes, forward
+            # and backward): 320 ms/step becomes 240, at unchanged peak VRAM.
+            discriminator_parameter_states = [
+                parameter.requires_grad
+                for parameter in discriminator_model.parameters()
+            ]
+            for parameter in discriminator_model.parameters():
+                parameter.requires_grad_(False)
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                # ``detach_real``: the real side is the feature matching
+                # *target* and its logits are discarded, so differentiating
+                # it builds a graph nothing consumes.  See
+                # ``MPD_MSD_Combined.forward``.
+                # The unwrapped module, not ``net_d``: under DDP the
+                # wrapper's forward arms the reducer for a backward that
+                # will never produce a discriminator gradient, and no
+                # gradient sync is wanted here in the first place.
+                _, y_d_hat_g, fmap_r, fmap_g = discriminator_model(
+                    y, y_hat, detach_real=True
                 )
-                discriminator_parameter_states = [
-                    parameter.requires_grad
-                    for parameter in discriminator_model.parameters()
-                ]
-                for parameter in discriminator_model.parameters():
-                    parameter.requires_grad_(False)
-
-                # ``d_generator_branchwise``, which is a memory decision and
-                # deliberately not ``d_branchwise``: the R1 layout is a
-                # separate question.  Off, this is the joint forward it always
-                # was.
-                branchwise_generator = bool(
-                    getattr(discriminator_model, "generator_branchwise", False)
-                )
-                if branchwise_generator:
-                    branch_terms = _branchwise_generator_terms(
-                        discriminator_model,
-                        y,
-                        y_hat,
-                        main_real_spectrograms,
-                        use_amp=use_amp,
-                        amp_dtype=amp_dtype,
-                        loss_scale=(
-                            grad_scaler.get_scale()
-                            if grad_scaler is not None
-                            else 1.0
-                        ),
-                        san_direction_weight=san_direction_weight,
-                        use_softplus=san_active,
-                    )
-                else:
-                    with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                        with torch.no_grad():
-                            _, fmap_r = discriminator_model._forward_audio(
-                                y, main_real_spectrograms
-                            )
-                        y_d_hat_g, fmap_g = discriminator_model._forward_audio(y_hat)
-            else:
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
 
 
             # Compute generator losses:
@@ -4742,11 +2701,11 @@ def training_loop(
                 if spectral_loss == "L1 Mel Loss":
                     y_mel = wave_to_mel(
                         config, y, num_mels=None,
-                        for_loss=chouwagan_stack_active,
+                        for_loss=False,
                     )
                     y_hat_mel = wave_to_mel(
                         config, y_hat, num_mels=None,
-                        for_loss=chouwagan_stack_active,
+                        for_loss=False,
                     )
                     if swap_l1_to_ms and fn_spectral_loss_ms is not None:
                         # Loss swap: L1 mel fades out, Multi-Scale mel fades in over swap_duration_steps
@@ -4770,11 +2729,11 @@ def training_loop(
                     # L1 Mel
                     y_mel = wave_to_mel(
                         config, y, num_mels=None,
-                        for_loss=chouwagan_stack_active,
+                        for_loss=False,
                     )
                     y_hat_mel = wave_to_mel(
                         config, y_hat, num_mels=None,
-                        for_loss=chouwagan_stack_active,
+                        for_loss=False,
                     )
                     loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel # * 45
                     # MS-STFT.  Weighted, because the mel term it sits beside
@@ -4796,66 +2755,18 @@ def training_loop(
                         "loss_spectral_ms_stft": loss_ms_stft,
                     }
 
-                loss_envelope = torch.zeros((), device=y.device)
-                loss_rms = torch.zeros((), device=y.device)
-                loss_peak = torch.zeros((), device=y.device)
-                if chouwagan_stack_active:
-                    if envelope_loss_weight > 0.0:
-                        loss_envelope = envelope_loss(
-                            y.float(),
-                            y_hat.float(),
-                            kernel_size=envelope_kernel,
-                            stride=envelope_stride,
-                            floor=envelope_floor,
-                        )
-                    if rms_loss_weight > 0.0:
-                        loss_rms = local_log_rms_loss(
-                            y,
-                            y_hat,
-                            window_size=rms_window_size,
-                            hop_size=rms_hop_size,
-                        )
-                    if peak_headroom_weight > 0.0:
-                        loss_peak = peak_headroom_loss(
-                            y_hat, threshold=peak_headroom_threshold
-                        )
-                loss_waveform = (
-                    envelope_loss_weight * loss_envelope
-                    + rms_loss_weight * loss_rms
-                    + peak_headroom_weight * loss_peak
-                )
-
-                # Feature Matching loss.  Branchwise, both this and the
-                # adversarial term below were already summed over branches
-                # inside the loop that differentiated them; only the configured
-                # weight is still outstanding.
-                if branchwise_generator:
-                    loss_fm = branch_terms["loss_fm"] * fm_weight
-                else:
-                    loss_fm = feature_loss(
-                        fmap_r,
-                        fmap_g,
-                        normalize=chouwagan_stack_active,
-                    ) * (fm_weight if chouwagan_stack_active else 2.0)
+                loss_fm = feature_loss(fmap_r, fmap_g, normalize=False) * 2.0
 
                 # Generator loss.  ``y_d_hat_g`` comes from the *generator*
                 # update's forward, which never sets ``san_training``, so these
                 # are plain logits and ``san_direction_weight`` is inert -- the
                 # direction output is the discriminator's business alone.
-                #
-                # The squared-softplus surrogate is SAN's, and it is one-sided:
-                # LSGAN's ``(1 - d) ** 2`` also punishes the generator for
-                # scoring *above* the real target, which is not a defect worth
-                # a gradient.
-                if branchwise_generator:
-                    loss_adv = branch_terms["loss_adv"]
-                else:
-                    loss_adv = generator_loss(
-                        y_d_hat_g,
-                        normalize=chouwagan_stack_active,
-                        san_direction_weight=san_direction_weight,
-                        use_softplus=san_active,
-                    )
+                loss_adv = generator_loss(
+                    y_d_hat_g,
+                    normalize=False,
+                    san_direction_weight=san_direction_weight,
+                    use_softplus=san_active,
+                )
 
                 loss_kl = kl_loss(
                     z_p,
@@ -4884,180 +2795,8 @@ def training_loop(
                     )
                     last_kl_per_dim = diagnostic_kl
 
-                adaptive_adv = torch.ones((), device=y.device)
-                adaptive_fm = torch.ones((), device=y.device)
-                last_layer_rec_grad = torch.zeros((), device=y.device)
-                last_layer_adv_grad = torch.zeros((), device=y.device)
-                last_layer_fm_grad = torch.zeros((), device=y.device)
-                adaptive_adv_requested = torch.zeros((), device=y.device)
-                adaptive_fm_requested = torch.zeros((), device=y.device)
-                # Gated on discriminator health rather than on the step count
-                # alone -- see ``_AdversarialCeilingGovernor``.  ``loss_disc``
-                # is this step's, since the discriminator update ran above.
-                adaptive_adv_ceiling = adversarial_ceiling_governor.update(
-                    phase_step if finetune_phase else global_step,
-                    loss_disc.item() if chouwagan_stack_active else None,
-                )
-                if chouwagan_stack_active:
-                    # Each refresh costs two extra autograd traversals (one of
-                    # them through the whole discriminator), measured at +16% of
-                    # step time.  The weight is a slowly-varying scalar that is
-                    # clamped to [0.01, 1.0], so recomputing it periodically and
-                    # reusing it in between buys that back.
-                    if (
-                        cached_adaptive_adv is None
-                        or global_step % adaptive_adv_interval == 0
-                    ):
-                        last_layer = _last_layer_parameter(
-                            _decoder_output_layer(model_g.dec)
-                        )
-                        # Branchwise, the GAN losses are detached scalars: their
-                        # gradient at the last layer comes from the waveform
-                        # gradients the branch loop accumulated, unscaled first
-                        # because the balance rule is a *ratio* against a
-                        # reconstruction gradient that was never scaled.
-                        branch_adv_parameter_grad = None
-                        branch_fm_parameter_grad = None
-                        if branchwise_generator:
-                            inverse_scale = 1.0 / branch_terms["loss_scale"]
-                            branch_adv_parameter_grad = _wave_parameter_gradient(
-                                y_hat,
-                                branch_terms["adv_wave_grad"] * inverse_scale,
-                                last_layer,
-                            )
-                            branch_fm_parameter_grad = _wave_parameter_gradient(
-                                y_hat,
-                                branch_terms["fm_wave_grad"]
-                                * (inverse_scale * fm_weight),
-                                last_layer,
-                            )
-                        (
-                            probe_adaptive_adv,
-                            probe_rec_grad,
-                            probe_adv_grad,
-                            probe_adv_requested,
-                        ) = _adaptive_adversarial_weight(
-                            # The waveform terms are part of the reconstruction
-                            # objective, so the GAN balance has to see them too.
-                            loss_spectral + loss_waveform,
-                            loss_adv,
-                            last_layer,
-                            balance_target=adaptive_adv_balance,
-                            minimum=adaptive_adv_min,
-                            maximum=adaptive_adv_ceiling,
-                            adversarial_gradient=branch_adv_parameter_grad,
-                        )
-                        # Shares the reconstruction gradient that call just
-                        # measured, so governing the second half of the GAN
-                        # objective costs one traversal, not three.
-                        probe_adaptive_fm = None
-                        probe_fm_grad = None
-                        probe_fm_requested = None
-                        if adaptive_fm_balance > 0.0:
-                            (
-                                probe_adaptive_fm,
-                                probe_fm_grad,
-                                probe_fm_requested,
-                            ) = _adaptive_feature_match_weight(
-                                loss_fm,
-                                last_layer,
-                                probe_rec_grad,
-                                balance_target=adaptive_fm_balance,
-                                minimum=adaptive_fm_min,
-                                maximum=adaptive_fm_max,
-                                feature_gradient=branch_fm_parameter_grad,
-                            )
-                        # ``_probe_gradient`` returns its last attempt rather
-                        # than raising, so a term with no representable
-                        # measurement still arrives here -- and a weight is not
-                        # one bad step, it is reused for
-                        # ``adaptive_adv_interval`` steps and multiplied into
-                        # ``loss_gen_total``.  One non-finite value reaching
-                        # the cache is a run that never takes another generator
-                        # step: the loss is NaN, every step is skipped, and no
-                        # amount of scaler backoff recovers it because the probe
-                        # does not go through the scaler.  So the cache only
-                        # ever takes finite values, and a failed probe keeps the
-                        # last good ones instead.
-                        probe_finite = bool(
-                            torch.isfinite(
-                                torch.stack(
-                                    [
-                                        value.detach().float().reshape(())
-                                        for value in (
-                                            probe_adaptive_adv,
-                                            probe_rec_grad,
-                                            probe_adv_grad,
-                                            probe_adv_requested,
-                                            probe_adaptive_fm,
-                                            probe_fm_grad,
-                                            probe_fm_requested,
-                                        )
-                                        if value is not None
-                                    ]
-                                )
-                            )
-                            .all()
-                            .item()
-                        )
-                        if probe_finite:
-                            cached_adaptive_adv = probe_adaptive_adv
-                            cached_rec_grad = probe_rec_grad
-                            cached_adv_grad = probe_adv_grad
-                            cached_adv_requested = probe_adv_requested
-                            if probe_adaptive_fm is not None:
-                                cached_adaptive_fm = probe_adaptive_fm
-                                cached_fm_grad = probe_fm_grad
-                                cached_fm_requested = probe_fm_requested
-                        else:
-                            adaptive_probe_failures += 1
-                            if cached_adaptive_adv is None:
-                                # Nothing good to fall back to yet.  The floor
-                                # is the conservative end of the rule's own
-                                # range, so the step still happens and the next
-                                # refresh can correct it.
-                                zero_probe = loss_adv.detach().float().new_zeros(())
-                                cached_adaptive_adv = zero_probe + adaptive_adv_min
-                                cached_rec_grad = zero_probe
-                                cached_adv_grad = zero_probe
-                                cached_adv_requested = zero_probe
-                            if (
-                                adaptive_fm_balance > 0.0
-                                and cached_adaptive_fm is None
-                            ):
-                                zero_probe = loss_fm.detach().float().new_zeros(())
-                                cached_adaptive_fm = zero_probe + adaptive_fm_max
-                                cached_fm_grad = zero_probe
-                                cached_fm_requested = zero_probe
-                    # The cached weight was clamped against the ceiling in force
-                    # when it was computed; re-clamp so a ceiling that moved in
-                    # between takes effect on the very next step.
-                    adaptive_adv = cached_adaptive_adv.clamp(
-                        min=adaptive_adv_min, max=adaptive_adv_ceiling
-                    )
-                    last_layer_rec_grad = cached_rec_grad
-                    last_layer_adv_grad = cached_adv_grad
-                    adaptive_adv_requested = cached_adv_requested
-                    if cached_adaptive_fm is not None:
-                        adaptive_fm = cached_adaptive_fm
-                        last_layer_fm_grad = cached_fm_grad
-                        adaptive_fm_requested = cached_fm_requested
-                    if adv_warmup_steps:
-                        adv_progress = min(1.0, global_step / adv_warmup_steps)
-                    else:
-                        adv_progress = 1.0
-                    gan_weight = adv_progress
-                else:
-                    gan_weight = 1.0
-
-                loss_core = (
-                    loss_spectral
-                    + loss_waveform
-                    + loss_kl
-                )
-                loss_gan = (
-                    adaptive_adv * loss_adv + adaptive_fm * loss_fm
-                ) * gan_weight
+                loss_core = loss_spectral + loss_kl
+                loss_gan = loss_adv + loss_fm
                 loss_gen_total = loss_core + loss_gan
                 if rank == 0 and prior_gap_delta is not None:
                     writer.add_scalar(
@@ -5074,300 +2813,23 @@ def training_loop(
             # Generator backward and update:
             optim_g.zero_grad(set_to_none=True)
             module_grad_metrics = {}
-            if (
-                chouwagan_stack_active
-                and rank == 0
-                and global_step % grad_source_probe_interval == 0
-            ):
-                decoder_parameters = _decoder_parameters(net_g)
-                grad_source_losses = {"spectral": loss_spectral}
-                if loss_waveform.requires_grad:
-                    grad_source_losses["waveform"] = loss_waveform
-                # The two GAN terms are probed from a loss graph on the joint
-                # path and from their waveform gradients on the branchwise one.
-                # Both express the same quantity: the wave series *is* the norm
-                # of that gradient, and the decoder series is it propagated one
-                # step further back.
-                grad_source_waves = {}
-                if branchwise_generator:
-                    inverse_scale = 1.0 / branch_terms["loss_scale"]
-                    grad_source_waves["adv"] = (
-                        branch_terms["adv_wave_grad"] * (inverse_scale * gan_weight)
-                    )
-                    grad_source_waves["fm"] = branch_terms["fm_wave_grad"] * (
-                        inverse_scale * fm_weight * float(adaptive_fm) * gan_weight
-                    )
-                else:
-                    grad_source_losses["adv"] = loss_adv * gan_weight
-                    # Weighted, unlike ``adv``: the fm weight is now governed,
-                    # so the unweighted probe would report a term the optimizer
-                    # never sees and hide the correction working.
-                    grad_source_losses["fm"] = adaptive_fm * loss_fm * gan_weight
-                for name, source_loss in grad_source_losses.items():
-                    writer.add_scalar(
-                        f"Grad_Source/decoder_{name}",
-                        _gradient_norm(source_loss, decoder_parameters).item(),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        f"Grad_Source/wave_{name}",
-                        _tensor_gradient_norm(source_loss, y_hat).item(),
-                        global_step,
-                    )
-                for name, wave_gradient in grad_source_waves.items():
-                    decoder_gradients = torch.autograd.grad(
-                        y_hat,
-                        decoder_parameters,
-                        grad_outputs=wave_gradient,
-                        retain_graph=True,
-                        allow_unused=True,
-                    )
-                    terms = [
-                        gradient.detach().float().square().sum()
-                        for gradient in decoder_gradients
-                        if gradient is not None
-                    ]
-                    writer.add_scalar(
-                        f"Grad_Source/decoder_{name}",
-                        torch.sqrt(torch.stack(terms).sum()).item() if terms else 0.0,
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        f"Grad_Source/wave_{name}",
-                        wave_gradient.detach().float().norm().item(),
-                        global_step,
-                    )
-            if chouwagan_stack_active:
-                # Branchwise, ``loss_gan`` is a number rather than a graph; the
-                # gradient it stands for was accumulated in wave space and is
-                # already carrying the AMP scale, exactly like the scaled
-                # scalar the joint path hands over.
-                gan_wave_gradient = None
-                if branchwise_generator:
-                    gan_wave_gradient = (
-                        branch_terms["adv_wave_grad"] * float(adaptive_adv)
-                        + branch_terms["fm_wave_grad"] * (float(adaptive_fm) * fm_weight)
-                    ) * gan_weight
-                if grad_scaler is not None:
-                    grad_scaler.scale(loss_core).backward(retain_graph=True)
-                    if branchwise_generator:
-                        _add_decoder_only_wave_gradients(
-                            y_hat, gan_wave_gradient, net_g
-                        )
-                    else:
-                        _add_decoder_only_gradients(
-                            grad_scaler.scale(loss_gan), net_g
-                        )
-                    grad_scaler.unscale_(optim_g)
-                else:
-                    loss_core.backward(retain_graph=True)
-                    if branchwise_generator:
-                        _add_decoder_only_wave_gradients(
-                            y_hat, gan_wave_gradient, net_g
-                        )
-                    else:
-                        _add_decoder_only_gradients(loss_gan, net_g)
-                if global_step % metrics_update_interval == 0:
-                    module_grad_metrics = _generator_gradient_metrics(net_g)
-                grad_norm_g = _clip_or_sample_grad_norm(
-                    net_g.parameters(),
-                    grad_clip_value_g,
-                    global_step,
-                    metrics_update_interval,
-                )
-                if grad_scaler is not None:
-                    grad_scaler.step(optim_g)
-                else:
-                    optim_g.step()
-
-                if rank == 0 and global_step % 50 == 0:
-                    writer.add_scalar(
-                        "GAN/adaptive_adv_weight",
-                        adaptive_adv.item(),
-                        global_step,
-                    )
-                    # The applied weight alone cannot show that the ceiling is
-                    # binding: a saturated weight logs as a flat line, which
-                    # reads exactly like a healthy constant.  These three make
-                    # the difference visible -- when `requested` sits far above
-                    # `ceiling`, the balance rule is being overruled, and
-                    # `saturation` is the fraction of it that survives.
-                    if chouwagan_stack_active:
-                        writer.add_scalar(
-                            "GAN/adaptive_adv_requested",
-                            adaptive_adv_requested.item(),
-                            global_step,
-                        )
-                        writer.add_scalar(
-                            "GAN/adaptive_adv_ceiling",
-                            adaptive_adv_ceiling,
-                            global_step,
-                        )
-                        # Flat at zero on a healthy run.  Anything else means
-                        # the balance rule is running on a stale weight because
-                        # its gradient probe had no representable measurement --
-                        # which under FP16 used to be a silent NaN instead.
-                        writer.add_scalar(
-                            "GAN/adaptive_probe_failures",
-                            float(adaptive_probe_failures),
-                            global_step,
-                        )
-                        writer.add_scalar(
-                            "GAN/adaptive_adv_saturation",
-                            min(
-                                1.0,
-                                adaptive_adv.item()
-                                / max(1e-6, adaptive_adv_requested.item()),
-                            ),
-                            global_step,
-                        )
-                    if r1_controller.active:
-                        # The share is the controlled variable and the scale is
-                        # the actuator.  Logging only the scale would leave a
-                        # controller that is failing to reach its target
-                        # indistinguishable from one that has reached it.
-                        #
-                        # Per branch as well as in aggregate: the branches are
-                        # what is being controlled, and the mean is exactly the
-                        # view that hid the 9.9x spread the per-branch
-                        # controller exists to remove.  A branch pinned at
-                        # ``minimum`` has lost authority and only its own series
-                        # shows it.
-                        writer.add_scalar(
-                            "GAN/r1_scale", r1_controller.scale, global_step
-                        )
-                        writer.add_scalar(
-                            "GAN/r1_to_disc_ratio", r1_controller.ratio, global_step
-                        )
-                        for _name in r1_controller.names:
-                            writer.add_scalar(
-                                f"R1_Branch/scale_{_name}",
-                                r1_controller.scale_for(_name),
-                                global_step,
-                            )
-                            writer.add_scalar(
-                                f"R1_Branch/ratio_{_name}",
-                                r1_controller.ratio_for(_name),
-                                global_step,
-                            )
-                        for _name, _share in r1_controller.newly_saturated():
-                            warning(
-                                f"'{_name}' has been pinned at the R1 ceiling "
-                                f"({r1_controller.maximum:g}) with a share of "
-                                f"{_share:.3f} against a target of "
-                                f"{r1_controller.target_ratio:.2f}. The controller "
-                                f"has no authority left over this branch; raise "
-                                f"r1_max_scale.",
-                                tag="[R1]",
-                            )
-                        for _name, _share in r1_controller.newly_floored():
-                            warning(
-                                f"'{_name}' has been pinned at the R1 floor "
-                                f"({r1_controller.minimum:g}) with a share of "
-                                f"{_share:.3f} against a target of "
-                                f"{r1_controller.target_ratio:.2f}. The branch is "
-                                f"over-regularised and the controller cannot ease "
-                                f"it further; lower r1_min_scale.",
-                                tag="[R1]",
-                            )
-                    writer.add_scalar(
-                        "GAN/last_layer_rec_grad",
-                        last_layer_rec_grad.item(),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "GAN/last_layer_adv_grad",
-                        last_layer_adv_grad.item(),
-                        global_step,
-                    )
-                    # The quantity being held at ``adv_balance_target``,
-                    # on the same terms as ``GAN/fm_to_rec_ratio`` below: *after*
-                    # the adaptive weight, so it is what the optimizer receives
-                    # rather than what the adversarial term asked for.  The two
-                    # sit side by side and are read as comparable, and until now
-                    # they were not -- this one was the raw gradient ratio, which
-                    # reads as tens against the other's fractions and makes a
-                    # balance rule sitting exactly on target look broken.
-                    #
-                    # Nothing is lost by weighting it: the raw ratio is
-                    # ``last_layer_adv_grad / last_layer_rec_grad``, and both are
-                    # logged above.  A run that spans this change has a step
-                    # discontinuity in the series at the resume.
-                    writer.add_scalar(
-                        "GAN/adv_to_rec_ratio",
-                        (
-                            adaptive_adv
-                            * last_layer_adv_grad
-                            / (last_layer_rec_grad + 1e-6)
-                        ).item(),
-                        global_step,
-                    )
-                    if adaptive_fm_balance > 0.0:
-                        writer.add_scalar(
-                            "GAN/adaptive_fm_weight", adaptive_fm.item(), global_step
-                        )
-                        writer.add_scalar(
-                            "GAN/adaptive_fm_requested",
-                            adaptive_fm_requested.item(),
-                            global_step,
-                        )
-                        writer.add_scalar(
-                            "GAN/last_layer_fm_grad",
-                            last_layer_fm_grad.item(),
-                            global_step,
-                        )
-                        # The quantity being held at ``fm_balance_target``.
-                        # Reported *after* the weight, so it is what the optimizer
-                        # actually receives rather than what fm asked for.
-                        writer.add_scalar(
-                            "GAN/fm_to_rec_ratio",
-                            (
-                                adaptive_fm
-                                * last_layer_fm_grad
-                                / (last_layer_rec_grad + 1e-6)
-                            ).item(),
-                            global_step,
-                        )
-                    # How far the discriminator is from emitting one constant
-                    # for real and fake.  Falling toward zero is the failure
-                    # the governor exists to catch, and reading it needs no
-                    # baseline: zero is dead, and bigger is better.
-                    writer.add_scalar(
-                        "GAN/disc_headroom",
-                        adversarial_ceiling_governor.headroom,
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "GAN/disc_headroom_best",
-                        adversarial_ceiling_governor.best_headroom,
-                        global_step,
-                    )
-                    # 1 while the governor is rewinding the ramp.  A series
-                    # that sits at 1 means the adversarial weight is as high as
-                    # this discriminator can support.
-                    writer.add_scalar(
-                        "GAN/ceiling_holding",
-                        float(adversarial_ceiling_governor.holding),
-                        global_step,
-                    )
+            if grad_scaler is not None:
+                grad_scaler.scale(loss_gen_total).backward()
+                grad_scaler.unscale_(optim_g)
             else:
-                if grad_scaler is not None:
-                    grad_scaler.scale(loss_gen_total).backward()
-                    grad_scaler.unscale_(optim_g)
-                else:
-                    loss_gen_total.backward()
-                if global_step % metrics_update_interval == 0:
-                    module_grad_metrics = _generator_gradient_metrics(net_g)
-                grad_norm_g = _clip_or_sample_grad_norm(
-                    net_g.parameters(),
-                    grad_clip_value_g,
-                    global_step,
-                    metrics_update_interval,
-                )
-                if grad_scaler is not None:
-                    grad_scaler.step(optim_g)
-                else:
-                    optim_g.step()
+                loss_gen_total.backward()
+            if global_step % metrics_update_interval == 0:
+                module_grad_metrics = _generator_gradient_metrics(net_g)
+            grad_norm_g = _clip_or_sample_grad_norm(
+                net_g.parameters(),
+                grad_clip_value_g,
+                global_step,
+                metrics_update_interval,
+            )
+            if grad_scaler is not None:
+                grad_scaler.step(optim_g)
+            else:
+                optim_g.step()
 
             if discriminator_parameter_states is not None:
                 for parameter, requires_grad in zip(
@@ -5600,11 +3062,6 @@ def training_loop(
                 avg_rolling_cache.setdefault(
                     part_key, deque(maxlen=rolling_loss_steps)
                 ).append(part_value.detach())
-            if chouwagan_stack_active:
-                avg_rolling_cache["loss_envelope"].append(loss_envelope.detach())
-                avg_rolling_cache["loss_rms"].append(loss_rms.detach())
-                avg_rolling_cache["loss_peak"].append(loss_peak.detach())
-                avg_rolling_cache["loss_waveform"].append(loss_waveform.detach())
             avg_rolling_cache["loss_kl"].append(loss_kl.detach())
 
             # D Grads:
@@ -5613,8 +3070,6 @@ def training_loop(
                     avg_rolling_cache["grad_norm_d"].append(grad_norm_d)
                 else:
                     writer.add_scalar("Grad_Norm_Diag/D_Skipped", 1, global_step)
-            if grad_norm_d_r1 is not None and torch.isfinite(grad_norm_d_r1):
-                avg_rolling_cache["grad_norm_d_r1"].append(grad_norm_d_r1)
             # G Grads:
             if grad_norm_g is not None:
                 if torch.isfinite(grad_norm_g):
@@ -5688,50 +3143,7 @@ def training_loop(
                         val = torch.stack(list(queue)).mean().item() if torch.is_tensor(queue[0]) else sum(queue)/len(queue)
                         scalar_dict_rolling[label] = val
 
-                if disc_branch_names and disc_branch_cache:
-                    # ``loss_disc`` is normalized by head count, so the governor's
-                    # ``floor_loss`` -- the loss of a head that emits one constant
-                    # for real and fake -- is already a *per-head* quantity.  The
-                    # same subtraction therefore gives each head the metric
-                    # ``GAN/disc_headroom`` reports for the ensemble, and the mean
-                    # of these series reproduces it exactly.  Reading them side by
-                    # side is the point: the aggregate cannot distinguish nine
-                    # heads losing ground evenly from one collapsed head being
-                    # carried by eight healthy ones.
-                    branch_means = torch.stack(list(disc_branch_cache)).mean(dim=0).cpu()
-                    floor_loss = (
-                        adversarial_ceiling_governor.floor_loss
-                        if adversarial_ceiling_governor is not None
-                        else None
-                    )
-                    branch_scalars = {}
-                    for index, name in enumerate(disc_branch_names):
-                        if index >= branch_means.shape[0]:
-                            break
-                        real_loss = branch_means[index, 0].item()
-                        fake_loss = branch_means[index, 1].item()
-                        branch_scalars[f"Disc_Branch/real_{name}"] = real_loss
-                        branch_scalars[f"Disc_Branch/fake_{name}"] = fake_loss
-                        if floor_loss is not None:
-                            branch_scalars[f"Disc_Branch/headroom_{name}"] = (
-                                floor_loss - (real_loss + fake_loss)
-                            )
-                    summarize(
-                        writer=writer,
-                        global_step=global_step,
-                        scalars=branch_scalars,
-                    )
-
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
-
-                if chouwagan_stack_active:
-                    source_scalars = collect_source_path_metrics(net_g)
-                    if source_scalars:
-                        summarize(
-                            writer=writer,
-                            global_step=global_step,
-                            scalars=source_scalars,
-                        )
 
                 # KL diagnostics (diag tab)
                 if len(kl_std_cache) > 0:
@@ -5989,7 +3401,7 @@ def training_loop(
                         config.train.learning_rate_d,
                         epoch,
                         d_path,
-                        extra=_checkpoint_extra(r1_controller, grad_scaler, r1_grad_scaler),
+                        extra=_checkpoint_extra(grad_scaler),
                     )
 
 

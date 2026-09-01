@@ -365,7 +365,6 @@ def get_bundle_model_names(model):
         warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []
 
-# Inference tab
 def inference_tab():
     with gr.Column():
         with gr.Row():
@@ -448,9 +447,6 @@ def inference_tab():
             )
 
         def on_model_change(model_path):
-            """
-            Handles UI changes for checkpoints and model bundles.
-            """
             bundle_models = get_bundle_model_names(model_path)
 
             if bundle_models:
@@ -460,7 +456,6 @@ def inference_tab():
                     gr.update(visible=True, choices=bundle_models, value=bundle_models[0])
                 )
             else:
-                # Normal .pth or single-model bundle
                 speakers = get_speakers_id(model_path)
                 speaker_val = speakers[0] if speakers else 0
                 is_bundle = is_model_bundle(model_path)
@@ -490,7 +485,6 @@ def inference_tab():
                 return gr.update(value=repurposed_index_value)
             return gr.update()
 
-    # Single inference tab
     with gr.Tab(_("Single input infer")):
         with gr.Column():
             upload_audio = gr.Audio(
@@ -812,7 +806,6 @@ def inference_tab():
             )
             vc_output2 = gr.Audio("Export Audio")
 
-    # Batch inference tab
     with gr.Tab(_("Batch")):
         with gr.Row():
             with gr.Column():

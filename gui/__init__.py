@@ -1,9 +1,8 @@
 """Native Qt front-end for ShiroRVC.
 
-This package is strictly additive: nothing outside ``gui/`` imports it, so the
-directory can be deleted without breaking the Gradio interface or the CLI.
-The only code allowed to reach into the host application lives in
-``gui.services`` -- see ``gui/README.md`` for the rule and why it exists.
+Strictly additive: nothing outside ``gui/`` imports it, so the directory can
+be deleted without breaking the Gradio interface or the CLI. Only
+``gui.services`` may reach into the host application -- see ``gui/README.md``.
 """
 
 from __future__ import annotations
@@ -13,10 +12,9 @@ from pathlib import Path
 
 APP_NAME = "ShiroRVC"
 
-#: Read from ``assets/config.json`` rather than imported from ``version.py``, so
-#: that this package needs nothing on ``sys.path`` to know what it is -- and so
-#: the number still has exactly one definition.  ``tests/test_version.py`` is
-#: what keeps this reader and ``version.read_version`` from drifting apart.
+#: Read from ``assets/config.json`` rather than imported from ``version.py`` so
+#: this package needs nothing on ``sys.path``. ``tests/test_version.py`` keeps
+#: this reader and ``version.read_version`` from drifting apart.
 _CONFIG_FILE = Path(__file__).resolve().parent.parent / "assets" / "config.json"
 
 try:

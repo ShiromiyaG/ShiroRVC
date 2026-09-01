@@ -110,16 +110,11 @@ def stylesheet(mode: str = "dark", accent: str = "violet") -> str:
 def _glyph_urls(values: dict[str, str], mode: str, accent: str) -> dict[str, str]:
     """Render the few glyphs QSS needs as images, and return their URLs.
 
-    Qt's stylesheet engine cannot draw a chevron or a tick from CSS: both need
-    a zero-sized box with borders, which it renders as a filled block.  Leaving
-    them to Fusion means a heavier, differently-weighted glyph sitting beside a
-    hand-drawn icon set, and a checkbox whose "checked" state is a plain filled
-    square.  Rasterising ours once per theme is what makes them match.
-
-    Written under the GUI's own state directory and keyed by theme, so a
-    palette switch does not reuse the previous theme's colour.  A failure here
-    is not worth a broken window: the QSS falls back to no image, which is what
-    it looked like before.
+    Qt's stylesheet engine cannot draw a chevron or a tick from CSS -- both
+    need a zero-sized box with borders, which it renders as a filled block --
+    so they are rasterised once per theme instead, keyed by theme and accent so
+    a palette switch does not reuse stale colours. A failure here falls back to
+    no image rather than a broken window.
     """
     from .widgets import icons
 

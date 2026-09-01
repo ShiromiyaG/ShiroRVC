@@ -86,7 +86,6 @@ def get_file_size_if_missing(file_list):
         for file in files:
             destination_path = os.path.join(local_folder, file)
             if not os.path.exists(destination_path):
-                # Construct URL depending on whether it's using the shared base or custom one
                 if base_url == url_base:
                     url = f"{base_url}/{remote_folder}{file}"
                 else:
@@ -140,11 +139,7 @@ def download_file(url, destination_path, global_bar):
 
 
 def download_mapping_files(file_mapping_list, global_bar):
-    """
-    Download all files in the provided file mapping list using a thread pool executor,
-    and update the global progress bar as downloads progress.
-    Supports optional third element (custom base URL) in the tuple.
-    """
+    """Download entries in parallel. Supports an optional third (custom base URL) tuple element."""
     with ThreadPoolExecutor() as executor:
         futures = []
         for entry in file_mapping_list:
@@ -200,9 +195,6 @@ def calculate_total_size(
     exe,
     smartcutter,
 ):
-    """
-    Calculate the total size of all files to be downloaded based on selected categories.
-    """
     total_size = 0
 
     if models:
@@ -225,9 +217,6 @@ def prequisites_download_pipeline(
     exe,
     smartcutter,
 ):
-    """
-    Manage the download pipeline for different categories of files.
-    """
     total_size = calculate_total_size(
         pretraineds_hifigan_list if pretraineds_hifigan else [],
         models,

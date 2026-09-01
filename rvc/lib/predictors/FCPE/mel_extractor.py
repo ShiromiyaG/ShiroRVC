@@ -30,18 +30,7 @@ class HannWindow(torch.nn.Module):
 
 
 class MelModule(torch.nn.Module):
-    """Mel extractor
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-    """
+    """Mel spectrogram extractor (inference)."""
 
     def __init__(self,
                  sr: [int, float],
@@ -67,7 +56,6 @@ class MelModule(torch.nn.Module):
         self.fmin = fmin
         self.fmax = fmax
         self.clip_val = clip_val
-        # self.mel_basis = {}
         self.register_buffer(
             'mel_basis',
             torch.tensor(librosa_mel_fn(sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)).float(),
@@ -84,18 +72,6 @@ class MelModule(torch.nn.Module):
                  center: bool = False,
                  no_cache_window: bool = False
                  ) -> torch.Tensor:  # (B, T, n_mels)
-        """Get mel spectrogram
-
-        Args:
-            y (torch.Tensor): Input waveform, shape=(B, T, 1).
-            key_shift (int, optional): Key shift. Defaults to 0.
-            speed (int, optional): Variable speed enhancement factor. Defaults to 1.
-            center (bool, optional): center for torch.stft. Defaults to False.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
         n_fft = self.n_fft
         win_size = self.win_size
         hop_length = self.hop_length
@@ -153,21 +129,7 @@ class MelModule(torch.nn.Module):
 
 
 class Wav2MelModule(torch.nn.Module):
-    """
-    Wav to mel converter
-    NOTE: This class of code is reserved for training only, please use Wav2MelModule for inference
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-        device (str, optional): Device. Defaults to 'cpu'.
-    """
+    """Wav-to-mel converter for training."""
 
     def __init__(self,
                  sr: [int, float],
@@ -181,12 +143,10 @@ class Wav2MelModule(torch.nn.Module):
                  mel_type="default",
                  ):
         super().__init__()
-        # catch None
         if fmin is None:
             fmin = 0
         if fmax is None:
             fmax = sr / 2
-        # init
         self.sampling_rate = sr
         self.n_mels = n_mels
         self.n_fft = n_fft
@@ -195,7 +155,6 @@ class Wav2MelModule(torch.nn.Module):
         self.fmin = fmin
         self.fmax = fmax
         self.clip_val = clip_val
-        # self.device = device
         self.register_buffer(
             'tensor_device_marker',
             torch.tensor(1.0).float(),
@@ -211,7 +170,6 @@ class Wav2MelModule(torch.nn.Module):
         self.mel_type = mel_type
 
     def device(self):
-        """Get device"""
         return self.tensor_device_marker.device
 
     @torch.no_grad()
@@ -221,19 +179,6 @@ class Wav2MelModule(torch.nn.Module):
                  keyshift: [int, float] = 0,
                  no_cache_window: bool = False
                  ) -> torch.Tensor:  # (B, T, n_mels)
-        """
-        Get mel spectrogram
-
-        Args:
-            audio (torch.Tensor): Input waveform, shape=(B, T, 1).
-            sample_rate (int): Sampling rate.
-            keyshift (int, optional): Key shift. Defaults to 0.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
-        # resample
         if sample_rate == self.sampling_rate:
             audio_res = audio
         else:
@@ -248,7 +193,6 @@ class Wav2MelModule(torch.nn.Module):
                 ).to(self.tensor_device_marker.device)
             audio_res = self.resample_kernel[key_str](audio.squeeze(-1)).unsqueeze(-1)
 
-        # extract
         mel = self.mel_extractor(audio_res, keyshift, no_cache_window=no_cache_window)
         n_frames = int(audio.shape[1] // self.hop_size) + 1
         if n_frames > int(mel.shape[1]):
@@ -260,19 +204,7 @@ class Wav2MelModule(torch.nn.Module):
 
 
 class MelExtractor:
-    """Mel extractor
-    NOTE: This class of code is reserved for training only, please use MelModule for inference
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-    """
+    """Mel spectrogram extractor for training; use MelModule for inference."""
 
     def __init__(self,
                  sr: [int, float],
@@ -309,18 +241,6 @@ class MelExtractor:
                  center: bool = False,
                  no_cache_window: bool = False
                  ) -> torch.Tensor:  # (B, T, n_mels)
-        """Get mel spectrogram
-
-        Args:
-            y (torch.Tensor): Input waveform, shape=(B, T, 1).
-            key_shift (int, optional): Key shift. Defaults to 0.
-            speed (int, optional): Variable speed enhancement factor. Defaults to 1.
-            center (bool, optional): center for torch.stft. Defaults to False.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
         sampling_rate = self.target_sr
         n_mels = self.n_mels
         n_fft = self.n_fft
@@ -385,27 +305,8 @@ class MelExtractor:
         return spec  # (B, T, n_mels)
 
 
-# init nv_mel_extractor cache
-# will remove this when we have a better solution
-# mel_extractor = MelExtractor(16000, 128, 1024, 1024, 160, 0, 8000)
-
-
 class Wav2Mel:
-    """
-    Wav to mel converter
-    NOTE: This class of code is reserved for training only, please use Wav2MelModule for inference
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-        device (str, optional): Device. Defaults to 'cpu'.
-    """
+    """Wav-to-mel converter for training; use Wav2MelModule for inference."""
 
     def __init__(self,
                  sr: [int, float],
@@ -419,12 +320,10 @@ class Wav2Mel:
                  device='cpu',
                  mel_type="default",
                  ):
-        # catch None
         if fmin is None:
             fmin = 0
         if fmax is None:
             fmax = sr / 2
-        # init
         self.sampling_rate = sr
         self.n_mels = n_mels
         self.n_fft = n_fft
@@ -444,7 +343,6 @@ class Wav2Mel:
         self.mel_type = mel_type
 
     def device(self):
-        """Get device"""
         return self.device
 
     @torch.no_grad()
@@ -454,19 +352,6 @@ class Wav2Mel:
                  keyshift: [int, float] = 0,
                  no_cache_window: bool = False
                  ) -> torch.Tensor:  # (B, T, n_mels)
-        """
-        Get mel spectrogram
-
-        Args:
-            audio (torch.Tensor): Input waveform, shape=(B, T, 1).
-            sample_rate (int): Sampling rate.
-            keyshift (int, optional): Key shift. Defaults to 0.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
-        # resample
         if sample_rate == self.sampling_rate:
             audio_res = audio
         else:
@@ -479,7 +364,6 @@ class Wav2Mel:
                 ).to(self.device)
             audio_res = self.resample_kernel[key_str](audio.squeeze(-1)).unsqueeze(-1)
 
-        # extract
         mel = self.mel_extractor(audio_res, keyshift, no_cache_window=no_cache_window)
         n_frames = int(audio.shape[1] // self.hop_size) + 1
         if n_frames > int(mel.shape[1]):
@@ -508,42 +392,35 @@ def unit_text():
               ' skip plotting.')
         exit(1)
 
-    # spawn mel extractor and wav2mel
     mel_extractor_test = MelExtractor(16000, 128, 1024, 1024, 160, 0, 8000)
     wav2mel_test = Wav2Mel(16000, 128, 1024, 1024, 160, 0, 8000)
 
-    # load audio
     audio_path = r'E:\AUFSe04BPyProgram\AUFSd04BPyProgram\ddsp-svc\20230308\diffusion-svc\samples\GJ2.wav'
     audio, sr = librosa.load(audio_path, sr=16000)
     audio = torch.from_numpy(audio).unsqueeze(0).unsqueeze(-1)
     audio = audio.to('cuda')
     print('  [UNIT_TEST] torchfcpe.mel_tools.mel_extractor: Audio shape: {}'.format(audio.shape))
 
-    # test mel extractor
     start_time = time.time()
     mel1 = mel_extractor_test(audio, 0, 1, False)
     print('  [UNIT_TEST] torchfcpe.mel_extractor: Mel extractor time cost: {:.3f}s'.format(
         time.time() - start_time))
     print('  [UNIT_TEST] torchfcpe.mel_extractor: Mel extractor output shape: {}'.format(mel1.shape))
 
-    # test wav2mel
     start_time = time.time()
     mel2 = wav2mel_test(audio, 16000, 0)
     print('  [UNIT_TEST] torchfcpe.mel_extractor: Wav2mel time cost: {:.3f}s'.format(
         time.time() - start_time))
     print('  [UNIT_TEST] torchfcpe.mel_extractor: Wav2mel output shape: {}'.format(mel2.shape))
 
-    # test melModule
     mel_module = MelModule(16000, 128, 1024, 1024, 160, 0, 8000).to('cuda')
     mel3 = mel_module(audio, 0, 1, False).to('cuda')
     print('  [UNIT_TEST] torchfcpe.mel_extractor: MelModule output shape: {}'.format(mel3.shape))
 
-    # test Wav2MelModule
     wav2mel_module = Wav2MelModule(16000, 128, 1024, 1024, 160, 0, 8000).to('cuda')
     mel4 = wav2mel_module(audio, 16000, 0).to('cuda')
     print('  [UNIT_TEST] torchfcpe.mel_extractor: Wav2MelModule output shape: {}'.format(mel4.shape))
 
-    # plot
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 5, 1)
     librosa.display.waveshow(audio.squeeze().cpu().numpy(), sr=16000)

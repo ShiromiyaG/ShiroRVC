@@ -4,16 +4,7 @@ import pathlib
 
 
 class DotDict(dict):
-    """
-    DotDict, used for config
-
-    Example:
-        # >>> config = DotDict({'a': 1, 'b': {'c': 2}}})
-        # >>> config.a
-        # 1
-        # >>> config.b.c
-        # 2
-    """
+    """Dict with attribute access, e.g. ``config.a.b`` instead of ``config['a']['b']``."""
 
     def __getattr__(*args):
         val = dict.get(*args)
@@ -24,7 +15,6 @@ class DotDict(dict):
 
 
 def spawn_wav2mel(args: DotDict, device: str = None) -> Wav2MelModule:
-    """Spawn wav2mel"""
     _type = args.mel.type
     if (str(_type).lower() == 'none') or (str(_type).lower() == 'default'):
         _type = 'default'
@@ -88,7 +78,7 @@ def spawn_wav2mel(args: DotDict, device: str = None) -> Wav2MelModule:
 
 
 def catch_none_args_opti(x, default, func_name, warning_str=None, level='WARN'):
-    """Catch None, optional"""
+    """Return default if x is None, optionally logging a warning."""
     if x is None:
         if warning_str is not None:
             print(f'[{level}] {warning_str}; using default {default} ({func_name}).')
@@ -98,7 +88,7 @@ def catch_none_args_opti(x, default, func_name, warning_str=None, level='WARN'):
 
 
 def catch_none_args_must(x, func_name, warning_str):
-    """Catch None, must"""
+    """Raise if x is None."""
     level = "ERROR"
     if x is None:
         raise ValueError(f'  [{level}] {warning_str}')
@@ -107,8 +97,6 @@ def catch_none_args_must(x, func_name, warning_str):
 
 
 def get_device(device: str, func_name: str) -> str:
-    """Get device"""
-
     if device is None:
         if torch.cuda.is_available():
             device = 'cuda'
@@ -120,7 +108,6 @@ def get_device(device: str, func_name: str) -> str:
     else:
         device = device
 
-    # Check if the specified device is available, if not, switch to cpu
     if ((device == 'cuda' and not torch.cuda.is_available()) or
             (device == 'mps' and not torch.backends.mps.is_available())):
         print(f'[WARNING] {device} is not available; switching to the CPU.')
@@ -130,7 +117,6 @@ def get_device(device: str, func_name: str) -> str:
 
 
 def get_config_json_in_same_path(path: str) -> str:
-    """Get config json in same path"""
     path = pathlib.Path(path)
     config_json = path.parent / 'config.json'
     if config_json.exists():

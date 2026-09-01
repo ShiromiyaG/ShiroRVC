@@ -35,12 +35,7 @@ from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.algorithm.commons import strip_parametrizations
 from rvc.lib.model_bundle import get_bundle_models, is_model_bundle, load_model_bundle
 from rvc.configs.config import Config
-from rvc.configs.vocoders import (
-    get_architecture_id,
-    get_vocoder_spec,
-    normalize_vocoder,
-    uses_chouwagan_stack,
-)
+from rvc.configs.vocoders import normalize_vocoder
 from rvc.infer.messages import (
     INFER_RANDOM_SEED_EXPOSED,
     INFER_SEED_SPECIFIED,
@@ -52,30 +47,23 @@ logging.getLogger("faiss").setLevel(logging.WARNING)
 logging.getLogger("faiss.loader").setLevel(logging.WARNING)
 
 class VoiceConverter:
-    """
-    A class for performing voice conversion using the Retrieval-Based Voice Conversion (RVC) method.
-    """
+    """Performs voice conversion using the RVC method."""
 
     def __init__(self):
-        """
-        Initializes the VoiceConverter with default configuration, and sets up models and parameters.
-        """
-        self.config = Config()  # Load configuration
-        self.hubert_model = (
-            None  # Initialize the Hubert model (for embedding extraction)
-        )
-        self.last_embedder_model = None  # Last used embedder model
-        self.tgt_sr = None  # Target sampling rate for the output audio
-        self.net_g = None  # Generator network for voice conversion
-        self.vc = None  # Voice conversion pipeline instance
-        self.cpt = None  # Checkpoint for loading model weights
-        self.active_cpt = None # Active checkpoint for the selected speaker
-        self.version = None  # Model version
-        self.n_spk = None  # Number of speakers in the model
-        self.use_f0 = None  # Whether the model uses F0
+        self.config = Config()
+        self.hubert_model = None
+        self.last_embedder_model = None
+        self.tgt_sr = None
+        self.net_g = None
+        self.vc = None
+        self.cpt = None
+        self.active_cpt = None  # Active checkpoint for the selected speaker
+        self.version = None
+        self.n_spk = None
+        self.use_f0 = None
         self.loaded_model = None
-        self.loaded_index = None # Holds the deserialized Faiss index
-        self.loaded_index_meta = None # Serialised sidecar for the bundle index
+        self.loaded_index = None  # Deserialized Faiss index
+        self.loaded_index_meta = None  # Serialised sidecar for the bundle index
         # Whether the embedder wants its input layer-normalised.  Extraction has
         # always honoured this; inference used to drop it on the floor, so a
         # custom embedder whose config asked for normalisation produced training
@@ -85,13 +73,6 @@ class VoiceConverter:
         self.hubert_do_normalize = False
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
-        """
-        Loads the HuBERT model for speaker embedding extraction.
-
-        Args:
-            embedder_model (str): Path to the pre-trained HuBERT model.
-            embedder_model_custom (str): Path to the custom HuBERT model.
-        """
         self.hubert_model, self.hubert_do_normalize = load_embedder_model(
             embedder_model, embedder_model_custom
         )
@@ -100,14 +81,6 @@ class VoiceConverter:
 
     @staticmethod
     def remove_audio_noise(data, sr, reduction_strength=0.7):
-        """
-        Removes noise from an audio file using the NoiseReduce library.
-
-        Args:
-            data (numpy.ndarray): The audio data as a NumPy array.
-            sr (int): The sample rate of the audio data.
-            reduction_strength (float): Strength of the noise reduction. Default is 0.7.
-        """
         try:
             reduced_noise = nr.reduce_noise(
                 y=data, sr=sr, prop_decrease=reduction_strength
@@ -119,14 +92,6 @@ class VoiceConverter:
 
     @staticmethod
     def convert_audio_format(input_path, output_path, output_format):
-        """
-        Converts an audio file to a specified output format.
-
-        Args:
-            input_path (str): Path to the input audio file.
-            output_path (str): Path to the output audio file.
-            output_format (str): Desired audio format (e.g., "WAV", "MP3").
-        """
         try:
             if output_format != "WAV":
                 audio, sample_rate = librosa.load(input_path, sr=None)
@@ -181,41 +146,11 @@ class VoiceConverter:
         index_continuity: float = 0.5,
         **kwargs,
     ):
-        """
-        Performs voice conversion on the input audio.
-
-        Args:
-            pitch (int): Key for F0 up-sampling.
-            filter_radius (float): Radius for filtering.
-            index_rate (float): Rate for index matching.
-            index_k (int): Neighbours averaged per frame by the retrieval.
-            index_power (float): Exponent of the inverse-distance weighting.
-            index_continuity (float): Weight of the temporal continuity bonus.
-            volume_envelope (int): RMS mix rate.
-            silence_gate_db (float): Input level, in dBFS, under which the output
-                is faded out.  The content encoder gives digital silence a
-                full-magnitude embedding whose direction depends on the rest of
-                the chunk, and the decoder renders that as hiss; this is what
-                keeps it out of passages the input says are empty.  None or -inf
-                disables the gate.
-            protect (float): Protection rate for certain audio segments.
-            f0_method (str): Method for F0 extraction.
-            audio_input_path (str): Path to the input audio file.
-            audio_output_path (str): Path to the output audio file.
-            model_path (str): Path to the voice conversion model.
-            index_path (str): Path to the index file.
-            split_audio (bool): Whether to split the audio for processing.
-            f0_autotune (bool): Whether to use F0 autotune.
-            clean_audio (bool): Whether to clean the audio.
-            clean_strength (float): Strength of the audio cleaning.
-            export_format (str): Format for exporting the audio.
-            f0_file (str): Path to the F0 file.
-            embedder_model (str): Path to the embedder model.
-            embedder_model_custom (str): Path to the custom embedder model.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            seed: (int): Seed for randomization of noise.
-            **kwargs: Additional keyword arguments.
+        """silence_gate_db: input level (dBFS) under which output is faded out. The
+        content encoder gives digital silence a full-magnitude embedding whose
+        direction depends on the rest of the chunk, and the decoder renders that
+        as hiss; this keeps it out of passages the input says are empty. None or
+        -inf disables the gate.
         """
         if not model_path:
             print_error("No model provided. Aborting conversion.", tag="[INFER]")
@@ -235,13 +170,11 @@ class VoiceConverter:
             start_time = time.time()
             info(f"Converting '{audio_input_path}'", tag="[INFER]")
 
-            # Loading the input audio and downsample to 16khz
             audio = load_audio_infer(audio_input_path, 16000, **kwargs)
             audio_max = np.abs(audio).max() / 0.95
             if audio_max > 1:
                 audio /= audio_max
 
-            # Load in the feature embedder model
             if not self.hubert_model or embedder_model != self.last_embedder_model:
                 self.load_hubert(embedder_model, embedder_model_custom)
                 self.last_embedder_model = embedder_model
@@ -264,7 +197,6 @@ class VoiceConverter:
             else:
                 chunks = [audio]
 
-            # Seed handling
             if seed != 0:
                 torch.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
@@ -276,7 +208,6 @@ class VoiceConverter:
                 torch.cuda.manual_seed_all(seed)
                 info(INFER_RANDOM_SEED_EXPOSED.format(seed=seed), tag="[INFER]")
 
-            # Collect chunked inference outputs ( if chunking's used )
             converted_chunks = []
             retrieval_config = RetrievalConfig.build(
                 k=index_k, power=index_power, continuity=index_continuity
@@ -360,16 +291,6 @@ class VoiceConverter:
         audio_output_path: str,
         **kwargs,
     ):
-        """
-        Performs voice conversion on a batch of input audio files.
-
-        Args:
-            audio_input_paths (str): List of paths to the input audio files.
-            audio_output_path (str): Path to the output audio file.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
-        """
         pid = os.getpid()
         try:
             with open(
@@ -428,13 +349,6 @@ class VoiceConverter:
                 os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
 
     def get_vc(self, weight_root, sid, bundle_submodel=None):
-        """
-        Loads the voice conversion model and sets up the pipeline.
-
-        Args:
-            weight_root (str): Path to the model weights.
-            sid (int or str): Speaker ID or Speaker Name.
-        """
         if sid == "" or sid == []:
             self.cleanup_model()
             if torch.cuda.is_available():
@@ -447,7 +361,6 @@ class VoiceConverter:
         bundle_models = get_bundle_models(self.cpt) if isinstance(self.cpt, dict) else {}
         if bundle_models:
             target_key = bundle_submodel
-
             if target_key and target_key in bundle_models:
                 model_data = bundle_models[target_key]
                 self.active_cpt = model_data["model_state"]
@@ -475,9 +388,6 @@ class VoiceConverter:
             self.loaded_model = None
 
     def cleanup_model(self):
-        """
-        Cleans up the model and releases resources.
-        """
         import gc
         for attr in ("net_g", "n_spk", "vc", "hubert_model", "tgt_sr", "cpt", "active_cpt", "loaded_model", "loaded_index", "loaded_index_meta"):
             setattr(self, attr, None)
@@ -486,12 +396,7 @@ class VoiceConverter:
             torch.cuda.empty_cache()
 
     def load_model(self, weight_root):
-        """
-        Loads the model weights from the specified path. Handles .pth and model bundles.
-
-        Args:
-            weight_root (str): Path to the model weights.
-        """
+        """Handles both plain .pth checkpoints and model bundles."""
         self.cpt = None
         self.loaded_index = None
         self.loaded_index_meta = None
@@ -505,12 +410,10 @@ class VoiceConverter:
             try:
                 bundle_data = load_model_bundle(weight_root)
 
-                # Check for new multi-model format
                 if "models" in bundle_data:
                     self.cpt = bundle_data
                     info(f"Bundle holds {len(bundle_data['models'])} models.", tag="[INFER]")
-                # Backward compatibility for old single-model bundles
-                else:
+                else:  # old single-model bundle format
                     self.cpt = bundle_data.get("model_state")
                     serialized_index = bundle_data.get("index_data")
                     self.loaded_index_meta = bundle_data.get("index_meta")
@@ -528,9 +431,6 @@ class VoiceConverter:
 
 
     def setup_network(self):
-        """
-        Sets up the network configuration based on the loaded checkpoint.
-        """
         if self.active_cpt is not None:
             self.tgt_sr = self.active_cpt["config"][-1]
             self.active_cpt["config"][-3] = self.active_cpt["weight"]["emb_g.weight"].shape[0]
@@ -545,18 +445,6 @@ class VoiceConverter:
                 )
             )
             vocoder_config = self.active_cpt.get("vocoder_config", {}) or {}
-            # Decoder options that move the id -- the iSTFT hop among them --
-            # travel in ``vocoder_config``, so the guard reads them from the
-            # checkpoint rather than from any config file.
-            if uses_chouwagan_stack(self.vocoder):
-                architecture_id = self.active_cpt.get("architecture_id")
-                if architecture_id != get_architecture_id(
-                    self.vocoder, vocoder_config
-                ):
-                    raise ValueError(
-                        f"Unsupported {get_vocoder_spec(self.vocoder)['label']} "
-                        f"architecture: {architecture_id or 'unknown'}."
-                    )
 
             synth_kwargs = {
                 "use_f0": self.use_f0,
@@ -565,7 +453,6 @@ class VoiceConverter:
                 "vocoder_config": vocoder_config,
             }
 
-            # Model init
             self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
 
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
@@ -579,9 +466,6 @@ class VoiceConverter:
             strip_parametrizations(self.net_g)
 
     def setup_vc_instance(self):
-        """
-        Sets up the voice conversion pipeline instance based on the target sampling rate and configuration.
-        """
         if self.active_cpt is not None:
             self.vc = VC(self.tgt_sr, self.config)
             self.n_spk = self.active_cpt["config"][-3]

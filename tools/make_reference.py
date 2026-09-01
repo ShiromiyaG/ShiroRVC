@@ -121,10 +121,9 @@ def build(
     usable_frames = min(feats.shape[0] * 2, f0_fine.size)
     if write_audio:
         # Re-read at the model's rate rather than upsampling the 16 kHz copy the
-        # extractor used: the preview compares mel spectrograms up to Nyquist,
-        # and a 16 kHz source resampled to 44.1 kHz is empty above 8 kHz -- the
-        # difference panel would then show the model inventing the whole top
-        # half of the band, which is an artefact of this tool, not the model.
+        # extractor used: a 16 kHz source resampled to 44.1 kHz is empty above
+        # 8 kHz, which would make the difference panel show the model
+        # inventing the whole top half of the band.
         wave = load_audio(str(source), sample_rate)
         if seconds:
             wave = wave[: int(seconds * sample_rate)]

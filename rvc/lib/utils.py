@@ -32,7 +32,7 @@ stft = base_path + ".exe" if sys.platform == "win32" else base_path
 
 
 def load_audio_16k(file):
-    # this is used by f0 and feature extractions that load preprocessed 16k files, so there's no need to resample - Noobies
+    # Callers already preprocess to 16k, so no resample happens here.
     try:
         audio, sr = librosa.load(file, sr=16000)
     except Exception as error:
@@ -62,17 +62,8 @@ def load_audio_ffmpeg(
     sample_rate: int = 48000,
     source_sr: int = None,
 ) -> np.ndarray:
-    """
-    Args:
-        source (str | np.ndarray): The path to the audio file or an in-memory audio chunk.
-        sample_rate (int): The target sample rate to resample the audio to.
-        source_sr (int): The sample rate of the input source. Required for in-memory audio.
-
-    Returns:
-        np.ndarray: A NumPy array containing the audio waveform as 32-bit floats.
-    """
+    """Load (or resample, for an in-memory chunk) audio via ffmpeg, as float32."""
     if isinstance(source, str):
-        # Handle file path
         source = source.strip(" ").strip('"').strip("\n").strip('"').strip(" ")
         if not os.path.exists(source):
             raise FileNotFoundError(f"The audio file was not found at the provided path: {source}")
@@ -88,16 +79,13 @@ def load_audio_ffmpeg(
         except Exception as e:
             raise RuntimeError(f"An unexpected error occurred while loading audio: {e}") from e
     elif isinstance(source, np.ndarray):
-        # Handle in-memory audio chunk
         if source_sr is None:
             raise ValueError("source_sr must be provided when passing a NumPy array.")
-        
-        # Ensure the array is a 32-bit float and mono
+
         if source.dtype != np.float32:
             source = source.astype(np.float32)
 
         if source.ndim > 1:
-            # If stereo, convert to mono
             source = np.mean(source, axis=1)
 
         try:
@@ -238,22 +226,9 @@ def load_embedder_model(embedder_model, custom_embedder=None):
 
 
 def extract_features(model, source, version, do_normalize=False):
-    """Extract HuBERT features for RVC inference/training.
-
-    For v1 (256-D): extracts layer 9 hidden states, then applies final_proj.
-    For v2 (768-D): uses the last hidden state directly.
-
-    If do_normalize is True, applies F.layer_norm to the raw waveform before
-    feeding to the model (matching what ContentVec/HuBERT expects).
-
-    Args:
-        model: HubertModelWithFinalProj instance.
-        source: Audio tensor of shape (1, num_samples).
-        version: "v1" or "v2".
-        do_normalize: Whether to apply layer normalization to the input.
-
-    Returns:
-        Tensor of shape (1, T, 256) for v1 or (1, T, 768) for v2.
+    """v1 (256-D) takes layer-9 hidden states through final_proj; v2 (768-D) uses
+    the last hidden state directly. do_normalize layer-norms the waveform first,
+    matching what ContentVec/HuBERT expects.
     """
     if do_normalize:
         source = F.layer_norm(source, source.shape)

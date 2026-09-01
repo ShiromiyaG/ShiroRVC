@@ -171,64 +171,32 @@ catalog falls back to English silently rather than raising.
 <details>
 <summary><b>The voice engines</b></summary>
 
-ShiroRVC ships three vocoders — the part that turns the model's internal
+ShiroRVC ships two vocoders — the part that turns the model's internal
 representation back into sound.
 
-| | **HiFi-GAN** | **ChouwaGAN** | **RefineGAN** |
-|---|---|---|---|
-| Sample rates | 32 / 40 / 48 kHz | 44.1 kHz | 44.1 kHz |
-| Frontend | Original VITS (flow + posterior) | VITS flow + posterior, rate-targeted KL | Original VITS (flow + posterior) |
-| Generator | NSF HiFi-GAN | Anti-aliased NSF with an excitation U-Net | Pulse template refined through parallel ResBlocks |
-| Discriminator | MPD + MSD | MPD (3 periods) + complex STFT + pseudo-CQT | MPD + MSD |
-| Decoder size | 15.7 M | 3.9 M | 13.2 M |
-| Discriminator size | 71.4 M | 2.5 M | 71.4 M |
+| | **HiFi-GAN** | **RefineGAN** |
+|---|---|---|
+| Sample rates | 32 / 40 / 48 kHz | 32 / 44.1 kHz |
+| Frontend | Original VITS (flow + posterior) | Original VITS (flow + posterior) |
+| Generator | NSF HiFi-GAN | Pulse template refined through parallel ResBlocks |
+| Discriminator | MPD + MSD | MPD + MSD |
+| Decoder size | 15.7 M | 13.2 M |
+| Discriminator size | 71.4 M | 71.4 M |
 
 **HiFi-GAN** is the well-tested option inherited from the original RVC, and the
 right choice if you want results that behave predictably.
 
-**ChouwaGAN** is what this fork exists for, aimed at singing at 44.1 kHz. Its
-excitation is a band-limited harmonic bank plus noise, and every harmonic is
-faded out as it approaches Nyquist, so the source never aliases and the decoder
-does not spend capacity cancelling tones it was handed. That excitation is
-rendered **once** at the full sample rate and band-limited down through a small
-U-Net, so every decoder stage sees a phase-consistent view of one signal rather
-than an independently re-rendered comb. The trunk itself is depthwise-separable
-with 2x-oversampled SnakeBeta activations, which is why 3.9 M parameters are
-enough. Its latent frontend is VITS's posterior-plus-flow with a per-dimension
-KL rate controller, so the latent cannot quietly collapse, and a scheduled
-fraction of every batch is decoded from the *prior* so the inference path
-receives reconstruction gradient.
-
-Its discriminator judges the **complex** STFT rather than magnitudes, so the
-adversarial signal carries phase, and compresses magnitudes by a power law so
-the sparse 10–20 kHz region is not drowned out by the low bins. Three periods
-rather than five: the five agreed with each other to a rank correlation of
-0.86–0.98, so their count was silently acting as a weight on one opinion. A
-pseudo-CQT branch is on by default — on a log frequency axis a harmonic stack
-slides rigidly with pitch, so one kernel detects it at every f0 — and a PQMF
-sub-band branch is available for inter-band aliasing.
-
-Every branch ends in a **sliced-adversarial (SAN)** head: the output projection
-is split into a unit-norm direction and a learned scale, trained on two separate
-objectives, so the trunk cannot make its own job easier by shrinking the
-projection. Lazy R1 regularisation runs one branch at a time under a per-branch
-strength controller. Both are switchable — `d_use_san` falls back to plain
-LSGAN logits, and `d_branchwise: false` collapses R1 onto a single controller
-and a single summed penalty.
-
 **RefineGAN** is [Applio](https://github.com/IAHispano/Applio)'s decoder, ported
-unchanged and configured for 44.1 kHz (`[3, 3, 7, 7]` upsampling against the
-441-sample hop). It works the other way around from the two above: instead of
-upsampling a latent and adding a source, it builds a sine excitation at the full
-rate, downsamples it into a channel pyramid with Kaiser-windowed resampling, and
-refines the latent against that pyramid through parallel multi-kernel ResBlocks,
-concatenating the matching excitation scale at every step.
+unchanged and configured for 32 / 44.1 kHz (`[3, 3, 7, 7]` upsampling against a
+441-sample hop at 44.1 kHz). It works the other way around from HiFi-GAN's NSF:
+instead of upsampling a latent and adding a source, it builds a sine excitation
+at the full rate, downsamples it into a channel pyramid with Kaiser-windowed
+resampling, and refines the latent against that pyramid through parallel
+multi-kernel ResBlocks, concatenating the matching excitation scale at every
+step.
 
 It runs on the stock VITS skeleton — `enc_q` + flow + `c_kl` — and on the plain
-MPD + MSD discriminator, so none of ChouwaGAN's adversarial machinery applies to
-it: **no SAN heads, no R1 penalty, no per-branch driving**. That makes it the
-conservative 44.1 kHz option, and the one to compare ChouwaGAN against, since
-the only thing that differs between the two runs is `net_g.dec`.
+MPD + MSD discriminator.
 
 </details>
 

@@ -13,19 +13,7 @@ import torch.nn.functional as F
 
 
 class ConformerNaiveEncoder(nn.Module):
-    """
-    Conformer Naive Encoder
-
-    Args:
-        dim_model (int): Dimension of model
-        num_layers (int): Number of layers
-        num_heads (int): Number of heads
-        use_norm (bool): Whether to use norm for FastAttention, only True can use bf16/fp16, default False
-        conv_only (bool): Whether to use only conv module without attention, default False
-        conv_dropout (float): Dropout rate of conv module, default 0.
-        atten_dropout (float): Dropout rate of attention module, default 0.
-        use_pre_norm (bool): Whether to use pre-norm, default False
-    """
+    """Stack of conformer encoder layers. use_norm=True is required for bf16/fp16."""
 
     def __init__(self,
                  num_layers: int,
@@ -41,8 +29,8 @@ class ConformerNaiveEncoder(nn.Module):
         self.num_heads = num_heads
         self.dim_model = dim_model
         self.use_norm = use_norm
-        self.residual_dropout = 0.1  # 废弃代码,仅做兼容性保留
-        self.attention_dropout = 0.1  # 废弃代码,仅做兼容性保留
+        self.residual_dropout = 0.1  # unused, kept for checkpoint compatibility
+        self.attention_dropout = 0.1  # unused, kept for checkpoint compatibility
 
         self.encoder_layers = nn.ModuleList(
             [
@@ -52,32 +40,13 @@ class ConformerNaiveEncoder(nn.Module):
         )
 
     def forward(self, x, mask=None) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor (#batch, length, dim_model)
-            mask (torch.Tensor): Mask tensor, default None
-        return:
-            torch.Tensor: Output tensor (#batch, length, dim_model)
-        """
-
         for (i, layer) in enumerate(self.encoder_layers):
             x = layer(x, mask)
         return x  # (#batch, length, dim_model)
 
 
 class CFNEncoderLayer(nn.Module):
-    """
-    Conformer Naive Encoder Layer
-
-    Args:
-        dim_model (int): Dimension of model
-        num_heads (int): Number of heads
-        use_norm (bool): Whether to use norm for FastAttention, only True can use bf16/fp16, default False
-        conv_only (bool): Whether to use only conv module without attention, default False
-        conv_dropout (float): Dropout rate of conv module, default 0.1
-        atten_dropout (float): Dropout rate of attention module, default 0.1
-        use_pre_norm (bool): Whether to use pre-norm, default False
-    """
+    """One conformer block: optional self-attention, then a conv module."""
 
     def __init__(self,
                  dim_model: int,
@@ -98,9 +67,8 @@ class CFNEncoderLayer(nn.Module):
             self.conformer = ConformerConvModule(dim_model)
         self.norm = nn.LayerNorm(dim_model)
 
-        self.dropout = nn.Dropout(0.1)  # 废弃代码,仅做兼容性保留
+        self.dropout = nn.Dropout(0.1)  # unused, kept for checkpoint compatibility
 
-        # selfatt -> fastatt: performer!
         if not conv_only:
             self.attn = SelfAttention(dim=dim_model,
                                       heads=num_heads,
@@ -111,13 +79,6 @@ class CFNEncoderLayer(nn.Module):
             self.attn = None
 
     def forward(self, x, mask=None) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor (#batch, length, dim_model)
-            mask (torch.Tensor): Mask tensor, default None
-        return:
-            torch.Tensor: Output tensor (#batch, length, dim_model)
-        """
         if self.attn is not None:
             x = x + (self.attn(self.norm(x), mask=mask))
 
@@ -200,10 +161,6 @@ class SelfAttention(nn.Module):
                                          look_forward=int(not causal),
                                          rel_pos_emb_config=(dim_head, local_heads)) if local_heads > 0 else None
 
-        # print (heads, nb_features, dim_head)
-        # name_embedding = torch.zeros(110, heads, dim_head, dim_head)
-        # self.name_embedding = nn.Parameter(name_embedding, requires_grad=True)
-
         self.to_q = nn.Linear(dim, inner_dim)
         self.to_k = nn.Linear(dim, inner_dim)
         self.to_v = nn.Linear(dim, inner_dim)
@@ -213,8 +170,6 @@ class SelfAttention(nn.Module):
     @torch.no_grad()
     def redraw_projection_matrix(self):
         self.fast_attention.redraw_projection_matrix()
-        # torch.nn.init.zeros_(self.name_embedding)
-        # print (torch.sum(self.name_embedding))
 
     def forward(self, x, context=None, mask=None, context_mask=None, name=None, inference=False, **kwargs):
         b, n, _, h, gh = *x.shape, self.heads, self.global_heads
@@ -223,25 +178,18 @@ class SelfAttention(nn.Module):
 
         context = default(context, x)
         context_mask = default(context_mask, mask) if not cross_attend else context_mask
-        # print (torch.sum(self.name_embedding))
         q, k, v = self.to_q(x), self.to_k(context), self.to_v(context)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
         (q, lq), (k, lk), (v, lv) = map(lambda t: (t[:, :gh], t[:, gh:]), (q, k, v))
 
         attn_outs = []
-        # print (name)
-        # print (self.name_embedding[name].size())
         if not empty(q):
             if exists(context_mask):
                 global_mask = context_mask[:, None, :, None]
                 v.masked_fill_(~global_mask, 0.)
             if cross_attend:
-                pass
-                # print (torch.sum(self.name_embedding))
-                # out = self.fast_attention(q,self.name_embedding[name],None)
-                # print (torch.sum(self.name_embedding[...,-1:]))
-                # attn_outs.append(out)
+                pass  # cross-attention not implemented
             else:
                 out = self.fast_attention(q, k, v)
                 attn_outs.append(out)
@@ -275,22 +223,11 @@ class FastAttention(nn.Module):
         self.generalized_attention = generalized_attention
         self.kernel_fn = kernel_fn
 
-        # if this is turned on, no projection will be used
-        # queries and keys will be softmax-ed as in the original efficient attention paper
+        # If True, q/k are softmax-ed directly instead of Performer-projected.
         self.no_projection = no_projection
 
         self.causal = causal
         self.use_norm = use_norm
-        '''
-        if causal:
-            try:
-                import fast_transformers.causal_product.causal_product_cuda
-                self.causal_linear_fn = partial(causal_linear_attention)
-            except ImportError:
-                print(
-                    'unable to import cuda code for auto-regressive Performer. will default to the memory inefficient non-cuda version')
-                self.causal_linear_fn = causal_linear_attention_noncuda
-        '''
         if self.causal or self.generalized_attention:
             raise NotImplementedError('Causal and generalized attention not implemented yet')
 
@@ -312,11 +249,6 @@ class FastAttention(nn.Module):
             k = torch.exp(k) if self.causal else k.softmax(dim=-2)
 
         elif self.generalized_attention:
-            '''
-            create_kernel = partial(generalized_kernel, kernel_fn=self.kernel_fn,
-                                    projection_matrix=self.projection_matrix, device=device)
-            q, k = map(create_kernel, (q, k))
-            '''
             raise NotImplementedError('generalized attention not implemented yet')
 
         else:
@@ -336,45 +268,35 @@ class FastAttention(nn.Module):
 
 def linear_attention(q, k, v):
     if v is None:
-        # print (k.size(), q.size())
         out = torch.einsum('...ed,...nd->...ne', k, q)
         return out
 
     else:
         k_cumsum = k.sum(dim=-2)
-        # k_cumsum = k.sum(dim = -2)
         D_inv = 1. / (torch.einsum('...nd,...d->...n', q, k_cumsum.type_as(q)) + 1e-8)
 
         context = torch.einsum('...nd,...ne->...de', k, v)
-        # print ("TRUEEE: ", context.size(), q.size(), D_inv.size())
         out = torch.einsum('...de,...nd,...n->...ne', context, q, D_inv)
         return out
 
 
 def softmax_kernel(data, *, projection_matrix, is_query, normalize_data=True, eps=1e-4, device=None):
     b, h, *_ = data.shape
-    # (batch size, head, length, model_dim)
 
-    # normalize model dim
     data_normalizer = (data.shape[-1] ** -0.25) if normalize_data else 1.
-
-    # what is ration?, projection_matrix.shape[0] --> 266
 
     ratio = (projection_matrix.shape[0] ** -0.5)
 
     projection = repeat(projection_matrix, 'j d -> b h j d', b=b, h=h)
     projection = projection.type_as(data)
 
-    # data_dash = w^T x
     data_dash = torch.einsum('...id,...jd->...ij', (data_normalizer * data), projection)
 
-    # diag_data = D**2
     diag_data = data ** 2
     diag_data = torch.sum(diag_data, dim=-1)
     diag_data = (diag_data / 2.0) * (data_normalizer ** 2)
     diag_data = diag_data.unsqueeze(dim=-1)
 
-    # print ()
     if is_query:
         data_dash = ratio * (
                 torch.exp(data_dash - diag_data -
@@ -388,20 +310,14 @@ def softmax_kernel(data, *, projection_matrix, is_query, normalize_data=True, ep
 
 def gaussian_orthogonal_random_matrix(nb_rows, nb_columns, scaling=0, qr_uniform_q=False, device=None):
     nb_full_blocks = int(nb_rows / nb_columns)
-    # print (nb_full_blocks)
     block_list = []
 
     for _ in range(nb_full_blocks):
         q = orthogonal_matrix_chunk(nb_columns, qr_uniform_q=qr_uniform_q, device=device)
         block_list.append(q)
-    # block_list[n] is a orthogonal matrix ... (model_dim * model_dim)
-    # print (block_list[0].size(), torch.einsum('...nd,...nd->...n', block_list[0], torch.roll(block_list[0],1,1)))
-    # print (nb_rows, nb_full_blocks, nb_columns)
     remaining_rows = nb_rows - nb_full_blocks * nb_columns
-    # print (remaining_rows)
     if remaining_rows > 0:
         q = orthogonal_matrix_chunk(nb_columns, qr_uniform_q=qr_uniform_q, device=device)
-        # print (q[:remaining_rows].size())
         block_list.append(q[:remaining_rows])
 
     final_matrix = torch.cat(block_list)
@@ -421,8 +337,7 @@ def orthogonal_matrix_chunk(cols, qr_uniform_q=False, device=None):
     q, r = torch.linalg.qr(unstructured_block.cpu(), mode='reduced')
     q, r = map(lambda t: t.to(device), (q, r))
 
-    # proposed by @Parskatt
-    # to make sure Q is uniform https://arxiv.org/pdf/math-ph/0609050.pdf
+    # Makes Q uniform (Parskatt); see https://arxiv.org/pdf/math-ph/0609050.pdf
     if qr_uniform_q:
         d = torch.diag(r, 0)
         q *= d.sign()

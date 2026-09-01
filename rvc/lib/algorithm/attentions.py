@@ -8,20 +8,7 @@ import math
 from typing import Optional
 
 class MultiHeadAttention(nn.Module):
-    """
-    Multi-head attention module with optional relative positional encoding and proximal bias.
-
-    Args:
-        channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
-        n_heads (int): Number of attention heads.
-        p_dropout (float, optional): Dropout probability. Defaults to 0.0.
-        window_size (int, optional): Window size for relative positional encoding. Defaults to None.
-        heads_share (bool, optional): Whether to share relative positional embeddings across heads. Defaults to True.
-        block_length (int, optional): Block length for local attention. Defaults to None.
-        proximal_bias (bool, optional): Whether to use proximal bias in self-attention. Defaults to False.
-        proximal_init (bool, optional): Whether to initialize the key projection weights the same as query projection weights. Defaults to False.
-    """
+    """Multi-head attention with optional relative positional encoding and proximal bias."""
     def __init__(
         self,
         channels: int,
@@ -108,7 +95,6 @@ class MultiHeadAttention(nn.Module):
         value: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ):
-        # reshape [b, d, t] -> [b, n_h, t, d_k]
         b, d, t_s = key.size()
         t_t = query.size(2)
         query = query.view(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)
@@ -143,7 +129,7 @@ class MultiHeadAttention(nn.Module):
                 # is the same every time.  Measured as ~1.4x of the whole
                 # coupling net's forward at 3000 frames.
                 scores = scores.masked_fill(self._block_mask(t_s, scores.device), -1e4)
-        p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
+        p_attn = F.softmax(scores, dim=-1)
         p_attn = self.drop(p_attn)
         output = torch.matmul(p_attn, value)
         if self.window_size is not None:
@@ -156,24 +142,14 @@ class MultiHeadAttention(nn.Module):
             )
         output = (
             output.transpose(2, 3).contiguous().view(b, d, t_t)
-        )  # [b, n_h, t_t, d_k] -> [b, d, t_t]
+        )
         return output, p_attn
 
     def _matmul_with_relative_values(self, x, y):
-        """
-        x: [b, h, l, m]
-        y: [h or 1, m, d]
-        ret: [b, h, l, d]
-        """
         ret = torch.matmul(x, y.unsqueeze(0))
         return ret
 
     def _matmul_with_relative_keys(self, x, y):
-        """
-        x: [b, h, l, d]
-        y: [h or 1, m, d]
-        ret: [b, h, l, m]
-        """
         ret = torch.matmul(x, y.unsqueeze(0).transpose(-2, -1))
         return ret
 
@@ -197,10 +173,6 @@ class MultiHeadAttention(nn.Module):
         return used_relative_embeddings
 
     def _relative_position_to_absolute_position(self, x):
-        """
-        x: [b, h, l, 2*l-1]
-        ret: [b, h, l, l]
-        """
         batch, heads, length, _ = x.size()
         # Concat columns of pad to shift from relative to absolute indexing.
         x = F.pad(
@@ -224,10 +196,6 @@ class MultiHeadAttention(nn.Module):
         return x_final
 
     def _absolute_position_to_relative_position(self, x):
-        """
-        x: [b, h, l, l]
-        ret: [b, h, l, 2*l-1]
-        """
         batch, heads, length, _ = x.size()
         # padd along column
         x = F.pad(
@@ -246,30 +214,13 @@ class MultiHeadAttention(nn.Module):
         return x_final
 
     def _attention_bias_proximal(self, length: int):
-        """Bias for self-attention to encourage attention to close positions.
-        Args:
-          length: an integer scalar.
-        Returns:
-          a Tensor with shape [1, 1, length, length]
-        """
+        """Bias for self-attention to encourage attention to close positions. Shape [1, 1, length, length]."""
         r = torch.arange(length, dtype=torch.float32)
         diff = torch.unsqueeze(r, 0) - torch.unsqueeze(r, 1)
         return torch.unsqueeze(torch.unsqueeze(-torch.log1p(torch.abs(diff)), 0), 0)
 
 
 class FFN(nn.Module):
-    """
-    Feed-forward network module.
-
-    Args:
-        in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
-        filter_channels (int): Number of filter channels in the convolution layers.
-        kernel_size (int): Kernel size of the convolution layers.
-        p_dropout (float, optional): Dropout probability. Defaults to 0.0.
-        activation (str, optional): Activation function to use. Defaults to None.
-        causal (bool, optional): Whether to use causal padding in the convolution layers. Defaults to False.
-    """
     def __init__(
         self,
         in_channels: int,

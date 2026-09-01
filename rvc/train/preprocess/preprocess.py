@@ -63,15 +63,6 @@ def secs_to_samples(secs, sr):
     return frac.numerator
 
 def save_audio(path: str, name: str, sample_rate: int, format: str, audio: np.ndarray):
-    """
-    Save audio to file.
-    Args:
-        path: Path to a directory where the audio file will be saved.
-        name: Name of the audio file without the extension.
-        sample_rate: Sample rate of the audio file.
-        format: Format of the audio file (WAV or FLAC).
-        audio: Audio data array.
-    """
     if format.lower() == "flac":
         memory_file = io.BytesIO()
         sf.write(
@@ -147,20 +138,17 @@ class PreProcess:
         loading_resampling: str,
         dataset_format: str
     ):
-        # Saving slices for GroundTruth ( 'sliced_audios' dir )
         save_audio(self.gt_wavs_dir, f"{sid}_{idx0}_{idx1}", self.sr, dataset_format, audio)
 
-        # Resampling of slices for wavs16k ( 'sliced_audios_16k' dir )
         if loading_resampling == "librosa":
             chunk_16k = librosa.resample(
                 audio, orig_sr=self.sr, target_sr=SAMPLE_RATE_16K, res_type=RES_TYPE
             )
-        else: # ffmpeg
+        else:
             chunk_16k = load_audio_ffmpeg(
                 audio, sample_rate=SAMPLE_RATE_16K, source_sr=self.sr,
             )
 
-        # Saving slices for 16khz ( 'sliced_audios_16k' dir )
         save_audio(self.wavs16k_dir, f"{sid}_{idx0}_{idx1}", SAMPLE_RATE_16K, dataset_format, chunk_16k)
 
 
@@ -193,12 +181,9 @@ class PreProcess:
         for start in range(0, total, stride):
             end = start + chunk_len_smpl
             if end > total:
-                # Tail handling. Rather than padding out to `chunk_len` with
-                # digital silence -- which puts a hard mel floor and a level the
-                # generator is then asked to reproduce into the dataset -- slide
-                # the window back so it ends on the last sample. That keeps the
-                # slice length exact and every sample real, at the cost of some
-                # extra overlap with the previous slice.
+                # Slide the window back to end on the last sample instead of
+                # padding the tail with silence, which would put a hard mel
+                # floor into the dataset.
                 remainder = total - start
                 if remainder < min_tail:
                     break
@@ -208,10 +193,9 @@ class PreProcess:
                         break  # the re-anchored window would duplicate the previous one
                     chunk = audio[start:]
                 else:
-                    # Whole file is shorter than one chunk. Variable-length
-                    # slices are supported downstream (the Automatic path emits
-                    # them routinely), so keep the real audio rather than
-                    # inflating it with silence.
+                    # Whole file shorter than one chunk; variable-length
+                    # slices are supported downstream (Automatic emits them
+                    # routinely).
                     chunk = audio
             else:
                 chunk = audio[start:end]
@@ -242,23 +226,19 @@ class PreProcess:
     ):
         audio_length = 0
         try:
-            # Loading the audio
             if loading_resampling == "librosa":
-                audio = load_audio(path, self.sr) # Librosa's using SoXr
+                audio = load_audio(path, self.sr)  # SoXr resampler
             else:
-                audio = load_audio_ffmpeg(path, self.sr) # FFmpeg's using Windowed Sinc filter with Blackman-Nuttall window.
+                audio = load_audio_ffmpeg(path, self.sr)  # windowed-sinc, Blackman-Nuttall
 
-            # Getting the length
             audio_length = librosa.get_duration(y=audio, sr=self.sr)
 
-            # Processing, Filtering, Noise reduction
             if process_effects:
                 audio = self.high_pass(audio)
             if noise_reduction:
                 import noisereduce as nr
                 audio = nr.reduce_noise(y=audio, sr=self.sr, prop_decrease=reduction_strength)
 
-            # Slicing approach
             if cut_preprocess == "Skip":
                 self.process_audio_segment(audio, sid, idx0, 0, loading_resampling, dataset_format)
             elif cut_preprocess == "Simple":
@@ -318,7 +298,6 @@ def _process_audio_worker(args):
     )
 
 def _dry_run_check_file(args):
-    """Worker: check one file (gt + 16k) for limiting. Returns dict with stats or None."""
     file_name, gt_wavs_dir, wavs16k_dir, target_rms, headroom, silence_thresh, eps, rms_norm_db = args
     worst_in_file = None
     for audio_dir in [gt_wavs_dir, wavs16k_dir]:
@@ -342,10 +321,7 @@ def _dry_run_check_file(args):
 
 
 def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_processes):
-    """
-    Dry-run: compute what post_rms would do without modifying files.
-    Returns (is_safe, worst_safe_db, summary).
-    """
+    """Compute what post_rms would do without modifying files. Returns (is_safe, worst_safe_db, summary)."""
     target_rms = 10 ** (rms_norm_db / 20)
     headroom = 10 ** (-0.5 / 20)
     silence_thresh = 10 ** (-40.0 / 20)
@@ -379,10 +355,7 @@ def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_pr
 
 
 def _apply_post_norm_from_gain(audio: np.ndarray, gt_audio: np.ndarray, mode: str, rms_norm_db: float):
-    """
-    Apply normalization using the same gain computed from gt_audio.
-    Ensures loudness consistency between gt and 16k versions.
-    """
+    """Apply normalization using the gain computed from gt_audio, so gt and 16k stay loudness-consistent."""
     if mode == "post_rms":
         eps = 1e-9
         target_rms = 10 ** (rms_norm_db / 20)
@@ -416,13 +389,8 @@ def _apply_post_norm_from_gain(audio: np.ndarray, gt_audio: np.ndarray, mode: st
 
 
 def _apply_post_norm(audio: np.ndarray, sr: int, mode: str, rms_norm_db: float):
-    """
-    Dispatch to the correct norm function.
-    All three operate on float32/float64 arrays and return float32.
-    Returns (audio, stats) where stats is None or a dict of limiting info.
-    """
+    """Returns (audio, stats), where stats is None or a dict of limiting info."""
     if mode == "post_rms":
-        # RMS normalization - Consistent loudness targeting -18 dBFS RMS
         eps = 1e-9
         target_rms = 10 ** (rms_norm_db / 20)
         headroom = 10 ** (-0.5  / 20)
@@ -445,14 +413,12 @@ def _apply_post_norm(audio: np.ndarray, sr: int, mode: str, rms_norm_db: float):
         return audio2.astype(np.float32), None
 
     elif mode == "post_peak_rvc":
-        # Classic RVC normalization - soft peak blend (MAX_AMPLITUDE * ALPHA)
         a_max = np.abs(audio).max()
         if a_max <= 0:
             return audio.astype(np.float32), None
         return ((audio / a_max * (MAX_AMPLITUDE * ALPHA)) + (1 - ALPHA) * audio).astype(np.float32), None
 
     elif mode == "post_peak":
-        # Simple peak normalization to 0.95
         peak = np.max(np.abs(audio))
         if peak > 0:
             return (audio / peak * 0.95).astype(np.float32), None
@@ -462,7 +428,6 @@ def _apply_post_norm(audio: np.ndarray, sr: int, mode: str, rms_norm_db: float):
 
 
 def _process_and_save_worker(args):
-    """Shared post-norm worker. Computes gain from gt, applies same gain to both."""
     file_name, gt_wavs_dir, wavs16k_dir, mode, rms_norm_db = args
     try:
         stem, ext = file_name.split(".")[0], file_name.split(".")[1]
@@ -532,11 +497,7 @@ def cleanup_dirs(exp_dir):
 
 
 def run_smart_cutter_stage(input_root, exp_dir, sr):
-    """
-    Stage 1: Sequential GPU processing.
-    Reads from input_root, writes to 'smart_cut_temp' inside exp_dir.
-    Returns the path to the NEW input root (the temp folder).
-    """
+    """Sequential GPU pass; returns the new input root (the temp folder it writes to)."""
     ckpt_dir = os.path.join(now_directory, r"rvc/models/smartcutter")
     output_root = os.path.join(exp_dir, "smart_cut_temp")
     os.makedirs(output_root, exist_ok=True)
@@ -545,25 +506,20 @@ def run_smart_cutter_stage(input_root, exp_dir, sr):
     logger.info(f"[SmartCutter] Original Input: {input_root}")
     logger.info(f"[SmartCutter] Temp Output: {output_root}")
 
-    # Initialize Interface
     engine = SmartCutterInterface(sr, ckpt_dir)
     engine.load_model()
 
     files_to_process = []
-    # Scan files
     for root, _, filenames in os.walk(input_root):
         for f in filenames:
             if f.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
                 full_path = os.path.join(root, f)
-
-                # Replicate folder structure in temp dir
                 rel_path = os.path.relpath(full_path, input_root)
                 out_path = os.path.join(output_root, rel_path)
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
                 files_to_process.append((full_path, out_path))
 
-    # Process Loop
     with progress_task(
         len(files_to_process),
         "SmartCutting",
@@ -572,7 +528,6 @@ def run_smart_cutter_stage(input_root, exp_dir, sr):
             engine.process_file(in_p, out_p)
             progress.advance(task_id)
 
-    # Cleanup GPU
     engine.unload()
     logger.info("SmartCutter Stage Complete. Proceeding to Slicing...")
 
@@ -656,7 +611,6 @@ def preprocess_training_set(
         else:
             logger.info("Contiguity check passed.")
 
-    # Pre-calculate total dataset duration
     total_dataset_duration = 0
     for audio_paths in speaker_map.values():
         for audio_path in audio_paths:
@@ -683,7 +637,6 @@ def preprocess_training_set(
 
     total_audio_length = 0
 
-    # Slicing & Resampling
     logger.info("Stage 1: Slicing & Resampling")
     with multiprocessing.Pool(processes=num_processes) as pool:
         for speaker_dir, audio_paths in track(
@@ -765,7 +718,6 @@ def preprocess_training_set(
 
         logger.info("Stage 2: Normalization")
 
-        # Dry-run safety check for post_rms
         if normalization_mode == "post_rms":
             logger.info("Performing a dry-run first to establish safety of chosen RMS dB...")
             is_safe, worst_safe, summary = _dry_run_post_rms(

@@ -31,17 +31,7 @@ class FolderContentsMaximumLimitError(Exception):
 
 
 def parse_url(url, warning=True):
-    """Parse URLs especially for Google Drive links.
-
-    Args:
-        url: URL to parse.
-        warning: Whether to warn if the URL is not a download link.
-
-    Returns:
-        A tuple (file_id, is_download_link), where file_id is the ID of the
-        file on Google Drive, and is_download_link is a flag indicating
-        whether the URL is a download link.
-    """
+    """Returns (file_id, is_download_link) for a Google Drive URL."""
     parsed = urllib_parse.urlparse(url)
     query = urllib_parse.parse_qs(parsed.query)
     is_gdrive = parsed.hostname in ("drive.google.com", "docs.google.com")
@@ -82,7 +72,6 @@ HOME = os.path.expanduser("~")
 
 
 def get_url_from_gdrive_confirmation(contents):
-    """Extract the download URL from a Google Drive confirmation page."""
     for pattern in (
         r'href="(\/uc\?export=download[^"]+)',
         r'href="/open\?id=([^"]+)"',
@@ -121,7 +110,6 @@ def get_url_from_gdrive_confirmation(contents):
 
 
 def _get_session(proxy, use_cookies, return_cookies_file=False):
-    """Create a requests session with optional proxy and cookie handling."""
     sess = requests.session()
     sess.headers.update(
         {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6)"}
@@ -154,43 +142,8 @@ def download(
     resume=False,
     format=None,
 ):
-    """Download file from URL.
-
-    Parameters
-    ----------
-    url: str
-        URL. Google Drive URL is also supported.
-    output: str
-        Output filename. Default is basename of URL.
-    quiet: bool
-        Suppress terminal output. Default is False.
-    proxy: str
-        Proxy.
-    speed: float
-        Download byte size per second (e.g., 256KB/s = 256 * 1024).
-    use_cookies: bool
-        Flag to use cookies. Default is True.
-    verify: bool or string
-        Either a bool, in which case it controls whether the server's TLS
-        certificate is verified, or a string, in which case it must be a path
-        to a CA bundle to use. Default is True.
-    id: str
-        Google Drive's file ID.
-    fuzzy: bool
-        Fuzzy extraction of Google Drive's file Id. Default is False.
-    resume: bool
-        Resume the download from existing tmp file if possible.
-        Default is False.
-    format: str, optional
-        Format of Google Docs, Spreadsheets and Slides. Default is:
-            - Google Docs: 'docx'
-            - Google Spreadsheet: 'xlsx'
-            - Google Slides: 'pptx'
-
-    Returns
-    -------
-    output: str
-        Output filename.
+    """Download a file from a URL, with special handling for Google Drive links
+    (including Docs/Sheets/Slides export and the confirmation-page redirect).
     """
     if not (id is None) ^ (url is None):
         raise ValueError("Either url or id has to be specified")

@@ -4,7 +4,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ShiroRVC\n"
-"POT-Creation-Date: 2026-08-31 20:05+0000\n"
+"POT-Creation-Date: 2026-09-01 16:32+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -444,10 +444,6 @@ msgstr ""
 
 #: tabs/train/train.py:1043
 msgid "Choose which GPUs to train on, and enable multi-GPU training."
-msgstr ""
-
-#: gui/views/training.py:156
-msgid "ChouwaGAN and RefineGAN are 44.1 kHz only."
 msgstr ""
 
 #: gui/views/training.py:179

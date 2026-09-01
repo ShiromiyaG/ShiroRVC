@@ -2,24 +2,20 @@
 
 A multispeaker fine-tune used to inherit the pretrained checkpoint's ``emb_g``
 whole, because ``verify_spk_dim`` let the checkpoint's row count win over the
-dataset's.  Speaker *k* of the dataset therefore started life *as* speaker *k*
-of the pretrain -- not a neutral initialisation.  Measured on ``f0G40k``,
-``dec.cond`` reads the directions the trained embedding occupies with 1.53x the
-gain it gives random ones, so the decoder renders those identities confidently
-from step 0 and the run has to move away from a wrong answer rather than toward
-a right one.  On a small dataset it does not move far enough, and the pretrain's
-timbre stays audible.
+dataset's. Speaker *k* of the dataset therefore started life *as* speaker *k*
+of the pretrain -- not a neutral initialisation -- and the decoder renders
+those identities confidently from step 0, so on a small dataset the pretrain's
+timbre stays audible because the run never moves far enough away from it.
 
-Discarding the table costs nothing in separation -- after ``dec.cond`` four
-fresh speakers sit 62.3 apart against 41.0 for four inherited ones -- and the
-unused rows were never the problem: a 109-row table with four speakers in use
-trains its four rows *bit-identically* to a 4-row table, because the untouched
-rows get a zero gradient and weight decay does not couple them.
+Discarding the table costs nothing in separation, and the unused rows were
+never the problem: a wide table with only a few speakers in use trains those
+rows *bit-identically* to a narrow table, because the untouched rows get a
+zero gradient and weight decay does not couple them.
 
-So the rule is about the rows that *are* used, and it keys off the shape: a row
-count that disagrees with the dataset's speaker count cannot be describing this
-dataset's speakers.  A count that agrees almost certainly is -- that is staged
-pretraining handing its own table forward -- and is kept.
+So the rule is about the rows that *are* used, and it keys off the shape: a
+row count that disagrees with the dataset's speaker count cannot be
+describing this dataset's speakers. A count that agrees almost certainly is
+-- that is staged pretraining handing its own table forward -- and is kept.
 """
 
 from __future__ import annotations

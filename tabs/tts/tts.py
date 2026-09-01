@@ -43,7 +43,6 @@ def process_input(file_path):
         return None, None
 
 
-# TTS tab
 def tts_tab():
     with gr.Column():
         with gr.Row():

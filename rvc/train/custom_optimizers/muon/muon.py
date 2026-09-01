@@ -1,34 +1,19 @@
 """Muon: momentum orthogonalised by Newton-Schulz, with an AdamW fallback.
 
-Muon replaces the raw momentum step for matrix-shaped parameters with its
-nearest orthogonal matrix, computed by a quintic Newton-Schulz iteration.  The
-motivation is that a momentum update for a linear layer is usually dominated by
-a handful of singular directions; orthogonalising spreads the step evenly over
-all of them, which is why it tends to beat AdamW on stacks of dense layers.
+The update is RMS-matched to AdamW (``_RMS_TARGET``) rather than run on a
+separate, much larger learning rate as in published Muon setups: an
+orthogonal (A, B) matrix has every singular value 1, so its RMS is
+``1/sqrt(max(A, B))``, typically 20-100x smaller than AdamW's ~0.2. Scaling
+the update instead lets Muon share this repo's learning rate, warmup and
+scheduler, so switching optimizer doesn't silently invalidate a tuned
+``learning_rate_g``.
 
-Two things make this implementation safe to drop into this repository:
-
-* **The update is RMS-matched to AdamW** (``_RMS_TARGET``).  An orthogonal
-  matrix of shape ``(A, B)`` has every singular value equal to 1, so its RMS is
-  ``1/sqrt(max(A, B))`` -- typically 20-100x smaller than the ~0.2 RMS of an
-  AdamW step.  Published Muon setups compensate with a separate, much larger
-  learning rate.  Scaling the update instead means Muon runs on the same
-  learning rate, warmup and scheduler as every other optimizer here, so
-  switching optimizer does not silently invalidate a tuned ``learning_rate_g``.
-
-* **Anything that is not genuinely a matrix falls back to AdamW inside the same
-  optimizer.**  Biases and norm gains (``ndim < 2``) are the obvious cases, but
-  so are two shapes this repository actually contains: speaker embeddings,
-  where orthogonalising rows would erase the learned per-speaker scale, and the
-  ``original0`` gain tensors of ``weight_norm`` parametrisations, which reshape
-  to ``(out, 1)`` -- orthogonalising a single-column matrix just renormalises
-  it, destroying the gain the parametrisation exists to learn.
-
-Caveat worth stating plainly: Muon is established on transformer-style dense
-stacks.  Applied to a weight-normalised convolutional vocoder it is reasonable
-but not something the literature has validated -- the E-Branchformer prior in
-the RefineGAN SVAE is the part of this model closest to where Muon is known to
-help.
+Anything not genuinely a matrix falls back to AdamW inside the same
+optimizer: biases/norm gains (``ndim < 2``), speaker embeddings
+(orthogonalising rows would erase the learned per-speaker scale), and the
+``original0`` gain tensors of ``weight_norm`` parametrisations, which reshape
+to ``(out, 1)`` -- orthogonalising a single-column matrix just renormalises
+it.
 """
 
 from __future__ import annotations
@@ -39,35 +24,21 @@ import torch
 from torch.optim.optimizer import Optimizer
 
 
-#: RMS an AdamW step lands near once the second moment has settled.  Matching it
-#: is what lets Muon share this repository's learning rates.
+#: RMS an AdamW step lands near once the second moment has settled; matching
+#: it is what lets Muon share this repository's learning rates.
 _RMS_TARGET = 0.2
 
-#: Coefficients of Keller Jordan's quintic iteration.  Tuned so the iteration
-#: converges from any starting spectrum in very few steps; they deliberately do
+#: Coefficients of Keller Jordan's quintic iteration. They deliberately do
 #: not converge to exactly 1, which is fine because only the direction matters.
 _NS_A, _NS_B, _NS_C = 3.4445, -4.7750, 2.0315
 
-#: Iterations, measured rather than inherited.  Reference implementations use 5,
-#: which suffices for the wide matrices a transformer MLP produces but not for
-#: near-square ones: a square matrix's smallest singular value starts close to
-#: zero, and the quintic converges slowest exactly there.  Smallest singular
-#: value after the iteration, worst of 8 random Gaussians per shape:
-#:
-#:     steps   64x64   256x256   32x128
-#:     3       0.00    0.00      0.68
-#:     5       0.04    0.00      0.68
-#:     7       0.47    0.05      0.68
-#:     9       0.68    0.54      0.68
-#:
-#: A singular value left near zero means that direction was not amplified at
-#: all, which is the one thing Muon is for.  Only at 9 is every shape in band.
-#: The cost is what makes this an easy call: on the largest tensor this model
-#: has (a 512-channel conv, 512x3584 once folded) the iteration measured 1.31 ms
-#: at 5 steps against 2.31 ms at 9, next to a training step of tens of ms.
-#:
-#: Random Gaussians are the worst case for conditioning and a real momentum
-#: buffer is better behaved, so this is a conservative setting, not a tuned one.
+#: Reference implementations use 5 steps, which suffices for wide matrices
+#: but not near-square ones (smallest singular value starts near zero, where
+#: the quintic converges slowest). Measured worst-case smallest singular
+#: value after the iteration (8 random Gaussians per shape) only clears 0.5
+#: on all tested shapes at 9 steps; cost is 1.31ms (5 steps) vs 2.31ms (9
+#: steps) on this model's largest tensor (512x3584), against a training step
+#: of tens of ms.
 DEFAULT_NS_STEPS = 9
 
 

@@ -2,22 +2,16 @@
 
 The reason to add MS-STFT beside a mel loss is the one thing mel cannot give:
 *linear* frequency resolution, which is what resolves a harmonic comb at the top
-of the band.  At 8 kHz a 128-band mel bin spans 507 Hz -- four harmonics at
-f0=120 -- so a comb and band-limited noise of equal energy score identically.
+of the band -- a 128-band mel bin at 8 kHz spans several harmonics, so a comb
+and band-limited noise of equal energy score identically to mel.
 
 Two things in the original implementation worked against that purpose, and both
-are pinned here.
-
-``log(mag.clamp(1e-5))``: measured over 24 slices of the 44.1 kHz dataset with a
-2048-point window, 8.06% of bins fall below that clamp and the 1st and 5th
-percentiles are exactly zero.  Those bins pin to log(1e-5) = -11.51, so a model
-emitting a plausible 1e-3 in silence scored 4.6 against 0.23 for an audible 2 dB
-error at the median magnitude of 0.013 -- and since d|log p - log t|/dp = 1/p,
-the silent bin also carried 13x the per-bin gradient.
-
-Spectral convergence: a Frobenius norm over the whole spectrogram is dominated
-by its largest entries, so the term is in practice "match the loudest bins",
-which is the low end the mel term already covers and already emphasises.
+are pinned here. ``log(mag.clamp(1e-5))`` pins near-silent bins to a large
+negative constant, so a plausible near-silent output scored far worse than an
+audible error elsewhere and carried a wildly outsized share of the gradient.
+Spectral convergence -- a Frobenius norm over the whole spectrogram -- is
+dominated by the loudest bins, duplicating the low end the mel term already
+emphasises.
 """
 
 from __future__ import annotations
@@ -80,8 +74,7 @@ def test_an_audible_gain_error_scores_its_own_log(gain, decibels):
 
     Well above the ``1 / log_scale`` knee, ``log1p`` is a logarithm, so a
     broadband gain error of ``g`` has to score exactly ``ln(g)`` -- the same
-    value ``log(clamp)`` gave.  Measured: 0.2309 against 0.2311 at 2 dB and
-    0.6926 against 0.6931 at 6 dB.  Changing the compression bought the silence
+    value ``log(clamp)`` gave.  Changing the compression bought the silence
     behaviour below for nothing here, which is the point.
     """
     target = _broadband()
@@ -97,12 +90,9 @@ def test_silence_is_not_scored_out_of_all_proportion():
     An inaudible broadband floor at 1e-4 (~-80 dBFS) where the target is
     digital silence is a defect worth some cost -- hiss in silence is a real
     failure mode for this vocoder -- but not an order of magnitude more than an
-    audible 2 dB error across the whole band.
-
-    Compared like for like, both covering every bin: ``log(clamp)`` scored the
-    inaudible case 4.985 against 0.231, **21.6x**.  With ``log1p`` it is 0.961
-    against 0.231, 4.2x.  The bound below passes the second and fails the
-    first, so it is testing the change rather than describing it.
+    audible 2 dB error across the whole band.  The bound below is loose enough
+    to pass the fixed loss and tight enough to fail the old ``log(clamp)``
+    term, so it tests the change rather than merely describing it.
     """
     loss = MultiScaleSTFTLoss()
     target = _broadband()

@@ -141,6 +141,8 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
                 f"Checkpoint architecture mismatch: expected '{expected_architecture}', "
                 f"received '{checkpoint_architecture or 'unknown'}'."
             )
+    assert_excitation_matches(model_state, checkpoint_dict)
+    assert_periods_match(model_state, checkpoint_dict)
     model_state.load_state_dict(checkpoint_dict["model"], strict=strict_load)
 
     if ema is not None:
@@ -212,6 +214,87 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
         checkpoint_dict.get("extra") or {},
     )
 
+def excitation_source(model):
+    """A short name for the decoder's excitation, or ``None`` if it has no say.
+
+    The three RefineGAN sources build different state dicts -- the sine owns
+    ``dec.m_source.merge.0.weight``, the bank owns ``dec.m_source.phase_offset``
+    sized by its harmonic count, the comb owns neither -- and the generator
+    resumes *non-strictly* (``generator_strict_load`` is false for this stack).
+    A cross-load therefore does not raise: a comb checkpoint into a sine
+    synthesiser leaves that ``Linear`` at its random init and trains on from a
+    silently wrong excitation.  The harmonic count rides along because it sizes
+    a real buffer, so it produces a confusing shape error where this produces a
+    sentence.
+    """
+    decoder = getattr(model, "dec", None)
+    source = getattr(decoder, "source_type", None)
+    if source is None:
+        return None
+    if source == "bank":
+        return f"bank{getattr(decoder.m_source, 'harmonic_num', 0)}"
+    return str(source)
+
+
+def assert_excitation_matches(model, checkpoint_dict, origin="checkpoint"):
+    """Absent means ``sine``: every checkpoint predating the key is one."""
+    expected = excitation_source(model)
+    if expected is None:
+        return
+    found = checkpoint_dict.get("excitation_source") or "sine"
+    if found != expected:
+        raise ValueError(
+            f"Excitation mismatch: this run builds '{expected}' but the "
+            f"{origin} was trained with '{found}'. Set refinegan_source "
+            f"(and refinegan_harmonics) to match, or start a fresh run."
+        )
+
+
+def discriminator_periods(model):
+    """The period set a discriminator was built with, or ``None`` if it has none."""
+    periods = getattr(model, "periods", None)
+    return None if periods is None else [int(p) for p in periods]
+
+
+def assert_periods_match(model, checkpoint_dict, origin="checkpoint"):
+    """Refuse to load a discriminator whose periods differ from this run's.
+
+    This one is *only* catchable by an explicit key, which is why the key
+    exists.  A period never appears in a parameter shape -- ``DiscriminatorP``
+    reshapes the waveform and then convolves with ``(k, 1)`` kernels, so the
+    period lives in the ``view`` and nowhere in the weights -- and both the
+    stock set and every rate-scaled one have five branches.  A strict
+    ``load_state_dict`` therefore succeeds perfectly while every branch starts
+    folding at a frequency its weights were never trained on, which shows up as
+    a discriminator that appears to have forgotten how to discriminate and no
+    error anywhere.  Nothing else in the checkpoint can tell the two apart.
+
+    ``None`` means "written before the key existed", and every such checkpoint
+    is one of the un-scaled runs -- so it is compared against the stock set
+    rather than waved through.  See ``PERIODS_BY_RATE`` for why the scaling
+    reaches a run through its config and not through code.
+    """
+    expected = discriminator_periods(model)
+    if expected is None:
+        return
+    found = checkpoint_dict.get("discriminator_periods")
+    if found is None:
+        from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (
+            DISCRIMINATOR_VERSIONS,
+        )
+
+        found = list(DISCRIMINATOR_VERSIONS["v3"][0])
+    found = [int(p) for p in found]
+    if found != expected:
+        raise ValueError(
+            f"Discriminator period mismatch: this run builds {expected} but the "
+            f"{origin} was trained with {found}. The periods are rate-scaled "
+            f"now (see PERIODS_BY_RATE); set d_periods to {found} in the "
+            f"experiment's config.json to keep resuming this run, or start a "
+            f"fresh one."
+        )
+
+
 def save_checkpoint(
     model, optimizer, learning_rate, iteration, checkpoint_path, ema=None, extra=None
 ):
@@ -230,6 +313,18 @@ def save_checkpoint(
     # Additive key.  "model" still holds the live weights, so anything that
     # reads these checkpoints without knowing about the EMA -- older code, the
     # extractor, the blender -- keeps seeing exactly what it saw before.
+    # Same additive contract, and the reason it is a separate key rather than a
+    # suffix on ``architecture_id``: the id is what the wider RVC ecosystem
+    # reads off a checkpoint, and it has to stay ``vits_gaussian_v1``.
+    source = excitation_source(model_instance)
+    if source is not None:
+        checkpoint_data["excitation_source"] = source
+    # Same additive contract again, and for the same reason as the excitation:
+    # the period set is invisible in the weights, so without this key a resume
+    # cannot tell that it changed.  Only discriminators have it.
+    periods = discriminator_periods(model_instance)
+    if periods is not None:
+        checkpoint_data["discriminator_periods"] = periods
     if ema is not None:
         checkpoint_data["ema"] = ema.state_dict()
     # Same additive contract: plain Python scalars for training-loop controllers

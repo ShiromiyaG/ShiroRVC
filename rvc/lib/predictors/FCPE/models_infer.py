@@ -17,16 +17,7 @@ from .torch_interp import batch_interp_with_replacement_detach
 
 
 def ensemble_f0(f0s, key_shift_list, tta_uv_penalty):
-    """_summary_
-
-    Args:
-        f0s (torch.Tensor): (B, T, len(key_shift_list))
-        key_shift_list (list): list of key shifts
-        tta_uv_penalty (float,int): uv penalty
-
-    Returns:
-        f0: (B, T, 1)
-    """
+    """Combine multi-key-shift f0 estimates (B, T, len(key_shift_list)) into one (B, T, 1) via DP."""
     device = f0s.device
     # convert f0 to note
     f0s = f0s / (
@@ -99,11 +90,7 @@ def ensemble_f0(f0s, key_shift_list, tta_uv_penalty):
 
 
 class InferCFNaiveMelPE(torch.nn.Module):
-    """Infer CFNaiveMelPE
-    Args:
-        args (DotDict): Config.
-        state_dict (dict): Model state dict.
-    """
+    """Inference wrapper around CFNaiveMelPE."""
 
     def __init__(self, args, state_dict):
         super().__init__()
@@ -124,15 +111,7 @@ class InferCFNaiveMelPE(torch.nn.Module):
         threshold: float = 0.006,
         key_shifts: list = [0],
     ) -> torch.Tensor:
-        """Infer
-        Args:
-            wav (torch.Tensor): Input wav, (B, n_sample, 1).
-            sr (int, float): Input wav sample rate.
-            decoder_mode (str): Decoder type. Default: "local_argmax", support "argmax" or "local_argmax".
-            threshold (float): Threshold to mask. Default: 0.006.
-            key_shifts (list): Key shifts. Default: [0].
-        return: f0 (torch.Tensor): f0 Hz, shape (B, (n_sample//hop_size + 1), 1).
-        """
+        """Returns f0 in Hz, shape (B, n_sample//hop_size + 1, len(key_shifts))."""
         with torch.no_grad():
             wav = wav.to(self.tensor_device_marker.device)
             mels = torch.stack(
@@ -160,25 +139,11 @@ class InferCFNaiveMelPE(torch.nn.Module):
         tta_key_shifts: list = [0, -12, 12],
         tta_use_origin_uv=False,
     ) -> torch.Tensor or (torch.Tensor, torch.Tensor):
-        """Infer
-        Args:
-            wav (torch.Tensor): Input wav, (B, n_sample, 1).
-            sr (int, float): Input wav sample rate.
-            decoder_mode (str): Decoder type. Default: "local_argmax", support "argmax" or "local_argmax".
-            threshold (float): Threshold to mask. Default: 0.006.
-            f0_min (float): Minimum f0. Default: None. Use in post-processing.
-            f0_max (float): Maximum f0. Default: None. Use in post-processing.
-            interp_uv (bool): Interpolate unvoiced frames. Default: False.
-            output_interp_target_length (int): Output interpolation target length. Default: None.
-            return_uv (bool): Return unvoiced frames. Default: False.
-            test_time_augmentation (bool): Test time augmentation. If enabled, the output may be better but slower. Default: False.
-            tta_uv_penalty (float): Test time augmentation unvoiced penalty. Default: 12.0.
-            tta_key_shifts (list): Test time augmentation key shifts. Default: [0, -12, 12].
-            tta_use_origin_uv (bool): Use origin uv. Default: False
-        return: f0 (torch.Tensor): f0 Hz, shape (B, (n_sample//hop_size + 1) or output_interp_target_length, 1).
-            if return_uv is True, return f0, uv. the shape of uv(torch.Tensor) is like f0.
+        """f0 in Hz; also returns the uv mask if return_uv is True.
+
+        test_time_augmentation infers at several key shifts and combines them via
+        ensemble_f0 for a more robust (but slower) estimate.
         """
-        # infer
         if test_time_augmentation:
             assert len(tta_key_shifts) > 0
             flag = 0
@@ -204,7 +169,6 @@ class InferCFNaiveMelPE(torch.nn.Module):
             f0_min = self.args_dict["model"]["f0_min"]
         uv = (f0_for_uv < f0_min).type(f0_for_uv.dtype)
         f0 = f0 * (1 - uv)
-        # interp
         if interp_uv:
             f0 = batch_interp_with_replacement_detach(
                 uv.squeeze(-1).bool(), f0.squeeze(-1)
@@ -219,7 +183,6 @@ class InferCFNaiveMelPE(torch.nn.Module):
                 mode="linear",
             ).transpose(1, 2)
             f0 = torch.where(f0.isnan(), float(0.0), f0)
-        # if return_uv is True, interp and return uv
         if return_uv:
             uv = torch.nn.functional.interpolate(
                 uv.transpose(1, 2),
@@ -231,29 +194,23 @@ class InferCFNaiveMelPE(torch.nn.Module):
             return f0
 
     def get_hop_size(self) -> int:
-        """Get hop size"""
         return DotDict(self.args_dict).mel.hop_size
 
     def get_hop_size_ms(self) -> float:
-        """Get hop size in ms"""
         return (
             DotDict(self.args_dict).mel.hop_size / DotDict(self.args_dict).mel.sr * 1000
         )
 
     def get_model_sr(self) -> int:
-        """Get model sample rate"""
         return DotDict(self.args_dict).mel.sr
 
     def get_mel_config(self) -> dict:
-        """Get mel config"""
         return dict(DotDict(self.args_dict).mel)
 
     def get_device(self) -> str:
-        """Get device"""
         return self.tensor_device_marker.device
 
     def get_model_f0_range(self) -> dict:
-        """Get model f0 range like {'f0_min': 32.70, 'f0_max': 1975.5}"""
         return {
             "f0_min": DotDict(self.args_dict).model.f0_min,
             "f0_max": DotDict(self.args_dict).model.f0_max,
@@ -261,25 +218,14 @@ class InferCFNaiveMelPE(torch.nn.Module):
 
 
 class InferCFNaiveMelPEONNX:
-    """Infer CFNaiveMelPE ONNX
-    Args:
-        args (DotDict): Config.
-        onnx_path (str): Path to onnx file.
-        device (str): Device. must be not None.
-    """
+    """ONNX inference wrapper; not implemented."""
 
     def __init__(self, args, onnx_path, device):
         raise NotImplementedError
 
 
 def spawn_bundled_infer_model(device: str = None) -> InferCFNaiveMelPE:
-    """
-    Spawn bundled infer model
-    This model has been trained on our dataset and comes with the package.
-    You can use it directly without anything else.
-    Args:
-        device (str): Device. Default: None.
-    """
+    """Load the model bundled with the package (pretrained, ready to use)."""
     file_path = pathlib.Path(__file__)
     model_path = file_path.parent / "assets" / "fcpe_c_v001.pt"
     model = spawn_infer_model_from_pt(str(model_path), device, bundled_model=True)
@@ -289,12 +235,6 @@ def spawn_bundled_infer_model(device: str = None) -> InferCFNaiveMelPE:
 def spawn_infer_model_from_onnx(
     onnx_path: str, device: str = None
 ) -> InferCFNaiveMelPEONNX:
-    """
-    Spawn infer model from onnx file
-    Args:
-        onnx_path (str): Path to onnx file.
-        device (str): Device. Default: None.
-    """
     device = get_device(device, "torchfcpe.tools.spawn_infer_cf_naive_mel_pe_from_onnx")
     config_path = get_config_json_in_same_path(onnx_path)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -318,13 +258,7 @@ def spawn_infer_model_from_onnx(
 def spawn_infer_model_from_pt(
     pt_path: str, device: str = None, bundled_model: bool = False
 ) -> InferCFNaiveMelPE:
-    """
-    Spawn infer model from pt file
-    Args:
-        pt_path (str): Path to pt file.
-        device (str): Device. Default: None.
-        bundled_model (bool): Whether this model is bundled model, only used in spawn_bundled_infer_model.
-    """
+    """bundled_model is only set True from spawn_bundled_infer_model."""
     device = get_device(device, "torchfcpe.tools.spawn_infer_cf_naive_mel_pe_from_pt")
     ckpt = torch.load(pt_path, map_location=torch.device(device))
     if bundled_model:
@@ -349,7 +283,6 @@ def spawn_infer_model_from_pt(
 
 
 def spawn_model(args: DotDict) -> CFNaiveMelPE:
-    """Spawn conformer naive model"""
     if args.model.type == "CFNaiveMelPE":
         pe_model = CFNaiveMelPE(
             input_channels=catch_none_args_must(
@@ -425,8 +358,6 @@ def spawn_model(args: DotDict) -> CFNaiveMelPE:
 
 
 def bundled_infer_model_unit_test(wav_path):
-    """Unit test for bundled infer model"""
-    # wav_path is your wav file path
     try:
         import librosa
         import matplotlib.pyplot as plt
@@ -442,7 +373,6 @@ def bundled_infer_model_unit_test(wav_path):
     f0_interp = infer_model.infer(torch.tensor(wav).unsqueeze(0), sr, interp_uv=True)
     plt.plot(f0.squeeze(-1).squeeze(0).numpy(), color="r", linestyle="-")
     plt.plot(f0_interp.squeeze(-1).squeeze(0).numpy(), color="g", linestyle="-")
-    # 添加图例
     plt.legend(["f0", "f0_interp"])
     plt.xlabel("frame")
     plt.ylabel("f0")

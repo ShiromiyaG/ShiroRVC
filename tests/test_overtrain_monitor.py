@@ -1,20 +1,14 @@
 """Which weights the holdout monitor keeps, and when it calls a run finished.
 
-Two bugs are pinned here, from opposite directions.
-
-The first cost the 44.1 kHz pretrain its best weights: one ``min_delta`` gated
-both "is this a new best?" and "has the run stopped improving?", and those want
-opposite thresholds.  The monitor still answers them separately.
-
-The second is what the fix to the first walked into.  With selection ungated,
+Two bugs are pinned here, from opposite directions. First, a single
+``min_delta`` used to gate both "is this a new best?" and "has the run
+stopped improving?", even though those want opposite thresholds -- the
+monitor now answers them separately. Second, once selection was ungated,
 ``best`` became a single-point argmin over a curve whose tail is flat and
-noisy, so it picked the luckiest evaluation rather than the best weights.  On
-``REAL_TAIL`` that is step 166k at 0.70210, which beats step 140k by 0.06%
-while the tail as a whole spans 1.5% -- a difference the run itself has no way
-to distinguish from noise, bought with 26k extra steps of memorisation.  The
-monitor now median-filters the score and measures every decision against a
-noise band it estimates from the recent history, so a tie inside that band goes
-to the earlier step.
+noisy, so it could pick the luckiest evaluation instead of the best weights.
+The monitor now median-filters the score and measures every decision against
+a noise band estimated from recent history, so a tie inside that band goes to
+the earlier step.
 
 ``train.py`` reads a run spec from ``sys.argv[1]`` at import, so the class is
 lifted out with ``ast``, the same way ``test_run_spec.py`` reads that file.
@@ -121,11 +115,9 @@ def _run(monitor, values):
 
 
 def test_a_lucky_evaluation_does_not_win_the_run(monitor_class):
-    """0.7021 beats 0.7025 by 0.06% on a tail that swings by 1.5%.
-
-    The old monitor exported step 166k for it.  Inside the band the two are the
-    same measurement, and the earlier one is 26k steps less overtrained.
-    """
+    """A late step that beats the true best by a hair, on a flat noisy tail,
+    must not win: inside the noise band they are the same measurement, and
+    the earlier step is less overtrained."""
     monitor = _run(monitor_class(patience=8, min_delta=0.001), REAL_TAIL)
     assert monitor.best_step == 140000
     assert monitor.sigma > (0.7025 - 0.7021)
@@ -143,13 +135,10 @@ def test_a_flat_tail_is_called_overtrained(monitor_class):
 
 
 def test_the_real_turn_is_found_and_called(monitor_class):
-    """The run that motivated the rewrite, end to end.
-
-    The minimum it keeps is one evaluation earlier than the raw argmin at 6154
-    -- 0.66749 against 0.66631, a 0.18% difference on a curve whose noise band
-    is 0.0003 to 0.0013 -- and it still calls the run at the same evaluation
-    the unsmoothed monitor did.
-    """
+    """End-to-end regression on the run that motivated the rewrite: the
+    smoothed minimum lands one evaluation earlier than the raw argmin, and the
+    run is still called overtrained at the same point the unsmoothed monitor
+    called it."""
     monitor = _run(monitor_class(patience=8, min_delta=0.001), ANDRE_MULTI)
     assert monitor.best_step == 5792
     assert monitor.overtrained

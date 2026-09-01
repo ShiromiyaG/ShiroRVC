@@ -12,20 +12,7 @@ from rvc.lib.algorithm.transformer_encoder import TransformerEncoder
 
 
 class TextEncoder(nn.Module):
-    """
-    Text Encoder.
-
-    Args:
-        out_channels (int): Output channels of the encoder.
-        hidden_channels (int): Hidden channels of the encoder.
-        filter_channels (int): Filter channels of the encoder.
-        n_heads (int): Number of attention heads.
-        n_layers (int): Number of encoder layers.
-        kernel_size (int): Kernel size of the convolutional layers.
-        p_dropout (float): Dropout probability.
-        embedding_dim (int): Embedding dimension for phone embeddings (v1 = 256, v2 = 768).
-        f0 (bool, optional): Whether to use F0 embedding. Defaults to True.
-    """
+    """Args: ``embedding_dim`` is the phone embedding size (v1 = 256, v2 = 768)."""
     def __init__(
         self,
         out_channels: int,
@@ -67,9 +54,9 @@ class TextEncoder(nn.Module):
         else:
             x = self.emb_phone(phone) + self.emb_pitch(pitch)
 
-        x = x * math.sqrt(self.hidden_channels)  # [b, t, h]
+        x = x * math.sqrt(self.hidden_channels)
         x = self.lrelu(x)
-        x = torch.transpose(x, 1, -1)  # [b, h, t]
+        x = torch.transpose(x, 1, -1)
         x_mask = torch.unsqueeze(sequence_mask(lengths, x.size(2)), 1).to(x.dtype)
         x = self.encoder(x * x_mask, x_mask)
 

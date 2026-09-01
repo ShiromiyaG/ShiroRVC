@@ -47,20 +47,16 @@ sys.path.append(now_dir)
 
 supported_audio_ext = { "wav", "mp3", "flac", "ogg", "opus", "m4a", "mp4", "aac", "alac", "wma", "aiff", "webm", "ac3", }
 
-saved_components = [] # List of components that should have their states saved ~ For presets
+saved_components = []  # components whose state is saved/restored by presets
 
 
-# Custom Pretraineds
 pretraineds_custom_path = os.path.join(now_dir, "rvc", "models", "pretraineds", "custom")
 pretraineds_custom_path_relative = os.path.relpath(pretraineds_custom_path, now_dir)
-# Custom embedders
 custom_embedder_root = os.path.join(now_dir, "rvc", "models", "embedders", "embedders_custom")
 custom_embedder_root_relative = os.path.relpath(custom_embedder_root, now_dir)
-# Training presets
 presets_path = os.path.join(now_dir, 'assets', 'training_presets')
 presets_path_relative = os.path.relpath(presets_path, now_dir)
 
-# Ensure dirs existence
 os.makedirs(pretraineds_custom_path_relative, exist_ok=True)
 os.makedirs(custom_embedder_root, exist_ok=True)
 os.makedirs(presets_path, exist_ok=True)
@@ -118,7 +114,6 @@ def get_datasets_list():
 def refresh_datasets():
     return {"choices": sorted(get_datasets_list()), "__type__": "update"}
 
-# Model Names
 models_path = os.path.join(now_dir, "logs")
 
 def get_models_list():
@@ -132,14 +127,12 @@ def get_models_list():
 def refresh_models():
     return {"choices": sorted(get_models_list()), "__type__": "update"}
 
-# Refresh Models and Datasets
 def refresh_models_and_datasets():
     return (
         {"choices": sorted(get_models_list()), "__type__": "update"},
         {"choices": sorted(get_datasets_list()), "__type__": "update"},
     )
 
-# Refresh Custom Embedders
 def get_embedder_custom_list():
     return [
         os.path.join(dirpath, dirname)
@@ -150,11 +143,9 @@ def get_embedder_custom_list():
 def refresh_custom_embedder_list():
     return {"choices": sorted(get_embedder_custom_list()), "__type__": "update"}
 
-# Retrieve presets
 def get_presets_list():
     return [os.path.splitext(s)[0] for s in os.listdir(presets_path) if s.endswith('.json')]
 
-# Drop Model
 def save_drop_model(dropbox):
     if ".pth" not in dropbox:
         gr.Info(_("Invalid pretrained file."))
@@ -167,7 +158,6 @@ def save_drop_model(dropbox):
         gr.Info(_("Refresh the list to use the uploaded pretrained file."))
     return None
 
-# Drop Dataset
 def save_drop_dataset_audio(dropbox, dataset_name):
     if not dataset_name:
         gr.Info(_("Enter a valid dataset name."))
@@ -194,7 +184,6 @@ def save_drop_dataset_audio(dropbox, dataset_name):
 
             return None, relative_dataset_path
 
-# Drop Custom Embedder
 def create_folder_and_move_files(folder_name, bin_file, config_file):
     if not folder_name:
         return "Folder name must not be empty."
@@ -225,7 +214,6 @@ def refresh_embedders_folders():
     ]
     return custom_embedders
 
-# Export
 def get_pth_list():
     return [
         os.path.relpath(os.path.join(dirpath, filename), now_dir)
@@ -248,7 +236,6 @@ def refresh_pth_and_index_list():
         {"choices": sorted(get_index_list()), "__type__": "update"},
     )
 
-# Export Pth and Index Files
 def export_pth(pth_path):
     allowed_paths = get_pth_list()
     normalized_allowed_paths = [os.path.abspath(os.path.join(now_dir, p)) for p in allowed_paths]
@@ -271,7 +258,6 @@ def export_index(index_path):
         warning(f"Not a valid index path, skipping: {index_path}", tag="[EXPORT]")
         return None
 
-# Upload to Google Drive
 def upload_to_google_drive(pth_path, index_path):
     def upload_file(file_path):
         if file_path:
@@ -294,7 +280,6 @@ def upload_to_google_drive(pth_path, index_path):
     upload_file(pth_path)
     upload_file(index_path)
 
-# Enable checkpointing for gpus with memory 
 def auto_enable_checkpointing():
     try:
         return max_vram_gpu(0) < 6
@@ -379,7 +364,6 @@ def start_train_from_ui(
     )
 
 
-# Init state for certain options.
 initial_sample_rate_choices = [
     str(rate) for rate in get_vocoder_sample_rates("hifi")
 ]
@@ -412,7 +396,6 @@ def update_vocoder_settings(vocoder_id, current_sample_rate, use_smartcutter):
         },
     )
 
-# Microarch. dependent features, options, functionalities etc.. Might expand in future.
 initial_optimizer = "AdamW"
 # Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES.
 initial_optimizer_choices = [
@@ -422,9 +405,7 @@ initial_optimizer_choices = [
     ("Lion", "Lion"),
 ]
 
-# Train Tab
 def train_tab():
-    # Training presets section
     with gr.Accordion(_("Training Presets"), open=False):
         with gr.Row():
             refresh_presets_button = gr.Button(_("Refresh Presets"))
@@ -440,7 +421,6 @@ def train_tab():
                 save_preset_button = gr.Button(_("Save to preset"))
                 load_preset_button = gr.Button(_("Load from preset"))
 
-    # Model settings section
     with gr.Accordion(_("Model Settings")):
         with gr.Row():
             with gr.Column():
@@ -503,7 +483,6 @@ def train_tab():
                         interactive=False,
                     )
 
-    # Preprocess section
     with gr.Accordion(_("Preprocessing")):
         dataset_path = gr.Dropdown(
             label=_("Dataset Path"),
@@ -655,7 +634,6 @@ def train_tab():
                 outputs=[preprocess_output_info],
             )
 
-    # Extract section
     with gr.Accordion(_("Extraction")):
         with gr.Row():
             f0_method = gr.Radio(
@@ -765,7 +743,6 @@ def train_tab():
             outputs=[extract_output_info],
         )
 
-    # Training section
     with gr.Accordion(_("Training")):
         with gr.Row():
             batch_size = gr.Slider(
@@ -799,15 +776,7 @@ def train_tab():
                 key='total_epoch_count'
             )
         with gr.Accordion(_("Advanced Settings for training"), open=False):
-            # Grouped by what the setting decides, not by widget type.  The
-            # previous layout was two columns of "checkboxes I wrote first" and
-            # "radios", with a full-width pile underneath -- so ``Pretrained``
-            # sat six controls above ``Custom Pretrained``, the LR scheduler was
-            # in a different column from warmup and the custom learning rates,
-            # and the index options were buried among training flags although
-            # the button that uses them is outside this accordion entirely.
-
-            # -- where the weights come from ---------------------------------
+            # Grouped by what the setting decides, not by widget type.
             gr.Markdown(f"#### {_('Starting point')}")
             with gr.Row():
                 with gr.Column(min_width=0):
@@ -859,7 +828,6 @@ def train_tab():
                         key='d_pretrained_path'
                     )
 
-            # -- the optimisation recipe, read top-down ----------------------
             gr.Markdown(f"#### {_('Optimisation')}")
             with gr.Row():
                 with gr.Column(min_width=0):
@@ -881,8 +849,6 @@ def train_tab():
                         interactive=True,
                         key='lr_scheduler'
                     )
-            # Both shape the learning rate, so they belong beside the scheduler
-            # rather than in the pile that used to follow the two columns.
             with gr.Row():
                 with gr.Column(min_width=0):
                     use_warmup = gr.Checkbox(
@@ -929,7 +895,6 @@ def train_tab():
                                 key='custom_lr_d'
                             )
 
-            # -- what gets written, and when to stop -------------------------
             gr.Markdown(f"#### {_('Checkpoints and quality')}")
             with gr.Row():
                 with gr.Column(min_width=0):
@@ -986,7 +951,6 @@ def train_tab():
                         show_progress="hidden",
                     )
 
-            # -- speed, memory and precision ---------------------------------
             gr.Markdown(f"#### {_('Performance')}")
             with gr.Row():
                 with gr.Column(min_width=0):
@@ -1030,25 +994,20 @@ def train_tab():
                         key='torch_compile_mode'
                     )
 
-            # -- which devices -----------------------------------------------
             gr.Markdown(f"#### {_('Hardware')}")
             with gr.Row():
                 with gr.Column(min_width=0):
                     multiple_gpu = gr.Checkbox(
                         label=_("GPU Settings"),
-                        # A tuple, not a string, until 2026-08-21: the trailing
-                        # comma made Gradio serialise the info as an array, and
-                        # being outside ``_()`` it was the one line in the tab
-                        # that could never be translated.
+                        # Must stay a plain string: a trailing comma turning
+                        # this into a tuple breaks translation and Gradio's
+                        # info serialization.
                         info=_("Choose which GPUs to train on, and enable "
                                "multi-GPU training."),
                         value=False,
                         interactive=True,
                         key='multiple_gpu'
                     )
-                    # Revealed by ``multiple_gpu.change`` further down.  Kept in
-                    # the same column as its toggle, like ``warmup_settings`` and
-                    # ``custom_lr_settings``.
                     with gr.Column(visible=False) as gpu_custom_settings:
                         with gr.Accordion(_("GPU ID override / Multi-gpu-training configuration")):
                             training_gpu = gr.Textbox(
@@ -1181,7 +1140,6 @@ def train_tab():
                 outputs=[train_output_info],
             )
 
-    # Export Model section
     with gr.Accordion(_("Export Model"), open=False):
         if not os.name == "nt":
             gr.Markdown(
@@ -1404,11 +1362,6 @@ def train_tab():
                 outputs=[custom_pretrained, pretrained_custom_settings],
                 show_progress="hidden",
             )
-            # placeholder_trigger.change(
-                # fn=lambda value: {"visible": not value, "__type__": "update"},
-                # inputs=[placeholder_trigger], # element to be unchecked / disabled
-                # outputs=[placeholder_result] # element to appear to appear
-            # )
             custom_pretrained.change(
                 fn=toggle_visible,
                 inputs=[custom_pretrained],

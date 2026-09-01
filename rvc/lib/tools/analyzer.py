@@ -24,7 +24,7 @@ def plot_spectrogram(y, sr, stft, duration, cmap="inferno"):
         origin="lower",
         extent=[0, duration, 0, sr / 1000],
         aspect="auto",
-        cmap=cmap,  # Change the colormap here
+        cmap=cmap,
     )
     plt.colorbar(format="%+2.0f dB")
     plt.xlabel("Time (s)")

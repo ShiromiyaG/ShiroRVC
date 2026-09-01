@@ -9,13 +9,6 @@ from torch import Tensor
 from typing import Tuple
 
 def feature_loss(fmap_r, fmap_g, normalize=False):
-    """
-    Compute the feature loss between reference and generated feature maps.
-
-    Args:
-        fmap_r (list of torch.Tensor): List of reference feature maps.
-        fmap_g (list of torch.Tensor): List of generated feature maps.
-    """
     terms = [
         torch.mean(torch.abs(rl - gl))
         for dr, dg in zip(fmap_r, fmap_g)
@@ -34,21 +27,12 @@ def discriminator_loss(
     normalize=False,
     per_branch=False,
 ):
-    """
-    Compute the discriminator loss for real and generated outputs.
+    """Discriminator loss, aggregated across all MPD/MSD heads.
 
-    Returns:
-        Tuple of (total_loss, real_loss_sum, fake_loss_sum) aggregated across
-        all MPD/MSD discriminator heads.
-
-    With ``per_branch``, a fourth element is appended: a detached ``(heads, 2)``
-    tensor holding each head's ``(real, fake)`` contribution before the
-    ``normalize`` division.  The aggregate hides which head is failing -- heads
-    of very different capacity are summed into one number, so a period
-    branch collapsing and a spectrogram branch collapsing look identical.  The
-    per-head values are computed either way; this only keeps them, and keeping
-    them as one stacked tensor means the caller pays a single device transfer
-    rather than one per head.
+    With ``per_branch``, a fourth element is appended: a detached
+    ``(heads, 2)`` tensor of each head's ``(real, fake)`` contribution before
+    the ``normalize`` division -- the aggregate alone hides which head (e.g.
+    a period vs. a spectrogram branch) is collapsing.
     """
     loss = 0
     loss_real = 0
@@ -60,19 +44,13 @@ def discriminator_loss(
         if isinstance(dr, (list, tuple)):
             dr_fun, dr_dir = dr
             dg_fun, dg_dir = dg
-            # SAN splits every head into a *function* output (trains the scale
-            # and the trunk) and a *direction* output (trains the unit-norm
-            # projection only).  Both must be driven by the same one-sided,
-            # bounded surrogate: real up, fake down.
-            #
-            # The fake-direction term used to be written as
-            # ``- w * softplus(1 - dg_dir) ** 2``.  That has the right sign but
-            # is unbounded below, and its gradient *grows* like ``1 - dg_dir``
-            # instead of saturating, so once the direction output on fakes goes
-            # negative that single term outweighs everything else and the
-            # discriminator can lower its loss without discriminating at all.
-            # Mirroring the function term keeps it bounded below by zero and
-            # makes it saturate, exactly like the real-side term.
+            # SAN splits every head into a *function* output (trains scale and
+            # trunk) and a *direction* output (trains the unit-norm projection
+            # only); both need the same one-sided, bounded surrogate. Mirroring
+            # the function term here (rather than `-w * softplus(1-dg_dir)**2`)
+            # keeps the fake-direction term bounded below and saturating --
+            # the unbounded form let the discriminator win by pushing the
+            # direction output on fakes negative without discriminating at all.
             r_loss = (
                 torch.mean(F.softplus(1 - dr_fun.float()) ** 2)
                 + float(san_direction_weight) * torch.mean(F.softplus(1 - dr_dir.float()) ** 2)
@@ -347,16 +325,7 @@ class BandWeightedSpectralLoss(nn.Module):
 
 
 def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
-    """
-    Compute the Kullback-Leibler divergence loss.
-
-    Args:
-        z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
-        logs_q (torch.Tensor): Log variance of the posterior distribution q [b, h, t_t].
-        m_p (torch.Tensor): Mean of the prior distribution p [b, h, t_t].
-        logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
-        z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
-    """
+    """KL divergence between posterior q and prior p, masked mean over valid frames."""
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     kl = (kl * z_mask).sum()
     loss = kl / z_mask.sum()
@@ -365,12 +334,7 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
 
 
 class MultiScaleSTFTLoss(nn.Module):
-    """
-    Multi-scale STFT loss for audio reconstruction.
-
-    Computes spectral convergence and log magnitude loss
-    at multiple STFT resolutions.
-    """
+    """Spectral convergence and log-magnitude loss at multiple STFT resolutions."""
 
     def __init__(
         self,
@@ -387,24 +351,15 @@ class MultiScaleSTFTLoss(nn.Module):
         #: Compression knee, matching ``wave_to_mel(for_loss=True)``.  See
         #: :meth:`forward` for why the compression is ``log1p`` and not ``log``.
         self.log_scale = float(log_scale)
-        #: Spectral convergence, off by default.  ``||X - X̂||_F / ||X||_F`` is
-        #: taken over the whole spectrogram, and a Frobenius norm is dominated
-        #: by the largest entries -- measured on this dataset the top 1% of bins
-        #: are above 7.1 while the median is 0.013, so the term is in practice a
-        #: "match the loudest bins" loss.  That is the low end, which the mel
-        #: term beside it already covers and already emphasises
-        #: (``mel_low_emphasis``).  The reason to reach for MS-STFT at
-        #: all is the *linear* frequency resolution it brings to the top of the
-        #: band; spending half the term on the bottom of it works against that.
+        #: Spectral convergence, off by default. ``||X - X̂||_F / ||X||_F``'s
+        #: Frobenius norm is dominated by the loudest bins (measured: top 1%
+        #: above 7.1 vs. median 0.013), which duplicates what the low-frequency
+        #: mel term already covers and works against MS-STFT's actual value:
+        #: linear frequency resolution at the top of the band.
         self.spectral_convergence = bool(spectral_convergence)
 
     def _stft(self, x: torch.Tensor, fft_size: int, hop_size: int, win_size: int) -> torch.Tensor:
-        """Compute STFT magnitude."""
-
-        # [B, C, T] -> [B, T]
-        x = x.squeeze(1) 
-
-        # Pad to avoid edge effects
+        x = x.squeeze(1)
         x = F.pad(x, (win_size // 2, win_size // 2), mode='reflect')
 
         window = torch.hann_window(win_size, device=x.device, dtype=x.dtype)
@@ -415,48 +370,30 @@ class MultiScaleSTFTLoss(nn.Module):
         return stft.abs()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute multi-scale STFT loss.
+        """Compute multi-scale STFT loss over ``(B, T)`` audio.
 
-        The compression is ``log1p(mag * log_scale)``, the same one
-        ``wave_to_mel(for_loss=True)`` uses, and not ``log(mag.clamp(1e-5))``.
-
-        That clamp is not a harmless guard against ``-inf`` here.  Measured over
-        24 slices of this dataset with a 2048-point window, **8.06% of bins fall
-        below 1e-5 and the 1st and 5th percentiles are exactly zero** -- real
-        digital silence, which these slices contain.  For those bins the target
-        pins to ``log(1e-5) = -11.51``, so a model emitting a plausible 1e-3
-        there scores an error of 4.6, against 0.23 for a genuinely audible 2 dB
-        error at the median magnitude of 0.013.  Worse, the gradient of
-        ``|log p - log t|`` is ``1/p``: 1000 at that silent bin against 77 at
-        the median one.  Eight percent of the spectrogram would carry an order
-        of magnitude more gradient than the audible content, all of it pushing
-        silence towards more silence -- which is not what limits quality.
-
-        ``log1p`` is logarithmic where the signal is (the two agree to three
-        decimals at audible levels) and turns linear below ``1 / log_scale``, so
-        a bin that should be zero is scored on how far from zero it is rather
-        than on the ratio between two numbers that are both inaudible.
-
-        Args:
-            pred: (B, T) predicted audio
-            target: (B, T) target audio
+        Uses ``log1p(mag * log_scale)``, matching ``wave_to_mel(for_loss=True)``,
+        instead of ``log(mag.clamp(1e-5))``: on this dataset 8% of bins are
+        real digital silence, and the clamp's fixed floor gives those bins a
+        gradient ~13x larger than audible ones, pushing silence toward more
+        silence. ``log1p`` agrees with ``log`` at audible levels but turns
+        linear below ``1 / log_scale``, so near-zero bins are scored on
+        distance from zero instead of a ratio between two inaudible numbers.
         """
         sc_loss = 0.0
         mag_loss = 0.0
 
         for fft_size, hop_size, win_size in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
-            pred_mag = self._stft(pred, fft_size, hop_size, win_size)      # [B, F, T]
-            target_mag = self._stft(target, fft_size, hop_size, win_size)  # [B, F, T]
+            pred_mag = self._stft(pred, fft_size, hop_size, win_size)
+            target_mag = self._stft(target, fft_size, hop_size, win_size)
 
             if self.spectral_convergence:
-                # Per-sample Frobenius norms
-                flat_target = target_mag.reshape(target_mag.size(0), -1)        # [B, F*T]
+                flat_target = target_mag.reshape(target_mag.size(0), -1)
                 flat_diff = (target_mag - pred_mag).reshape(target_mag.size(0), -1)
-                target_nrg = torch.norm(flat_target, p=2, dim=1)                # [B]
-                diff_nrg = torch.norm(flat_diff, p=2, dim=1)                    # [B]
+                target_nrg = torch.norm(flat_target, p=2, dim=1)
+                diff_nrg = torch.norm(flat_diff, p=2, dim=1)
 
-                # Mask out silent samples (SC is undefined for zero-energy)
+                # SC is undefined for zero-energy targets
                 mask = target_nrg > 1e-4
                 if mask.any():
                     sc_loss += (diff_nrg[mask] / target_nrg[mask]).mean()

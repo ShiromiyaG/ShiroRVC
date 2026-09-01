@@ -1,16 +1,10 @@
 """Exponential moving average of the generator weights.
 
-A GAN vocoder's weights oscillate by construction: the generator is chasing a
-discriminator that is chasing it back, so consecutive steps disagree even when
-training is going well.  Averaging over the recent trajectory keeps the part
-those steps agree on and drops the part that is just the two of them circling,
-which is why an EMA of a GAN generator is normally better than any single step
-of it -- and why picking a step, however carefully, has a ceiling that this does
-not.
-
-Held as a shadow copy rather than folded back into the live weights.  Training
-has to continue along its own trajectory; an EMA that fed back into it would be
-a different optimiser, not an average of this one.
+A GAN vocoder's weights oscillate by construction (generator and
+discriminator chasing each other), so averaging over the recent trajectory
+is normally better than any single step. Held as a shadow copy rather than
+folded back into the live weights, since feeding it back would make this a
+different optimiser rather than an average of this one.
 """
 
 from __future__ import annotations

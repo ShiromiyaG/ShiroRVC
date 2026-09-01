@@ -18,11 +18,8 @@ APP_NAME = "ShiroRVC"
 
 
 def message_box(text: str, title: str = APP_NAME) -> None:
-    """Report a failure without a console.
-
-    A windowed build has no stderr anyone will see, so an early failure would
-    otherwise be a silent non-launch.
-    """
+    """Report a failure without a console: a windowed build has no stderr
+    anyone will see."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -35,7 +32,6 @@ def message_box(text: str, title: str = APP_NAME) -> None:
 
 
 def application_root() -> Path:
-    """The install directory: where this executable lives."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent

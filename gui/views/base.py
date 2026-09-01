@@ -65,17 +65,15 @@ class Page(QWidget):
             holder.setObjectName("Root")
             scroll.setWidget(holder)
 
-            # A form is capped and centred rather than filling the window: on a
-            # wide monitor an uncapped card turns a 0-1 slider into 1400 px of
-            # travel, which is both hard to aim and hard to read the label of.
+            # Capped and centred rather than filling the window: on a wide
+            # monitor an uncapped card turns a 0-1 slider into 1400 px of
+            # travel, hard to aim and hard to read the label of.
             column = QWidget()
             column.setMaximumWidth(self.max_width)
             centring = QHBoxLayout(holder)
             centring.setContentsMargins(0, 0, 0, 0)
-            # The column takes the stretch so it grows with the window; the
-            # maximum width is what stops it, and the side stretches only
-            # collect whatever is left over. Giving the column zero stretch
-            # instead collapses it to its minimum and centres a narrow strip.
+            # The column takes the stretch so it grows with the window; giving
+            # it zero stretch instead collapses it to its minimum.
             centring.addStretch(0)
             centring.addWidget(column, 1)
             centring.addStretch(0)
