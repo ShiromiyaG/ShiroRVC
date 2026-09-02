@@ -324,12 +324,21 @@ class BandWeightedSpectralLoss(nn.Module):
         return (elementwise * weights).mean()
 
 
-def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
-    """KL divergence between posterior q and prior p, masked mean over valid frames."""
-    kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
-    kl = (kl * z_mask).sum()
-    loss = kl / z_mask.sum()
+def kl_loss(z_p, logs_q, m_p, logs_p, z_mask, return_terms: bool = False):
+    """KL divergence between posterior q and prior p, masked mean over valid frames.
 
+    ``return_terms`` additionally hands back the *detached* per-element
+    divergence, before any masking or reduction.  The per-dimension KL
+    diagnostics want exactly the tensor this function has already formed, and
+    forming it a second time at the call site is a full extra elementwise pass
+    -- a square and an ``exp`` over ``(batch, channels, frames)`` -- every
+    step, for a number that is only read once per logging interval.
+    """
+    kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
+    loss = (kl * z_mask).sum() / z_mask.sum()
+
+    if return_terms:
+        return loss, kl.detach()
     return loss
 
 

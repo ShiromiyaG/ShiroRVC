@@ -172,3 +172,18 @@ def get_total_norm(tensors, norm_type=2.0, error_if_nonfinite=False):
         raise RuntimeError("The total norm is non-finite (NaN or Inf).")
 
     return total_norm
+
+def cache_scope():
+    """Context for building a tensor that outlives the call that built it.
+
+    The holdout evaluation runs under ``torch.inference_mode()``, and any tensor
+    first materialised there is an *inference tensor* -- it carries no version
+    counter, so autograd refuses to save it for backward.  A per-call value is
+    fine, but a value stashed on the module (a filter kernel, an attention mask)
+    survives into the next training step and poisons every step after it with
+    ``RuntimeError: Inference tensors cannot be saved for backward``.  The fix
+    has to be at the point the cache is *filled*, not where it is used, so the
+    stored tensor is a normal one whichever mode happened to see the first call.
+    """
+
+    return torch.inference_mode(False)

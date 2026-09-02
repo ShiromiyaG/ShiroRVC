@@ -137,12 +137,13 @@ class Flip(nn.Module):
         g: Optional[torch.Tensor] = None,
         reverse: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        x = torch.flip(x, [1])
-        if not reverse:
-            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
-            return x, logdet
-        else:
-            return x, torch.zeros([1], device=x.device)
+        # ``None`` and not a zero tensor.  A flip permutes channels, so its
+        # Jacobian is unit and the log-determinant is exactly 0 -- and the only
+        # caller, ``ResidualCouplingBlock``, discards it either way.  Both
+        # branches were allocating a constant per flip, four flips per flow
+        # call, and the reverse one allocated it on the *host* while the rest
+        # of inference runs on the device.
+        return torch.flip(x, [1]), None
 
 
 class ResidualCouplingLayer(nn.Module):
@@ -211,26 +212,36 @@ class ResidualCouplingLayer(nn.Module):
         x_mask: torch.Tensor,
         g: Optional[torch.Tensor] = None,
         reverse: bool = False,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
         h = self.pre(x0) * x_mask
         h = self.enc(h, x_mask, g=g)
         stats = self.post(h) * x_mask
-        if not self.mean_only:
-            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
-        else:
-            m = stats
-            logs = torch.zeros_like(m)
 
+        if self.mean_only:
+            # Under ``mean_only`` the layer has no scale: ``logs`` is
+            # identically zero, so ``exp(logs)`` is 1 and the log-determinant
+            # is 0.  Materialising them cost a ``zeros_like``, an ``exp``, a
+            # multiply that also lands in the backward graph (``x1`` requires
+            # grad, so the constant factor is a real node), and a full
+            # reduction -- per layer, per call, all provably constant.
+            #
+            # This is not a rarely taken branch: ``ResidualCouplingBlock``
+            # builds *every* layer with ``mean_only=True`` and discards the
+            # log-determinant, so it is the only path the model runs.
+            m = stats
+            if not reverse:
+                x1 = m + x1 * x_mask
+            else:
+                x1 = (x1 - m) * x_mask
+            return torch.cat([x0, x1], 1), None
+
+        m, logs = torch.split(stats, [self.half_channels] * 2, 1)
         if not reverse:
             x1 = m + x1 * torch.exp(logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            logdet = torch.sum(logs, [1, 2])
-            return x, logdet
-        else:
-            x1 = (x1 - m) * torch.exp(-logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            return x, torch.zeros([1])
+            return torch.cat([x0, x1], 1), torch.sum(logs, [1, 2])
+        x1 = (x1 - m) * torch.exp(-logs) * x_mask
+        return torch.cat([x0, x1], 1), None
 
     def remove_weight_norm(self):
         self.enc.remove_weight_norm()

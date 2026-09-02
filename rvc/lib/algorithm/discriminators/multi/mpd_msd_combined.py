@@ -422,6 +422,15 @@ class DiscriminatorR(torch.nn.Module):
         )
         self.conv_post = norm_f(torch.nn.Conv2d(32, 1, (3, 3), padding=(1, 1)))
 
+        # ``win_length`` is fixed at construction, so the boxcar is a constant
+        # and was being rebuilt on every call -- three resolution branches,
+        # both the real and the fake pass, and both the discriminator and the
+        # generator update, i.e. twelve allocations of the same vector per
+        # training step.  Non-persistent so no checkpoint gains a key.
+        self.register_buffer(
+            "window", torch.ones(int(self.resolution[2])), persistent=False
+        )
+
     def spectrogram(self, x):
         n_fft, hop_length, win_length = self.resolution
         pad = int((n_fft - hop_length) / 2)
@@ -431,7 +440,7 @@ class DiscriminatorR(torch.nn.Module):
             n_fft=n_fft,
             hop_length=hop_length,
             win_length=win_length,
-            window=torch.ones(win_length, device=x.device),
+            window=self.window,
             center=False,
             return_complex=True,
         )

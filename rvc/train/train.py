@@ -757,6 +757,17 @@ def _prior_gap(
     return (prior_error - full_error).detach(), prior_error.detach()
 
 
+def _cache_mean(cache) -> float:
+    """Mean of a rolling cache of device scalars, in one transfer.
+
+    The caches these read are filled every step and read once per logging
+    interval, so they hold tensors rather than floats: a per-step ``.item()``
+    is a synchronisation in the middle of the training step, and this is the
+    one place the window actually has to reach the host.
+    """
+    return torch.stack(list(cache)).mean().item()
+
+
 def _clip_or_sample_grad_norm(
     parameters,
     max_norm,
@@ -2778,30 +2789,38 @@ def training_loop(
                         use_softplus=san_active,
                     )
 
-                    loss_kl = kl_loss(
+                    loss_kl, raw_kl = kl_loss(
                         z_p,
                         logs_q,
                         m_p,
                         logs_p,
                         z_mask,
-                    ) * config.train.c_kl
+                        return_terms=True,
+                    )
+                    loss_kl = loss_kl * config.train.c_kl
 
-                    # KL diagnostic: per-dimension raw divergence.
+                    # KL diagnostic: per-dimension raw divergence.  Two things
+                    # this deliberately does not do.  It does not re-form
+                    # ``raw_kl`` -- that is the tensor ``kl_loss`` just built,
+                    # handed back detached.  And it does not call ``.item()``:
+                    # the three it used to make sat between the generator's
+                    # forward and its backward, so each one drained the queue
+                    # and gave up the CPU's run-ahead on a step that is
+                    # dispatch-bound, for three floats nothing reads until the
+                    # next logging interval.  The caches hold device tensors
+                    # and are reduced where the series are written.
                     with torch.no_grad():
-                        raw_kl = logs_p - logs_q - 0.5 + 0.5 * (
-                            (z_p - m_p) ** 2
-                        ) * torch.exp(-2 * logs_p)
                         raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
                             dim=(0, 2)
                         ).clamp(min=1)
                         diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
-                        kl_std_cache.append(diagnostic_kl.std().item())
-                        kl_mean_cache.append(diagnostic_kl.mean().item())
+                        # ``.float()`` so the deque holds one dtype whatever
+                        # autocast handed this step, which is what lets the
+                        # window be reduced with a single ``torch.stack``.
+                        kl_std_cache.append(diagnostic_kl.std().float())
+                        kl_mean_cache.append(diagnostic_kl.mean().float())
                         kl_active_cache.append(
-                            (diagnostic_kl > kl_active_threshold)
-                            .float()
-                            .mean()
-                            .item()
+                            (diagnostic_kl > kl_active_threshold).float().mean()
                         )
                         last_kl_per_dim = diagnostic_kl
 
@@ -3170,10 +3189,14 @@ def training_loop(
 
                 # KL diagnostics (diag tab)
                 if len(kl_std_cache) > 0:
+                    # The caches hold device tensors, so this is where the
+                    # window's three numbers cross to the host -- once per
+                    # ``rolling_loss_steps``, on a line that is already
+                    # synchronising to write TensorBoard.
                     diag_scalars = {
-                        "diag/kl_std": sum(kl_std_cache) / len(kl_std_cache),
-                        "diag/kl_mean_per_dim": sum(kl_mean_cache) / len(kl_mean_cache),
-                        "diag/kl_active_fraction": sum(kl_active_cache) / len(kl_active_cache),
+                        "diag/kl_std": _cache_mean(kl_std_cache),
+                        "diag/kl_mean_per_dim": _cache_mean(kl_mean_cache),
+                        "diag/kl_active_fraction": _cache_mean(kl_active_cache),
                     }
                     summarize(
                         writer=writer,

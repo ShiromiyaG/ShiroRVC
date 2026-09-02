@@ -26,6 +26,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from rvc.lib.algorithm.commons import cache_scope
+
 
 def _safe_pad(x: Tensor, padding: int) -> Tensor:
     if padding == 0:
@@ -96,11 +98,12 @@ class FixedLowPass1d(nn.Module):
         channels = int(x.shape[1])
         key = (channels, x.dtype, x.device)
         if getattr(self, "_kernel_key", None) != key:
-            self._kernel_cache = (
-                self.kernel.to(device=x.device, dtype=x.dtype)
-                .expand(channels, -1, -1)
-                .contiguous()
-            )
+            with cache_scope():
+                self._kernel_cache = (
+                    self.kernel.to(device=x.device, dtype=x.dtype)
+                    .expand(channels, -1, -1)
+                    .contiguous()
+                )
             self._kernel_key = key
         return self._kernel_cache
 
@@ -142,11 +145,12 @@ class AntiAliasedUpsample1d(nn.Module):
         channels = int(x.shape[1])
         key = (channels, x.dtype, x.device)
         if getattr(self, "_kernel_key", None) != key:
-            self._kernel_cache = (
-                self.kernel.to(device=x.device, dtype=x.dtype)
-                .expand(channels, -1, -1)
-                .contiguous()
-            )
+            with cache_scope():
+                self._kernel_cache = (
+                    self.kernel.to(device=x.device, dtype=x.dtype)
+                    .expand(channels, -1, -1)
+                    .contiguous()
+                )
             self._kernel_key = key
         return self._kernel_cache
 

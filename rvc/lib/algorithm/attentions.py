@@ -7,6 +7,9 @@ import math
 
 from typing import Optional
 
+from rvc.lib.algorithm.commons import cache_scope
+
+
 class MultiHeadAttention(nn.Module):
     """Multi-head attention with optional relative positional encoding and proximal bias."""
     def __init__(
@@ -82,9 +85,10 @@ class MultiHeadAttention(nn.Module):
         """``True`` where a query may *not* attend, cached by length and device."""
         key = (length, device)
         if getattr(self, "_block_mask_key", None) != key:
-            band = torch.ones(length, length, dtype=torch.bool, device=device)
-            band = band.triu(-self.block_length).tril(self.block_length)
-            self._block_mask_cache = ~band
+            with cache_scope():
+                band = torch.ones(length, length, dtype=torch.bool, device=device)
+                band = band.triu(-self.block_length).tril(self.block_length)
+                self._block_mask_cache = ~band
             self._block_mask_key = key
         return self._block_mask_cache
 

@@ -376,6 +376,27 @@ class HarmonicBankGenerator(nn.Module):
         offsets[0] = 0.0  # the fundamental keeps a defined phase origin
         self.register_buffer("phase_offset", offsets, persistent=True)
 
+        # Two constants that were being rebuilt on every call.  ``forward`` is
+        # ``@torch.compiler.disable``d, so nothing downstream folds them away
+        # and each one is pure dispatch on a step that is dispatch-bound.
+        # Non-persistent: both are pure functions of the constructor arguments,
+        # so a checkpoint that carried them would only be able to disagree with
+        # them.  The envelope kernel is normalised here rather than per call
+        # for the same reason.
+        envelope_kernel = torch.hann_window(
+            2 * self.crossfade_samples + 1, periodic=False
+        )
+        self.register_buffer(
+            "envelope_kernel",
+            envelope_kernel / envelope_kernel.sum(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "harmonics",
+            torch.arange(1, self.harmonic_num + 1, dtype=torch.float32),
+            persistent=False,
+        )
+
     @staticmethod
     def _fill_unvoiced(f0: torch.Tensor, voiced: torch.Tensor):
         """Hold the nearest voiced f0 across an unvoiced gap.
@@ -415,10 +436,7 @@ class HarmonicBankGenerator(nn.Module):
         was supposed to be.
         """
         radius = self.crossfade_samples
-        window = torch.hann_window(
-            2 * radius + 1, periodic=False, device=mask.device, dtype=mask.dtype
-        )
-        window = window / window.sum()
+        window = self.envelope_kernel.to(dtype=mask.dtype)
         padded = F.pad(mask.unsqueeze(1), (radius, radius), mode="replicate")
         return F.conv1d(padded, window.view(1, 1, -1)).squeeze(1)
 
@@ -469,9 +487,7 @@ class HarmonicBankGenerator(nn.Module):
         cycles = torch.cumsum(f0.double() / self.sampling_rate, dim=-1)
         phase = ((2.0 * math.pi) * (cycles - cycles.floor())).to(f0.dtype)
 
-        harmonics = torch.arange(
-            1, self.harmonic_num + 1, device=f0.device, dtype=f0.dtype
-        )
+        harmonics = self.harmonics.to(dtype=f0.dtype)
         wave = torch.sin(
             phase.unsqueeze(-1) * harmonics.view(1, 1, -1)
             + self.phase_offset.to(f0.dtype).view(1, 1, -1)
