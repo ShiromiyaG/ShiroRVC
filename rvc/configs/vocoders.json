@@ -13,17 +13,20 @@
         "discriminator": "mpd_msd",
         "architecture_id": "hifi_gan_nsf_v1"
     },
-    "refinegan": {
-        "label": "RefineGAN",
-        "architecture": "refinegan",
-        "config_dir": "refinegan",
+    "refinegan2": {
+        "label": "RefineGAN v2",
+        "architecture": "refinegan2",
+        "config_dir": "refinegan2",
         "sample_rates": [
-            32000,
-            44100
+            32000
         ],
-        "pretrained_dir": "refinegan",
-        "generator": "refinegan",
+        "pretrained_dir": "refinegan2",
+        "generator": "refinegan2",
         "discriminator": "mpd_msd_v3",
-        "architecture_id": "vits_gaussian_v1"
+        "architecture_id": "vits_gaussian_v1",
+        "aliases": [
+            "refinegan",
+            "RefineGAN"
+        ]
     }
 }

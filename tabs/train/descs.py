@@ -4,7 +4,10 @@ from rvc.train.messages import TORCH_COMPILE_MODES
 
 VOCODER_INFO_RVC = N_("Choose a vocoder; its available sample rates are selected automatically.")
 
-PREPROCESS_RMS_VALUE_INFO = N_("Target loudness for RMS normalization.")
+PREPROCESS_RMS_VALUE_INFO = N_(
+    "Target level for the normalization method. LUFS for BS.1770 loudness; "
+    "dBFS for the legacy RMS mode."
+)
 
 DATASET_FORMAT_INFO = N_("Output format for sliced audio. WAV is larger; FLAC is lossless.")
 

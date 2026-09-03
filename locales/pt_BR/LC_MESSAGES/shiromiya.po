@@ -1208,9 +1208,6 @@ msgstr "Desligado significa treinar do zero, o que exige muito mais dados."
 msgid "On a multispeaker model, keeps one voice's articulation out of another's. Saved as <model>_spk<id>.index, beside the full one."
 msgstr "Em um modelo multispeaker, evita que a articulação de uma voz entre na de outra. Salvo como <model>_spk<id>.index, ao lado do índice completo."
 
-msgid "Only used by the RMS modes."
-msgstr "Usado apenas pelos modos RMS."
-
 msgid "Only worth it on genuinely noisy source material."
 msgstr "Só vale a pena em material de origem realmente ruidoso."
 
@@ -1411,9 +1408,6 @@ msgstr "Arquivo .pth"
 
 msgid "Quefrency for formant shifting"
 msgstr "Quefrência do deslocamento de formantes"
-
-msgid "RMS Target (dBFS)"
-msgstr "Alvo de RMS (dBFS)"
 
 msgid "RMS Volume Envelope"
 msgstr "Envelope de volume RMS"
@@ -1854,11 +1848,14 @@ msgstr "Vozes do TTS"
 msgid "TTS status."
 msgstr "Status do TTS."
 
-msgid "Target RMS (dB)"
-msgstr "RMS alvo (dB)"
+msgid "Target Level (LUFS)"
+msgstr "Nível Alvo (LUFS)"
 
-msgid "Target loudness for RMS normalization."
-msgstr "Volume alvo da normalização RMS."
+msgid "Target level (LUFS)"
+msgstr "Nível alvo (LUFS)"
+
+msgid "Target level for the normalization method. LUFS for BS.1770 loudness; dBFS for the legacy RMS mode."
+msgstr "Nível alvo do método de normalização. LUFS para o padrão BS.1770; dBFS para o modo RMS legado."
 
 msgid "Target sample rate. Match it to the dataset when possible."
 msgstr "Taxa de amostragem alvo. Faça-a coincidir com o dataset quando possível."
@@ -2072,6 +2069,9 @@ msgstr "Usa pesos pré-treinados para fazer fine-tuning."
 
 msgid "Used by the Generate Index button below, after training."
 msgstr "Usado pelo botão Gerar Índice abaixo, depois do treino."
+
+msgid "Used by the loudness and RMS modes; ignored by the peak ones."
+msgstr "Usado pelos modos de loudness e RMS; ignorado pelos de pico."
 
 msgid "Utilities"
 msgstr "Utilitários"

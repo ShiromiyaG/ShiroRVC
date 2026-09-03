@@ -33,8 +33,8 @@ from rvc.lib.algorithm.resampling import (  # noqa: E402
 @pytest.mark.parametrize(
     "factory",
     [
-        lambda: AntiAliasedUpsample1d(2, 4, 0.95),
-        lambda: FixedLowPass1d(2, width=4, rolloff=0.95, stride=2),
+        lambda: AntiAliasedUpsample1d(2, 4, 0.95, 6.0),
+        lambda: FixedLowPass1d(2, width=4, rolloff=0.95, filter_beta=6.0, stride=2),
     ],
 )
 def test_resampler_kernel_cache_is_not_an_inference_tensor(factory):
@@ -43,7 +43,13 @@ def test_resampler_kernel_cache_is_not_an_inference_tensor(factory):
     with torch.inference_mode():
         module(warm)
 
-    assert not torch.is_inference(module._kernel_cache)
+    # ``AntiAliasedUpsample1d`` caches a polyphase weight instead of a grouped
+    # kernel since 2026-09-03; both are built under ``cache_scope`` and this
+    # test is about that, not about which tensor it is.
+    cached = getattr(module, "_kernel_cache", None)
+    if cached is None:
+        cached = module._poly_cache[0]
+    assert not torch.is_inference(cached)
 
     x = torch.randn(2, 3, 64, requires_grad=True)
     module(x).sum().backward()

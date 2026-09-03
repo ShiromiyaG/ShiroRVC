@@ -198,7 +198,8 @@ class TrainingPage(Page):
 
         advanced.add_row(
             Field(_("Normalisation"), self.normalization, ""),
-            Field(_("Target RMS (dB)"), self.rms_db, _("Only used by the RMS modes.")),
+            Field(_("Target level (LUFS)"), self.rms_db,
+                  _("Used by the loudness and RMS modes; ignored by the peak ones.")),
             Field(_("Resampler"), self.resampling, ""),
         )
 
@@ -235,7 +236,7 @@ class TrainingPage(Page):
 
         self.extract_embedder = SearchableCombo(editable=False)
         self.extract_embedder.refresh_button.hide()
-        self.extract_embedder.set_items(catalog.EMBEDDER_MODELS)
+        self.extract_embedder.set_items(catalog.TRAINING_EMBEDDER_MODELS)
 
         self.extract_custom_embedder = SearchableCombo()
         self.extract_custom_embedder.set_items(catalog.list_custom_embedders())

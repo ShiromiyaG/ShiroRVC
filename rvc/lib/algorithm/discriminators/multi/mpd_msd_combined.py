@@ -8,78 +8,38 @@ from torch.nn.utils.parametrizations import spectral_norm, weight_norm
 from rvc.lib.algorithm.commons import get_padding
 from rvc.lib.algorithm.residuals import LRELU_SLOPE
 
-#: Applio's ``MultiPeriodDiscriminator`` branch layouts, kept under their names
-#: so a diff against upstream is a diff and not a translation.  ``v2`` is what
-#: Applio runs for HiFi-GAN; ``v3`` is what it selects for RefineGAN, and the
-#: difference is not cosmetic -- it trades the three widest period branches for
-#: three multi-resolution spectrogram branches, which are the ones that see a
-#: frequency-domain defect at all.
-#: ``v3l`` is this fork's: v3 with the frequency axis actually downsampled.
+#: Applio's branch layouts, under their names so a diff is a diff.  ``v2`` is
+#: HiFi-GAN's; ``v3`` trades its three widest period branches for three
+#: multi-resolution spectrogram branches.  ``v4`` is this fork's: ``v3`` minus
+#: its longest period.
 #:
-#: Applio's ``DiscriminatorR`` strides ``(1, 2)`` -- it decimates the *frame*
-#: axis and carries 257/513/1025 frequency bins at 32 channels through all five
-#: layers, which is where the branch's cost is.  Striding frequency in the last
-#: two layers instead was measured, on a probe that trains the three branches
-#: for 300 steps to separate real audio from a defect and reports held-out
-#: accuracy over three seeds:
+#: ``DiscriminatorR``'s frequency axis can be decimated -- ``(1, 2, 2)`` in the
+#: last two layers measured no worse than Applio's ``(1, 1, 1)`` on both probe
+#: defects and 24% cheaper (81.1 vs 107.0 ms, 342 vs 396 MiB, batch 8 / 0.4 s).
+#: Reach it through ``d_frequency_strides``; it is not a version.
 #:
-#:   defect                     Applio (1,1,1)   this (1,2,2)   (2,2,2)
-#:   frame-rate AM (the leak)   68.0% +- 12.5    76.5% +- 4.4   71.5% +- 14.5
-#:   over-smoothed above 9 kHz  57.8% +-  0.8    58.2% +- 0.2   --
-#:
-#: at 81.1 ms against 107.0 and 342 MiB against 396 (fwd+bwd, batch 8, 0.4 s).
-#: Not worse on either defect, less seed-dependent -- Applio's schedule collapsed
-#: to chance on one of three seeds -- and 24% cheaper.
-#:
-#: Two things that look like obvious wins and are not, both measured:
-#:
-#: * Reusing ChouwaGAN's spectrogram branch (7.4x faster, 3x less memory) drops
-#:   the AM accuracy to 54%, i.e. chance.  Its hops are 128/256/512 samples.
-#: * Trading the 512-point branch for a 4096-point one -- more frequency
-#:   resolution, which is where +-100 Hz sidebands live -- drops it to 50.5%.
-#:
-#: Both fail for the same reason: the branch catches frame-rate mirroring as a
-#: **temporal** modulation, not as frequency sidebands.  100 Hz is a 10 ms
-#: period, and only the 512-point branch's 50-sample hop (1.1 ms) resolves it;
-#: 4096/480 gives 10.9 ms per frame, which aliases the modulation to DC.  The
-#: fine-hop branch is the one that must not be touched.
-#: The rate HiFi-GAN's period set was designed at, and the reference every
-#: entry in ``PERIODS_BY_RATE`` is derived from.
+#: What must not be touched is the 512-point branch's 50-sample hop.  The
+#: branch catches frame-rate mirroring as a *temporal* modulation, so 100 Hz
+#: needs a frame shorter than its 10 ms period; a 4096-point branch (10.9 ms)
+#: drops held-out accuracy to chance, and so does ChouwaGAN's 128/256/512.
 REFERENCE_SAMPLE_RATE = 22050
 
 
 def rate_scaled_periods(periods, sample_rate, reference_rate=REFERENCE_SAMPLE_RATE):
     """The period set that keeps HiFi-GAN's *time scales* at another rate.
 
-    A period-``p`` branch folds the waveform onto a grid whose row rate is
-    ``sr / p``, so both things a period means -- the frequency it folds at
-    (``sr / p`` Hz) and the span its receptive field covers (647 rows, i.e.
-    ``647 * p / sr`` seconds) -- are invariant only if ``p`` scales *with* the
-    sample rate.  ``[2, 3, 5, 7, 11]`` was chosen at 22.05 kHz and has been
-    carried to every rate since unchanged, which quietly moves the whole set up
-    an octave at 44.1 kHz:
+    A period-``p`` branch folds onto a grid at ``sr / p`` Hz and its receptive
+    field spans ``647 * p / sr`` seconds, so both meanings of a period hold only
+    if ``p`` scales with the rate.  ``[2, 3, 5, 7, 11]`` was chosen at 22.05 kHz
+    and carried everywhere unchanged, which empties the *slow* end: at 32 kHz
+    the longest branch drops from 323 ms to 222, and pitch structure lives
+    there.
 
-        p    22.05 kHz              44.1 kHz
-        2    11025 Hz /  58.7 ms    22050 Hz /  29.3 ms
-        3     7350 Hz /  88.0 ms    14700 Hz /  44.0 ms
-        5     4410 Hz / 146.7 ms     8820 Hz /  73.4 ms
-        7     3150 Hz / 205.4 ms     6300 Hz / 102.7 ms
-        11    2005 Hz / 322.8 ms     4009 Hz / 161.4 ms
-
-    The set does not get *worse* at the top -- it gets emptier at the bottom.
-    Nothing is left looking at a span longer than 161 ms, which is where pitch
-    and its slow structure live, and that is the half of the range a converter
-    for singing can least afford to drop.
-
-    The scaled targets are not prime, and the periods have to stay pairwise
-    coprime or two branches fold onto overlapping sample subsets and become one
-    branch with twice the cost.  So each target is rounded to the nearest unused
-    prime *in log space*, which is the right metric because the quantity being
-    preserved is a ratio.  The worst residual is +25% (period 5 at 44.1 kHz
-    against a target of 4).
-
-    ``reference_rate`` returns the input unchanged, which is the property that
-    makes this readable as a derivation rather than as a new design.
+    Targets are rounded to the nearest unused prime in log space -- prime
+    because two periods sharing a factor fold onto overlapping samples and
+    become one branch at two branches' cost, log because the quantity preserved
+    is a ratio.  ``reference_rate`` returns the input unchanged, which is what
+    makes this a derivation rather than a new design.
     """
 
     def is_prime(value):
@@ -98,42 +58,54 @@ def rate_scaled_periods(periods, sample_rate, reference_rate=REFERENCE_SAMPLE_RA
     return tuple(sorted(scaled))
 
 
-#: ``rate_scaled_periods(v3's periods, rate)``, frozen.
+#: The reviewed, frozen result of ``rate_scaled_periods`` for the versions and
+#: rates that ship.  A *pin*, not a source: the constructor derives, and a test
+#: asserts the two agree -- that is what keeps the rule and the numbers together.
 #:
-#: The values live in ``rvc/configs/refinegan/*.json`` as explicit ``d_periods``
-#: rather than being applied here when ``d_periods`` is ``None``, and that is
-#: deliberate: an experiment keeps its own ``config.json``, so writing the
-#: numbers into the shipped configs changes only *new* experiments while a run
-#: in flight keeps the set its discriminator was trained with.  Applying it
-#: from code would have changed every existing run's periods on the next
-#: resume -- and silently, because a period never appears in a parameter shape
-#: (``DiscriminatorP``'s kernels are ``(k, 1)`` whatever ``p`` is), so five old
-#: branches load cleanly into five new ones.  ``assert_periods_match`` in
-#: ``rvc/train/utils.py`` is what closes that door for the future.
+#: Membership marks a version as rate-scaled.  ``v1``/``v2`` are absent on
+#: purpose: v2's eight periods are Applio's and every RVC v2 pretrained D is
+#: trained against them, so they stay verbatim at every rate.
 #:
-#: This table is the reviewed artefact and the configs must agree with it; the
-#: tests pin both directions.  HiFi-GAN's ``v2`` is deliberately not in here:
-#: its eight periods are Applio's, its pretrains are trained against them, and
-#: the parity is worth more than the alignment.
+#: Deriving instead of writing the list into each config costs one thing: an
+#: unkeyed checkpoint from before the scaling no longer resumes into a
+#: ``d_version``-only config.  It fails in ``assert_periods_match``, naming the
+#: ``d_periods`` to set.  A period is invisible in every weight
+#: (``DiscriminatorP``'s kernels are ``(k, 1)`` whatever ``p`` is), so that
+#: guard is the only thing that can tell.
 PERIODS_BY_RATE = {
-    32000: (3, 5, 7, 11, 17),
-    44100: (5, 7, 11, 13, 23),
+    "v3": {32000: (3, 5, 7, 11, 17)},
+    "v4": {32000: (3, 5, 7, 11)},
 }
+
+
+#: The three multi-resolution spectrogram branches, shared by ``v3`` and
+#: ``v4``.  The 512-point branch's 50-sample hop is the one that must not be
+#: touched -- see the note above ``REFERENCE_SAMPLE_RATE``.
+V3_RESOLUTIONS = [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]]
 
 DISCRIMINATOR_VERSIONS = {
     "v1": ([2, 3, 5, 7, 11, 17], [], (1, 1, 1)),
     "v2": ([2, 3, 5, 7, 11, 17, 23, 37], [], (1, 1, 1)),
-    "v3": (
-        [2, 3, 5, 7, 11],
-        [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]],
-        (1, 1, 1),
-    ),
-    "v3l": (
-        [2, 3, 5, 7, 11],
-        [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]],
-        (1, 2, 2),
-    ),
+    "v3": ([2, 3, 5, 7, 11], V3_RESOLUTIONS, (1, 1, 1)),
+    # ``v3`` minus its longest period (17 at 32 kHz), and nothing else.  The
+    # spectrogram branches keep full frequency resolution: they are the only
+    # part of this D with any resolution above 10 kHz, which is the band being
+    # chased.  A longer period folds at a lower rate, so it is the branch least
+    # able to say anything up there -- the cheapest one to lose.
+    "v4": ([2, 3, 5, 7], V3_RESOLUTIONS, (1, 1, 1)),
 }
+
+
+def periods_for(version: str, sample_rate: int):
+    """The frozen set for a version at a rate; raises rather than guessing."""
+
+    try:
+        return PERIODS_BY_RATE[version][int(sample_rate)]
+    except KeyError as error:
+        raise KeyError(
+            f"No frozen period set for version {version!r} at {sample_rate} Hz; "
+            f"known: {{v: sorted(r) for v, r in PERIODS_BY_RATE.items()}}."
+        ) from error
 
 
 class MPD_MSD_Combined(torch.nn.Module):
@@ -148,7 +120,8 @@ class MPD_MSD_Combined(torch.nn.Module):
         resolutions=None,
         frequency_strides=None,
         use_msd: bool = True,
-        sample_rate: int = 44100,
+        use_fast_mpd: bool = False,
+        sample_rate: int = 32000,
         use_univhd: bool = False,
         univhd_n_fft: int = 2048,
         univhd_hop_length: int = 256,
@@ -158,31 +131,26 @@ class MPD_MSD_Combined(torch.nn.Module):
         univhd_channels: int = 32,
         univhd_half_harmonic: bool = True,
     ):
-        """``version`` picks a preset; the four overrides edit it branch by branch.
-
-        Each family is independently addressable because they cost very
-        different things and see very different defects.  Measured fwd+bwd at
-        batch 8 over 0.4 s: the scale branch is 16 ms / 168 MiB, a period branch
-        ~9 ms / ~250 MiB each, and a spectrogram branch ~30 ms / ~430 MiB (~24 ms
-        under ``v3l``).  Five periods are 1.25 GiB on their own, so dropping two
-        of them is a bigger lever than anything inside a branch.
+        """``version`` picks a preset; the overrides edit it branch by branch.
 
         ``None`` means "whatever the version says"; an empty list means "none of
-        this family", which is the distinction a falsy check would lose.
+        this family" -- a distinction a falsy check would lose.
 
-        ``use_univhd`` appends the harmonic branch (arXiv 2512.03486), off by
-        default and additive by design.  Measured on an RTX 5060 against ``v3``,
-        batch 8 over 0.4 s, both discriminator passes forward and backward:
-        317 ms / 3468 MiB becomes 346 ms / 3801 MiB, i.e. +9% on each for
-        +0.33 M parameters.  That is the number that makes it an addition
-        rather than a trade -- a period branch is ~11 M.  It is a flag and not
-        a ``d_version`` because the paper's own best configuration is MS-STFT
-        *plus* UnivHD; nothing here is meant to come out for it.  It is the one
-        branch here that needs ``sample_rate``: its filterbank is laid out in
-        Hz, and its ``f_max`` is ``sample_rate / (2 * harmonics)``.  Every other
-        branch reads samples and periods and is rate-agnostic, which is why the
-        argument did not exist until now and why it defaults rather than being
-        required.
+        Branch costs, fwd+bwd at batch 8 over 0.4 s: scale 16 ms / 168 MiB,
+        each period ~9 ms / ~250 MiB, each spectrogram ~30 ms / ~430 MiB.
+        Dropping a period is a bigger lever than anything inside a branch.
+
+        ``use_fast_mpd`` swaps every period branch for
+        :class:`FastDiscriminatorP` -- 15x fewer parameters at indistinguishable
+        probe accuracy; see that class for the numbers and for what the probe
+        cannot see.  It changes every period branch's shapes, so a strict load
+        of a checkpoint trained the other way fails on its own.
+
+        ``sample_rate`` selects branch *frequencies*, not just UnivHD's
+        filterbank: for the versions in ``PERIODS_BY_RATE`` the periods are
+        derived from it.  ``use_univhd`` appends the harmonic branch (arXiv
+        2512.03486) for +9% time and memory and +0.33 M parameters -- additive,
+        as the paper runs it.
         """
 
         super().__init__()
@@ -194,7 +162,19 @@ class MPD_MSD_Combined(torch.nn.Module):
         preset_periods, preset_resolutions, preset_strides = DISCRIMINATOR_VERSIONS[
             version
         ]
-        periods = preset_periods if periods is None else list(periods)
+        if periods is None:
+            # ``version in PERIODS_BY_RATE`` is the rate-scaled marker; v1 and
+            # v2 keep Applio's set at every rate.  Derived rather than looked
+            # up so an unfrozen rate still gets a correct set instead of an
+            # exception -- the frozen table is the reviewed pin, not the only
+            # legal answer, and ``rate_scaled_periods`` is the rule it pins.
+            periods = (
+                list(rate_scaled_periods(preset_periods, sample_rate))
+                if version in PERIODS_BY_RATE
+                else preset_periods
+            )
+        else:
+            periods = list(periods)
         resolutions = (
             preset_resolutions if resolutions is None else [list(r) for r in resolutions]
         )
@@ -211,14 +191,16 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.resolutions = tuple(tuple(int(v) for v in r) for r in resolutions)
         self.frequency_strides = tuple(int(s) for s in frequency_strides)
         self.use_msd = bool(use_msd)
+        self.use_fast_mpd = bool(use_fast_mpd)
         self.use_univhd = bool(use_univhd)
         self.sample_rate = int(sample_rate)
         self.use_checkpointing = use_checkpointing
         branches = []
         if self.use_msd:
             branches.append(DiscriminatorS(use_spectral_norm=use_spectral_norm))
+        period_branch = FastDiscriminatorP if self.use_fast_mpd else DiscriminatorP
         branches += [
-            DiscriminatorP(p, use_spectral_norm=use_spectral_norm)
+            period_branch(p, use_spectral_norm=use_spectral_norm)
             for p in self.periods
         ]
         branches += [
@@ -372,6 +354,105 @@ class DiscriminatorP(torch.nn.Module):
         for conv in self.convs:
             x = self.lrelu(conv(x))
             fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+        return x, fmap
+
+
+class FastDiscriminatorP(torch.nn.Module):
+    """A period branch at a fraction of ``DiscriminatorP``'s width.
+
+    Same reshape and the same six feature maps; the channel schedule is
+    ``32, 64, 128, 256`` capped rather than ``32, 128, 512, 1024, 1024``, and
+    there are four strided layers instead of five plus a stride-1 layer at the
+    end.  Ported from KazeFlow's ChouwaGAN discriminator.
+
+    Why it is worth having: the period family is 32.88 M of the 38.81 M
+    parameters in a ``v4`` discriminator, so this is where the memory is.  At
+    32 kHz over the shipped period set, 300 steps / 3 seeds, held-out accuracy
+    at separating real audio from one defect:
+
+        defect             stock (32.88 M)   this at 256 (2.18 M)
+        >9 kHz shelf loss   66.2 +- 8.2       62.1 +- 13.1  (at 128)
+        f0 jitter           74.2 +- 6.2       71.7 +-  5.2  (at 128)
+        slow dynamics       72.1 +- 3.9       70.4 +-  3.3  (at 128)
+
+    Every gap is smaller than at least one side's seed spread.  A capacity
+    sweep on the same probe was flat from 128 to 512 channels (78.5 / 80.0 /
+    80.0 / 80.6 on frame-rate AM against the stock schedule's 83.1), which is
+    why 256 is the shipped width: it is the knee, not a compromise.
+
+    What the probe cannot see, stated because it is the reason this is opt-in:
+    it measures detection of a fixed defect by a freshly trained branch, not
+    whether a 15x smaller adversary keeps providing gradient against a
+    generator adapting to it for 100k steps.  The failure mode there is
+    saturation, not blindness.  It also changes ``loss_fm``'s scale -- six maps
+    at <=256 channels instead of <=1024 -- which the feature-matching governor,
+    the adversarial ceiling and the per-branch R1 all read.
+    """
+
+    def __init__(
+        self,
+        period: int,
+        kernel_size: int = 5,
+        stride: int = 3,
+        channels: int = 32,
+        max_channels: int = 256,
+        n_layers: int = 4,
+        use_spectral_norm: bool = False,
+    ):
+        super().__init__()
+        self.period = period
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
+
+        self.convs = torch.nn.ModuleList()
+        in_channels = 1
+        for layer in range(n_layers):
+            out_channels = min(channels * (2 ** layer), max_channels)
+            self.convs.append(
+                norm_f(
+                    torch.nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        (kernel_size, 1),
+                        (stride, 1),
+                        padding=(get_padding(kernel_size, 1), 0),
+                    )
+                )
+            )
+            in_channels = out_channels
+
+        self.conv_final = norm_f(
+            torch.nn.Conv2d(
+                in_channels,
+                in_channels,
+                (kernel_size, 1),
+                1,
+                padding=(get_padding(kernel_size, 1), 0),
+            )
+        )
+        self.conv_post = norm_f(
+            torch.nn.Conv2d(in_channels, 1, (3, 1), 1, padding=(1, 0))
+        )
+        # ``LRELU_SLOPE`` and not KazeFlow's 0.1: this is a capacity swap, and
+        # an activation that differs from the branch it replaces would make it
+        # two changes wearing one name.
+        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
+
+    def forward(self, x):
+        fmap = []
+        b, c, t = x.shape
+        if t % self.period != 0:
+            n_pad = self.period - (t % self.period)
+            x = torch.nn.functional.pad(x, (0, n_pad), "reflect")
+        x = x.view(b, c, -1, self.period)
+
+        for conv in self.convs:
+            x = self.lrelu(conv(x))
+            fmap.append(x)
+        x = self.lrelu(self.conv_final(x))
+        fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
         x = torch.flatten(x, 1, -1)

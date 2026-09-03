@@ -20,6 +20,10 @@ from . import paths
 # GUI's first paint free of backend imports.
 F0_METHODS = ["rmvpe", "crepe", "crepe-tiny", "fcpe"]
 EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2", "custom"]
+#: Training is the smaller set.  ``spin_v1`` was retired as a *training*
+#: choice; it stays above because a model already trained against it still has
+#: to run, and the embedder is read off the checkpoint at inference.
+TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2", "custom"]
 EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
 #: Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; first entry is the default.
 OPTIMIZERS = ["AdamW", "Sched-Free AdamW", "Muon", "Lion"]
@@ -38,7 +42,18 @@ TORCH_COMPILE_MODES = [
     "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",
 ]
 CUT_PREPROCESS = ["Skip", "Simple", "Automatic", "New Automatic"]
-NORMALIZATION_MODES = ["none", "post_peak", "post_peak_rvc", "post_rms"]
+#: ``post_rms``, ``post_peak_rvc`` and ``post_loudness`` are gone from the
+#: list but not from the code: an experiment whose config names one re-runs
+#: unchanged.  All three level every *slice* independently, which flattens the
+#: dynamics between phrases; ``post_rms`` additionally has a -40 dBFS gate that
+#: is scale-dependent.  See ``rvc/train/preprocess/loudness.py``.
+#:
+#: ``pre_loudness`` is the default: one gain per source recording, so
+#: recordings match each other and the dynamics inside one survive.  It runs
+#: after slicing like everything else; the name is about intent.  Measuring
+#: before slicing is not the same thing and is measurably worse -- see
+#: ``rvc/train/preprocess/loudness.py``.
+NORMALIZATION_MODES = ["none", "post_peak", "pre_loudness"]
 LOADING_RESAMPLING = ["librosa", "ffmpeg"]
 DATASET_FORMATS = ["WAV", "FLAC", "MP3", "OGG", "M4A"]
 

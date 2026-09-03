@@ -1,7 +1,7 @@
 """Reading audio off disk, and nothing else.
 
 Split out of :mod:`rvc.lib.utils` because of what importing that module costs.
-It pulls in torch, transformers and pyloudnorm to serve the embedder helpers
+It pulls in torch and transformers to serve the embedder helpers
 that live alongside these loaders -- 4.6 s on this machine, measured with
 ``-X importtime`` -- and preprocessing pays it twice over: once in the parent,
 and once more in *every* pool worker, because ``multiprocessing`` on Windows

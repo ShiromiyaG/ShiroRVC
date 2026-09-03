@@ -142,6 +142,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
                 f"received '{checkpoint_architecture or 'unknown'}'."
             )
     assert_excitation_matches(model_state, checkpoint_dict)
+    assert_decoder_layout_matches(model_state, checkpoint_dict)
     assert_periods_match(model_state, checkpoint_dict)
     model_state.load_state_dict(checkpoint_dict["model"], strict=strict_load)
 
@@ -217,23 +218,16 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
 def excitation_source(model):
     """A short name for the decoder's excitation, or ``None`` if it has no say.
 
-    The three RefineGAN sources build different state dicts -- the sine owns
-    ``dec.m_source.merge.0.weight``, the bank owns ``dec.m_source.phase_offset``
-    sized by its harmonic count, the comb owns neither -- and the generator
-    resumes *non-strictly* (``generator_strict_load`` is false for this stack).
-    A cross-load therefore does not raise: a comb checkpoint into a sine
-    synthesiser leaves that ``Linear`` at its random init and trains on from a
-    silently wrong excitation.  The harmonic count rides along because it sizes
-    a real buffer, so it produces a confusing shape error where this produces a
-    sentence.
+    Only ``sine`` is built since 2026-09-03, but the guard stays: the removed
+    sources owned different state-dict keys (``bank`` a ``phase_offset`` sized
+    by its harmonic count, ``comb`` none at all) and the generator resumes
+    *non-strictly*, so a bank or comb checkpoint loads into this synthesiser
+    without raising and leaves ``m_source.merge`` at its random init.  A
+    sentence beats training on from a silently wrong excitation.
     """
     decoder = getattr(model, "dec", None)
     source = getattr(decoder, "source_type", None)
-    if source is None:
-        return None
-    if source == "bank":
-        return f"bank{getattr(decoder.m_source, 'harmonic_num', 0)}"
-    return str(source)
+    return None if source is None else str(source)
 
 
 def assert_excitation_matches(model, checkpoint_dict, origin="checkpoint"):
@@ -245,8 +239,207 @@ def assert_excitation_matches(model, checkpoint_dict, origin="checkpoint"):
     if found != expected:
         raise ValueError(
             f"Excitation mismatch: this run builds '{expected}' but the "
-            f"{origin} was trained with '{found}'. Set refinegan_source "
-            f"(and refinegan_harmonics) to match, or start a fresh run."
+            f"{origin} was trained with '{found}'. The 'comb' and 'bank' "
+            f"sources were removed on 2026-09-03, so such a checkpoint cannot "
+            f"be resumed -- start a fresh run."
+        )
+
+
+#: What the shipped configs carried before the decoder layout became
+#: configurable.  A checkpoint written before the key exists is one of these,
+#: and reading it as "whatever this run builds" would make the guard useless in
+#: exactly the case it exists for.
+LEGACY_UPSAMPLE_RATES = {32000: [4, 4, 4, 5]}
+
+#: ``AntiAliasedActivation``'s design before 2026-09-03: 2x oversampling and a
+#: 25-tap filter cutting at 0.90 of the stage's Nyquist.  Same reasoning as
+#: ``LEGACY_UPSAMPLE_RATES`` -- reading a key-less checkpoint as "whatever this
+#: run builds" makes the guard useless where it matters, and this one is worth
+#: 19 dB of round-trip error, so it is not a cosmetic difference.
+LEGACY_ANTIALIAS_FILTER = [2, 6, 0.9, 6.0]
+
+#: The trunk upsamplers' interpolation filter before 2026-09-03: flat
+#: ``12 / 0.90 / 6.0`` at every stage.  Same contract as the two above -- the
+#: kernels are non-persistent, so a checkpoint cannot tell the designs apart,
+#: and this one moves the worst image by 57 dB.
+LEGACY_UPSAMPLE_FILTER = [[12, 12, 12, 12], [0.9] * 4, [6.0] * 4]
+
+
+def upsample_filter(decoder):
+    """The trunk upsamplers' per-stage filter design, or ``None`` if absent."""
+
+    width = getattr(decoder, "filter_width", None)
+    if width is None:
+        return None
+    return [
+        [int(v) for v in width],
+        [float(v) for v in decoder.rolloff],
+        [float(v) for v in decoder.filter_beta],
+    ]
+
+
+def antialias_adain(decoder):
+    """Whether the stages' ``AdaIN`` activations are anti-aliased.
+
+    A checkpoint trained before 2026-09-03 has the same ``antialias`` and
+    ``antialias_stages`` as one trained after and a different signal path: the
+    six ``AdaIN`` per stage were raw either way until the flag reached them,
+    and they turned out to be the site that decides whether the inharmonic
+    lines are there.  Nothing else in the layout separates the two.
+    """
+
+    from rvc.lib.algorithm.generators.refinegan2 import AdaIN
+
+    found = [m.antialias for m in decoder.modules() if isinstance(m, AdaIN)]
+    return None if not found else bool(any(found))
+
+
+def antialias_filter(decoder):
+    """The anti-aliased activations' filter design, or ``None`` when there are none.
+
+    Read off a built module rather than off the config: the design is a set of
+    constructor defaults, so a decoder built by hand and one built from a
+    config have to report the same thing.
+    """
+
+    from rvc.lib.algorithm.resampling import AntiAliasedActivation
+
+    for module in decoder.modules():
+        if isinstance(module, AntiAliasedActivation):
+            factor, width, rolloff, beta = module.design
+            return [int(factor), int(width), float(rolloff), float(beta)]
+    return None
+
+
+def decoder_layout(model):
+    """The decoder arrangement that leaves no trace in the weights.
+
+    Two of these are invisible to ``load_state_dict``: reordering
+    ``upsample_rates`` keeps all 271 tensors' keys *and* shapes (channel counts
+    follow the stage index, not the rate), and ``AntiAliasedActivation``'s
+    kernels are non-persistent so wrapping an activation adds no key -- nor
+    does *redesigning* its filter, which is why the design itself is reported
+    here.  Any of them loads silently into a decoder trained for a different
+    signal path.
+
+    The source gain a strict load *would* catch, but it is reported here too:
+    a named mismatch beats a missing-key list.  Same additive-key contract as
+    ``excitation_source``.  ``None`` for anything that is not this decoder.
+    """
+
+    decoder = getattr(model, "dec", None)
+    rates = getattr(decoder, "upsample_rates", None)
+    if rates is None:
+        return None
+    return {
+        "upsample_rates": [int(rate) for rate in rates],
+        "antialias_stages": [int(s) for s in getattr(decoder, "antialias_stages", ())],
+        "antialias": str(getattr(decoder, "antialias", "none")),
+        "source_gain": bool(getattr(decoder, "has_source_gain", False)),
+        "source_bands": int(getattr(decoder, "source_bands", 0)),
+        "antialias_rates": [
+            int(r) for r in getattr(decoder, "antialias_rates", ())
+        ],
+        # ``None`` when nothing is anti-aliased, so a run with the activations
+        # raw does not carry a filter design it never used -- and does not
+        # mismatch every other such run over one.
+        "antialias_filter": antialias_filter(decoder),
+        "antialias_adain": antialias_adain(decoder),
+        # Imaging, not aliasing: what the interpolation filter leaves of the
+        # spectral copies zero-stuffing makes.  No ``antialias_*`` option
+        # touches it, and it is just as invisible to ``load_state_dict``.
+        "upsample_filter": upsample_filter(decoder),
+    }
+
+
+def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
+    """Absent means the shipped legacy layout: no anti-aliasing, old ordering."""
+
+    expected = decoder_layout(model)
+    if expected is None:
+        return
+    found = checkpoint_dict.get("decoder_layout")
+    if found is None:
+        sample_rate = int(getattr(model, "sr", 0) or 0)
+        found = {
+            "upsample_rates": LEGACY_UPSAMPLE_RATES.get(
+                sample_rate, expected["upsample_rates"]
+            ),
+            "antialias_stages": [],
+            "antialias": "none",
+            "source_gain": False,
+            "source_bands": 0,
+            "antialias_rates": [],
+            "antialias_filter": None,
+            "upsample_filter": None,
+            "antialias_adain": False,
+        }
+    design = found.get("antialias_filter") or None
+    imaging = found.get("upsample_filter") or None
+    # Absent means raw, which is what every run before the flag existed had.
+    adain = bool(found.get("antialias_adain", False))
+    found = {
+        "upsample_rates": [int(r) for r in found.get("upsample_rates", [])],
+        "antialias_stages": [int(s) for s in found.get("antialias_stages", [])],
+        "antialias": str(found.get("antialias", "none")),
+        "source_gain": bool(found.get("source_gain", False)),
+        "source_bands": int(found.get("source_bands", 0)),
+        # Absent means none: the two loops' activations were raw in every run
+        # before 2026-09-03, and wrapping one adds no state-dict key.
+        "antialias_rates": [int(r) for r in found.get("antialias_rates", [])],
+    }
+    # Absent means the legacy design, but only for a checkpoint that had
+    # anti-aliased activations at all: a run with none has no design, and
+    # inventing one would make every raw-activation checkpoint mismatch over
+    # a field neither of them uses.
+    if design is None and (
+        found["antialias_rates"]
+        or (found["antialias_stages"] and found["antialias"] != "none")
+    ):
+        design = LEGACY_ANTIALIAS_FILTER
+    found["antialias_filter"] = (
+        None
+        if design is None
+        else [int(design[0]), int(design[1]), float(design[2]), float(design[3])]
+    )
+    # Absent means the flat legacy design, sized to the checkpoint's own stage
+    # count -- unlike the anti-aliasing, every RefineGAN run ever had these
+    # upsamplers, so there is no "had none" case to leave as ``None``.  A
+    # decoder that reports no schedule at all is a different vocoder, and then
+    # ``expected`` carries ``None`` too.
+    if imaging is None and expected["upsample_filter"] is not None:
+        stages = len(found["upsample_rates"]) or len(expected["upsample_rates"])
+        imaging = [[12] * stages, [0.9] * stages, [6.0] * stages]
+    found["upsample_filter"] = (
+        None
+        if imaging is None
+        else [
+            [int(v) for v in imaging[0]],
+            [float(v) for v in imaging[1]],
+            [float(v) for v in imaging[2]],
+        ]
+    )
+    found["antialias_adain"] = (
+        None if expected["antialias_adain"] is None else adain
+    )
+    if found != expected:
+        raise ValueError(
+            f"Decoder layout mismatch: this run builds {expected} but the "
+            f"{origin} was trained with {found}. Neither the stage ordering "
+            f"nor the anti-aliased activations appear in any weight, so this "
+            f"is the only thing that can tell them apart. Set "
+            f"upsample_rates / refinegan2_antialias_stages / "
+            f"refinegan2_antialias / refinegan2_antialias_rates / "
+            f"refinegan2_source_gain to match, or start a fresh run. "
+            f"``antialias_adain`` says whether the stages' AdaIN activations "
+            f"are anti-aliased; it follows refinegan2_antialias and is False in "
+            f"every checkpoint written before 2026-09-03. "
+            f"``antialias_filter`` is "
+            f"[factor, width, rolloff, beta] and is a constructor default of "
+            f"AntiAliasedActivation; ``upsample_filter`` is "
+            f"[widths, rolloffs, betas] per stage for the trunk's "
+            f"interpolation filters. Neither is a config key: a mismatch "
+            f"there means the checkpoint predates the current filter design."
         )
 
 
@@ -334,6 +527,12 @@ def save_checkpoint(
     periods = discriminator_periods(model_instance)
     if periods is not None:
         checkpoint_data["discriminator_periods"] = periods
+    # Same additive contract once more: the stage ordering and the anti-aliased
+    # activations are invisible in the weights, so a resume cannot tell that
+    # either changed. Only generators have it.
+    layout = decoder_layout(model_instance)
+    if layout is not None:
+        checkpoint_data["decoder_layout"] = layout
     if ema is not None:
         checkpoint_data["ema"] = ema.state_dict()
     # Same additive contract: plain Python scalars for training-loop controllers
@@ -497,8 +696,8 @@ def plot_validation_preview_to_figure(
     # The vertical axis is bin index, and mel bins are not evenly spaced in Hz.
     # Stretching them onto a linear 0..Nyquist ruler -- which is what an extent
     # of ``(0, top_frequency)`` does -- put every label except the two endpoints
-    # in the wrong place, and not by a little: at 128 bins over 44.1 kHz the
-    # tick reading "5.5k" sits on bin 32, whose real centre is 1.02 kHz. A
+    # in the wrong place, and not by a little: at 128 bins over 32 kHz the
+    # tick reading "4.0k" sits on bin 32, whose real centre is 0.94 kHz. A
     # deficit under 1 kHz reads as a defect at 4 kHz, which is a diagnosis this
     # axis has no business making. Keep the image in bin space and move the
     # ticks instead, so what the eye measures is the filterbank's own spacing.

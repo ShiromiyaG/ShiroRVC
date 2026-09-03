@@ -247,6 +247,17 @@ class _MultiScaleDilatedBlock(torch.nn.Module):
                 for d in DILATIONS
             ]
         )
+        # The three are summed, so they *are* one sparse 17x5 convolution --
+        # rates (1, 2, 4) on a 5-tap axis touch rows -2..2, -4..4, -8..8.
+        # Merging them is 13% more multiplies for one launch on cuDNN's dense
+        # path instead of three on its dilated one, and measured over the three
+        # block shapes in isolation it looked like 1.98 ms -> 1.29 ms.  It is
+        # not: ``weight_norm`` reparametrises these, so the merged weight has
+        # to be rebuilt on every call to stay on the autograd path, and that
+        # costs more than the launches save.  Careful A/B, best of 3 x 30 at
+        # the training shape: forward 3.261 -> 3.316 ms, fwd+bwd 10.55 ->
+        # 11.46.  The isolated benchmark had hoisted the rebuild out of the
+        # timing loop.  Left as three convs.
         self.down = norm_f(
             torch.nn.Conv2d(channels, channels, (5, 5), stride=(2, 1), padding=(2, 2))
         )

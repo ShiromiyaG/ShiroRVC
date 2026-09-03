@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from rvc.train.extract.preparing_files import generate_config
 
-SHIPPED = ROOT / "rvc" / "configs" / "refinegan" / "44100.json"
+SHIPPED = ROOT / "rvc" / "configs" / "refinegan2" / "32000.json"
 
 
 @pytest.fixture
@@ -54,17 +54,17 @@ def test_a_config_from_an_older_architecture_is_replaced(tmp_path, shipped):
     stale["model"]["architecture_id"] = "shiro_vits_svae_v2"
     # A shape-defining key the stale config disagrees on: the point of the
     # guard is that it does not survive the replacement.
-    stale["model"]["refinegan_harmonics"] = [64, 64, 64]
+    stale["model"]["refinegan2_antialias_rates"] = [1, 2, 3]
     _write(tmp_path / "config.json", stale)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(32000, str(tmp_path), "refinegan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert written["model"]["architecture_id"] == (
         shipped["model"]["architecture_id"]
     )
-    assert written["model"]["refinegan_harmonics"] == (
-        shipped["model"]["refinegan_harmonics"]
+    assert written["model"]["refinegan2_antialias_rates"] == (
+        shipped["model"]["refinegan2_antialias_rates"]
     )
 
 
@@ -75,7 +75,7 @@ def test_the_replaced_config_is_kept(tmp_path, shipped):
     stale["train"]["learning_rate_d"] = 0.0009
     _write(tmp_path / "config.json", stale)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(32000, str(tmp_path), "refinegan")
 
     backup = tmp_path / "config.json.shiro_vits_svae_v2.bak"
     assert backup.exists()
@@ -96,16 +96,16 @@ def test_a_config_that_names_no_architecture_at_all_is_replaced(tmp_path, shippe
     """
     stale = json.loads(json.dumps(shipped))
     del stale["model"]["architecture_id"]
-    stale["model"]["refinegan_use_frame_energy"] = True
+    stale["model"]["refinegan2_use_frame_energy"] = True
     _write(tmp_path / "config.json", stale)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(32000, str(tmp_path), "refinegan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert written["model"]["architecture_id"] == (
         shipped["model"]["architecture_id"]
     )
-    assert "refinegan_use_frame_energy" not in written["model"]
+    assert "refinegan2_use_frame_energy" not in written["model"]
     assert (tmp_path / "config.json.unknown.bak").exists()
 
 
@@ -131,7 +131,7 @@ def test_a_matching_config_is_left_exactly_alone(tmp_path, shipped):
     tuned["train"]["learning_rate_d"] = 0.0009
     _write(tmp_path / "config.json", tuned)
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(32000, str(tmp_path), "refinegan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert written["train"]["learning_rate_d"] == pytest.approx(0.0009)
@@ -140,7 +140,7 @@ def test_a_matching_config_is_left_exactly_alone(tmp_path, shipped):
 
 def test_a_missing_config_is_created(tmp_path, shipped):
 
-    generate_config(44100, str(tmp_path), "refinegan")
+    generate_config(32000, str(tmp_path), "refinegan")
 
     written = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert written["model"]["architecture_id"] == (

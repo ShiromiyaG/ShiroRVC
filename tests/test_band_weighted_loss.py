@@ -26,7 +26,7 @@ from rvc.train.losses import (  # noqa: E402
     mel_low_frequency_weights,
 )
 
-SR = 44100
+SR = 32000
 BINS = 128
 
 

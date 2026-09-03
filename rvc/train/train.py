@@ -68,6 +68,7 @@ install_rich_print()
 
 from utils import (
     summarize,
+    assert_decoder_layout_matches,
     assert_excitation_matches,
     assert_periods_match,
     load_checkpoint,
@@ -682,10 +683,11 @@ def get_d_model(config, vocoder, use_checkpointing):
     # ``mpd_msd`` is Applio's v2 (8 periods); ``mpd_msd_v3`` is what it picks
     # for RefineGAN (5 periods + 3 multi-resolution spectrogram branches).
     # ``d_version`` overrides the default -- v3 does not fit an 8 GB card at
-    # batch 8 (6.42 GiB / 5912 ms/step vs v2's 4.64 GiB / 498 ms/step); v3l
-    # (v3 with the last two layers frequency-downsampled) was tried as a
-    # cheaper default but measured no improvement over v3 on newer hardware,
-    # so it stays available only as an explicit override.
+    # batch 8 (6.42 GiB / 5912 ms/step vs v2's 4.64 GiB / 498 ms/step).  The
+    # RefineGAN2 config names ``v4`` explicitly: v3 minus its longest period
+    # branch, which buys back the time and memory the decoder's anti-aliased
+    # activations spend.  The default below stays ``v3`` so a config predating
+    # that key builds what it always did.
     version = "v3" if discriminator_id == "mpd_msd_v3" else "v2"
     version = str(getattr(config.model, "d_version", None) or version)
     # ``d_use_*`` switches a whole family off; ``d_periods``/``d_resolutions``
@@ -700,6 +702,9 @@ def get_d_model(config, vocoder, use_checkpointing):
         ),
         frequency_strides=setting("d_frequency_strides"),
         use_msd=bool(setting("d_use_msd", True)),
+        # Opt-in, so an absent key builds the branches every existing
+        # discriminator was trained with.
+        use_fast_mpd=bool(setting("d_use_fast_mpd", False)),
         # UnivHD (arXiv 2512.03486) is opt-in and *additive*: it appends a
         # harmonic-order branch and removes nothing, which is how the paper
         # runs it.  Off by default because it is unmeasured on this fork -- the
@@ -1470,6 +1475,9 @@ def _assert_resumable_architecture(net_g, checkpoint_path):
     # to ``vits_gaussian_v1`` for every RefineGAN source on purpose -- see
     # ``get_architecture_id`` -- and this stack resumes non-strictly.
     assert_excitation_matches(model, checkpoint, origin="checkpoint")
+    # Same reasoning, and the same door: the stage ordering and the
+    # anti-aliased activations leave no trace in any weight either.
+    assert_decoder_layout_matches(model, checkpoint, origin="checkpoint")
     expected = getattr(model, "architecture_id", None)
     if not expected or expected == "vits_gaussian_v1":
         return
@@ -1629,6 +1637,11 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             # loading an RVC v2 pretrain into a comb or bank run is exactly
             # the mismatch worth naming.
             assert_excitation_matches(
+                net_g.module if hasattr(net_g, "module") else net_g,
+                checkpoint,
+                origin="pretrain",
+            )
+            assert_decoder_layout_matches(
                 net_g.module if hasattr(net_g, "module") else net_g,
                 checkpoint,
                 origin="pretrain",
@@ -3242,7 +3255,7 @@ def training_loop(
                         # The time axis is frames * hop / sample_rate.  This
                         # used to fall back to the function's default of 256
                         # while every shipped config uses sample_rate/100
-                        # (441 at 44.1 kHz), which labelled the axis 1.7x short.
+                        # (320 at 32 kHz), which labelled the axis 1.7x short.
                         hop_length=config.data.hop_length,
                         # Same story one axis over: the frequency ticks are only
                         # right if they are placed on the mel range the mels

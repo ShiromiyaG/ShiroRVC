@@ -19,7 +19,6 @@ fireredvad==0.0.2
 stftpitchshift
 flatten-dict==0.4.2
 torch-dct==0.1.6
-pyloudnorm==0.1.1
 
 # Machine learning and deep learning
 numba==0.64.0

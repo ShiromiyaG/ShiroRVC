@@ -1,4 +1,4 @@
 from .hifigan_nsf import HiFiGANNSFGenerator
-from .refinegan import RefineGANGenerator
+from .refinegan2 import RefineGAN2Generator
 
-__all__ = ["HiFiGANNSFGenerator", "RefineGANGenerator"]
+__all__ = ["HiFiGANNSFGenerator", "RefineGAN2Generator"]

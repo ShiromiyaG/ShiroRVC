@@ -335,7 +335,7 @@ def run_preprocess_script(
     clean_strength: float,
     chunk_len: float,
     overlap_len: float,
-    normalization_mode: str = "post_rms",
+    normalization_mode: str = "pre_loudness",
     loading_resampling: str = "librosa",
     dataset_format: str = "WAV",
     rms_norm_db: float = -18.0
@@ -1153,7 +1153,7 @@ PREPROCESS_OWN = [
     ),
     click.option(
         "--normalization_mode",
-        type=click.Choice(["none", "post_peak", "post_peak_rvc", "post_rms"]),
+        type=click.Choice(["none", "post_peak", "pre_loudness"]),
         default='post_peak',
         show_default=True,
         help="Normalization mode.",
@@ -1206,7 +1206,10 @@ EXTRACT_OWN = [
     ),
     click.option(
         "--embedder_model",
-        type=click.Choice(["contentvec", "spin_v1", "spin_v2", "custom"]),
+        # No ``spin_v1``: it is not trainable any more.  Inference keeps it, so
+        # models already trained against it still run -- see
+        # ``TRAINING_EMBEDDER_MODELS`` in ``gui/services/catalog.py``.
+        type=click.Choice(["contentvec", "spin_v2", "custom"]),
         default='contentvec',
         show_default=True,
         help="Choose the model used for generating speaker embeddings.",

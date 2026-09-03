@@ -13,6 +13,14 @@ def load_vocoder_registry():
 
 
 def normalize_vocoder(vocoder):
+    """Resolve a vocoder id, label or alias to a registry key.
+
+    Unknown values raise rather than defaulting.  ``refinegan`` was renamed to
+    ``refinegan2`` and kept as an alias; without one, an older run spec would
+    have quietly built HiFi-GAN, which is the failure this whole registry
+    exists to make impossible.
+    """
+
     value = str(vocoder or "hifi").strip()
     registry = load_vocoder_registry()
     if value in registry:
@@ -20,12 +28,16 @@ def normalize_vocoder(vocoder):
 
     value_lower = value.lower()
     for vocoder_id, spec in registry.items():
-        if value_lower in {
+        names = {
             str(spec.get("label", "")).lower(),
             str(spec.get("architecture", "")).lower(),
-        }:
+        }
+        names.update(str(alias).lower() for alias in spec.get("aliases", ()))
+        if value_lower in names:
             return vocoder_id
-    return "hifi"
+    raise ValueError(
+        f"Unknown vocoder {vocoder!r}; known ids are {sorted(registry)}."
+    )
 
 
 def get_vocoder_spec(vocoder):
@@ -86,7 +98,7 @@ def get_architecture_id(vocoder, options=None):
     """
     spec = get_vocoder_spec(vocoder)
     base = spec.get("gaussian_architecture_id", spec["architecture_id"])
-    # ``refinegan_source`` deliberately does *not* appear here.  It swaps the
+    # ``refinegan2_source`` deliberately does *not* appear here.  It swaps the
     # excitation generator, and the state dicts differ -- the sine owns
     # ``dec.m_source.merge.0.weight``, the bank owns ``dec.m_source.phase_offset``
     # -- so it has every reason to.  But this id is also what the whole RVC

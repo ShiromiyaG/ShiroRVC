@@ -1,3 +1,4 @@
+import traceback
 import inspect
 import math
 import torch
@@ -33,7 +34,7 @@ def vocoder_config_from_model(model: dict) -> dict:
     """Split a config's ``model`` block into the vocoder's share of it.
 
     Config keys used to be tagged by prefix, and the exporter selected them with
-    ``startswith("refinegan_")``.  Without the prefix there is nothing to match
+    ``startswith("refinegan2_")``.  Without the prefix there is nothing to match
     on, so the split is stated once, here, as "everything ``Synthesizer`` does
     not name in its own signature" -- the frontend, decoder and discriminator
     options, which is exactly what lands in ``**kwargs``.
@@ -114,13 +115,21 @@ class Synthesizer(torch.nn.Module):
         # the config pins that ``dec_kwargs`` also derives is handed over rather
         # than passed twice, which would be a duplicate keyword argument.
         decoder_config = dict(vocoder_options)
+        # ``refinegan_*`` was renamed to ``refinegan2_*``.  A config written
+        # under the old prefix would otherwise read as "every option absent",
+        # which builds a decoder with the anti-aliasing and the excitation gain
+        # silently off -- so the old spelling is accepted, and the new one wins
+        # if a config somehow carries both.
+        for key in [k for k in decoder_config if k.startswith("refinegan_")]:
+            decoder_config.setdefault("refinegan2_" + key[len("refinegan_") :],
+                                      decoder_config[key])
         for key in list(decoder_config):
             if key in dec_kwargs:
                 dec_kwargs[key] = decoder_config.pop(key)
         generator_id = vocoder_spec["generator"]
         if generator_id == "hifi_nsf":
             self.dec = generators.HiFiGANNSFGenerator(**dec_kwargs)
-        elif generator_id == "refinegan":
+        elif generator_id == "refinegan2":
             # Applio's RefineGAN.  It takes neither the ResBlock
             # schedule nor the upsample kernels -- its blocks are fixed at
             # ``(3, 7, 11) x (1, 3, 5)`` and it upsamples by interpolation --
@@ -136,26 +145,31 @@ class Synthesizer(torch.nn.Module):
                 raise ValueError(
                     f"{vocoder_spec['label']} supports {supported}, not {int(sr)}."
                 )
-            self.dec = generators.RefineGANGenerator(
+            self.dec = generators.RefineGAN2Generator(
                 sample_rate=int(sr),
-                downsample_rates=tuple(upsample_rates[::-1]),
                 upsample_rates=tuple(upsample_rates),
                 upsample_initial_channel=upsample_initial_channel,
                 num_mels=inter_channels,
                 start_channels=int(
-                    decoder_config.get("refinegan_start_channels", 16)
+                    decoder_config.get("refinegan2_start_channels", 16)
                 ),
                 leaky_relu_slope=float(
-                    decoder_config.get("refinegan_leaky_relu_slope", 0.2)
+                    decoder_config.get("refinegan2_leaky_relu_slope", 0.2)
                 ),
                 gin_channels=gin_channels,
                 checkpointing=checkpointing,
-                source_type=str(
-                    decoder_config.get("refinegan_source", "sine")
+                # Absent means "off", so a config written before these keys
+                # existed builds exactly the decoder it used to.  The layout
+                # they select is invisible in the state dict, which is why
+                # ``decoder_layout`` writes it into the checkpoint.
+                antialias_stages=decoder_config.get("refinegan2_antialias_stages"),
+                antialias=str(
+                    decoder_config.get("refinegan2_antialias", "half")
                 ),
-                source_harmonics=int(
-                    decoder_config.get("refinegan_harmonics", 64)
+                source_gain=bool(
+                    decoder_config.get("refinegan2_source_gain", False)
                 ),
+                antialias_rates=decoder_config.get("refinegan2_antialias_rates"),
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
@@ -238,7 +252,7 @@ class Synthesizer(torch.nn.Module):
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "refinegan"}:
+        if self.vocoder not in {"hifi", "refinegan2"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode
@@ -252,7 +266,11 @@ class Synthesizer(torch.nn.Module):
                 mode=mode,
             )
         except Exception as error:
-            warning(f"{VOCODER_COMPILE_ENABLE_FAILED} {error}", tag="[INIT]")
+            warning(
+                f"{VOCODER_COMPILE_ENABLE_FAILED} {error}\n"
+                f"{traceback.format_exc()}",
+                tag="[INIT]",
+            )
             return False
         compile_failed = False
 
@@ -264,7 +282,16 @@ class Synthesizer(torch.nn.Module):
                 return compiled_forward(*args, **kwargs)
             except Exception as error:
                 compile_failed = True
-                warning(f"{VOCODER_COMPILE_RUNTIME_FAILED} {error}", tag="[TRAIN]")
+                # The traceback, not just the message.  This fires once per run
+                # and then falls back to eager for good, so the noise is
+                # bounded -- and without it ``TORCHDYNAMO_VERBOSE=1`` changes
+                # nothing, because the frames it enriches are the ones this
+                # ``except`` was discarding.  That cost a debugging round.
+                warning(
+                    f"{VOCODER_COMPILE_RUNTIME_FAILED} {error}\n"
+                    f"{traceback.format_exc()}",
+                    tag="[TRAIN]",
+                )
                 return eager_forward(*args, **kwargs)
 
         decoder.forward = training_forward

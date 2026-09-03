@@ -10,6 +10,7 @@ import concurrent.futures
 import json
 from distutils.util import strtobool
 import librosa
+import math
 import multiprocessing
 import shutil
 import soundfile as sf
@@ -33,6 +34,13 @@ configure_logging(tag="[PREPROCESS]")
 
 from rvc.lib.audio_io import load_audio, load_audio_ffmpeg
 from rvc.train.preprocess.slicer import Slicer
+from rvc.train.preprocess.loudness import (
+    apply_gain_with_ceiling,
+    block_powers,
+    integrated_lufs,
+    loudness_from_blocks,
+    loudness_gain,
+)
 
 import logging
 logger = logging.getLogger(__name__)
@@ -95,8 +103,8 @@ class PreProcess:
         )
         self.sr = sr
         # Second-order sections rather than transfer-function coefficients:
-        # at 48 Hz / 44.1 kHz the normalized cutoff is 0.0022, which pushes the
-        # poles to |p| = 0.9979 and makes the `ba` form badly conditioned. It
+        # a 48 Hz cutoff normalises to 0.003 at 32 kHz and 0.002 at 48 kHz,
+        # pushing the poles to |p| = 0.993-0.996 and making `ba` ill-conditioned. It
         # still holds up in float64, but `sos` is the form scipy recommends here
         # and it lets the filter run natively in float32.
         self.hp_sos = signal.butter(
@@ -380,9 +388,184 @@ def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_pr
     return True, None, None
 
 
-def _apply_post_norm_from_gain(audio: np.ndarray, gt_audio: np.ndarray, mode: str, rms_norm_db: float):
+def source_key(file_name: str) -> str:
+    """The recording a slice came from.
+
+    Slices are written as ``{sid}_{idx0}_{idx1}``: ``sid`` is the speaker and
+    ``idx0`` enumerates that speaker's source files, so the first two fields
+    together name one recording.  ``idx0`` restarts per speaker directory,
+    which is why ``sid`` has to be part of the key.
+    """
+
+    stem = os.path.splitext(os.path.basename(file_name))[0]
+    parts = stem.split("_")
+    return "_".join(parts[:2]) if len(parts) >= 2 else stem
+
+
+def _source_scan_worker(args):
+    """Pass 1: the block powers and peak of one slice, tagged by recording."""
+    file_name, gt_wavs_dir = args
+    try:
+        audio, sr = sf.read(os.path.join(gt_wavs_dir, file_name))
+    except Exception:
+        return None
+    if audio.size == 0:
+        return None
+    return (
+        source_key(file_name),
+        block_powers(audio, sr).astype(np.float32),
+        float(np.abs(audio).max()),
+    )
+
+
+def plan_source_gains(gt_wavs_dir, audio_files, target_lufs, num_processes,
+                      ceiling_db=-1.0):
+    """One gain per source recording, and the target they can all actually hit.
+
+    Two things make this different from running the per-slice mode and calling
+    it a day.  The loudness of a recording is measured by pooling its slices'
+    block powers and gating **once** -- gating per slice and averaging the
+    results is a different (and wrong) number, because the relative gate is
+    defined against the whole measurement.  And when a recording cannot reach
+    the target without exceeding the ceiling, the *target itself* comes down
+    for everyone rather than that one recording being quietly limited: a
+    dataset where some sources reached the target and others did not is not
+    level-matched, which was the entire point.
+
+    Returns ``(gains, effective_target, summary)``.
+    """
+
+    powers, peaks = {}, {}
+    arg_list = [(f, gt_wavs_dir) for f in audio_files]
+    workers = pool_size(num_processes, len(audio_files))
+    # A pool of one is a spawned interpreter's worth of startup to do what this
+    # process can do inline, and on Windows spawning from inside a test runner
+    # re-imports the caller.  Scanning is a filter and a mean per file, so the
+    # serial path is the right one whenever there is only one worker anyway.
+    if workers <= 1:
+        results = (_source_scan_worker(a) for a in arg_list)
+        for result in results:
+            if not result:
+                continue
+            key, power, peak = result
+            powers.setdefault(key, []).append(power)
+            peaks[key] = max(peaks.get(key, 0.0), peak)
+    else:
+        with multiprocessing.Pool(processes=workers) as pool:
+            for result in pool.imap_unordered(_source_scan_worker, arg_list):
+                if not result:
+                    continue
+                key, power, peak = result
+                powers.setdefault(key, []).append(power)
+                peaks[key] = max(peaks.get(key, 0.0), peak)
+
+    ceiling = 10.0 ** (ceiling_db / 20.0)
+    loudness, headroom_limit = {}, []
+    for key, chunks in powers.items():
+        measured = loudness_from_blocks(np.concatenate(chunks))
+        loudness[key] = measured
+        if math.isfinite(measured) and peaks[key] > 0.0:
+            # The loudest this recording can be before its own peak hits the
+            # ceiling, in LUFS.
+            headroom_limit.append(measured + 20.0 * math.log10(ceiling / peaks[key]))
+
+    effective = target_lufs
+    summary = None
+    if headroom_limit and min(headroom_limit) < target_lufs:
+        effective = min(headroom_limit)
+        summary = {
+            "num_limited": sum(1 for h in headroom_limit if h < target_lufs),
+            "num_sources": len(loudness),
+            "worst": effective,
+        }
+
+    gains = {}
+    for key, measured in loudness.items():
+        if not math.isfinite(measured):
+            gains[key] = 1.0
+            continue
+        gain = 10.0 ** ((effective - measured) / 20.0)
+        # Belt and braces: rounding could still put a peak a hair over.
+        if peaks[key] * gain > ceiling:
+            gain = ceiling / peaks[key]
+        gains[key] = float(gain)
+    return gains, effective, summary
+
+
+def _apply_source_gain_worker(args):
+    """Pass 2: scale a slice and its 16 kHz copy by their recording's gain."""
+    file_name, gt_wavs_dir, wavs16k_dir, gain = args
+    try:
+        stem, ext = file_name.split(".")[0], file_name.split(".")[1]
+        gt_audio, gt_sr = sf.read(os.path.join(gt_wavs_dir, file_name))
+        save_audio(gt_wavs_dir, stem, gt_sr, ext, (gt_audio * gain).astype(np.float32))
+        k16_audio, k16_sr = sf.read(os.path.join(wavs16k_dir, file_name))
+        save_audio(wavs16k_dir, stem, k16_sr, ext, (k16_audio * gain).astype(np.float32))
+    except Exception as e:
+        logger.error(f"Error normalizing {file_name} (pre_loudness): {e}")
+        raise e
+
+
+def _dry_run_loudness_file(args):
+    file_name, gt_wavs_dir, target_lufs, ceiling_db = args
+    try:
+        audio, sr = sf.read(os.path.join(gt_wavs_dir, file_name))
+    except Exception:
+        return None
+    measured = integrated_lufs(audio, sr)
+    if not math.isfinite(measured):
+        return None
+    peak = float(np.abs(audio).max())
+    if peak <= 0.0:
+        return None
+    peak_db = 20.0 * math.log10(peak)
+    # Crest above the *loudness*, not above the RMS: it is what the ceiling
+    # costs when the file is pushed to the target.
+    crest_db = peak_db - measured
+    return dict(crest_db=crest_db, safe_max_db=ceiling_db - crest_db,
+                peak_db=peak_db, gain_db=target_lufs - measured)
+
+
+def _dry_run_slice_loudness(gt_wavs_dir, audio_files, target_lufs, num_processes,
+                           ceiling_db=-1.0):
+    """What ``post_loudness`` would do, without writing anything.
+
+    Same contract as the RMS dry run: ``(is_safe, worst_safe_db, summary)``, so
+    a target the dataset cannot reach becomes a message and an auto-adjustment
+    rather than a set of files quietly short of it.
+    """
+
+    arg_list = [(f, gt_wavs_dir, target_lufs, ceiling_db) for f in audio_files]
+    crests, peaks, gains, safes = [], [], [], []
+    with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
+        for result in pool.imap_unordered(_dry_run_loudness_file, arg_list):
+            if result and result["safe_max_db"] < target_lufs:
+                crests.append(result["crest_db"])
+                peaks.append(result["peak_db"])
+                gains.append(result["gain_db"])
+                safes.append(result["safe_max_db"])
+    if safes:
+        return False, min(safes), {
+            "num_limited": len(safes),
+            "avg_gain": float(np.mean(gains)),
+            "avg_peak": float(np.mean(peaks)),
+            "avg_crest": float(np.mean(crests)),
+        }
+    return True, None, None
+
+
+def _apply_post_norm_from_gain(audio: np.ndarray, gt_audio: np.ndarray, mode: str, rms_norm_db: float, gt_sample_rate: int = 40000):
     """Apply normalization using the gain computed from gt_audio, so gt and 16k stay loudness-consistent."""
-    if mode == "post_rms":
+    if mode == "post_loudness":
+        # The gain is measured on ``gt_audio`` and applied to both copies, so
+        # the 16 kHz feature input and the ground truth stay at the same level.
+        # Its own rate is what the K-weighting has to be built at, hence
+        # ``gt_sample_rate`` rather than the 16 kHz one.
+        gain = loudness_gain(gt_audio, gt_sample_rate, rms_norm_db)
+        scaled, _ = apply_gain_with_ceiling(audio, gain)
+        return scaled.astype(np.float32)
+
+    elif mode == "post_rms":
         eps = 1e-9
         target_rms = 10 ** (rms_norm_db / 20)
         headroom = 10 ** (-0.5 / 20)
@@ -416,7 +599,20 @@ def _apply_post_norm_from_gain(audio: np.ndarray, gt_audio: np.ndarray, mode: st
 
 def _apply_post_norm(audio: np.ndarray, sr: int, mode: str, rms_norm_db: float):
     """Returns (audio, stats), where stats is None or a dict of limiting info."""
-    if mode == "post_rms":
+    if mode == "post_loudness":
+        measured = integrated_lufs(audio, sr)
+        gain = loudness_gain(audio, sr, rms_norm_db)
+        scaled, limited_db = apply_gain_with_ceiling(audio, gain)
+        if limited_db > 0.0:
+            return scaled.astype(np.float32), dict(
+                gain_db=20 * np.log10(gain),
+                peak_db=20 * np.log10(max(np.abs(audio * gain).max(), 1e-12)),
+                crest_db=limited_db,
+                safe_max_db=rms_norm_db - limited_db,
+            )
+        return scaled.astype(np.float32), None
+
+    elif mode == "post_rms":
         eps = 1e-9
         target_rms = 10 ** (rms_norm_db / 20)
         headroom = 10 ** (-0.5  / 20)
@@ -463,7 +659,9 @@ def _process_and_save_worker(args):
         save_audio(gt_wavs_dir, stem, gt_sr, ext, gt_result)
 
         k16_audio, k16_sr = sf.read(os.path.join(wavs16k_dir, file_name))
-        k16_result = _apply_post_norm_from_gain(k16_audio, gt_audio, mode, rms_norm_db)
+        k16_result = _apply_post_norm_from_gain(
+            k16_audio, gt_audio, mode, rms_norm_db, gt_sample_rate=gt_sr
+        )
         save_audio(wavs16k_dir, stem, k16_sr, ext, k16_result)
     except Exception as e:
         logger.error(f"Error normalizing {file_name} ({mode}): {e}")
@@ -501,9 +699,12 @@ def save_dataset_duration(file_path, dataset_duration, normalization_mode, rms_n
         "total_dataset_duration": formatted_duration,
         "total_seconds": round(dataset_duration, 2),
     }
-    if normalization_mode in ("post_rms", "post_peak_rvc", "post_peak"):
+    if normalization_mode in ("pre_loudness", "post_loudness", "post_rms",
+                              "post_peak_rvc", "post_peak"):
         new_data["normalization_method"] = normalization_mode
-        if normalization_mode == "post_rms":
+        if normalization_mode in ("pre_loudness", "post_loudness"):
+            new_data["normalization_target_lufs"] = rms_norm_db
+        elif normalization_mode == "post_rms":
             new_data["normalization_rms_db"] = rms_norm_db
     data.update(new_data)
 
@@ -706,6 +907,8 @@ def preprocess_training_set(
                     total_audio_length += result
 
     POST_NORM_MODES = {
+        "pre_loudness": "Loudness Normalization (BS.1770, per recording)",
+        "post_loudness": "Loudness Normalization (BS.1770, per slice)",
         "post_rms":      "RMS Normalization",
         "post_peak_rvc": "Peak Normalization (RVC)",
         "post_peak":     "Peak Normalization",
@@ -718,7 +921,53 @@ def preprocess_training_set(
 
         logger.info("Stage 2: Normalization")
 
-        if normalization_mode == "post_rms":
+        if normalization_mode == "pre_loudness":
+            logger.info("Measuring loudness per source recording...")
+            gains, effective, summary = plan_source_gains(
+                gt_wavs_dir, audio_files, rms_norm_db, num_processes
+            )
+            if summary:
+                logger.warning(
+                    f"Loudness norm: {rms_norm_db:.1f} LUFS is out of headroom on "
+                    f"{summary['num_limited']} of {summary['num_sources']} recordings. "
+                    f"Lowering the target to {effective:.1f} LUFS for all of them, so "
+                    f"they stay matched."
+                )
+            logger.info(
+                f"Post Normalization: {POST_NORM_MODES[normalization_mode]} "
+                f"({len(gains)} recordings). Initiating..."
+            )
+            arg_list = [
+                (f, gt_wavs_dir, wavs16k_dir, gains.get(source_key(f), 1.0))
+                for f in audio_files
+            ]
+            with multiprocessing.Pool(
+                processes=pool_size(num_processes, len(audio_files))
+            ) as pool:
+                with progress_task(
+                    len(audio_files), POST_NORM_MODES[normalization_mode]
+                ) as (progress, task_id):
+                    for _ in pool.imap_unordered(_apply_source_gain_worker, arg_list):
+                        progress.advance(task_id)
+            # Falls through to the shared tail so the run ends the same way
+            # every other mode does; the effective target is what gets recorded.
+            rms_norm_db = effective
+
+        elif normalization_mode == "post_loudness":
+            logger.info("Dry run: checking the target is reachable without limiting...")
+            is_safe, worst_safe, summary = _dry_run_slice_loudness(
+                gt_wavs_dir, audio_files, rms_norm_db, num_processes
+            )
+            if not is_safe:
+                logger.warning(
+                    f"Loudness norm: {rms_norm_db:.1f} LUFS would be limited on "
+                    f"{summary['num_limited']} files (avg crest {summary['avg_crest']:.0f} LU, "
+                    f"peak {summary['avg_peak']:.1f} dBFS). "
+                    f"Auto-adjusting to {worst_safe:.1f} LUFS."
+                )
+                rms_norm_db = worst_safe
+
+        elif normalization_mode == "post_rms":
             logger.info("Performing a dry-run first to establish safety of chosen RMS dB...")
             is_safe, worst_safe, summary = _dry_run_post_rms(
                 gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_processes
@@ -731,16 +980,17 @@ def preprocess_training_set(
                 )
                 rms_norm_db = worst_safe
 
-        logger.info(f"Post Normalization: {POST_NORM_MODES[normalization_mode]}. Initiating...")
-        arg_list = [(f, gt_wavs_dir, wavs16k_dir, normalization_mode, rms_norm_db) for f in audio_files]
+        if normalization_mode != "pre_loudness":
+            logger.info(f"Post Normalization: {POST_NORM_MODES[normalization_mode]}. Initiating...")
+            arg_list = [(f, gt_wavs_dir, wavs16k_dir, normalization_mode, rms_norm_db) for f in audio_files]
 
-        with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
-            with progress_task(
-                len(audio_files),
-                POST_NORM_MODES[normalization_mode],
-            ) as (progress, task_id):
-                for _ in pool.imap_unordered(_process_and_save_worker, arg_list):
-                    progress.advance(task_id)
+            with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
+                with progress_task(
+                    len(audio_files),
+                    POST_NORM_MODES[normalization_mode],
+                ) as (progress, task_id):
+                    for _ in pool.imap_unordered(_process_and_save_worker, arg_list):
+                        progress.advance(task_id)
 
     save_dataset_duration(os.path.join(exp_dir, "model_info.json"), total_audio_length, normalization_mode, rms_norm_db)
 

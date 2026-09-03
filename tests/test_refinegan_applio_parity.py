@@ -1,13 +1,14 @@
-"""RefineGAN's discriminator and spectral loss, pinned against Applio's.
+"""RefineGAN2's discriminator and spectral loss.
 
-RefineGAN is Applio's architecture, and Applio does not train it the way it
-trains HiFi-GAN: ``train.py`` special-cases the vocoder and switches *two*
-things at once -- ``disc_version = "v3"`` and ``multiscale_mel_loss = True``.
-This fork used to ship neither, so RefineGAN was training against the v2
-discriminator and a single-scale L1 mel. Neither difference is visible in a
-checkpoint or a loss curve, only in what the run converges to, which is why
-it is pinned here against reference values taken from ``.tmp/Applio`` (a
-read-only checkout).
+The decoder started as Applio's RefineGAN, and what it inherited is pinned
+here against reference values taken from ``.tmp/Applio`` (a read-only
+checkout): ``v3``'s branch layout, the multi-scale mel loss reducing to
+Applio's, the decimation filter, the ``AdaIN`` noise being training-only.
+
+Where the fork has diverged, this file pins the divergence instead -- ``v4``
+against ``v3``, a single-scale mel loss, and the discriminator's per-family
+switches.  Neither kind of difference is visible in a checkpoint or a loss
+curve, only in what a run converges to.
 """
 
 from __future__ import annotations
@@ -33,24 +34,24 @@ from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (  # noqa: E
     DiscriminatorR,
     DiscriminatorS,
 )
-from rvc.lib.algorithm.generators import refinegan as R  # noqa: E402
+from rvc.lib.algorithm.generators import refinegan2 as R  # noqa: E402
 
-CONFIG = ROOT / "rvc" / "configs" / "refinegan" / "44100.json"
-CONFIG_32K = ROOT / "rvc" / "configs" / "refinegan" / "32000.json"
+CONFIG = ROOT / "rvc" / "configs" / "refinegan2" / "32000.json"
+CONFIG_32K = CONFIG  # kept as a name; RefineGAN ships at 32 kHz only
 
 
 def _generator(**overrides):
     model = json.loads(CONFIG.read_text())["model"]
     torch.manual_seed(0)
     kwargs = dict(
-        sample_rate=44100,
+        sample_rate=32000,
         upsample_rates=model["upsample_rates"],
         num_mels=model["inter_channels"],
         gin_channels=model["gin_channels"],
         upsample_initial_channel=model["upsample_initial_channel"],
     )
     kwargs.update(overrides)
-    return R.RefineGANGenerator(**kwargs)
+    return R.RefineGAN2Generator(**kwargs)
 
 
 def _inputs(batch=1, frames=8):
@@ -65,20 +66,6 @@ def _inputs(batch=1, frames=8):
 # --------------------------------------------------------------------------
 # discriminator
 # --------------------------------------------------------------------------
-
-
-def test_refinegan_selects_applios_v3_discriminator():
-    assert get_discriminator_id("refinegan") == "mpd_msd_v3"
-    assert get_discriminator_id("hifi") == "mpd_msd"
-
-
-def test_the_v3_layout_is_applios():
-    periods, resolutions, strides = DISCRIMINATOR_VERSIONS["v3"]
-    assert periods == [2, 3, 5, 7, 11]
-    assert resolutions == [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]]
-    assert strides == (1, 1, 1)
-    assert DISCRIMINATOR_VERSIONS["v2"][0] == [2, 3, 5, 7, 11, 17, 23, 37]
-    assert DISCRIMINATOR_VERSIONS["v2"][1] == []
 
 
 def test_v3_builds_the_branches_applio_builds():
@@ -108,7 +95,7 @@ def test_the_default_version_leaves_every_other_vocoder_where_it_was():
 
 def test_an_unknown_version_is_refused():
     with pytest.raises(ValueError):
-        MPD_MSD_Combined(False, version="v4")
+        MPD_MSD_Combined(False, version="v9")
 
 
 def test_the_v3_branches_return_the_shapes_the_loop_expects():
@@ -142,14 +129,17 @@ def test_the_resolution_branch_reads_a_spectrogram():
 # --------------------------------------------------------------------------
 
 
-def test_refinegan_trains_against_the_multi_scale_mel_loss():
-    """Applio sets ``multiscale_mel_loss = True`` for RefineGAN and only for
-    RefineGAN.  The fork selects it by config key rather than by vocoder name,
-    so the config is where this has to be pinned."""
+def test_refinegan2_trains_against_a_single_scale_mel_loss():
+    """Applio picks the multi-scale mel loss for RefineGAN; this config does
+    not.  The two are not interchangeable at the same ``c_mel``: the
+    multi-scale branch divides by three and the single-scale one does not, so
+    the effective weight is 45 here against 15 there.  Pinned in the config
+    because that is where the choice is made -- the fork selects the loss by
+    key rather than by vocoder name."""
 
-    assert json.loads(CONFIG.read_text())["train"]["spectral_loss"] == (
-        "Multi-Scale Mel Loss"
-    )
+    train = json.loads(CONFIG.read_text())["train"]
+    assert train["spectral_loss"] == "L1 Mel Loss"
+    assert train["c_mel"] == 45
 
 
 def test_the_multi_scale_mel_loss_is_applios_when_the_chouwagan_stack_is_off():
@@ -161,7 +151,7 @@ def test_the_multi_scale_mel_loss_is_applios_when_the_chouwagan_stack_is_off():
     from rvc.train.mel_processing import MultiScaleMelSpectrogramLoss
 
     loss = MultiScaleMelSpectrogramLoss(
-        sample_rate=44100, safe_log=False, loss_fn=torch.nn.L1Loss()
+        sample_rate=32000, safe_log=False, loss_fn=torch.nn.L1Loss()
     )
     assert loss.stft_params == [
         (5, 32), (10, 64), (20, 128), (40, 256),
@@ -253,7 +243,7 @@ def test_nothing_in_the_decoder_forces_a_cpu_kernel():
     generator = _generator()
     assert type(generator.upp) is int
     assert getattr(R.SineGenerator.forward, "_torchdynamo_disable", False)
-    assert getattr(R.RefineGANGenerator._decimate, "_torchdynamo_disable", False)
+    assert getattr(R.RefineGAN2Generator._decimate, "_torchdynamo_disable", False)
 
 
 def test_the_decimation_filter_is_unchanged():
@@ -264,7 +254,7 @@ def test_the_decimation_filter_is_unchanged():
 
     import inspect
 
-    source = inspect.getsource(R.RefineGANGenerator._decimate)
+    source = inspect.getsource(R.RefineGAN2Generator._decimate)
     assert "torchaudio.functional.resample" in source
     assert "lowpass_filter_width=64" in source
     assert "beta=14.769656459379492" in source
@@ -278,13 +268,13 @@ def test_the_discriminator_version_is_overridable_from_the_config():
     """
 
     model = json.loads(CONFIG.read_text())["model"]
-    # ``v3l`` is v3's branches with a cheaper frequency stride; ``v3`` restores
+    # ``v4`` is v3's branches with a cheaper frequency stride; ``v3`` restores
     # exact Applio parity.  Either way the layout is v3's, not v2's.
-    assert model["d_version"] in ("v3", "v3l")
+    assert model["d_version"] in ("v3", "v4")
 
     def resolve(config_model):
         # Mirrors ``_build_d_model``: the registry chooses, ``d_version`` wins.
-        version = "v3" if get_discriminator_id("refinegan") == "mpd_msd_v3" else "v2"
+        version = "v3" if get_discriminator_id("refinegan2") == "mpd_msd_v3" else "v2"
         return str(getattr(config_model, "d_version", None) or version)
 
     assert resolve(types.SimpleNamespace()) == "v3"
@@ -312,38 +302,54 @@ def test_the_upsampler_folds_its_gain_into_the_kernel():
         torch.manual_seed(0)
         x = torch.randn(2, 8, 120)
         kernel = plain.expand(8, -1, -1).contiguous()
-        padded = F.pad(x, (module.pad, module.pad), mode="replicate")
+        padded = F.pad(x, (module.pad, module.pad + 1), mode="replicate")
         before = factor * F.conv_transpose1d(
             padded, kernel, stride=factor, padding=module.pad_left, groups=8
         )
-        trim = module.pad_right - module.pad_left
-        if trim:
-            before = before[..., :-trim]
+        before = before[..., : x.shape[-1] * factor]
         assert torch.allclose(module(x), before, atol=1e-5, rtol=1e-5)
 
 
-def test_v3l_is_v3s_layout_with_a_cheaper_frequency_stride():
-    """The fork's variant: striding frequency in the last two layers of
-    ``DiscriminatorR`` (which Applio keeps at full resolution throughout)
-    measurably improves detection of the frame-rate AM defect, but does not
-    move end-to-end step time or peak VRAM, since the discriminator is not
-    the bound half of the step. So both shipped configs keep exact Applio
-    parity (``v3``), and ``v3l`` is pinned here as an override, not a
-    default."""
+def test_v4_is_v3_minus_its_longest_period():
+    """The fork's variant: ``v3`` with the widest period branch dropped and
+    nothing else touched.
+
+    The spectrogram branches keep full frequency resolution on purpose. They
+    are the only part of this discriminator with any resolution above 10 kHz,
+    and the deficit being chased there is a 17-19 dB hole in exactly that band,
+    so cheapening the frequency axis is the one saving that works against the
+    thing the change is for. The longest period is the safe branch to lose
+    instead: a longer period folds at a lower rate, so it says the least about
+    the top octave.
+    """
 
     periods_v3, resolutions_v3, strides_v3 = DISCRIMINATOR_VERSIONS["v3"]
-    periods_v3l, resolutions_v3l, strides_v3l = DISCRIMINATOR_VERSIONS["v3l"]
-    assert periods_v3l == periods_v3
-    assert resolutions_v3l == resolutions_v3
-    assert strides_v3 == (1, 1, 1)
-    assert strides_v3l == (1, 2, 2)
+    periods_v4, resolutions_v4, strides_v4 = DISCRIMINATOR_VERSIONS["v4"]
+    assert periods_v4 == periods_v3[:-1]
+    assert resolutions_v4 == resolutions_v3
+    assert strides_v3 == strides_v4 == (1, 1, 1)
 
-    model = MPD_MSD_Combined(False, version="v3l")
+    model = MPD_MSD_Combined(False, version="v4")
+    branch = [d for d in model.discriminators if isinstance(d, DiscriminatorR)][0]
+    assert [c.stride for c in branch.convs] == [(1, 1), (1, 2), (1, 2), (1, 2), (1, 1)]
+
+    # Dropping a branch *does* change the parameter count, which is the whole
+    # difference from the frequency-strided schedule this name used to mean --
+    # that one was checkpoint-compatible with v3 and this one is not. The
+    # ``discriminator_periods`` key is what turns that into an error message.
+    assert sum(p.numel() for p in model.parameters()) < sum(
+        p.numel() for p in MPD_MSD_Combined(False, version="v3").parameters()
+    )
+
+
+def test_the_frequency_strided_schedule_is_still_reachable():
+    """It stopped being a version, not an option: the probe that justified
+    ``(1, 2, 2)`` still stands, and ``d_frequency_strides`` still names it."""
+
+    model = MPD_MSD_Combined(False, version="v3", frequency_strides=(1, 2, 2))
     branch = [d for d in model.discriminators if isinstance(d, DiscriminatorR)][0]
     assert [c.stride for c in branch.convs] == [(1, 1), (1, 2), (2, 2), (2, 2), (1, 1)]
-
-    # A stride schedule changes the grid, never the parameter count -- so the
-    # two versions stay checkpoint-compatible with each other.
+    # A stride schedule changes the grid, never the parameter count.
     assert sum(p.numel() for p in model.parameters()) == sum(
         p.numel() for p in MPD_MSD_Combined(False, version="v3").parameters()
     )
@@ -356,7 +362,7 @@ def test_the_fine_hop_branch_is_what_catches_the_frame_rate_defect():
     100 Hz is a 10 ms period, and only the ~1 ms hop resolves it -- a coarser
     hop aliases the modulation to DC. The branch reads mirroring in *time*."""
 
-    _, resolutions, _ = DISCRIMINATOR_VERSIONS["v3l"]
+    _, resolutions, _ = DISCRIMINATOR_VERSIONS["v4"]
     hops = sorted(hop for _n_fft, hop, _win in resolutions)
     assert hops[0] == 50
     assert 50 / 44100 * 1000 < 10.0 / 2  # under half the 10 ms period
@@ -382,36 +388,42 @@ def test_the_upsample_schedule_multiplies_to_the_hop(path):
     assert config["train"]["segment_size"] % hop == 0
 
 
-def test_the_32k_config_keeps_the_44k_segment_in_frames():
+def test_the_config_keeps_a_forty_frame_segment():
     """The segment is what the discriminator branches and the mel losses see,
-    and it is a *frame* count that should stay comparable across rates."""
+    and it is a *frame* count -- 40 frames, 0.4 s, whatever the rate.  It used
+    to be checked as an agreement between the 32 and 44.1 kHz configs; with
+    44.1 kHz gone the invariant is the number itself."""
 
     at_32k = json.loads(CONFIG_32K.read_text())
-    at_44k = json.loads(CONFIG.read_text())
 
     def frames(config):
         return config["train"]["segment_size"] // config["data"]["hop_length"]
 
-    assert frames(at_32k) == frames(at_44k) == 40
+    assert frames(at_32k) == 40
     assert at_32k["data"]["sample_rate"] == 32000
-    # The cross-rate invariant is that the two configs agree, not which version
-    # they agree on -- what the discriminator sees has to stay comparable across
-    # rates for the same reason the segment does.
-    assert at_32k["model"]["d_version"] == at_44k["model"]["d_version"]
+    assert at_32k["train"]["segment_size"] == 40 * at_32k["data"]["hop_length"]
 
 
-def test_the_registry_ships_both_rates():
+def test_the_registry_ships_only_32k():
+    """44.1 kHz was removed from RefineGAN.  Pinned so the config directory and
+    the registry cannot drift apart -- a rate listed here with no config is a
+    crash at model construction, and a config with no listing is unreachable."""
+
     from rvc.configs.vocoders import get_vocoder_sample_rates
 
-    assert get_vocoder_sample_rates("refinegan") == [32000, 44100]
+    assert get_vocoder_sample_rates("refinegan2") == [32000]
+    shipped = sorted(
+        int(p.stem) for p in (ROOT / "rvc" / "configs" / "refinegan2").glob("*.json")
+    )
+    assert shipped == get_vocoder_sample_rates("refinegan2")
 
 
-@pytest.mark.parametrize("rate", [32000, 44100])
-def test_the_decoder_writes_the_right_length_at_both_rates(rate):
+@pytest.mark.parametrize("rate", [32000])
+def test_the_decoder_writes_the_right_length(rate):
     from rvc.lib.algorithm.synthesizers import Synthesizer
 
     config = json.loads(
-        (ROOT / "rvc" / "configs" / "refinegan" / ("%d.json" % rate)).read_text()
+        (ROOT / "rvc" / "configs" / "refinegan2" / ("%d.json" % rate)).read_text()
     )
     model = dict(config["model"])
     model.pop("use_spectral_norm", None)
@@ -423,7 +435,7 @@ def test_the_decoder_writes_the_right_length_at_both_rates(rate):
         segment_size=frames,
         use_f0=True,
         sr=rate,
-        vocoder="refinegan",
+        vocoder="refinegan2",
         checkpointing=False,
         **model
     ).eval()
@@ -436,9 +448,12 @@ def test_the_decoder_writes_the_right_length_at_both_rates(rate):
     assert out.shape == (1, 1, frames * hop)
 
 
-def test_an_unsupported_rate_is_still_refused():
+@pytest.mark.parametrize("rate", [44100, 48000])
+def test_an_unsupported_rate_is_still_refused(rate):
     """The hardcoded 44.1 kHz check became a registry lookup; it must not have
-    become nothing at all."""
+    become nothing at all -- and 44.1 kHz is now one of the rates it refuses,
+    which is the cheapest possible proof that the removal reached the code
+    rather than only the config directory."""
 
     from rvc.lib.algorithm.synthesizers import Synthesizer
 
@@ -450,8 +465,8 @@ def test_an_unsupported_rate_is_still_refused():
             spec_channels=config["data"]["filter_length"] // 2 + 1,
             segment_size=40,
             use_f0=True,
-            sr=48000,
-            vocoder="refinegan",
+            sr=rate,
+            vocoder="refinegan2",
             checkpointing=False,
             **model
         )
@@ -493,24 +508,32 @@ def test_the_branch_knobs_are_present_and_inert_by_default(path):
     build the preset its ``d_version`` names."""
 
     model = json.loads(path.read_text())["model"]
-    for key in ("d_resolutions", "d_frequency_strides"):
-        assert key in model and model[key] is None
+    # The three content knobs are derivable from ``d_version`` and are no
+    # longer written out at all; the ``d_use_*`` switches are left absent when
+    # true, since they only ever mean anything as ``false``.
+    for key in ("d_periods", "d_resolutions", "d_frequency_strides"):
+        assert key not in model, f"{key} is derivable from d_version"
     for key in ("d_use_msd", "d_use_periods", "d_use_resolutions"):
         assert model.get(key, True) is True, f"{key} would change the preset"
 
-    built = _build(types.SimpleNamespace(**dict(model, d_use_univhd=False)))
-    preset = MPD_MSD_Combined(model["use_spectral_norm"], version=model["d_version"])
-    # ``d_periods`` is the one content knob that is *not* inert any more -- see
-    # ``test_the_periods_are_scaled_to_the_rate`` -- so what is pinned here is
-    # the branch *layout*, which the scaling leaves alone: same families, same
-    # counts, same order, only different fold frequencies.
+    rate = json.loads(path.read_text())["data"]["sample_rate"]
+    built = _build(types.SimpleNamespace(
+        **dict(model, d_use_univhd=False, sample_rate=rate)))
+    preset = MPD_MSD_Combined(model["use_spectral_norm"],
+                              version=model["d_version"], sample_rate=rate)
     assert [type(a) for a in built.discriminators] == [
         type(b) for b in preset.discriminators
     ]
+    assert built.periods == preset.periods
 
 
 def test_each_family_can_be_replaced_or_turned_off():
-    model = json.loads(CONFIG.read_text())["model"]
+    config = json.loads(CONFIG.read_text())
+    model = dict(config["model"], sample_rate=config["data"]["sample_rate"])
+    n_periods = len(
+        MPD_MSD_Combined(False, version=model["d_version"],
+                         sample_rate=model["sample_rate"]).periods
+    )
 
     def variant(**overrides):
         merged = dict(model, d_use_univhd=False)
@@ -518,7 +541,7 @@ def test_each_family_can_be_replaced_or_turned_off():
         return _build(types.SimpleNamespace(**merged))
 
     assert [type(d) for d in variant(d_use_msd=False).discriminators] == (
-        [DiscriminatorP] * 5 + [DiscriminatorR] * 3
+        [DiscriminatorP] * n_periods + [DiscriminatorR] * 3
     )
     assert [type(d) for d in variant(d_periods=[2, 3]).discriminators] == (
         [DiscriminatorS] + [DiscriminatorP] * 2 + [DiscriminatorR] * 3
@@ -526,7 +549,7 @@ def test_each_family_can_be_replaced_or_turned_off():
     # An empty list means "none of this family" -- the distinction a falsy
     # check loses, and the reason ``setting`` tests against ``None``.
     assert [type(d) for d in variant(d_resolutions=[]).discriminators] == (
-        [DiscriminatorS] + [DiscriminatorP] * 5
+        [DiscriminatorS] + [DiscriminatorP] * n_periods
     )
     assert variant(d_frequency_strides=[1, 1, 1]).frequency_strides == (1, 1, 1)
     assert variant(d_resolutions=[[512, 50, 240]]).resolutions == ((512, 50, 240),)
@@ -544,7 +567,7 @@ def test_a_malformed_resolution_is_refused():
 
 def test_the_branches_still_run_when_the_families_are_edited():
     model = MPD_MSD_Combined(
-        False, version="v3l", periods=[2], resolutions=[[512, 50, 240]], use_msd=False
+        False, version="v4", periods=[2], resolutions=[[512, 50, 240]], use_msd=False
     ).eval()
     real = torch.randn(2, 1, 17640) * 0.1
     fake = torch.randn(2, 1, 17640) * 0.1
@@ -560,7 +583,7 @@ def test_the_branches_still_run_when_the_families_are_edited():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast needs CUDA")
 @pytest.mark.parametrize(
-    "vocoder,rate", [("refinegan", 32000), ("refinegan", 44100)]
+    "vocoder,rate", [("refinegan2", 32000)]
 )
 def test_a_step_survives_fp16_autocast(vocoder, rate):
     """``train.py`` has driven ``use_fp16`` through ``autocast`` and a
@@ -594,7 +617,7 @@ def test_a_step_survives_fp16_autocast(vocoder, rate):
         .cuda()
         .train()
     )
-    net_d = MPD_MSD_Combined(False, version=model.get("d_version", "v3l"))
+    net_d = MPD_MSD_Combined(False, version=model.get("d_version", "v4"))
     net_d = net_d.cuda().train()
 
     decoder = net_g.dec
@@ -631,7 +654,12 @@ def test_one_boolean_per_family_turns_it_off():
     "off" should not require writing out an empty list -- and ``d_use_msd`` was
     already a boolean, so the other two being lists was simply inconsistent."""
 
-    model = json.loads(CONFIG.read_text())["model"]
+    config = json.loads(CONFIG.read_text())
+    model = dict(config["model"], sample_rate=config["data"]["sample_rate"])
+    n_periods = len(
+        MPD_MSD_Combined(False, version=model["d_version"],
+                         sample_rate=model["sample_rate"]).periods
+    )
 
     def kinds(**overrides):
         # UnivHD is not one of the families this is about, and it appends a
@@ -642,8 +670,12 @@ def test_one_boolean_per_family_turns_it_off():
         return [type(d) for d in _build(types.SimpleNamespace(**merged)).discriminators]
 
     assert kinds(d_use_periods=False) == [DiscriminatorS] + [DiscriminatorR] * 3
-    assert kinds(d_use_resolutions=False) == [DiscriminatorS] + [DiscriminatorP] * 5
-    assert kinds(d_use_msd=False) == [DiscriminatorP] * 5 + [DiscriminatorR] * 3
+    assert kinds(d_use_resolutions=False) == (
+        [DiscriminatorS] + [DiscriminatorP] * n_periods
+    )
+    assert kinds(d_use_msd=False) == (
+        [DiscriminatorP] * n_periods + [DiscriminatorR] * 3
+    )
     # Off wins over the content key: the two answer different questions, and a
     # leftover list must not resurrect a family someone switched off.
     assert kinds(d_use_periods=False, d_periods=[2, 3]) == (
@@ -736,3 +768,110 @@ def test_forward_still_differentiates_the_real_side_by_default():
     real = torch.randn(2, 1, 4096)
     real_logits, _, _, _ = model(real, torch.randn(2, 1, 4096))
     assert all(logits.requires_grad for logits in real_logits)
+
+
+# --------------------------------------------------------------------------
+# the light period branch
+# --------------------------------------------------------------------------
+
+
+def test_fast_mpd_is_off_unless_asked_for():
+    """The *constructor* default is off, so an absent key builds the branches
+    every existing discriminator was trained with.
+
+    What the shipped config chooses is a separate question and is deliberately
+    not asserted here -- it is a tuning decision that moves, while "absent
+    means the old behaviour" is the contract that must not.
+    """
+
+    from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (
+        FastDiscriminatorP,
+    )
+
+    default = MPD_MSD_Combined(False, version="v4", sample_rate=32000)
+    assert default.use_fast_mpd is False
+    assert not any(isinstance(b, FastDiscriminatorP) for b in default.discriminators)
+
+    # And the trainer's own default agrees with the constructor's.
+    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
+    assert 'setting("d_use_fast_mpd", False)' in source
+
+
+def test_fast_mpd_swaps_the_period_family_and_nothing_else():
+    """A capacity swap, not a layout change: same branches in the same order,
+    same six feature maps per period branch, so the feature-matching loss keeps
+    its shape and only its width changes."""
+
+    from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (
+        FastDiscriminatorP,
+    )
+
+    common = dict(version="v4", sample_rate=32000, use_univhd=True)
+    stock = MPD_MSD_Combined(False, use_fast_mpd=False, **common)
+    fast = MPD_MSD_Combined(False, use_fast_mpd=True, **common)
+
+    def layout(model):
+        """Branch families in order, with both period classes as one family."""
+        return [
+            "period" if isinstance(b, (DiscriminatorP, FastDiscriminatorP))
+            else type(b).__name__
+            for b in model.discriminators
+        ]
+
+    assert layout(stock) == layout(fast)
+    assert [type(b) for b in fast.discriminators
+            if isinstance(b, (DiscriminatorP, FastDiscriminatorP))] == (
+        [FastDiscriminatorP] * len(fast.periods)
+    )
+    assert [type(b) for b in stock.discriminators
+            if isinstance(b, (DiscriminatorP, FastDiscriminatorP))] == (
+        [DiscriminatorP] * len(stock.periods)
+    )
+
+    audio = torch.randn(2, 1, 12800)
+    other = torch.randn(2, 1, 12800)
+    with torch.no_grad():
+        _, _, fmap_stock, _ = stock(audio, other)
+        _, _, fmap_fast, _ = fast(audio, other)
+    assert [len(f) for f in fmap_stock] == [len(f) for f in fmap_fast]
+
+
+def test_fast_mpd_is_where_the_parameters_are():
+    """The period family is 32.88 M of a v4 discriminator's 38.81 M, which is
+    why this is the lever that matters for memory.  Measured end to end at
+    32 kHz, batch 8, eager: 631.7 ms / 4528 MiB becomes 623.5 / 3769."""
+
+    common = dict(version="v4", sample_rate=32000, use_univhd=True)
+    stock = sum(p.numel() for p in
+                MPD_MSD_Combined(False, use_fast_mpd=False, **common).parameters())
+    fast = sum(p.numel() for p in
+               MPD_MSD_Combined(False, use_fast_mpd=True, **common).parameters())
+    assert stock / fast > 4.0
+    assert fast < 10e6
+
+
+def test_the_swap_cannot_load_the_wrong_checkpoint():
+    """No separate guard for this one: every period branch changes shape, so a
+    strict load raises on its own.  Pinned so that stays true -- the periods
+    needed an explicit key precisely because they *do not* change any shape."""
+
+    common = dict(version="v4", sample_rate=32000)
+    stock = MPD_MSD_Combined(False, use_fast_mpd=False, **common)
+    fast = MPD_MSD_Combined(False, use_fast_mpd=True, **common)
+    with pytest.raises(RuntimeError):
+        fast.load_state_dict(stock.state_dict(), strict=True)
+
+
+def test_the_trainer_reads_the_flag():
+    import ast
+
+    tree = ast.parse((ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8"))
+    names = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "setting"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    assert "d_use_fast_mpd" in names

@@ -131,7 +131,7 @@ def envelope_loss(
     """Positive and negative max-pool envelope MAE on companded amplitude.
 
     ``kernel_size``/``stride`` set the timescale the envelope is measured on.
-    The 5/3 default is roughly a 100 us window at 44.1 kHz, which is tight
+    The 5/3 default is roughly a 160 us window at 32 kHz, which is tight
     enough to act like a waveform loss.  RefineGAN randomises the phase of the
     NSF overtones every step, so a sample-exact waveform is not a reachable
     target: pass a millisecond-scale window (e.g. 100/50) to constrain the

@@ -411,6 +411,16 @@ if __name__ == "__main__":
             f"{vocoder_arch} does not provide a configuration for {sample_rate} Hz."
         )
     embedder_model = sys.argv[7]
+    # ``spin_v1`` was retired as a training choice.  Refused here rather than
+    # dropped from the UI alone, because a stale experiment config or a copied
+    # command line would otherwise extract against it silently.  Inference is
+    # untouched: the embedder is read off the checkpoint, so models already
+    # trained against spin_v1 still run.
+    if embedder_model == "spin_v1":
+        raise ValueError(
+            "spin_v1 can no longer be used for training; choose contentvec, "
+            "spin_v2 or custom. Existing spin_v1 models still run at inference."
+        )
     embedder_model_custom = sys.argv[8] if len(sys.argv) > 8 else None
     include_mutes = int(sys.argv[9]) if len(sys.argv) > 9 else 2
     remove_16k_slices = sys.argv[10].lower() == "true" if len(sys.argv) > 10 else False

@@ -49,7 +49,7 @@ def test_hifigan_is_the_only_architecture_the_guard_can_reach():
         return spec.get("gaussian_architecture_id") or spec["architecture_id"]
 
     assert architecture("hifi") == "hifi_gan_nsf_v1"
-    assert architecture("refinegan") == "vits_gaussian_v1"
+    assert architecture("refinegan2") == "vits_gaussian_v1"
 
 
 def test_an_absent_id_is_not_a_mismatch_on_the_pretrained_path():

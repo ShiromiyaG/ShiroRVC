@@ -511,7 +511,7 @@ def train_tab():
                     normalization_mode = gr.Radio(
                         label=_("Loudness Normalization"),
                         info=_(NORMALIZATION_INFO),
-                        choices=["none", "post_peak", "post_peak_rvc", "post_rms"],
+                        choices=["none", "post_peak", "pre_loudness"],
                         value="post_peak",
                         interactive=True,
                         visible=True,
@@ -520,7 +520,7 @@ def train_tab():
             with gr.Row():
                 rms_norm_db = gr.Slider(
                     -24.0, -3.0, -18.0, step=1.0,
-                    label=_("RMS Target (dBFS)"),
+                    label=_("Target Level (LUFS)"),
                     info=_(PREPROCESS_RMS_VALUE_INFO),
                     interactive=True,
                     visible=False,
@@ -637,7 +637,6 @@ def train_tab():
                 info=_("Model used for speaker features."),
                 choices=[
                     "contentvec",
-                    "spin_v1",
                     "spin_v2",
                     "custom",
                 ],
@@ -1270,7 +1269,9 @@ def train_tab():
                 return gr.update(visible=bool(noise_reduction))
 
             def toggle_rms_norm_slider(norm_mode):
-                return gr.update(visible=norm_mode == "post_rms")
+                return gr.update(
+                    visible=norm_mode in ("post_rms", "post_loudness", "pre_loudness")
+                )
 
             saved_components.extend([
                 # Model settings
@@ -1381,7 +1382,6 @@ def train_tab():
                     "48000": 0.36,
                     "40000": 0.38,
                     "32000": 0.40,
-                    "44100": 0.37,
                 }.get(sr, 0.36),
                 inputs=[sampling_rate],
                 outputs=[overlap_len],

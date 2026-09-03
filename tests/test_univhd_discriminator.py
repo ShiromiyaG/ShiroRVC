@@ -35,8 +35,7 @@ from rvc.lib.algorithm.discriminators.single.univhd import (  # noqa: E402
 )
 
 CONFIGS = [
-    ROOT / "rvc" / "configs" / "refinegan" / "32000.json",
-    ROOT / "rvc" / "configs" / "refinegan" / "44100.json",
+    ROOT / "rvc" / "configs" / "refinegan2" / "32000.json",
 ]
 
 
