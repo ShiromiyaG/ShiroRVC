@@ -34,6 +34,25 @@ DISCRIMINATOR_COMPILE_RUNTIME_FAILED = (
     "Discriminator compilation failed; continuing in eager mode:"
 )
 
+FRONTEND_COMPILE_NOT_SUPPORTED = (
+    "Frontend compilation ignored: this synthesizer does not support it."
+)
+FRONTEND_COMPILE_NO_CUDA = (
+    "Frontend compilation ignored: CUDA is unavailable."
+)
+FRONTEND_COMPILE_ENABLED = (
+    "Frontend compilation enabled with mode '{mode}'. The prior, posterior "
+    "and flow build their graphs on the first batches; unlike the decoder "
+    "they see variable lengths, so expect a few recompiles before the step "
+    "time settles."
+)
+FRONTEND_COMPILE_ENABLE_FAILED = (
+    "Frontend compilation could not be enabled:"
+)
+FRONTEND_COMPILE_RUNTIME_FAILED = (
+    "Frontend compilation failed; continuing in eager mode:"
+)
+
 VOCODER_COMPILE_CLI_HELP = "Compile the selected vocoder decoder during training."
 TORCH_COMPILE_MODE_CLI_HELP = "Torch compile mode used for the vocoder decoder."
 

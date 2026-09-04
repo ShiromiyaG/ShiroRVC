@@ -15,6 +15,8 @@ from rvc.configs.vocoders import (
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
 from rvc.lib.terminal import info, warning
 from rvc.train.messages import (
+    FRONTEND_COMPILE_ENABLE_FAILED,
+    FRONTEND_COMPILE_RUNTIME_FAILED,
     VOCODER_COMPILE_ENABLE_FAILED,
     VOCODER_COMPILE_RUNTIME_FAILED,
 )
@@ -298,6 +300,83 @@ class Synthesizer(torch.nn.Module):
         self._decoder_compile_enabled = True
         self._decoder_compile_mode = mode
         return True
+
+    def enable_frontend_compile(self, mode: str = "default") -> bool:
+        """Compile the prior, posterior and flow -- the half the decoder is not.
+
+        ``compile_vocoder`` reaches ``self.dec`` only, and the decoder is not
+        where the eager time goes.  ATen dispatches on a batch-1 forward, caches
+        warm: ``dec`` 1199, ``enc_p`` 498, ``enc_q`` 353, ``flow`` 292.  With
+        the decoder compiled, these three *are* the generator's remaining
+        Python-side cost, and the step is dispatch-bound.
+
+        ``dynamic=None``, not the decoder's ``dynamic=False``.  The decoder is
+        handed a fixed ``segment_size`` slice, so specialising on one shape is
+        free; these three read ``spec`` at the batch's own padded length, which
+        changes from batch to batch.  ``False`` would recompile per distinct
+        length and spend more on compilation than the graphs ever return.
+        ``None`` lets Dynamo specialise on the first shape and generalise on the
+        second, which is the behaviour this wants.
+
+        Off by default and unmeasured: it is three graphs over code with
+        masking, variable lengths and a sampling step, none of which the
+        decoder's graph has to survive.  Each module is wrapped independently so
+        one that cannot be traced falls back on its own rather than taking the
+        other two with it.
+        """
+
+        if getattr(self, "_frontend_compile_enabled", False):
+            return getattr(self, "_frontend_compile_mode", mode) == mode
+
+        modules = [
+            module
+            for module in (self.enc_p, self.enc_q, self.flow)
+            if module is not None
+        ]
+        if not modules:
+            return False
+
+        enabled = False
+        for module in modules:
+            eager_forward = module.forward
+            try:
+                compiled_forward = torch.compile(
+                    eager_forward, dynamic=None, mode=mode
+                )
+            except Exception as error:
+                warning(
+                    f"{FRONTEND_COMPILE_ENABLE_FAILED} {error}\n"
+                    f"{traceback.format_exc()}",
+                    tag="[INIT]",
+                )
+                continue
+
+            def training_forward(
+                *args, _module=module, _eager=eager_forward, _compiled=compiled_forward,
+                **kwargs,
+            ):
+                # The defaults bind this iteration's module; a closure over the
+                # loop variable would give every wrapper the last one.
+                if not _module.training or getattr(_module, "_compile_failed", False):
+                    return _eager(*args, **kwargs)
+                try:
+                    return _compiled(*args, **kwargs)
+                except Exception as error:
+                    _module._compile_failed = True
+                    warning(
+                        f"{FRONTEND_COMPILE_RUNTIME_FAILED} {error}\n"
+                        f"{traceback.format_exc()}",
+                        tag="[TRAIN]",
+                    )
+                    return _eager(*args, **kwargs)
+
+            module.forward = training_forward
+            enabled = True
+
+        if enabled:
+            self._frontend_compile_enabled = True
+            self._frontend_compile_mode = mode
+        return enabled
 
     def __prepare_scriptable__(self):
         self.remove_weight_norm()

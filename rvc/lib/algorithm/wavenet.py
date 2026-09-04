@@ -87,7 +87,6 @@ class WaveNet(torch.nn.Module):
         self, x: torch.Tensor, x_mask: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
         output = torch.zeros_like(x)
-        n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
         if g is not None:
             g = self.cond_layer(g)
@@ -102,7 +101,7 @@ class WaveNet(torch.nn.Module):
             else:
                 g_l = torch.zeros_like(x_in)
 
-            acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, n_channels_tensor)
+            acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, self.hidden_channels)
             acts = self.drop(acts)
 
             res_skip_acts = res_skip_layer(acts)

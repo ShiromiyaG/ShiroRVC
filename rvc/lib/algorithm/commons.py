@@ -112,11 +112,21 @@ def subsequent_mask(length):
 
 
 @torch.jit.script
-def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
-    n_channels_int = n_channels[0]
+def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels: int):
+    """``n_channels`` is a plain ``int``, not a one-element tensor.
+
+    VITS passes a ``torch.IntTensor([hidden_channels])`` here and reads
+    ``n_channels[0]`` back out to slice with, which this fork inherited.  That
+    is an allocation plus a ``select`` plus an ``aten._local_scalar_dense`` per
+    WaveNet layer -- 28 scalar extractions per generator forward, measured, for
+    a number that was a Python ``int`` at the call site all along.  Under
+    ``torch.compile`` it is worse than wasteful: reading a scalar out of a
+    tensor breaks the graph, once per WaveNet forward.
+    """
+
     in_act = input_a + input_b
-    t_act = torch.tanh(in_act[:, :n_channels_int, :])
-    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    t_act = torch.tanh(in_act[:, :n_channels, :])
+    s_act = torch.sigmoid(in_act[:, n_channels:, :])
     acts = t_act * s_act
     return acts
 

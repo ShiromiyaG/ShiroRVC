@@ -12,6 +12,8 @@
         "lr_decay": 0.999875,
         "lr_final_ratio": 0.25,
         "rolling_loss_steps": 50,
+        "compile_discriminator": true,
+        "compile_frontend": false,
         "validation_preview_dpi": 67,
         "validation_preview_width": 24.0,
         "validation_preview_height": 5.8,

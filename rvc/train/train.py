@@ -59,6 +59,9 @@ from rvc.train.messages import (
     DISCRIMINATOR_COMPILE_ENABLED,
     DISCRIMINATOR_COMPILE_NO_CUDA,
     DISCRIMINATOR_COMPILE_NOT_SUPPORTED,
+    FRONTEND_COMPILE_ENABLED,
+    FRONTEND_COMPILE_NO_CUDA,
+    FRONTEND_COMPILE_NOT_SUPPORTED,
     VOCODER_COMPILE_ENABLED,
     VOCODER_COMPILE_NO_CUDA,
     VOCODER_COMPILE_NOT_SUPPORTED,
@@ -1432,6 +1435,41 @@ def enable_vocoder_compile(net_g, device, rank):
     return enabled
 
 
+def enable_frontend_compile(net_g, config, device, rank):
+    """Compile the prior/posterior/flow, driven by ``compile_frontend``.
+
+    In the config rather than the run spec, for the same reason as
+    ``compile_discriminator``: what is compiled travels with the architecture,
+    not with the button the run was started from.  ``torch_compile_mode`` is not
+    consulted here either -- ``reduce-overhead`` records CUDA graphs, and these
+    modules see a different length almost every batch.
+    """
+
+    if not bool(getattr(config.train, "compile_frontend", False)):
+        return False
+    if device.type != "cuda":
+        if rank == 0:
+            info(FRONTEND_COMPILE_NO_CUDA, tag="[INIT]")
+        return False
+
+    cache_dir = os.path.join(current_dir, "logs", ".torchinductor")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
+
+    model = net_g.module if hasattr(net_g, "module") else net_g
+    enable = getattr(model, "enable_frontend_compile", None)
+    if enable is None:
+        if rank == 0:
+            info(FRONTEND_COMPILE_NOT_SUPPORTED, tag="[INIT]")
+        return False
+    enabled = enable(mode="default")
+    if not enabled and rank == 0:
+        info(FRONTEND_COMPILE_NOT_SUPPORTED, tag="[INIT]")
+    if enabled and rank == 0:
+        info(FRONTEND_COMPILE_ENABLED.format(mode="default"), tag="[INIT]")
+    return enabled
+
+
 def enable_discriminator_compile(net_d, config, device, rank):
     """Compile the discriminator, driven by ``compile_discriminator`` in the
     config (not a run-spec flag, since it travels with the architecture).
@@ -2179,6 +2217,7 @@ def run(
     )
 
     enable_vocoder_compile(net_g, device, rank)
+    enable_frontend_compile(net_g, config, device, rank)
     enable_discriminator_compile(net_d, config, device, rank)
 
     # GradScaler for FP16 AMP.  The init_scale is set high to avoid an early

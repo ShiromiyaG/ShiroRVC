@@ -1,4 +1,5 @@
 import math
+import traceback
 
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,11 @@ from torch.nn.utils.parametrizations import spectral_norm, weight_norm
 
 from rvc.lib.algorithm.commons import get_padding
 from rvc.lib.algorithm.residuals import LRELU_SLOPE
+from rvc.train.messages import (
+    DISCRIMINATOR_COMPILE_ENABLE_FAILED,
+    DISCRIMINATOR_COMPILE_RUNTIME_FAILED,
+)
+from rvc.lib.terminal import warning
 
 #: Applio's branch layouts, under their names so a diff is a diff.  ``v2`` is
 #: HiFi-GAN's; ``v3`` trades its three widest period branches for three
@@ -233,6 +239,67 @@ class MPD_MSD_Combined(torch.nn.Module):
                 "the periods and the resolutions were all turned off."
             )
         self.discriminators = torch.nn.ModuleList(branches)
+
+    def enable_compile(self, mode: str = "default") -> bool:
+        """Compile the paired real/fake forward, replacing ``forward`` in place.
+
+        ``train.py`` looks this method up with ``getattr(model, "enable_compile",
+        None)`` and silently reports "not supported" when it is missing, which
+        is what ``compile_discriminator`` did for every run after the ChouwaGAN
+        discriminator -- the only class that ever defined it -- was removed.
+
+        Worth compiling: at batch 1 over 0.4 s this forward dispatches 558 ATen
+        ops, and the training step runs it twice (once for the discriminator
+        update, once with ``no_grad_real`` for the generator's), so 1116 of the
+        ~2283 the step still spends outside the compiled decoder are here.  Of
+        those 558, 132 are ``_weight_norm_interface`` -- the parametrisation
+        recomputing ``g * v / ||v||`` for every convolution on every forward,
+        which is exactly what a fused graph stops paying separately.
+
+        ``no_grad_real`` is a Python ``bool``, so Dynamo guards on it and keeps
+        one graph per value rather than branching inside either.  Checkpointing
+        is the case that is *not* compiled: it is a fallback for a card that
+        cannot hold the activations, and pairing it with compilation trades a
+        known-good path for an untested one.
+        """
+
+        if getattr(self, "_compile_enabled", False):
+            return getattr(self, "_compile_mode", mode) == mode
+
+        eager_forward = self.forward
+        try:
+            compiled_forward = torch.compile(eager_forward, dynamic=False, mode=mode)
+        except Exception as error:
+            warning(
+                f"{DISCRIMINATOR_COMPILE_ENABLE_FAILED} {error}\n"
+                f"{traceback.format_exc()}",
+                tag="[INIT]",
+            )
+            return False
+        compile_failed = False
+
+        def training_forward(*args, **kwargs):
+            nonlocal compile_failed
+            if not self.training or compile_failed or self.use_checkpointing:
+                return eager_forward(*args, **kwargs)
+            try:
+                return compiled_forward(*args, **kwargs)
+            except Exception as error:
+                compile_failed = True
+                # The traceback, for the same reason the decoder's fallback
+                # keeps one: this fires once and then stays eager, so without
+                # it the run reports a failure nobody can act on.
+                warning(
+                    f"{DISCRIMINATOR_COMPILE_RUNTIME_FAILED} {error}\n"
+                    f"{traceback.format_exc()}",
+                    tag="[TRAIN]",
+                )
+                return eager_forward(*args, **kwargs)
+
+        self.forward = training_forward
+        self._compile_enabled = True
+        self._compile_mode = mode
+        return True
 
     def forward(self, y, y_hat, no_grad_real: bool = False):
         """``no_grad_real`` runs the real branch under ``no_grad``.
