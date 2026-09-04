@@ -98,13 +98,17 @@
         "refinegan2_start_channels": 16,
         "refinegan2_leaky_relu_slope": 0.2,
         "refinegan2_antialias_stages": [
+            0,
             1,
             2
         ],
         "refinegan2_antialias": "adain",
         "refinegan2_antialias_rates": [
+            100,
+            500,
             2000,
-            8000
+            8000,
+            32000
         ],
         "refinegan2_source_gain": true,
         "architecture_id": "vits_gaussian_v1"

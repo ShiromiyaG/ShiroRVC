@@ -453,9 +453,10 @@ class RefineGAN2Generator(nn.Module):
             ``loop_rates``. This is the knob that matters: it selects by the
             rate a nonlinearity actually runs at, so it can reach the
             ``downs[]`` activation at 8 kHz where the fold at ``8000 - k*f0``
-            is created. Protecting every rate the decoder has costs 12% of the
-            step against raw activations; the shipped config does that.
-            Defaults to none.
+            is created, and naming ``sample_rate`` also covers the activation
+            before ``conv_post``. Protecting every rate the decoder has costs
+            12% of the step against raw activations; the shipped config does
+            that. Defaults to none.
         antialias_stages (Sequence[int], optional): Which upsampling stages get
             anti-aliased activations in their residual blocks. Defaults to none,
             and the shipped config leaves it there: it addresses the residual
@@ -571,6 +572,24 @@ class RefineGAN2Generator(nn.Module):
                 else nn.Identity()
                 for rate in self.up_rates
             ]
+        )
+
+        # The last nonlinearity before ``conv_post``, which runs at the output
+        # rate and folds about the output Nyquist -- so whatever it creates
+        # lands in the render with one convolution left to traverse, the
+        # shortest path any site in this decoder has.  Nothing reached it:
+        # ``antialias_stages`` indexes the residual blocks and
+        # ``antialias_rates`` indexed the two loops' lists, and this activation
+        # is in neither.  It follows ``sample_rate in antialias_rates``, which
+        # is ``down_rates[0]`` -- the same rate as ``downs[0]``, and the two are
+        # the only sites at the output rate outside the last stage's blocks --
+        # rather than getting a flag of its own: a decoder that protects the
+        # output rate everywhere except the one place it reaches the output
+        # would be the same trap ``AdaIN`` was.
+        self.out_activation = (
+            AntiAliasedActivation(leaky_relu_slope=leaky_relu_slope)
+            if int(sample_rate) in protected
+            else nn.Identity()
         )
 
         # ``int``, not the ``np.int64`` ``np.prod`` returns.  Dynamo wraps a
@@ -814,7 +833,11 @@ class RefineGAN2Generator(nn.Module):
                 x = torch.cat([x, down], dim=1)
                 x = res(x)
 
-        x = F.leaky_relu(x, self.leaky_relu_slope)
+        x = (
+            F.leaky_relu(x, self.leaky_relu_slope)
+            if isinstance(self.out_activation, nn.Identity)
+            else self.out_activation(x)
+        )
         x = self.conv_post(x)
         x = torch.tanh(x)
 

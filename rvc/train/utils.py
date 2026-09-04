@@ -294,6 +294,22 @@ def antialias_adain(decoder):
     return None if not found else bool(any(found))
 
 
+def antialias_output(decoder):
+    """Whether the activation before ``conv_post`` is anti-aliased.
+
+    It follows ``sample_rate in antialias_rates``, so it is implied by a field
+    the layout already carries -- but only for a checkpoint written after the
+    activation existed.  One written before with the output rate protected has
+    the same ``antialias_rates`` and a raw activation at the site with the
+    shortest path to the render, which is exactly the mismatch this file is for.
+    """
+
+    activation = getattr(decoder, "out_activation", None)
+    if activation is None:
+        return None
+    return not isinstance(activation, torch.nn.Identity)
+
+
 def antialias_filter(decoder):
     """The anti-aliased activations' filter design, or ``None`` when there are none.
 
@@ -345,6 +361,7 @@ def decoder_layout(model):
         # mismatch every other such run over one.
         "antialias_filter": antialias_filter(decoder),
         "antialias_adain": antialias_adain(decoder),
+        "antialias_output": antialias_output(decoder),
         # Imaging, not aliasing: what the interpolation filter leaves of the
         # spectral copies zero-stuffing makes.  No ``antialias_*`` option
         # touches it, and it is just as invisible to ``load_state_dict``.
@@ -373,11 +390,16 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             "antialias_filter": None,
             "upsample_filter": None,
             "antialias_adain": False,
+            "antialias_output": False,
         }
     design = found.get("antialias_filter") or None
     imaging = found.get("upsample_filter") or None
     # Absent means raw, which is what every run before the flag existed had.
     adain = bool(found.get("antialias_adain", False))
+    # Absent means raw, which is what every run before the activation existed
+    # had -- including one whose ``antialias_rates`` already named the output
+    # rate for the sake of ``downs[0]``.
+    output = bool(found.get("antialias_output", False))
     found = {
         "upsample_rates": [int(r) for r in found.get("upsample_rates", [])],
         "antialias_stages": [int(s) for s in found.get("antialias_stages", [])],
@@ -422,6 +444,9 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
     found["antialias_adain"] = (
         None if expected["antialias_adain"] is None else adain
     )
+    found["antialias_output"] = (
+        None if expected["antialias_output"] is None else output
+    )
     if found != expected:
         raise ValueError(
             f"Decoder layout mismatch: this run builds {expected} but the "
@@ -434,6 +459,10 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             f"``antialias_adain`` says whether the stages' AdaIN activations "
             f"are anti-aliased; it follows refinegan2_antialias and is False in "
             f"every checkpoint written before 2026-09-03. "
+            f"``antialias_output`` says whether the activation before "
+            f"conv_post is anti-aliased; it follows sample_rate being in "
+            f"refinegan2_antialias_rates and is False in every checkpoint "
+            f"written before that activation existed. "
             f"``antialias_filter`` is "
             f"[factor, width, rolloff, beta] and is a constructor default of "
             f"AntiAliasedActivation; ``upsample_filter`` is "

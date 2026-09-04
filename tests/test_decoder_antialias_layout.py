@@ -243,6 +243,9 @@ def test_the_layout_round_trips_through_a_checkpoint():
         "antialias_rates": [],
         "antialias_filter": [2, 16, 0.99, 6.0],
         "antialias_adain": True,
+        # No rate is protected here, so the activation before ``conv_post`` is
+        # raw too: it follows ``sample_rate in antialias_rates``.
+        "antialias_output": False,
         # Heavy interpolation filter on the last stage only: it is the one
         # whose image reaches the output (path gain -19.9 dB against -49.5
         # and -59.3 for stages 2 and 1) and the one whose input is long
@@ -380,8 +383,18 @@ def test_the_shipped_config_anti_aliases_the_adain_and_nothing_else(sample_rate)
 
         nothing                                    97.8 ms   1832 MiB
         stages[1,2] "adain"                       128.1      2001
-        the same plus rates[2k,8k]                137.8      1944   <- ships
+        the same plus rates[2k,8k]                137.8      1944
         stages[1,2] "full" plus rates[2k,8k]      234.3      2813
+
+    What ships is wider than the last row of that ladder on the cheap axis and
+    narrower on the expensive one -- every loop rate and the output activation,
+    every stage's AdaIN but the last:
+
+        stages[1,2] + rates[2k,8k]                145.7 ms   1848 MiB
+        + every loop rate + conv_post             156.1      1956
+        + stage 0                                 162.9      2059   <- ships
+        + stage 3                                 215.5      2489
+        the same with "half"                      346.0      3631
 
     The loop rates went out on that last render and came back.  Every render
     above is off ``G_8833``, which was trained with no anti-aliasing at all,
@@ -396,19 +409,24 @@ def test_the_shipped_config_anti_aliases_the_adain_and_nothing_else(sample_rate)
 
     down, up = loop_rates(sample_rate, model["upsample_rates"])
     assert model["refinegan2_antialias"] == "adain"
+    # Every rate either loop runs at, which is what makes the ladder above a
+    # statement about the AdaIN rather than about which loop sites were left
+    # raw -- and naming ``sample_rate`` is also what reaches the activation
+    # before ``conv_post``.  All five cost 10 ms more than the two.
+    assert sorted(model["refinegan2_antialias_rates"]) == sorted(set(down) | set(up))
+    assert sample_rate in model["refinegan2_antialias_rates"]
+    # Every stage but the last.  Stage ``count - 1`` runs at the output rate,
+    # where its six AdaIN are 4x the tensor of the 8 kHz stage's: 145.7 ms for
+    # the shipped config against 215.5 with it, batch 8 over 0.4 s, where the
+    # whole rest of the coverage is 17 ms.  It is the one place cost and
+    # coverage disagree by enough to leave a site raw on purpose.
     count = len(model["upsample_rates"])
-    assert model["refinegan2_antialias_stages"] == [count - 3, count - 2]
-    for rate in model["refinegan2_antialias_rates"]:
-        assert rate in down and rate in up
-    # The protected rates are the *output* rates of the protected stages, so
-    # the loop activations either side of each anti-aliased AdaIN are covered.
-    assert sorted(model["refinegan2_antialias_rates"]) == sorted(
+    assert model["refinegan2_antialias_stages"] == list(range(count - 1))
+    # the stages named are the ones running at 500, 2000 and 8000 Hz
+    assert [
         up[stage] * model["upsample_rates"][stage]
         for stage in model["refinegan2_antialias_stages"]
-    )
-    # the stages named are the ones running at 2 and 8 kHz
-    for stage in model["refinegan2_antialias_stages"]:
-        assert up[stage] * model["upsample_rates"][stage] in (2000, 8000)
+    ] == [500, 2000, 8000]
 
 
 def test_an_antialias_rate_no_activation_runs_at_is_refused():
@@ -845,6 +863,45 @@ def test_the_adain_coverage_is_in_the_layout():
     keyless = {k: v for k, v in layout.items() if k != "antialias_adain"}
     with pytest.raises(ValueError, match="Decoder layout mismatch"):
         assert_decoder_layout_matches(covered, {"decoder_layout": keyless})
+
+
+def test_the_output_rate_reaches_the_activation_before_conv_post():
+    """The site with the shortest path to the render, and the one nothing
+    could address: it is in neither loop's ``ModuleList`` and in no residual
+    block, so ``antialias_stages`` and ``antialias_rates`` both missed it."""
+
+    raw = _generator((5, 4, 4, 4), stages=[1, 2], antialias_rates=[2000, 8000])
+    covered = _generator(
+        (5, 4, 4, 4), stages=[1, 2], antialias_rates=[2000, 8000, 32000]
+    )
+    assert isinstance(raw.out_activation, torch.nn.Identity)
+    assert isinstance(covered.out_activation, AntiAliasedActivation)
+    # ...and the same rate covers ``downs[0]``, which is the other site at the
+    # output rate and is concatenated straight into the last stage.
+    assert isinstance(covered.down_activations[0], AntiAliasedActivation)
+
+    # same contract as everything else in this file: no state-dict key
+    assert set(raw.state_dict()) == set(covered.state_dict())
+
+    model = torch.nn.Module()
+    model.dec = covered
+    model.sr = 32000
+    layout = decoder_layout(model)
+    assert layout["antialias_output"] is True
+    assert decoder_layout_of(raw)["antialias_output"] is False
+
+    # a checkpoint from before the activation existed names the same protected
+    # rates and had a raw site there, so absent has to read as False
+    keyless = {k: v for k, v in layout.items() if k != "antialias_output"}
+    with pytest.raises(ValueError, match="antialias_output"):
+        assert_decoder_layout_matches(model, {"decoder_layout": keyless})
+
+
+def decoder_layout_of(decoder):
+    model = torch.nn.Module()
+    model.dec = decoder
+    model.sr = 32000
+    return decoder_layout(model)
 
 
 def test_the_polyphase_upsample_matches_the_transposed_form():
