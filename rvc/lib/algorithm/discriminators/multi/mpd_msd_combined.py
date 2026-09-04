@@ -7,6 +7,7 @@ from torch.utils.checkpoint import checkpoint
 from torch.nn.utils.parametrizations import spectral_norm, weight_norm
 
 from rvc.lib.algorithm.commons import get_padding
+from rvc.lib.algorithm.discriminators.san import SANConv1d, SANConv2d, san_tail
 from rvc.lib.algorithm.residuals import LRELU_SLOPE
 from rvc.train.messages import (
     DISCRIMINATOR_COMPILE_ENABLE_FAILED,
@@ -129,6 +130,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         use_fast_mpd: bool = False,
         sample_rate: int = 32000,
         use_univhd: bool = False,
+        use_san: bool = False,
         univhd_n_fft: int = 2048,
         univhd_hop_length: int = 256,
         univhd_harmonics: int = 10,
@@ -199,14 +201,22 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.use_msd = bool(use_msd)
         self.use_fast_mpd = bool(use_fast_mpd)
         self.use_univhd = bool(use_univhd)
+        # ``train.py`` reads this to decide whether the losses take their SAN
+        # form; it is an attribute rather than a lookup on the branches so a
+        # discriminator that is *asked* for SAN and could not build it cannot
+        # report otherwise.
+        self.use_san = bool(use_san)
+        self.supports_san = self.use_san
         self.sample_rate = int(sample_rate)
         self.use_checkpointing = use_checkpointing
         branches = []
         if self.use_msd:
-            branches.append(DiscriminatorS(use_spectral_norm=use_spectral_norm))
+            branches.append(
+                DiscriminatorS(use_spectral_norm=use_spectral_norm, use_san=self.use_san)
+            )
         period_branch = FastDiscriminatorP if self.use_fast_mpd else DiscriminatorP
         branches += [
-            period_branch(p, use_spectral_norm=use_spectral_norm)
+            period_branch(p, use_spectral_norm=use_spectral_norm, use_san=self.use_san)
             for p in self.periods
         ]
         branches += [
@@ -214,6 +224,7 @@ class MPD_MSD_Combined(torch.nn.Module):
                 list(r),
                 use_spectral_norm=use_spectral_norm,
                 frequency_strides=self.frequency_strides,
+                use_san=self.use_san,
             )
             for r in self.resolutions
         ]
@@ -231,6 +242,7 @@ class MPD_MSD_Combined(torch.nn.Module):
                     channels=int(univhd_channels),
                     half_harmonic=bool(univhd_half_harmonic),
                     use_spectral_norm=use_spectral_norm,
+                    use_san=self.use_san,
                 )
             )
         if not branches:
@@ -301,7 +313,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         self._compile_mode = mode
         return True
 
-    def forward(self, y, y_hat, no_grad_real: bool = False):
+    def forward(self, y, y_hat, no_grad_real: bool = False, san_training: bool = False):
         """``no_grad_real`` runs the real branch under ``no_grad``.
 
         The generator update needs the real side only as a *target*: its logits
@@ -318,22 +330,29 @@ class MPD_MSD_Combined(torch.nn.Module):
         """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
         checkpointing = self.training and self.use_checkpointing
+        # Only the discriminator update asks for the direction output.  In the
+        # generator's pass the direction is not something the generator may
+        # move, so requesting it would build a graph with no consumer -- the
+        # same waste ``no_grad_real`` exists to avoid.
+        san = bool(san_training) and self.use_san
         for d in self.discriminators:
             # The other two arms add no context manager at all, and not
             # ``enable_grad``: an outer ``no_grad`` (the validation path) must
             # stay in force.
             if no_grad_real:
                 with torch.no_grad():
-                    y_d_r, fmap_r = d(y)
+                    y_d_r, fmap_r = d(y, san_training=san)
             elif checkpointing:
-                y_d_r, fmap_r = checkpoint(d, y, use_reentrant=False)
+                y_d_r, fmap_r = checkpoint(d, y, san_training=san, use_reentrant=False)
             else:
-                y_d_r, fmap_r = d(y)
+                y_d_r, fmap_r = d(y, san_training=san)
 
             if checkpointing:
-                y_d_g, fmap_g = checkpoint(d, y_hat, use_reentrant=False)
+                y_d_g, fmap_g = checkpoint(
+                    d, y_hat, san_training=san, use_reentrant=False
+                )
             else:
-                y_d_g, fmap_g = d(y_hat)
+                y_d_g, fmap_g = d(y_hat, san_training=san)
 
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
@@ -346,7 +365,7 @@ class MPD_MSD_Combined(torch.nn.Module):
 class DiscriminatorS(torch.nn.Module):
     """Multi-scale discriminator branch, operating directly on the waveform."""
 
-    def __init__(self, use_spectral_norm: bool = False):
+    def __init__(self, use_spectral_norm: bool = False, use_san: bool = False):
         super().__init__()
 
         norm_f = spectral_norm if use_spectral_norm else weight_norm
@@ -360,18 +379,22 @@ class DiscriminatorS(torch.nn.Module):
                 norm_f(torch.nn.Conv1d(1024, 1024, 5, 1, padding=2)),
             ]
         )
-        self.conv_post = norm_f(torch.nn.Conv1d(1024, 1, 3, 1, padding=1))
+        self.use_san = bool(use_san)
+        # No ``norm_f`` on a SAN head: it normalises its own weight, and the two
+        # reparametrisations would fight over the same tensor.
+        self.conv_post = (
+            SANConv1d(1024, 1, 3, 1, padding=1)
+            if self.use_san
+            else norm_f(torch.nn.Conv1d(1024, 1, 3, 1, padding=1))
+        )
         self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
 
-    def forward(self, x):
+    def forward(self, x, san_training: bool = False):
         fmap = []
         for conv in self.convs:
             x = self.lrelu(conv(x))
             fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-        return x, fmap
+        return san_tail(self, x, fmap, san_training)
 
 
 class DiscriminatorP(torch.nn.Module):
@@ -383,6 +406,7 @@ class DiscriminatorP(torch.nn.Module):
         kernel_size: int = 5,
         stride: int = 3,
         use_spectral_norm: bool = False,
+        use_san: bool = False,
     ):
         super().__init__()
         self.period = period
@@ -407,10 +431,15 @@ class DiscriminatorP(torch.nn.Module):
             ]
         )
 
-        self.conv_post = norm_f(torch.nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
+        self.use_san = bool(use_san)
+        self.conv_post = (
+            SANConv2d(1024, 1, (3, 1), 1, padding=(1, 0))
+            if self.use_san
+            else norm_f(torch.nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
+        )
         self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
 
-    def forward(self, x):
+    def forward(self, x, san_training: bool = False):
         fmap = []
         b, c, t = x.shape
         if t % self.period != 0:
@@ -421,10 +450,7 @@ class DiscriminatorP(torch.nn.Module):
         for conv in self.convs:
             x = self.lrelu(conv(x))
             fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-        return x, fmap
+        return san_tail(self, x, fmap, san_training)
 
 
 class FastDiscriminatorP(torch.nn.Module):
@@ -468,6 +494,7 @@ class FastDiscriminatorP(torch.nn.Module):
         max_channels: int = 256,
         n_layers: int = 4,
         use_spectral_norm: bool = False,
+        use_san: bool = False,
     ):
         super().__init__()
         self.period = period
@@ -499,15 +526,18 @@ class FastDiscriminatorP(torch.nn.Module):
                 padding=(get_padding(kernel_size, 1), 0),
             )
         )
-        self.conv_post = norm_f(
-            torch.nn.Conv2d(in_channels, 1, (3, 1), 1, padding=(1, 0))
+        self.use_san = bool(use_san)
+        self.conv_post = (
+            SANConv2d(in_channels, 1, (3, 1), 1, padding=(1, 0))
+            if self.use_san
+            else norm_f(torch.nn.Conv2d(in_channels, 1, (3, 1), 1, padding=(1, 0)))
         )
         # ``LRELU_SLOPE`` and not KazeFlow's 0.1: this is a capacity swap, and
         # an activation that differs from the branch it replaces would make it
         # two changes wearing one name.
         self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
 
-    def forward(self, x):
+    def forward(self, x, san_training: bool = False):
         fmap = []
         b, c, t = x.shape
         if t % self.period != 0:
@@ -520,10 +550,7 @@ class FastDiscriminatorP(torch.nn.Module):
             fmap.append(x)
         x = self.lrelu(self.conv_final(x))
         fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-        return x, fmap
+        return san_tail(self, x, fmap, san_training)
 
 
 class DiscriminatorR(torch.nn.Module):
@@ -545,6 +572,7 @@ class DiscriminatorR(torch.nn.Module):
         resolution,
         use_spectral_norm: bool = False,
         frequency_strides=(1, 1, 1),
+        use_san: bool = False,
     ):
         super().__init__()
 
@@ -568,7 +596,12 @@ class DiscriminatorR(torch.nn.Module):
             ]
             + [norm_f(torch.nn.Conv2d(32, 32, (3, 3), padding=(1, 1)))]
         )
-        self.conv_post = norm_f(torch.nn.Conv2d(32, 1, (3, 3), padding=(1, 1)))
+        self.use_san = bool(use_san)
+        self.conv_post = (
+            SANConv2d(32, 1, (3, 3), padding=(1, 1))
+            if self.use_san
+            else norm_f(torch.nn.Conv2d(32, 1, (3, 3), padding=(1, 1)))
+        )
 
         # ``win_length`` is fixed at construction, so the boxcar is a constant
         # and was being rebuilt on every call -- three resolution branches,
@@ -594,12 +627,10 @@ class DiscriminatorR(torch.nn.Module):
         )
         return torch.norm(torch.view_as_real(x), p=2, dim=-1)
 
-    def forward(self, x):
+    def forward(self, x, san_training: bool = False):
         fmap = []
         x = self.spectrogram(x).unsqueeze(1)
         for layer in self.convs:
             x = F.leaky_relu(layer(x), self.lrelu_slope)
             fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        return torch.flatten(x, 1, -1), fmap
+        return san_tail(self, x, fmap, san_training)

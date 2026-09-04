@@ -189,7 +189,13 @@ def test_an_unknown_mode_is_refused():
 
 
 def _generator(
-    rates, stages=None, rate=32000, antialias_rates=None, upsample_filter=None
+    rates,
+    stages=None,
+    rate=32000,
+    antialias_rates=None,
+    upsample_filter=None,
+    linear_down_path=False,
+    up_activation_after_upsample=False,
 ):
     return RefineGAN2Generator(
         sample_rate=rate,
@@ -199,6 +205,8 @@ def _generator(
         upsample_initial_channel=512,
         antialias_stages=stages,
         antialias_rates=antialias_rates,
+        linear_down_path=linear_down_path,
+        up_activation_after_upsample=up_activation_after_upsample,
         **(
             {}
             if upsample_filter is None
@@ -239,20 +247,40 @@ def test_the_layout_round_trips_through_a_checkpoint():
         "antialias_stages": [3],
         "antialias": "half",
         "source_gain": False,
+        # ``None`` rather than ``"post"``: this decoder has no gain, so it has
+        # no softplus to place, and a run without one must not mismatch a run
+        # without one over where a module neither of them has would go.
+        "source_gain_order": None,
         "source_bands": 0,
         "antialias_rates": [],
         "antialias_filter": [2, 16, 0.99, 6.0],
+        # The oversampling factor per site group.  ``antialias_filter`` reports
+        # only the first instance in module order, so with the two groups at
+        # different factors it names one of them and these two name both.
+        "antialias_factor": 2,
+        "antialias_rate_factor": 2,
+        # Per stage: the taps are free where the round trip is launch-bound and
+        # about 45% of it at the output-rate shapes.
+        "antialias_width": [16, 16, 16, 16],
+        "antialias_rate_width": 16,
         "antialias_adain": True,
         # No rate is protected here, so the activation before ``conv_post`` is
         # raw too: it follows ``sample_rate in antialias_rates``.
         "antialias_output": False,
-        # Heavy interpolation filter on the last stage only: it is the one
-        # whose image reaches the output (path gain -19.9 dB against -49.5
-        # and -59.3 for stages 2 and 1) and the one whose input is long
-        # enough that a 385-tap kernel costs no edge.
+        # Same contract as ``antialias_output``: implied by the rates, but only
+        # for a checkpoint written after the wrapper existed.
+        "antialias_tanh": False,
+        # Structural, and off: every activation the down loop ever had, each
+        # up activation still ahead of its upsampler.
+        "linear_down_path": False,
+        "up_activation_after_upsample": False,
+        # Interpolation filter that grows with the stage's input length:
+        # stage 0 (40 samples in a training segment) keeps the short kernel,
+        # stages 1-3 get a deeper stopband, since their -37 dB image is not
+        # aliasing and no ``antialias_*`` option removes it downstream.
         "upsample_filter": [
-            [12, 12, 12, 48],
-            [0.9, 0.9, 0.9, 0.99],
+            [12, 24, 32, 48],
+            [0.9, 0.95, 0.97, 0.99],
             [6.0, 6.0, 6.0, 9.0],
         ],
     }
@@ -407,14 +435,27 @@ def test_the_shipped_config_anti_aliases_the_adain_and_nothing_else(sample_rate)
     model = json.loads(CONFIGS[sample_rate].read_text())["model"]
     from rvc.lib.algorithm.generators.refinegan2 import loop_rates
 
-    down, up = loop_rates(sample_rate, model["upsample_rates"])
+    down, up = loop_rates(
+        sample_rate,
+        model["upsample_rates"],
+        linear_down_path=model["refinegan2_linear_down_path"],
+        up_activation_after_upsample=model[
+            "refinegan2_up_activation_after_upsample"
+        ],
+    )
     assert model["refinegan2_antialias"] == "adain"
-    # Every rate either loop runs at, which is what makes the ladder above a
-    # statement about the AdaIN rather than about which loop sites were left
-    # raw -- and naming ``sample_rate`` is also what reaches the activation
-    # before ``conv_post``.  All five cost 10 ms more than the two.
-    assert sorted(model["refinegan2_antialias_rates"]) == sorted(set(down) | set(up))
-    assert sample_rate in model["refinegan2_antialias_rates"]
+    # The ladder above was measured with twelve loop sites, all of them
+    # protected.  The two structural flags deleted or moved every site that
+    # folded into the audible band, so what is left to protect is the output
+    # rate: ``downs[0]``, which rectifies a full-band sine and has no headroom
+    # at all, the activation before ``conv_post``, and the ``tanh``.  Naming a
+    # rate that no longer exists is refused at construction, which is what
+    # keeps this list honest rather than decorative.
+    assert model["refinegan2_antialias_rates"] == [sample_rate]
+    assert sample_rate in set(down) | set(up)
+    # ...and every rate the loops still run at is either the protected one or
+    # one the layout already gave headroom to.
+    assert set(down) == {sample_rate}
     # Every stage but the last.  Stage ``count - 1`` runs at the output rate,
     # where its six AdaIN are 4x the tensor of the 8 kHz stage's: 145.7 ms for
     # the shipped config against 215.5 with it, batch 8 over 0.4 s, where the
@@ -422,10 +463,12 @@ def test_the_shipped_config_anti_aliases_the_adain_and_nothing_else(sample_rate)
     # coverage disagree by enough to leave a site raw on purpose.
     count = len(model["upsample_rates"])
     assert model["refinegan2_antialias_stages"] == list(range(count - 1))
-    # the stages named are the ones running at 500, 2000 and 8000 Hz
+    # The stages named are the ones running at 500, 2000 and 8000 Hz.  A
+    # stage's residual blocks run at its *output* rate, which is what ``up``
+    # now reports directly -- the up activation moved to the same side of the
+    # upsampler as they are on.
     assert [
-        up[stage] * model["upsample_rates"][stage]
-        for stage in model["refinegan2_antialias_stages"]
+        up[stage] for stage in model["refinegan2_antialias_stages"]
     ] == [500, 2000, 8000]
 
 
@@ -534,6 +577,12 @@ def test_an_exported_model_rebuilds_the_same_decoder(sample_rate):
     exported = vocoder_config_from_model(dict(model))
     assert "refinegan2_antialias_stages" in exported
     assert "refinegan2_antialias" in exported
+    # The export is derived from ``Synthesizer``'s signature, so these travel
+    # for free -- but "for free" is exactly the kind of thing that stops being
+    # true silently, and a factor that does not travel renders the exported
+    # model at 2 whatever it trained at.
+    assert "refinegan2_antialias_factor" in exported
+    assert "refinegan2_antialias_rate_factor" in exported
 
     rebuilt = Synthesizer(
         spec_channels=spec_channels,
@@ -776,8 +825,8 @@ def test_the_upsample_schedule_is_heavy_only_where_the_input_is_long():
 
     A long kernel on a short input is worse than a short one: the upsampler
     replicate-pads, so the extra taps read an invented continuation.  Stage 3
-    is both the stage whose image reaches the output and the stage with the
-    most input samples, which is why it is the only one lengthened.
+    has the most input samples and takes the longest kernel; stage 0 has the
+    fewest and keeps the shortest.
     """
 
     from rvc.lib.algorithm.generators.refinegan2 import (
@@ -788,9 +837,13 @@ def test_the_upsample_schedule_is_heavy_only_where_the_input_is_long():
 
     assert len(DEFAULT_UPSAMPLE_WIDTH) == len(DEFAULT_UPSAMPLE_ROLLOFF)
     assert len(DEFAULT_UPSAMPLE_WIDTH) == len(DEFAULT_UPSAMPLE_BETA)
-    # every stage but the last keeps the design it always had
-    assert set(DEFAULT_UPSAMPLE_WIDTH[:-1]) == {12}
-    assert set(DEFAULT_UPSAMPLE_ROLLOFF[:-1]) == {0.90}
+    # stage 0 has 40 input samples in a training segment and keeps the
+    # short kernel; every later stage has more input and a longer filter,
+    # so the schedule is monotone in width and in rolloff
+    assert DEFAULT_UPSAMPLE_WIDTH[0] == 12
+    assert DEFAULT_UPSAMPLE_ROLLOFF[0] == 0.90
+    assert list(DEFAULT_UPSAMPLE_WIDTH) == sorted(DEFAULT_UPSAMPLE_WIDTH)
+    assert list(DEFAULT_UPSAMPLE_ROLLOFF) == sorted(DEFAULT_UPSAMPLE_ROLLOFF)
     assert DEFAULT_UPSAMPLE_WIDTH[-1] > 2 * DEFAULT_UPSAMPLE_WIDTH[0]
     assert DEFAULT_UPSAMPLE_ROLLOFF[-1] > DEFAULT_UPSAMPLE_ROLLOFF[0]
 
@@ -1001,3 +1054,678 @@ def test_adain_mode_covers_only_the_wrappers():
     # half-covered stage impossible to ask for
     counts = [sum(wanted[m]) for m in ANTIALIAS_MODES]
     assert counts == sorted(counts)
+
+
+def _factors(decoder):
+    """Every anti-aliased activation's factor, split by site group."""
+
+    loops = [
+        m.design[0]
+        for group in (decoder.down_activations, decoder.up_activations)
+        for m in group
+        if isinstance(m, AntiAliasedActivation)
+    ]
+    if isinstance(decoder.out_activation, AntiAliasedActivation):
+        loops.append(decoder.out_activation.design[0])
+    inside = set()
+    for block in decoder.upsample_conv_blocks:
+        inside.update(
+            m.design[0]
+            for m in block.modules()
+            if isinstance(m, AntiAliasedActivation)
+        )
+    return sorted(set(loops)), sorted(inside)
+
+
+def test_the_two_site_groups_take_their_own_factor():
+    """The factor is what sets the alias floor, and the groups differ in price.
+
+    The nine loop and output sites are a handful against the stages' dozens,
+    so a factor that is unaffordable inside the res-blocks is affordable there
+    -- which is the whole reason these are two knobs rather than one.
+    """
+
+    decoder = RefineGAN2Generator(
+        sample_rate=32000,
+        upsample_rates=(5, 4, 4, 4),
+        upsample_initial_channel=512,
+        num_mels=192,
+        start_channels=16,
+        gin_channels=256,
+        antialias_stages=(0, 1, 2),
+        antialias="adain",
+        antialias_rates=(100, 500, 2000, 8000, 32000),
+        antialias_factor=2,
+        antialias_rate_factor=3,
+    )
+    loops, inside = _factors(decoder)
+    assert loops == [3]
+    assert inside == [2]
+    assert len(
+        [
+            m
+            for m in list(decoder.down_activations)
+            + list(decoder.up_activations)
+            + [decoder.out_activation]
+            if isinstance(m, AntiAliasedActivation)
+        ]
+    ) == 9
+
+
+def test_the_rate_factor_follows_the_stage_one_when_unset():
+    """A config that names only one of them cannot get the two disagreeing."""
+
+    decoder = RefineGAN2Generator(
+        sample_rate=32000,
+        upsample_rates=(5, 4, 4, 4),
+        upsample_initial_channel=512,
+        num_mels=192,
+        start_channels=16,
+        gin_channels=256,
+        antialias_stages=(0,),
+        antialias="adain",
+        antialias_rates=(8000,),
+        antialias_factor=4,
+    )
+    assert decoder.antialias_rate_factor == 4
+    loops, inside = _factors(decoder)
+    assert loops == [4] and inside == [4]
+
+
+@pytest.mark.parametrize("field", ["antialias_factor", "antialias_rate_factor"])
+def test_a_factor_below_two_is_refused(field):
+    """At 1 the round trip oversamples nothing and is a bare lowpass.
+
+    ``AntiAliasedUpsample1d`` returns its input untouched at factor 1 while
+    ``FixedLowPass1d`` still filters, so the module would quietly become a tone
+    control -- the same trap ``rolloff`` was at 0.90.
+    """
+
+    with pytest.raises(ValueError, match="at least 2"):
+        RefineGAN2Generator(
+            sample_rate=32000,
+            upsample_rates=(5, 4, 4, 4),
+            upsample_initial_channel=512,
+            num_mels=192,
+            start_channels=16,
+            gin_channels=256,
+            antialias_stages=(0,),
+            antialias="adain",
+            **{field: 1},
+        )
+
+
+def test_a_checkpoint_from_before_the_factor_key_reads_as_two():
+    """Absent means 2: it was the constructor default and nothing reached it.
+
+    A checkpoint written before these fields existed has to keep loading, and
+    it can only have been trained at 2.
+    """
+
+    model = torch.nn.Module()
+    model.dec = _generator((5, 4, 4, 4), stages=[3])
+    model.sr = 32000
+    layout = decoder_layout(model)
+    without = {k: v for k, v in layout.items() if not k.endswith("_factor")}
+    assert_decoder_layout_matches(model, {"decoder_layout": without})
+
+
+def test_a_changed_factor_is_refused():
+    """It leaves no trace in the weights, like everything else in the layout."""
+
+    model = torch.nn.Module()
+    model.dec = _generator((5, 4, 4, 4), stages=[3])
+    model.sr = 32000
+    stale = dict(decoder_layout(model))
+    stale["antialias_rate_factor"] = 3
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(model, {"decoder_layout": stale})
+
+
+def _widths(decoder):
+    """Every anti-aliased activation's filter width, by stage and by loop."""
+
+    loops = {
+        m.design[1]
+        for group in (decoder.down_activations, decoder.up_activations)
+        for m in group
+        if isinstance(m, AntiAliasedActivation)
+    }
+    if isinstance(decoder.out_activation, AntiAliasedActivation):
+        loops.add(decoder.out_activation.design[1])
+    stages = [
+        sorted({
+            m.design[1]
+            for m in block.modules()
+            if isinstance(m, AntiAliasedActivation)
+        })
+        for block in decoder.upsample_conv_blocks
+    ]
+    return sorted(loops), stages
+
+
+def test_the_width_can_differ_per_stage():
+    """The taps are free where the round trip is launch-bound.
+
+    At the small shapes the AA pair is dominated by launch overhead and a wider
+    filter costs nothing; at the output-rate shapes the taps are about 45% of
+    it.  So the schedule exists to keep the better filter exactly where it is
+    free -- which a single scalar cannot express.
+    """
+
+    decoder = RefineGAN2Generator(
+        sample_rate=32000,
+        upsample_rates=(5, 4, 4, 4),
+        upsample_initial_channel=512,
+        num_mels=192,
+        start_channels=16,
+        gin_channels=256,
+        antialias_stages=(0, 1, 2),
+        antialias="full",
+        antialias_rates=(8000,),
+        antialias_width=[16, 16, 8, 8],
+        antialias_rate_width=8,
+    )
+    loops, stages = _widths(decoder)
+    assert loops == [8]
+    assert stages[0] == [16] and stages[1] == [16] and stages[2] == [8]
+    # Stage 3 is not in ``antialias_stages``, so it has no wrapped activation
+    # to carry a width at all.
+    assert stages[3] == []
+
+
+def test_a_scalar_width_covers_every_stage():
+    decoder = RefineGAN2Generator(
+        sample_rate=32000,
+        upsample_rates=(5, 4, 4, 4),
+        upsample_initial_channel=512,
+        num_mels=192,
+        start_channels=16,
+        gin_channels=256,
+        antialias_stages=(0, 1, 2),
+        antialias="adain",
+        antialias_rates=(8000,),
+        antialias_width=8,
+    )
+    assert decoder.antialias_width == (8, 8, 8, 8)
+    # Unset, the loops take the widest stage value rather than a constant, so
+    # a config that narrows everything does not leave them behind.
+    assert decoder.antialias_rate_width == 8
+
+
+def test_a_width_schedule_of_the_wrong_length_is_refused():
+    with pytest.raises(ValueError, match="antialias_width"):
+        RefineGAN2Generator(
+            sample_rate=32000,
+            upsample_rates=(5, 4, 4, 4),
+            upsample_initial_channel=512,
+            num_mels=192,
+            start_channels=16,
+            gin_channels=256,
+            antialias_stages=(0,),
+            antialias="adain",
+            antialias_width=[16, 8],
+        )
+
+
+def test_a_checkpoint_from_before_the_width_key_reads_as_sixteen():
+    model = torch.nn.Module()
+    model.dec = _generator((5, 4, 4, 4), stages=[3])
+    model.sr = 32000
+    layout = decoder_layout(model)
+    without = {
+        k: v for k, v in layout.items() if k not in
+        ("antialias_width", "antialias_rate_width")
+    }
+    assert_decoder_layout_matches(model, {"decoder_layout": without})
+
+
+def test_a_changed_width_is_refused():
+    """Non-persistent kernels again: the weights cannot tell 8 from 16."""
+
+    model = torch.nn.Module()
+    model.dec = _generator((5, 4, 4, 4), stages=[3])
+    model.sr = 32000
+    stale = dict(decoder_layout(model))
+    stale["antialias_width"] = [16, 16, 8, 8]
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(model, {"decoder_layout": stale})
+
+
+def test_the_output_tanh_follows_the_output_rate():
+    """It is a pointwise nonlinearity with nothing after it.
+
+    Not the decoder's problem -- against a 32x reference of itself it adds
+    -61.4 dB at ``|max| = 0.9``, well under the activation floor, because a
+    smooth curve's harmonic series decays fast where ``leaky_relu``'s corner
+    makes products of every order.  Wrapped anyway because ``conv_post`` emits
+    one channel, so it costs almost nothing.
+    """
+
+    raw = _generator((5, 4, 4, 4), stages=[0], antialias_rates=[])
+    protected = _generator((5, 4, 4, 4), stages=[0], antialias_rates=[32000])
+    assert isinstance(raw.out_tanh, torch.nn.Tanh)
+    assert isinstance(protected.out_tanh, AntiAliasedActivation)
+    # It carries the loop group's design, like the other output-rate site.
+    assert protected.out_tanh.design[0] == protected.antialias_rate_factor
+    # And it adds no state-dict key, which is why the layout has to say so.
+    assert set(raw.state_dict()) == set(protected.state_dict())
+    assert decoder_layout(_wrap(raw))["antialias_tanh"] is False
+    assert decoder_layout(_wrap(protected))["antialias_tanh"] is True
+
+
+def _wrap(decoder):
+    model = torch.nn.Module()
+    model.dec = decoder
+    model.sr = 32000
+    return model
+
+
+def test_a_checkpoint_from_before_the_tanh_wrapper_reads_as_raw():
+    model = _wrap(_generator((5, 4, 4, 4), stages=[3], antialias_rates=[32000]))
+    layout = decoder_layout(model)
+    assert layout["antialias_tanh"] is True
+    without = {k: v for k, v in layout.items() if k != "antialias_tanh"}
+    # A checkpoint that protected the output rate but predates the wrapper had
+    # a raw tanh, so it must not silently match one that has it.
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(model, {"decoder_layout": without})
+
+
+# --------------------------------------------------------------------------
+# not making the fold, rather than filtering it
+# --------------------------------------------------------------------------
+#
+# Anti-aliasing is the generic answer for a nonlinearity that has to exist, and
+# it is never free: the round trip is an upsample, an activation and a
+# downsample where there was one activation.  At the two 8 kHz sites that make
+# the 4 kHz fold, whether the nonlinearity has to exist at all is a question
+# with an answer.
+#
+#     down loop, past the first stage   it does not have to exist    -> deleted
+#     up loop, before the upsampler     it does, but not at 8 kHz    -> moved
+#
+# Both change what the decoder computes at identical weights, so both are
+# ``decoder_layout`` fields and neither is a patch on a checkpoint.
+
+
+def _down_skips(decoder):
+    """``(pre-activation output, skip the trunk receives)`` per down stage.
+
+    Read off the running decoder rather than recomputed: ``downs[]`` is a local
+    in ``forward``, but every entry after the first is
+    ``downsample_blocks[i - 1]``'s output with or without an activation on it,
+    and it arrives at the trunk as the *last* channels of
+    ``upsample_conv_blocks[count - 1 - i]``'s input.  So a hook at each end
+    brackets exactly the one operation these flags remove.
+    """
+
+    count = len(decoder.upsample_rates)
+    outputs, skips, handles = {}, {}, []
+
+    for index, block in enumerate(decoder.downsample_blocks):
+        handles.append(
+            block.register_forward_hook(
+                lambda _m, _i, out, index=index: outputs.__setitem__(index, out)
+            )
+        )
+    for index, block in enumerate(decoder.upsample_conv_blocks):
+        handles.append(
+            block.register_forward_pre_hook(
+                lambda _m, inputs, index=index: skips.__setitem__(index, inputs[0])
+            )
+        )
+
+    with torch.no_grad():
+        decoder.eval()(*_inputs())
+
+    for handle in handles:
+        handle.remove()
+
+    pairs = []
+    for source in range(count - 1):
+        y = outputs[source]
+        # ``downs[source + 1]`` goes to the up stage that runs at its rate
+        skip = skips[count - 1 - (source + 1)][:, -y.shape[1] :]
+        pairs.append((y, skip))
+    return pairs
+
+
+def _inputs(frames=40, batch=1, seed=0):
+    torch.manual_seed(seed)
+    mel = torch.randn(batch, 192, frames) * 0.5
+    f0 = torch.full((batch, frames), 220.0)
+    g = torch.randn(batch, 256, 1) * 0.1
+    return mel, f0, g
+
+
+def test_the_linear_down_path_deletes_the_sites_rather_than_filtering_them():
+    """``downs[]`` hands the trunk band-limited copies of the excitation.  The
+    only activation there doing work the trunk needs is the first, at the
+    output rate, which rectifies the sine and creates the harmonics; the ones
+    after it run on a signal that is already rectified and already band-limited
+    to half their own rate, so their second-order products land straight above
+    Nyquist.  That is the site that bisected at +38.4 dB of excess at
+    ``8000 - k*f0``, and it is deleted here rather than filtered."""
+
+    plain = _generator((5, 4, 4, 4))
+    linear = _generator((5, 4, 4, 4), linear_down_path=True)
+    linear.load_state_dict(plain.state_dict(), strict=True)
+
+    for y, skip in _down_skips(plain):
+        assert torch.allclose(skip, F.leaky_relu(y, 0.2), atol=1e-6)
+    for y, skip in _down_skips(linear):
+        # the conv's output reaches the trunk untouched
+        assert torch.allclose(skip, y, atol=1e-6)
+
+    # one site left, at the output rate, and the rest of the loop is conv,
+    # decimate, conv
+    assert plain.down_rates == (32000, 8000, 2000, 500)
+    assert linear.down_rates == (32000,)
+    assert len(linear.down_activations) == 1
+
+    # and it costs nothing in the weights, which is why the layout carries it
+    assert set(plain.state_dict()) == set(linear.state_dict())
+
+
+def test_the_up_activation_can_run_after_the_upsampler():
+    """Same nonlinearity, same parameters, four times the rate.  Stage 3's runs
+    at 32 kHz instead of 8 kHz, so it folds about 16 kHz rather than about
+    4 kHz -- which is what an anti-aliased activation buys, at the stage's own
+    factor and without the trip back, because the signal is going to that rate
+    anyway."""
+
+    before = _generator((5, 4, 4, 4))
+    after = _generator((5, 4, 4, 4), up_activation_after_upsample=True)
+    after.load_state_dict(before.state_dict(), strict=True)
+
+    def trunk(decoder):
+        """``(upsampler input, what the res block reads)`` per up stage."""
+        seen, handles = {}, []
+        for index, block in enumerate(decoder.upsample_blocks):
+            handles.append(
+                block.register_forward_pre_hook(
+                    lambda _m, inputs, index=index: seen.__setitem__(
+                        ("in", index), inputs[0]
+                    )
+                )
+            )
+        for index, block in enumerate(decoder.upsample_conv_blocks):
+            handles.append(
+                block.register_forward_pre_hook(
+                    lambda _m, inputs, index=index: seen.__setitem__(
+                        ("out", index), inputs[0]
+                    )
+                )
+            )
+        with torch.no_grad():
+            decoder.eval()(*_inputs())
+        for handle in handles:
+            handle.remove()
+        return seen
+
+    # The upsampler's own input is the observable: with the activation ahead
+    # of it that input is already rectified and the res block reads ``ups(x)``
+    # unchanged, and with the activation moved the res block reads
+    # ``leaky_relu(ups(x))``.  Both directions are asserted, so neither case
+    # can pass by the two expressions happening to agree.
+    for decoder, moved in ((before, False), (after, True)):
+        seen = trunk(decoder)
+        for index, ups in enumerate(decoder.upsample_blocks):
+            with torch.no_grad():
+                interpolated = ups(seen[("in", index)])
+            activated = F.leaky_relu(interpolated, 0.2)
+            # the skip is concatenated after the trunk, so the trunk is the
+            # leading channels
+            got = seen[("out", index)][:, : interpolated.shape[1]]
+            expected, other = (
+                (activated, interpolated) if moved else (interpolated, activated)
+            )
+            assert torch.allclose(got, expected, atol=1e-6)
+            assert not torch.allclose(got, other, atol=1e-6)
+
+    # the site rates move with it, which is what ``antialias_rates`` indexes
+    assert before.up_rates == (100, 500, 2000, 8000)
+    assert after.up_rates == (500, 2000, 8000, 32000)
+    assert set(before.state_dict()) == set(after.state_dict())
+
+
+def test_the_flags_move_which_rates_can_be_protected():
+    """``antialias_rates`` names a rate, and these two decide which rates
+    exist.  A config that keeps naming 100 Hz after moving the up sites is
+    protecting nothing, which is the failure that option exists to end."""
+
+    from rvc.lib.algorithm.generators.refinegan2 import loop_rates
+
+    assert loop_rates(32000, (5, 4, 4, 4)) == (
+        (32000, 8000, 2000, 500),
+        (100, 500, 2000, 8000),
+    )
+    assert loop_rates(32000, (5, 4, 4, 4), linear_down_path=True) == (
+        (32000,),
+        (100, 500, 2000, 8000),
+    )
+    assert loop_rates(32000, (5, 4, 4, 4), up_activation_after_upsample=True) == (
+        (32000, 8000, 2000, 500),
+        (500, 2000, 8000, 32000),
+    )
+    # With both on the decoder has four activation rates, not five, and 100 Hz
+    # is not one of them.
+    assert loop_rates(
+        32000, (5, 4, 4, 4), linear_down_path=True, up_activation_after_upsample=True
+    ) == ((32000,), (500, 2000, 8000, 32000))
+
+    with pytest.raises(ValueError, match="match no activation rate") as excinfo:
+        _generator(
+            (5, 4, 4, 4),
+            antialias_rates=[100, 500, 2000, 8000, 32000],
+            linear_down_path=True,
+            up_activation_after_upsample=True,
+        )
+    message = str(excinfo.value)
+    assert "linear_down_path=True" in message
+    assert "up_activation_after_upsample=True" in message
+
+    # ...and the rates that survive still reach both loops
+    decoder = _generator(
+        (5, 4, 4, 4),
+        antialias_rates=[500, 2000, 8000, 32000],
+        linear_down_path=True,
+        up_activation_after_upsample=True,
+    )
+    assert all(
+        isinstance(act, AntiAliasedActivation) for act in decoder.up_activations
+    )
+    assert isinstance(decoder.down_activations[0], AntiAliasedActivation)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"linear_down_path": True},
+        {"up_activation_after_upsample": True},
+        {"linear_down_path": True, "up_activation_after_upsample": True},
+    ],
+)
+def test_the_structural_flags_are_in_the_layout(flags):
+    """Neither adds, removes or reshapes a tensor, so a checkpoint trained
+    without them loads perfectly into a decoder that has them -- and computes
+    something else."""
+
+    plain = _wrap(_generator((5, 4, 4, 4)))
+    moved = _wrap(_generator((5, 4, 4, 4), **flags))
+    assert set(plain.dec.state_dict()) == set(moved.dec.state_dict())
+
+    layout = decoder_layout(moved)
+    for key, value in flags.items():
+        assert layout[key] is value
+    assert_decoder_layout_matches(moved, {"decoder_layout": layout})
+
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(moved, {"decoder_layout": decoder_layout(plain)})
+
+    # absent means off: every checkpoint written before the flags existed ran
+    # the full down loop and activated ahead of every upsampler
+    without = {k: v for k, v in layout.items() if k not in flags}
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(moved, {"decoder_layout": without})
+    assert_decoder_layout_matches(
+        plain, {"decoder_layout": {k: v for k, v in decoder_layout(plain).items()
+                                   if k not in flags}}
+    )
+
+
+@pytest.mark.parametrize("sample_rate", sorted(CONFIGS))
+def test_the_shipped_config_turns_both_structural_flags_on(sample_rate):
+    """Not filtering the fold, not making it.  Both change what the decoder
+    computes at fixed weights, so they are a fresh pretrain rather than
+    something a running experiment picks up -- and the keys ship written out
+    so the choice is in the config instead of buried in a default."""
+
+    model = json.loads(CONFIGS[sample_rate].read_text())["model"]
+    assert model["refinegan2_linear_down_path"] is True
+    assert model["refinegan2_up_activation_after_upsample"] is True
+
+    # The config has to *build*: ``antialias_rates`` names rates, the flags
+    # decide which rates exist, and a rate that matches no site is refused at
+    # construction.  So this is the assertion that the three keys agree.
+    decoder = RefineGAN2Generator(
+        sample_rate=sample_rate,
+        upsample_rates=tuple(model["upsample_rates"]),
+        num_mels=model["inter_channels"],
+        gin_channels=model["gin_channels"],
+        upsample_initial_channel=model["upsample_initial_channel"],
+        antialias_stages=model["refinegan2_antialias_stages"],
+        antialias=model["refinegan2_antialias"],
+        antialias_rates=model["refinegan2_antialias_rates"],
+        source_gain=model["refinegan2_source_gain"],
+        linear_down_path=model["refinegan2_linear_down_path"],
+        up_activation_after_upsample=model[
+            "refinegan2_up_activation_after_upsample"
+        ],
+    )
+    assert len(decoder.down_activations) == 1
+    assert decoder.up_rates[-1] == sample_rate
+
+
+def test_the_synthesizer_passes_both_flags_through():
+    from rvc.lib.algorithm.synthesizers import Synthesizer
+
+    import inspect
+
+    source = inspect.getsource(Synthesizer.__init__)
+    assert "refinegan2_linear_down_path" in source
+    assert "refinegan2_up_activation_after_upsample" in source
+
+
+def test_the_gain_is_positive_at_every_sample():
+    """The softplus runs after the interpolators, and that is what makes the
+    envelope positive *where it multiplies the excitation*.
+
+    Run at the frame rate it guarantees positivity to a sinc that then rings
+    through zero, and a negative gain is not a small error: it is the
+    excitation changing sign inside a frame, every harmonic phase-flipped.
+    Nothing downstream can undo it, because nothing was aliased -- it is the
+    envelope the trunk was handed.
+    """
+
+    decoder = _generator((5, 4, 4, 4))
+    decoder.has_source_gain = True
+    decoder.source_gain = torch.nn.Conv1d(192, 1, 1)
+    from rvc.lib.algorithm.resampling import AntiAliasedUpsample1d
+
+    decoder.source_gain_ups = torch.nn.ModuleList(
+        [
+            AntiAliasedUpsample1d(
+                rate,
+                filter_width=decoder.filter_width[stage],
+                rolloff=decoder.rolloff[stage],
+                filter_beta=decoder.filter_beta[stage],
+            )
+            for stage, rate in enumerate((5, 4, 4, 4))
+        ]
+    )
+
+    # A projection with no reason to be smooth, which is the case the sinc
+    # interpolators were put here for in the first place.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        decoder.source_gain.weight.normal_(0.0, 0.3)
+        decoder.source_gain.bias.zero_()
+        mel = torch.randn(1, 192, 120)
+        har_source = torch.ones(1, 1, 120 * 320)
+        gain = decoder._apply_source_gain(har_source, mel)
+
+        # what the other order would have produced, on the same weights
+        rough = F.softplus(decoder.source_gain(mel))
+        for ups in decoder.source_gain_ups:
+            rough = ups(rough)
+        rough = rough[..., : har_source.shape[-1]]
+
+    assert gain.min() > 0.0
+    # ...and the point of the move: the frame-rate order does not clear zero
+    assert rough.min() < 0.0
+    # not a rounding artefact at one sample either
+    assert (rough < 0).float().mean() > 0.01
+
+
+def test_the_gain_is_still_the_identity_at_initialisation():
+    """The interpolators preserve DC, so moving the softplus past them leaves
+    ``softplus(0.5413) = 1`` exactly where it was -- which is what lets a run
+    switch the gain on without rescaling its source on step zero."""
+
+    decoder = RefineGAN2Generator(
+        sample_rate=32000,
+        upsample_rates=(5, 4, 4, 4),
+        num_mels=192,
+        gin_channels=256,
+        upsample_initial_channel=512,
+        source_gain=True,
+    )
+    with torch.no_grad():
+        har_source = torch.ones(1, 1, 40 * 320)
+        gain = decoder._apply_source_gain(har_source, torch.randn(1, 192, 40))
+    # The residual is the interpolators' own DC error at the segment edge, and
+    # it is *smaller* this way round: 7.3e-5 against 2.1e-4 with the softplus
+    # at the frame rate.
+    assert torch.allclose(gain, torch.ones_like(gain), atol=2e-4)
+
+
+def test_the_softplus_placement_is_in_the_layout():
+    """It is not a setting -- there is one order -- but the two orders are
+    different signal paths at identical weights, so a checkpoint from before
+    the move has to be refused rather than rendered through the wrong one."""
+
+    with_gain = _wrap(
+        RefineGAN2Generator(
+            sample_rate=32000,
+            upsample_rates=(5, 4, 4, 4),
+            num_mels=192,
+            gin_channels=256,
+            upsample_initial_channel=512,
+            source_gain=True,
+        )
+    )
+    layout = decoder_layout(with_gain)
+    assert layout["source_gain_order"] == "post"
+    assert_decoder_layout_matches(with_gain, {"decoder_layout": layout})
+
+    # absent means the frame-rate order, which is every checkpoint before it
+    without = {k: v for k, v in layout.items() if k != "source_gain_order"}
+    with pytest.raises(ValueError, match="source_gain_order"):
+        assert_decoder_layout_matches(with_gain, {"decoder_layout": without})
+
+    # a decoder with no gain has no softplus to place, and must not mismatch
+    # another one over it
+    plain = _wrap(_generator((5, 4, 4, 4)))
+    assert decoder_layout(plain)["source_gain_order"] is None
+    assert_decoder_layout_matches(
+        plain,
+        {
+            "decoder_layout": {
+                k: v
+                for k, v in decoder_layout(plain).items()
+                if k != "source_gain_order"
+            }
+        },
+    )

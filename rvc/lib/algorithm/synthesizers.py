@@ -172,6 +172,36 @@ class Synthesizer(torch.nn.Module):
                     decoder_config.get("refinegan2_source_gain", False)
                 ),
                 antialias_rates=decoder_config.get("refinegan2_antialias_rates"),
+                # Absent means 2, which is what every checkpoint written before
+                # these keys was trained at.
+                antialias_factor=int(
+                    decoder_config.get("refinegan2_antialias_factor", 2)
+                ),
+                antialias_rate_factor=decoder_config.get(
+                    "refinegan2_antialias_rate_factor"
+                ),
+                # Absent means 16, the width every checkpoint before this key
+                # was trained at.  Scalar or one per stage, like the trunk
+                # upsamplers' own schedule.
+                antialias_width=decoder_config.get(
+                    "refinegan2_antialias_width", 16
+                ),
+                antialias_rate_width=decoder_config.get(
+                    "refinegan2_antialias_rate_width"
+                ),
+                # Structural, not filtering: these delete or move the fold
+                # sites themselves, so they also move which rates
+                # ``refinegan2_antialias_rates`` may name.  Absent means off,
+                # which is the path every checkpoint before them was trained
+                # on.
+                linear_down_path=bool(
+                    decoder_config.get("refinegan2_linear_down_path", False)
+                ),
+                up_activation_after_upsample=bool(
+                    decoder_config.get(
+                        "refinegan2_up_activation_after_upsample", False
+                    )
+                ),
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")

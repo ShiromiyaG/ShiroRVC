@@ -310,12 +310,35 @@ def antialias_output(decoder):
     return not isinstance(activation, torch.nn.Identity)
 
 
+def antialias_tanh(decoder):
+    """Whether the output ``tanh`` is anti-aliased.
+
+    Implied by ``antialias_rates`` naming the output rate, but only for a
+    checkpoint written after this existed -- one written before with that rate
+    protected has the same field and a raw ``tanh``.  Same additive contract as
+    ``antialias_output``, and the same reason: the resamplers' kernels are not
+    state-dict keys, so the weights cannot tell the two apart.
+    """
+
+    activation = getattr(decoder, "out_tanh", None)
+    if activation is None:
+        return None
+    return not isinstance(activation, torch.nn.Tanh)
+
+
 def antialias_filter(decoder):
     """The anti-aliased activations' filter design, or ``None`` when there are none.
 
     Read off a built module rather than off the config: the design is a set of
     constructor defaults, so a decoder built by hand and one built from a
     config have to report the same thing.
+
+    This reports the *first* instance in module order, which is a loop
+    activation.  Since ``antialias_factor`` and ``antialias_rate_factor`` can
+    differ, the factor here names only one of the two groups -- which is why
+    both are carried explicitly in ``decoder_layout`` rather than left to be
+    inferred from this field.  Width, rolloff and beta are uniform across every
+    site, so those three are complete as reported.
     """
 
     from rvc.lib.algorithm.resampling import AntiAliasedActivation
@@ -352,6 +375,12 @@ def decoder_layout(model):
         "antialias_stages": [int(s) for s in getattr(decoder, "antialias_stages", ())],
         "antialias": str(getattr(decoder, "antialias", "none")),
         "source_gain": bool(getattr(decoder, "has_source_gain", False)),
+        # Where the gain's ``softplus`` runs.  Not a config key and not an
+        # option -- there is one order -- but the two orders are different
+        # signal paths at identical weights, and the frame-rate one puts up to
+        # 10.8% of the envelope's samples below zero, which is the excitation
+        # changing sign.  ``None`` when there is no gain at all.
+        "source_gain_order": getattr(decoder, "source_gain_order", None),
         "source_bands": int(getattr(decoder, "source_bands", 0)),
         "antialias_rates": [
             int(r) for r in getattr(decoder, "antialias_rates", ())
@@ -360,8 +389,34 @@ def decoder_layout(model):
         # raw does not carry a filter design it never used -- and does not
         # mismatch every other such run over one.
         "antialias_filter": antialias_filter(decoder),
+        # The oversampling factor decides the alias floor and, like everything
+        # else here, leaves no trace in the weights: both resamplers register
+        # their kernels non-persistently.  Two groups, two fields -- a decoder
+        # with the loops at 3 and the stages at 2 is a different signal path
+        # from one with both at 2, and ``antialias_filter`` alone cannot say so.
+        "antialias_factor": getattr(decoder, "antialias_factor", None),
+        "antialias_rate_factor": getattr(decoder, "antialias_rate_factor", None),
+        # The width is per stage, because the taps are free at the small shapes
+        # and about 45% of the round trip at the output-rate ones.
+        "antialias_width": (
+            None
+            if getattr(decoder, "antialias_width", None) is None
+            else [int(v) for v in decoder.antialias_width]
+        ),
+        "antialias_rate_width": getattr(decoder, "antialias_rate_width", None),
+        "antialias_tanh": antialias_tanh(decoder),
         "antialias_adain": antialias_adain(decoder),
         "antialias_output": antialias_output(decoder),
+        # Structural: neither filters a fold, they remove or move the sites
+        # that make one.  ``linear_down_path`` deletes the down loop's
+        # activations after the first and ``up_activation_after_upsample``
+        # runs each up activation at its stage's output rate -- both change
+        # what the decoder computes at identical weights, and neither adds,
+        # removes or reshapes a single tensor.
+        "linear_down_path": bool(getattr(decoder, "linear_down_path", False)),
+        "up_activation_after_upsample": bool(
+            getattr(decoder, "up_activation_after_upsample", False)
+        ),
         # Imaging, not aliasing: what the interpolation filter leaves of the
         # spectral copies zero-stuffing makes.  No ``antialias_*`` option
         # touches it, and it is just as invisible to ``load_state_dict``.
@@ -391,6 +446,14 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             "upsample_filter": None,
             "antialias_adain": False,
             "antialias_output": False,
+            "antialias_tanh": False,
+            "antialias_factor": 2,
+            "antialias_rate_factor": 2,
+            "antialias_width": None,
+            "antialias_rate_width": 16,
+            "linear_down_path": False,
+            "up_activation_after_upsample": False,
+            "source_gain_order": "pre",
         }
     design = found.get("antialias_filter") or None
     imaging = found.get("upsample_filter") or None
@@ -400,6 +463,23 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
     # had -- including one whose ``antialias_rates`` already named the output
     # rate for the sake of ``downs[0]``.
     output = bool(found.get("antialias_output", False))
+    # Absent means raw, which every run before this had -- including one whose
+    # antialias_rates already named the output rate for the other sites there.
+    out_tanh = bool(found.get("antialias_tanh", False))
+    # Absent means 2.  It was the constructor default and no config key could
+    # reach it, so every run before these two fields existed had exactly that
+    # at both site groups -- including one whose ``antialias_filter`` says so
+    # already, which is why this cannot disagree with that field.
+    factor = int(found.get("antialias_factor") or 2)
+    rate_factor = int(found.get("antialias_rate_factor") or factor)
+    # Absent means 16 at every site, which is what the constructor default was
+    # before the width could be reached from a config.  A ``None`` stage
+    # schedule is filled to the checkpoint's own stage count below, since the
+    # count is what decides its length.
+    width = found.get("antialias_width")
+    rate_width = int(found.get("antialias_rate_width") or 16)
+    # ``found`` is rebuilt below; the flags are read off the original.
+    found_raw = found
     found = {
         "upsample_rates": [int(r) for r in found.get("upsample_rates", [])],
         "antialias_stages": [int(s) for s in found.get("antialias_stages", [])],
@@ -447,6 +527,42 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
     found["antialias_output"] = (
         None if expected["antialias_output"] is None else output
     )
+    # ``None`` for a decoder that has no such attribute at all, the same way
+    # the two flags above are, so another vocoder does not mismatch over a
+    # field neither side uses.
+    found["antialias_tanh"] = (
+        None if expected["antialias_tanh"] is None else out_tanh
+    )
+    found["antialias_factor"] = (
+        None if expected["antialias_factor"] is None else factor
+    )
+    found["antialias_rate_factor"] = (
+        None if expected["antialias_rate_factor"] is None else rate_factor
+    )
+    if expected["antialias_width"] is None:
+        found["antialias_width"] = None
+    else:
+        stages = len(found["upsample_rates"]) or len(expected["upsample_rates"])
+        found["antialias_width"] = (
+            [16] * stages if width is None else [int(v) for v in width]
+        )
+    found["antialias_rate_width"] = (
+        None if expected["antialias_rate_width"] is None else rate_width
+    )
+    # Absent means off, which is the only path that existed before the flags
+    # did: every activation in the down loop present, every one in the up loop
+    # before its upsampler.
+    # Absent means ``"pre"``: every run before 2026-09-04 built the envelope
+    # with the ``softplus`` at the frame rate and interpolated the result.
+    found["source_gain_order"] = (
+        None
+        if expected["source_gain_order"] is None
+        else str(found_raw.get("source_gain_order") or "pre")
+    )
+    found["linear_down_path"] = bool(found_raw.get("linear_down_path", False))
+    found["up_activation_after_upsample"] = bool(
+        found_raw.get("up_activation_after_upsample", False)
+    )
     if found != expected:
         raise ValueError(
             f"Decoder layout mismatch: this run builds {expected} but the "
@@ -455,7 +571,17 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             f"is the only thing that can tell them apart. Set "
             f"upsample_rates / refinegan2_antialias_stages / "
             f"refinegan2_antialias / refinegan2_antialias_rates / "
-            f"refinegan2_source_gain to match, or start a fresh run. "
+            f"refinegan2_source_gain / refinegan2_linear_down_path / "
+            f"refinegan2_up_activation_after_upsample to match, or start a "
+            f"fresh run. "
+            f"``source_gain_order`` says where the excitation gain's softplus "
+            f"runs; it is ``pre`` in every checkpoint written before it moved "
+            f"after the interpolators, and it is not a setting -- a ``pre`` "
+            f"checkpoint has to be retrained, not reconfigured. "
+            f"``linear_down_path`` and ``up_activation_after_upsample`` are "
+            f"structural -- they delete the down loop's activations after the "
+            f"first and move each up activation to its stage's output rate -- "
+            f"and are False in every checkpoint written before they existed. "
             f"``antialias_adain`` says whether the stages' AdaIN activations "
             f"are anti-aliased; it follows refinegan2_antialias and is False in "
             f"every checkpoint written before 2026-09-03. "

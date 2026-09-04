@@ -94,6 +94,7 @@
         "d_version": "v4",
         "d_use_univhd": true,
         "d_use_fast_mpd": false,
+        "d_use_san": true,
         "use_spectral_norm": false,
         "gin_channels": 256,
         "spk_embed_dim": 109,
@@ -106,13 +107,15 @@
         ],
         "refinegan2_antialias": "adain",
         "refinegan2_antialias_rates": [
-            100,
-            500,
-            2000,
-            8000,
             32000
         ],
+        "refinegan2_antialias_factor": 2,
+        "refinegan2_antialias_rate_factor": 2,
+        "refinegan2_antialias_width": 16,
+        "refinegan2_antialias_rate_width": 16,
         "refinegan2_source_gain": true,
+        "refinegan2_linear_down_path": true,
+        "refinegan2_up_activation_after_upsample": true,
         "architecture_id": "vits_gaussian_v1"
     }
 }

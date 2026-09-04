@@ -111,3 +111,43 @@ def test_a_model_with_no_decoder_is_not_checked():
 
     assert excitation_source(type("M", (), {})()) is None
     assert_excitation_matches(type("M", (), {})(), {"excitation_source": "bank"})
+
+
+def test_the_excitation_amplitude_does_not_depend_on_the_seed():
+    """``merge`` is a ``Linear(1, 1, bias=False)`` and, at ``harmonic_num=0``,
+    has nothing to merge: it is one scalar multiplying the whole excitation.
+
+    Its default init draws that scalar from ``U(-1, 1)``, which made the
+    source's amplitude a property of the seed -- negative in about half of
+    them, under a tenth of the intended level in one in seven, and 132x between
+    the loudest and the quietest measured on the excitation itself.  Nothing
+    downstream normalises it: ``sine_amp`` states the amplitude and this was
+    free to ignore it.  The neighbouring ``source_gain`` is initialised to
+    exactly 1.0 so that switching it on cannot rescale the source, which is the
+    same intent this had to be brought in line with.
+    """
+
+    amplitudes = []
+    for seed in range(8):
+        torch.manual_seed(seed)
+        source = SineGenerator(SR)
+        assert source.merge[0].weight.item() == 1.0
+        amplitudes.append(_excitation(source, 220.0).std().item())
+
+    # A sine at ``sine_amp`` has RMS ``sine_amp / sqrt(2)``; the noise the
+    # source adds on a voiced frame is ``noise_std``, three orders down.
+    expected = 0.1 / 2**0.5
+    for rms in amplitudes:
+        assert abs(rms - expected) / expected < 0.02
+    assert max(amplitudes) / min(amplitudes) < 1.01
+
+
+def test_the_merge_weight_still_comes_from_the_checkpoint():
+    """The init is not the value: a resumed run loads what it learned, which is
+    what makes this the one change in this decoder that is not a fresh
+    pretrain."""
+
+    source = SineGenerator(SR)
+    trained = {"merge.0.weight": torch.full_like(source.merge[0].weight, -0.42)}
+    source.load_state_dict(trained, strict=True)
+    assert source.merge[0].weight.item() == pytest.approx(-0.42)

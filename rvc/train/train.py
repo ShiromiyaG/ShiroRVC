@@ -716,6 +716,12 @@ def get_d_model(config, vocoder, use_checkpointing):
         # wide to separate above ~700 Hz.
         sample_rate=int(config.data.sample_rate),
         use_univhd=bool(setting("d_use_univhd", False)),
+        # SAN (arXiv 2301.12811): splits every branch's last projection into a
+        # unit-norm direction and a scale.  Off by default and unmeasured on
+        # this fork -- it changes conv_post's state-dict keys, so it is a
+        # fresh-run decision, and it changes the loss floor, so every number
+        # read off loss_disc has to be relearned.
+        use_san=bool(setting("d_use_san", False)),
         univhd_n_fft=int(setting("d_univhd_n_fft", 2048)),
         univhd_hop_length=int(setting("d_univhd_hop_length", 256)),
         univhd_harmonics=int(setting("d_univhd_harmonics", 10)),
@@ -1433,6 +1439,21 @@ def enable_vocoder_compile(net_g, device, rank):
     if enabled and rank == 0:
         info(VOCODER_COMPILE_ENABLED.format(mode=mode), tag="[INIT]")
     return enabled
+
+
+def _normalize_san_weights(net_d):
+    """Put every SAN direction back on the unit sphere after ``optim_d.step``.
+
+    The projection is only unit-norm because it is *kept* there; an Adam step
+    moves it off, and a direction that is not a direction is the one thing the
+    method cannot tolerate.  A no-op when no branch carries a SAN head.
+    """
+
+    model = net_d.module if hasattr(net_d, "module") else net_d
+    for module in model.modules():
+        normalize = getattr(module, "normalize_weight", None)
+        if normalize is not None:
+            normalize()
 
 
 def enable_frontend_compile(net_g, config, device, rank):
@@ -2659,7 +2680,11 @@ def training_loop(
             _loss_disc_acc, _loss_disc_real_acc, _loss_disc_fake_acc, _grad_norm_d_acc = [], [], [], []
 
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+                # The only pass that asks for the direction output: it is the
+                # one whose gradient trains the discriminator.
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(
+                    y, y_hat.detach(), san_training=san_active
+                )
 
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 disc_loss_parts = discriminator_loss(
@@ -2687,6 +2712,8 @@ def training_loop(
                 grad_scaler.step(optim_d)
             else:
                 optim_d.step()
+            if san_active:
+                _normalize_san_weights(net_d)
 
             # Temp accumulation
             _loss_disc_acc.append(loss_disc.detach())
