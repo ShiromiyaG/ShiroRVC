@@ -9,7 +9,7 @@ on the frame grid.
 phase-randomised harmonic bank with a conditioning-driven envelope) were
 removed on 2026-09-03.  They existed to be traded against the inharmonic lines
 in the render, and those turned out to be the ``AdaIN`` activations -- see
-``test_decoder_antialias_layout.py``, where the A/B renders are recorded.  On a
+``test_decoder_layout.py``, where the A/B renders are recorded.  On a
 fixed trunk with ``source_gain`` on, the bank had measured *worse* than the
 sine anyway (held-out multi-scale mel 1.7357 -> 1.8057 against 1.9714 ->
 1.7418).

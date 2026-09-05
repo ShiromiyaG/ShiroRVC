@@ -160,47 +160,26 @@ class Synthesizer(torch.nn.Module):
                 ),
                 gin_channels=gin_channels,
                 checkpointing=checkpointing,
-                # Absent means "off", so a config written before these keys
-                # existed builds exactly the decoder it used to.  The layout
-                # they select is invisible in the state dict, which is why
-                # ``decoder_layout`` writes it into the checkpoint.
-                antialias_stages=decoder_config.get("refinegan2_antialias_stages"),
-                antialias=str(
-                    decoder_config.get("refinegan2_antialias", "half")
-                ),
                 source_gain=bool(
                     decoder_config.get("refinegan2_source_gain", False)
                 ),
-                antialias_rates=decoder_config.get("refinegan2_antialias_rates"),
-                # Absent means 2, which is what every checkpoint written before
-                # these keys was trained at.
-                antialias_factor=int(
-                    decoder_config.get("refinegan2_antialias_factor", 2)
+                # Absent means 1.0 -- the full-band BLIT every run before this
+                # key existed was trained against.  It is not a default anyone
+                # should ship: see ``BlitGenerator.bandwidth``.
+                source_bandwidth=float(
+                    decoder_config.get("refinegan2_source_bandwidth", 1.0)
                 ),
-                antialias_rate_factor=decoder_config.get(
-                    "refinegan2_antialias_rate_factor"
-                ),
-                # Absent means 16, the width every checkpoint before this key
-                # was trained at.  Scalar or one per stage, like the trunk
-                # upsamplers' own schedule.
-                antialias_width=decoder_config.get(
-                    "refinegan2_antialias_width", 16
-                ),
-                antialias_rate_width=decoder_config.get(
-                    "refinegan2_antialias_rate_width"
-                ),
-                # Structural, not filtering: these delete or move the fold
-                # sites themselves, so they also move which rates
-                # ``refinegan2_antialias_rates`` may name.  Absent means off,
-                # which is the path every checkpoint before them was trained
-                # on.
-                linear_down_path=bool(
-                    decoder_config.get("refinegan2_linear_down_path", False)
-                ),
-                up_activation_after_upsample=bool(
-                    decoder_config.get(
-                        "refinegan2_up_activation_after_upsample", False
-                    )
+                # Absent means *on* here, while absent means *off* in
+                # ``decoder_layout``.  That asymmetry is deliberate and the two
+                # defaults answer different questions: a config written today
+                # and naming nothing should get the sane excitation, while a
+                # checkpoint naming nothing was demonstrably trained before the
+                # normalisation existed.  An old config resuming an old
+                # checkpoint therefore raises rather than silently changing the
+                # source level by 13-23 dB, which is the whole point of the
+                # guard.
+                source_normalize=bool(
+                    decoder_config.get("refinegan2_source_normalize", True)
                 ),
             )
         else:

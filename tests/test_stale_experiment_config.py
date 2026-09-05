@@ -54,7 +54,7 @@ def test_a_config_from_an_older_architecture_is_replaced(tmp_path, shipped):
     stale["model"]["architecture_id"] = "shiro_vits_svae_v2"
     # A shape-defining key the stale config disagrees on: the point of the
     # guard is that it does not survive the replacement.
-    stale["model"]["refinegan2_antialias_rates"] = [1, 2, 3]
+    stale["model"]["upsample_rates"] = [4, 4, 4, 5]
     _write(tmp_path / "config.json", stale)
 
     generate_config(32000, str(tmp_path), "refinegan")
@@ -63,8 +63,8 @@ def test_a_config_from_an_older_architecture_is_replaced(tmp_path, shipped):
     assert written["model"]["architecture_id"] == (
         shipped["model"]["architecture_id"]
     )
-    assert written["model"]["refinegan2_antialias_rates"] == (
-        shipped["model"]["refinegan2_antialias_rates"]
+    assert written["model"]["upsample_rates"] == (
+        shipped["model"]["upsample_rates"]
     )
 
 

@@ -12,8 +12,6 @@
         "lr_decay": 0.999875,
         "lr_final_ratio": 0.25,
         "rolling_loss_steps": 50,
-        "compile_discriminator": true,
-        "compile_frontend": false,
         "validation_preview_dpi": 67,
         "validation_preview_width": 24.0,
         "validation_preview_height": 5.8,
@@ -100,22 +98,7 @@
         "spk_embed_dim": 109,
         "refinegan2_start_channels": 16,
         "refinegan2_leaky_relu_slope": 0.2,
-        "refinegan2_antialias_stages": [
-            0,
-            1,
-            2
-        ],
-        "refinegan2_antialias": "adain",
-        "refinegan2_antialias_rates": [
-            32000
-        ],
-        "refinegan2_antialias_factor": 2,
-        "refinegan2_antialias_rate_factor": 2,
-        "refinegan2_antialias_width": 16,
-        "refinegan2_antialias_rate_width": 16,
         "refinegan2_source_gain": true,
-        "refinegan2_linear_down_path": true,
-        "refinegan2_up_activation_after_upsample": true,
         "architecture_id": "vits_gaussian_v1"
     }
 }
