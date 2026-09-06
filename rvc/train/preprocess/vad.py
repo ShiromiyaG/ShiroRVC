@@ -136,13 +136,22 @@ def _gpu_is_usable():
     ``torch`` is imported lazily: this module is reachable from the option
     check in the UI, which must not pay for a CUDA import to answer whether a
     dropdown entry works.
+
+    ``device_count`` rather than ``is_available``: the latter probes through
+    the CUDA runtime, which initializes a context in whatever process asks.
+    The parent calls this (via :func:`preferred_device`) before it forks the
+    worker pool, and a fork of a process that has touched CUDA can never
+    initialize it again -- every worker would then hit "Cannot re-initialize
+    CUDA in forked subprocess" and demote itself to CPU, i.e. the probe alone
+    would cost the GPU it was asking about.  ``device_count`` answers from
+    NVML instead and is documented not to poison the fork.
     """
     if _GPU_REFUSED:
         return False
     try:
         import torch
 
-        return torch.cuda.is_available()
+        return torch.cuda.device_count() > 0
     except Exception:
         return False
 

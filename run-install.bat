@@ -82,7 +82,7 @@ exit /b 0
 
 :create_conda_env
 echo Creating Conda environment...
-call "%MINICONDA_DIR%\_conda.exe" create --no-shortcuts -y -k --prefix "%ENV_DIR%" python=%PYTHON_VERSION%
+call "%MINICONDA_DIR%\_conda.exe" create --no-shortcuts -y -k --prefix "%ENV_DIR%" --override-channels --channel conda-forge python=%PYTHON_VERSION%
 if errorlevel 1 goto :error
 echo Conda environment created successfully.
 echo.

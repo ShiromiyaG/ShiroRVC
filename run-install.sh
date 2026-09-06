@@ -76,7 +76,11 @@ install_miniconda() {
 
 create_conda_env() {
     echo "Creating Conda environment..."
-    "$MINICONDA_DIR/bin/conda" create -y -k --prefix "$ENV_DIR" "python=$PYTHON_VERSION" \
+    # conda-forge with --override-channels keeps the defaults channels out of the
+    # solve: those require accepting Anaconda's Terms of Service, which aborts a
+    # non-interactive install.
+    "$MINICONDA_DIR/bin/conda" create -y -k --prefix "$ENV_DIR" \
+        --override-channels --channel conda-forge "python=$PYTHON_VERSION" \
         || fail "could not create the Conda environment"
     echo "Conda environment created successfully."
     echo

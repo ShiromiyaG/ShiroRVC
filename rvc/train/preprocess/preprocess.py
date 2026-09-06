@@ -369,12 +369,14 @@ def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_pr
     gain_dbs, peak_dbs, crest_dbs, safe_maxs = [], [], [], []
 
     with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
-        for result in pool.imap_unordered(_dry_run_check_file, arg_list):
-            if result:
-                gain_dbs.append(result["gain_db"])
-                peak_dbs.append(result["peak_db"])
-                crest_dbs.append(result["crest_db"])
-                safe_maxs.append(result["safe_max_db"])
+        with progress_task(len(arg_list), "Checking RMS target") as (progress, task_id):
+            for result in pool.imap_unordered(_dry_run_check_file, arg_list):
+                progress.advance(task_id)
+                if result:
+                    gain_dbs.append(result["gain_db"])
+                    peak_dbs.append(result["peak_db"])
+                    crest_dbs.append(result["crest_db"])
+                    safe_maxs.append(result["safe_max_db"])
 
     if safe_maxs:
         worst_safe = min(safe_maxs)
@@ -438,26 +440,29 @@ def plan_source_gains(gt_wavs_dir, audio_files, target_lufs, num_processes,
     powers, peaks = {}, {}
     arg_list = [(f, gt_wavs_dir) for f in audio_files]
     workers = pool_size(num_processes, len(audio_files))
-    # A pool of one is a spawned interpreter's worth of startup to do what this
-    # process can do inline, and on Windows spawning from inside a test runner
-    # re-imports the caller.  Scanning is a filter and a mean per file, so the
-    # serial path is the right one whenever there is only one worker anyway.
-    if workers <= 1:
-        results = (_source_scan_worker(a) for a in arg_list)
-        for result in results:
-            if not result:
-                continue
-            key, power, peak = result
-            powers.setdefault(key, []).append(power)
-            peaks[key] = max(peaks.get(key, 0.0), peak)
-    else:
-        with multiprocessing.Pool(processes=workers) as pool:
-            for result in pool.imap_unordered(_source_scan_worker, arg_list):
+    # This pass re-reads every slice Stage 1 just wrote, so on a large dataset
+    # it is minutes of work with nothing to show for it until the gains come
+    # back.  Without the bar it is indistinguishable from a hang.
+    with progress_task(len(arg_list), "Measuring loudness") as (progress, task_id):
+        def collect(results):
+            for result in results:
+                progress.advance(task_id)
                 if not result:
                     continue
                 key, power, peak = result
                 powers.setdefault(key, []).append(power)
                 peaks[key] = max(peaks.get(key, 0.0), peak)
+
+        # A pool of one is a spawned interpreter's worth of startup to do what
+        # this process can do inline, and on Windows spawning from inside a
+        # test runner re-imports the caller.  Scanning is a filter and a mean
+        # per file, so the serial path is the right one whenever there is only
+        # one worker anyway.
+        if workers <= 1:
+            collect(_source_scan_worker(a) for a in arg_list)
+        else:
+            with multiprocessing.Pool(processes=workers) as pool:
+                collect(pool.imap_unordered(_source_scan_worker, arg_list))
 
     ceiling = 10.0 ** (ceiling_db / 20.0)
     loudness, headroom_limit = {}, []
@@ -537,13 +542,17 @@ def _dry_run_slice_loudness(gt_wavs_dir, audio_files, target_lufs, num_processes
 
     arg_list = [(f, gt_wavs_dir, target_lufs, ceiling_db) for f in audio_files]
     crests, peaks, gains, safes = [], [], [], []
+    # Same reason as the bar in ``plan_source_gains``: a full pass over the
+    # slices, printing nothing until it is done.
     with multiprocessing.Pool(processes=pool_size(num_processes, len(audio_files))) as pool:
-        for result in pool.imap_unordered(_dry_run_loudness_file, arg_list):
-            if result and result["safe_max_db"] < target_lufs:
-                crests.append(result["crest_db"])
-                peaks.append(result["peak_db"])
-                gains.append(result["gain_db"])
-                safes.append(result["safe_max_db"])
+        with progress_task(len(arg_list), "Checking loudness target") as (progress, task_id):
+            for result in pool.imap_unordered(_dry_run_loudness_file, arg_list):
+                progress.advance(task_id)
+                if result and result["safe_max_db"] < target_lufs:
+                    crests.append(result["crest_db"])
+                    peaks.append(result["peak_db"])
+                    gains.append(result["gain_db"])
+                    safes.append(result["safe_max_db"])
     if safes:
         return False, min(safes), {
             "num_limited": len(safes),
