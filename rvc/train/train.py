@@ -2733,8 +2733,7 @@ def training_loop(
             )
             optim_d.zero_grad(set_to_none=True)
 
-            # Run discriminator on generated output
-            discriminator_model = net_d.module if hasattr(net_d, "module") else net_d
+            # Run discriminator on generated output.
             # The generator update reads the discriminator; it never trains it.
             # Its backward still computes a weight gradient for every branch,
             # and that gradient is thrown away -- ``optim_d.zero_grad`` above
@@ -2745,212 +2744,220 @@ def training_loop(
             # is unchanged.  Paired with ``no_grad_real`` below, measured on an
             # RTX 5060 at batch 8 over 0.4 s (v3 + UnivHD, both passes, forward
             # and backward): 320 ms/step becomes 240, at unchanged peak VRAM.
-            discriminator_parameter_states = [
-                parameter.requires_grad
-                for parameter in discriminator_model.parameters()
-            ]
-            for parameter in discriminator_model.parameters():
-                parameter.requires_grad_(False)
-            try:
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    # ``no_grad_real``: the real side is the feature matching
-                    # *target* and its logits are discarded, so differentiating
-                    # it builds a graph nothing consumes.  See
-                    # ``MPD_MSD_Combined.forward``.
-                    # The unwrapped module, not ``net_d``: under DDP the
-                    # wrapper's forward arms the reducer for a backward that
-                    # will never produce a discriminator gradient, and no
-                    # gradient sync is wanted here in the first place.
-                    _, y_d_hat_g, fmap_r, fmap_g = discriminator_model(
-                        y, y_hat, no_grad_real=True
+            # ``Module.requires_grad_`` *is* the loop over ``parameters()``,
+            # and on ``net_d`` and not the unwrapped module because DDP holds
+            # the module as a submodule and adds no parameters of its own --
+            # the same 165 tensors either way.  The unwrap below is for the
+            # *call*, which is a different question.
+            net_d.requires_grad_(False)
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                # ``no_grad_real``: the real side is the feature matching
+                # *target* and its logits are discarded, so differentiating
+                # it builds a graph nothing consumes.  See
+                # ``MPD_MSD_Combined.forward``.
+                #
+                # The unwrapped module, and here the unwrap is load
+                # bearing: ``DistributedDataParallel._post_forward`` calls
+                # ``reducer.prepare_for_backward`` whenever grad is
+                # enabled, arming an allreduce that this backward can never
+                # complete -- every parameter is frozen, so no gradient
+                # hook fires.  The next iteration's discriminator forward
+                # then raises "Expected to have finished reduction in the
+                # prior iteration before starting a new one".  No gradient
+                # sync is wanted here in the first place.
+                discriminator_model = (
+                    net_d.module if hasattr(net_d, "module") else net_d
+                )
+                _, y_d_hat_g, fmap_r, fmap_g = discriminator_model(
+                    y, y_hat, no_grad_real=True
+                )
+
+
+            # Compute generator losses:
+            prior_gap_delta = None
+            prior_gap_error = None
+            if (
+                rank == 0
+                and m_p is not None
+                and diagnostics_interval > 0
+                and global_step % diagnostics_interval == 0
+                # The flow runs at the prior's frame rate; a batch where the
+                # two rates disagree is not comparable and is skipped rather
+                # than silently trimmed.
+                and m_p.shape[-1] == z.shape[-1]
+            ):
+                prior_gap_delta, prior_gap_error = _prior_gap(
+                    model_g,
+                    m_p,
+                    x_mask,
+                    ids_slice,
+                    config.train.segment_size // config.data.hop_length,
+                    pitchf,
+                    sid,
+                    y,
+                    y_hat,
+                    config,
+                )
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+
+                # Spectral loss.  The component terms are logged separately
+                # where a mode has more than one, because the combined series
+                # cannot show which half is actually moving -- and for
+                # "Hybrid L1" the balance between them is the thing to tune.
+                loss_spectral_parts: dict[str, torch.Tensor] = {}
+                if spectral_loss == "L1 Mel Loss":
+                    y_mel = wave_to_mel(
+                        config, y, num_mels=None,
+                        for_loss=False,
                     )
-
-
-                # Compute generator losses:
-                prior_gap_delta = None
-                prior_gap_error = None
-                if (
-                    rank == 0
-                    and m_p is not None
-                    and diagnostics_interval > 0
-                    and global_step % diagnostics_interval == 0
-                    # The flow runs at the prior's frame rate; a batch where the
-                    # two rates disagree is not comparable and is skipped rather
-                    # than silently trimmed.
-                    and m_p.shape[-1] == z.shape[-1]
-                ):
-                    prior_gap_delta, prior_gap_error = _prior_gap(
-                        model_g,
-                        m_p,
-                        x_mask,
-                        ids_slice,
-                        config.train.segment_size // config.data.hop_length,
-                        pitchf,
-                        sid,
-                        y,
-                        y_hat,
-                        config,
+                    y_hat_mel = wave_to_mel(
+                        config, y_hat, num_mels=None,
+                        for_loss=False,
                     )
-                with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-
-                    # Spectral loss.  The component terms are logged separately
-                    # where a mode has more than one, because the combined series
-                    # cannot show which half is actually moving -- and for
-                    # "Hybrid L1" the balance between them is the thing to tune.
-                    loss_spectral_parts: dict[str, torch.Tensor] = {}
-                    if spectral_loss == "L1 Mel Loss":
-                        y_mel = wave_to_mel(
-                            config, y, num_mels=None,
-                            for_loss=False,
-                        )
-                        y_hat_mel = wave_to_mel(
-                            config, y_hat, num_mels=None,
-                            for_loss=False,
-                        )
-                        if swap_l1_to_ms and fn_spectral_loss_ms is not None:
-                            # Loss swap: L1 mel fades out, Multi-Scale mel fades in over swap_duration_steps
-                            swap_progress = min(1.0, max(0.0, (global_step - swap_start_step) / max(1, swap_duration_steps)))
-                            swap_alpha = 0.5 * (1.0 - math.cos(math.pi * swap_progress))  # smooth 0->1 ramp
-                            loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
-                            loss_ms_mel = fn_spectral_loss_ms(y, y_hat) * config.train.c_mel / 3.0
-                            loss_spectral = (1.0 - swap_alpha) * loss_l1_mel + swap_alpha * loss_ms_mel
-                            loss_spectral_parts = {
-                                "loss_spectral_l1_mel": loss_l1_mel,
-                                "loss_spectral_ms_mel": loss_ms_mel,
-                            }
-                            if swap_progress >= 1.0 and not swap_completed:
-                                swap_completed = True
-                                success(f"Loss swap complete at step {global_step}; now using multi-scale mel loss.", tag="[TRAIN]")
-                        else:
-                            loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
-                    elif spectral_loss == "Multi-Scale Mel Loss":
-                        loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0 # * 15
-                    elif spectral_loss == "Hybrid L1":
-                        # L1 Mel
-                        y_mel = wave_to_mel(
-                            config, y, num_mels=None,
-                            for_loss=False,
-                        )
-                        y_hat_mel = wave_to_mel(
-                            config, y_hat, num_mels=None,
-                            for_loss=False,
-                        )
-                        loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel # * 45
-                        # MS-STFT.  Weighted, because the mel term it sits beside
-                        # carries c_mel (45 by default): at a hardcoded 1.0 the
-                        # multi-resolution term -- the only part of this loss that
-                        # resolves high frequencies directly -- contributes almost
-                        # nothing to the gradient it is there to provide.
-                        loss_ms_stft = (
-                            fn_spectral_loss2(y_hat.float(), y.float()) * ms_stft_weight
-                        )
-                        # Loss
-                        loss_spectral = loss_l1_mel + loss_ms_stft
-                        # Logged post-weight, which is what the sum above actually
-                        # sees: the point of these two series is to show whether
-                        # ``ms_stft_weight`` is high enough for the
-                        # MS-STFT term to matter beside a mel term carrying c_mel.
+                    if swap_l1_to_ms and fn_spectral_loss_ms is not None:
+                        # Loss swap: L1 mel fades out, Multi-Scale mel fades in over swap_duration_steps
+                        swap_progress = min(1.0, max(0.0, (global_step - swap_start_step) / max(1, swap_duration_steps)))
+                        swap_alpha = 0.5 * (1.0 - math.cos(math.pi * swap_progress))  # smooth 0->1 ramp
+                        loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
+                        loss_ms_mel = fn_spectral_loss_ms(y, y_hat) * config.train.c_mel / 3.0
+                        loss_spectral = (1.0 - swap_alpha) * loss_l1_mel + swap_alpha * loss_ms_mel
                         loss_spectral_parts = {
                             "loss_spectral_l1_mel": loss_l1_mel,
-                            "loss_spectral_ms_stft": loss_ms_stft,
+                            "loss_spectral_ms_mel": loss_ms_mel,
                         }
-
-                    loss_fm = feature_loss(fmap_r, fmap_g, normalize=False) * 2.0
-
-                    # Generator loss.  ``y_d_hat_g`` comes from the *generator*
-                    # update's forward, which never sets ``san_training``, so these
-                    # are plain logits and ``san_direction_weight`` is inert -- the
-                    # direction output is the discriminator's business alone.
-                    loss_adv = generator_loss(
-                        y_d_hat_g,
-                        normalize=False,
-                        san_direction_weight=san_direction_weight,
-                        use_softplus=san_active,
+                        if swap_progress >= 1.0 and not swap_completed:
+                            swap_completed = True
+                            success(f"Loss swap complete at step {global_step}; now using multi-scale mel loss.", tag="[TRAIN]")
+                    else:
+                        loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
+                elif spectral_loss == "Multi-Scale Mel Loss":
+                    loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0 # * 15
+                elif spectral_loss == "Hybrid L1":
+                    # L1 Mel
+                    y_mel = wave_to_mel(
+                        config, y, num_mels=None,
+                        for_loss=False,
                     )
-
-                    loss_kl, raw_kl = kl_loss(
-                        z_p,
-                        logs_q,
-                        m_p,
-                        logs_p,
-                        z_mask,
-                        return_terms=True,
+                    y_hat_mel = wave_to_mel(
+                        config, y_hat, num_mels=None,
+                        for_loss=False,
                     )
-                    loss_kl = loss_kl * config.train.c_kl
+                    loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel # * 45
+                    # MS-STFT.  Weighted, because the mel term it sits beside
+                    # carries c_mel (45 by default): at a hardcoded 1.0 the
+                    # multi-resolution term -- the only part of this loss that
+                    # resolves high frequencies directly -- contributes almost
+                    # nothing to the gradient it is there to provide.
+                    loss_ms_stft = (
+                        fn_spectral_loss2(y_hat.float(), y.float()) * ms_stft_weight
+                    )
+                    # Loss
+                    loss_spectral = loss_l1_mel + loss_ms_stft
+                    # Logged post-weight, which is what the sum above actually
+                    # sees: the point of these two series is to show whether
+                    # ``ms_stft_weight`` is high enough for the
+                    # MS-STFT term to matter beside a mel term carrying c_mel.
+                    loss_spectral_parts = {
+                        "loss_spectral_l1_mel": loss_l1_mel,
+                        "loss_spectral_ms_stft": loss_ms_stft,
+                    }
 
-                    # KL diagnostic: per-dimension raw divergence.  Two things
-                    # this deliberately does not do.  It does not re-form
-                    # ``raw_kl`` -- that is the tensor ``kl_loss`` just built,
-                    # handed back detached.  And it does not call ``.item()``:
-                    # the three it used to make sat between the generator's
-                    # forward and its backward, so each one drained the queue
-                    # and gave up the CPU's run-ahead on a step that is
-                    # dispatch-bound, for three floats nothing reads until the
-                    # next logging interval.  The caches hold device tensors
-                    # and are reduced where the series are written.
-                    with torch.no_grad():
-                        raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
-                            dim=(0, 2)
-                        ).clamp(min=1)
-                        diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
-                        # ``.float()`` so the deque holds one dtype whatever
-                        # autocast handed this step, which is what lets the
-                        # window be reduced with a single ``torch.stack``.
-                        kl_std_cache.append(diagnostic_kl.std().float())
-                        kl_mean_cache.append(diagnostic_kl.mean().float())
-                        kl_active_cache.append(
-                            (diagnostic_kl > kl_active_threshold).float().mean()
-                        )
-                        last_kl_per_dim = diagnostic_kl
+                loss_fm = feature_loss(fmap_r, fmap_g, normalize=False) * 2.0
 
-                    loss_core = loss_spectral + loss_kl
-                    loss_gan = loss_adv + loss_fm
-                    loss_gen_total = loss_core + loss_gan
-                    if rank == 0 and prior_gap_delta is not None:
-                        writer.add_scalar(
-                            "diag/prior_gap_mel_l1",
-                            prior_gap_delta.item(),
-                            global_step,
-                        )
-                        writer.add_scalar(
-                            "diag/prior_mel_l1",
-                            prior_gap_error.item(),
-                            global_step,
-                        )
-
-                # Generator backward and update:
-                optim_g.zero_grad(set_to_none=True)
-                module_grad_metrics = {}
-                if grad_scaler is not None:
-                    grad_scaler.scale(loss_gen_total).backward()
-                    grad_scaler.unscale_(optim_g)
-                else:
-                    loss_gen_total.backward()
-                if global_step % metrics_update_interval == 0:
-                    module_grad_metrics = _generator_gradient_metrics(net_g)
-                grad_norm_g = _clip_or_sample_grad_norm(
-                    net_g.parameters(),
-                    grad_clip_value_g,
-                    global_step,
-                    metrics_update_interval,
+                # Generator loss.  ``y_d_hat_g`` comes from the *generator*
+                # update's forward, which never sets ``san_training``, so these
+                # are plain logits and ``san_direction_weight`` is inert -- the
+                # direction output is the discriminator's business alone.
+                loss_adv = generator_loss(
+                    y_d_hat_g,
+                    normalize=False,
+                    san_direction_weight=san_direction_weight,
+                    use_softplus=san_active,
                 )
-                if grad_scaler is not None:
-                    grad_scaler.step(optim_g)
-                else:
-                    optim_g.step()
-            finally:
-                # ``finally`` and not a plain restore after the step: a
-                # skipped batch or a raise anywhere above would otherwise
-                # leave every ``net_d`` parameter frozen for the rest of
-                # the run, with ``loss_disc`` still logged and
-                # ``optim_d.step`` still called -- a discriminator that
-                # has silently stopped learning.
-                for parameter, requires_grad in zip(
-                    discriminator_model.parameters(),
-                    discriminator_parameter_states,
-                    strict=True,
-                ):
-                    parameter.requires_grad_(requires_grad)
+
+                loss_kl, raw_kl = kl_loss(
+                    z_p,
+                    logs_q,
+                    m_p,
+                    logs_p,
+                    z_mask,
+                    return_terms=True,
+                )
+                loss_kl = loss_kl * config.train.c_kl
+
+                # KL diagnostic: per-dimension raw divergence.  Two things
+                # this deliberately does not do.  It does not re-form
+                # ``raw_kl`` -- that is the tensor ``kl_loss`` just built,
+                # handed back detached.  And it does not call ``.item()``:
+                # the three it used to make sat between the generator's
+                # forward and its backward, so each one drained the queue
+                # and gave up the CPU's run-ahead on a step that is
+                # dispatch-bound, for three floats nothing reads until the
+                # next logging interval.  The caches hold device tensors
+                # and are reduced where the series are written.
+                with torch.no_grad():
+                    raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
+                        dim=(0, 2)
+                    ).clamp(min=1)
+                    diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
+                    # ``.float()`` so the deque holds one dtype whatever
+                    # autocast handed this step, which is what lets the
+                    # window be reduced with a single ``torch.stack``.
+                    kl_std_cache.append(diagnostic_kl.std().float())
+                    kl_mean_cache.append(diagnostic_kl.mean().float())
+                    kl_active_cache.append(
+                        (diagnostic_kl > kl_active_threshold).float().mean()
+                    )
+                    last_kl_per_dim = diagnostic_kl
+
+                loss_core = loss_spectral + loss_kl
+                loss_gan = loss_adv + loss_fm
+                loss_gen_total = loss_core + loss_gan
+                if rank == 0 and prior_gap_delta is not None:
+                    writer.add_scalar(
+                        "diag/prior_gap_mel_l1",
+                        prior_gap_delta.item(),
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        "diag/prior_mel_l1",
+                        prior_gap_error.item(),
+                        global_step,
+                    )
+
+            # Generator backward and update:
+            optim_g.zero_grad(set_to_none=True)
+            module_grad_metrics = {}
+            if grad_scaler is not None:
+                grad_scaler.scale(loss_gen_total).backward()
+                grad_scaler.unscale_(optim_g)
+            else:
+                loss_gen_total.backward()
+            if global_step % metrics_update_interval == 0:
+                module_grad_metrics = _generator_gradient_metrics(net_g)
+            grad_norm_g = _clip_or_sample_grad_norm(
+                net_g.parameters(),
+                grad_clip_value_g,
+                global_step,
+                metrics_update_interval,
+            )
+            if grad_scaler is not None:
+                grad_scaler.step(optim_g)
+            else:
+                optim_g.step()
+            # Unwind the freeze.  A plain restore and not a ``finally``: the
+            # batch loop catches nothing, ``run`` is the process target, so an
+            # exception anywhere above ends this process rather than reaching
+            # another step that a frozen discriminator could spoil.
+            #
+            # Unconditionally ``True`` and not a captured state list:
+            # ``apply_frontend_freeze`` is the only other ``requires_grad``
+            # write in the codebase and it operates on ``net_g``, so every
+            # discriminator parameter is trainable at every step.  A freeze
+            # that ever reaches ``net_d`` -- a frozen-D stage, a partial
+            # pretrained load -- makes both paragraphs false, and this is the
+            # line to change.
+            net_d.requires_grad_(True)
 
 
             if grad_scaler is not None:
