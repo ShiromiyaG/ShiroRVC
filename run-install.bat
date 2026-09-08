@@ -12,7 +12,6 @@ set "MINICONDA_URL=https://repo.anaconda.com/miniconda/Miniconda3-py312_26.5.3-2
 set "CONDA_EXE=%MINICONDA_DIR%\Scripts\conda.exe"
 set "PYTHON_VERSION=3.12"
 set "TORCH_VERSION=2.13.0"
-set "TORCHVISION_VERSION=0.28.0"
 set "TORCHAUDIO_VERSION=2.11.0"
 set "PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu130"
 
@@ -102,7 +101,7 @@ call "%MINICONDA_DIR%\condabin\conda.bat" activate "%ENV_DIR%" || goto :error
 
 echo Installing pip packages...
 uv pip install --upgrade setuptools || goto :error
-uv pip install torch==%TORCH_VERSION% torchvision==%TORCHVISION_VERSION% torchaudio==%TORCHAUDIO_VERSION% --upgrade --index-url %PYTORCH_INDEX_URL% || goto :error
+uv pip install torch==%TORCH_VERSION% torchaudio==%TORCHAUDIO_VERSION% --upgrade --index-url %PYTORCH_INDEX_URL% || goto :error
 uv pip install -r "%INSTALL_DIR%\requirements.txt" || goto :error
 
 :: Translation catalogs: gettext falls back to English without raising

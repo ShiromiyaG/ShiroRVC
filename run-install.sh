@@ -13,7 +13,6 @@ ENV_DIR="$INSTALL_DIR/env"
 MINICONDA_VERSION="py312_26.5.3-2"
 PYTHON_VERSION="3.12"
 TORCH_VERSION="2.13.0"
-TORCHVISION_VERSION="0.28.0"
 TORCHAUDIO_VERSION="2.11.0"
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu130"
 
@@ -99,8 +98,8 @@ install_dependencies() {
     local uv=("$ENV_DIR/bin/python" -m uv pip install --python "$ENV_DIR/bin/python")
 
     "${uv[@]}" --upgrade setuptools || fail "setuptools"
-    "${uv[@]}" "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" \
-        "torchaudio==$TORCHAUDIO_VERSION" --upgrade --index-url "$PYTORCH_INDEX_URL" \
+    "${uv[@]}" "torch==$TORCH_VERSION" "torchaudio==$TORCHAUDIO_VERSION" \
+        --upgrade --index-url "$PYTORCH_INDEX_URL" \
         || fail "PyTorch"
     "${uv[@]}" -r "$INSTALL_DIR/requirements.txt" || fail "requirements.txt"
 

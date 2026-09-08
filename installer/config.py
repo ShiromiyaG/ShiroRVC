@@ -33,7 +33,6 @@ TORCH_INDEXES = {
 #: Used only when requirements.txt cannot be parsed for them.
 FALLBACK_TORCH_PINS = {
     "torch": "2.13.0",
-    "torchvision": "0.28.0",
     "torchaudio": "2.11.0",
 }
 

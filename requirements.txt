@@ -17,25 +17,20 @@ noisereduce
 # Neural VAD behind the "New Automatic" cutter; pulls kaldi-native-fbank.
 fireredvad==0.0.2
 stftpitchshift
-flatten-dict==0.4.2
-torch-dct==0.1.6
 
 # Machine learning and deep learning
+# Pulled in by librosa/resampy, not imported directly; pinned for numpy 2.2.
 numba==0.64.0
 torch==2.13.0
 torchaudio==2.11.0
-torchvision==0.28.0
 torchcrepe==0.0.23
-torch-optimizer
 einops
 transformers==4.44.2
 # Direct dependency of the SPIN WavLM embedder, which loads its projection head
 # from a .safetensors file rather than through transformers.
 safetensors>=0.4.0
-nnaudio==0.3.3
 triton==3.7.1; sys_platform == "linux"
 triton-windows==3.7.1.post27; sys_platform == "win32"
-peft==0.17.1
 schedulefree==1.4.1
 
 # Visualization and UI
@@ -45,10 +40,7 @@ gradio==6.9.0
 local_attention==1.11.2
 
 # Miscellaneous utilities
-tensorboardX
 edge-tts==7.2.7
-pypresence
 beautifulsoup4
-flask
 psutil==7.0.0
 zstandard
