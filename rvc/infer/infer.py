@@ -65,16 +65,16 @@ class VoiceConverter:
         self.loaded_index = None  # Deserialized Faiss index
         self.loaded_index_meta = None  # Serialised sidecar for the bundle index
         # Whether the embedder wants its input layer-normalised.  Extraction has
-        # always honoured this; inference used to drop it on the floor, so a
-        # custom embedder whose config asked for normalisation produced training
+        # always honoured this; inference used to drop it on the floor, so an
+        # embedder whose config asked for normalisation produced training
         # features and query features from two different distributions -- an
         # index that silently retrieved the wrong neighbours, with nothing
         # anywhere reporting a problem.
         self.hubert_do_normalize = False
 
-    def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
+    def load_hubert(self, embedder_model: str):
         self.hubert_model, self.hubert_do_normalize = load_embedder_model(
-            embedder_model, embedder_model_custom
+            embedder_model
         )
         self.hubert_model = self.hubert_model.to(self.config.device).float()
         self.hubert_model.eval()
@@ -133,7 +133,6 @@ class VoiceConverter:
         f0_autotune_strength: float = 1,
         filter_radius: float = 3.0,
         embedder_model: str = "contentvec",
-        embedder_model_custom: str = None,
         clean_audio: bool = False,
         clean_strength: float = 0.5,
         export_format: str = "WAV",
@@ -176,7 +175,7 @@ class VoiceConverter:
                 audio /= audio_max
 
             if not self.hubert_model or embedder_model != self.last_embedder_model:
-                self.load_hubert(embedder_model, embedder_model_custom)
+                self.load_hubert(embedder_model)
                 self.last_embedder_model = embedder_model
 
             file_index = (
@@ -439,9 +438,9 @@ class VoiceConverter:
             self.version = self.active_cpt.get("version", "v1")
             # The width the model was actually built with, read off the text
             # encoder's own input layer.  The version rule below is only a
-            # fallback: it holds for contentvec and the spin_v* pair, and is
-            # wrong for any embedder whose width is not tied to the RVC
-            # version -- spin_wavlm_512 is 256-wide under version "v2".
+            # fallback: it holds for contentvec and the spin_v* pair, and
+            # would be wrong for any embedder whose width is not tied to the
+            # RVC version.
             emb_phone = self.active_cpt["weight"].get("enc_p.emb_phone.weight")
             if emb_phone is not None:
                 self.text_enc_hidden_dim = int(emb_phone.shape[1])

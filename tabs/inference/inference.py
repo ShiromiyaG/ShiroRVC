@@ -30,17 +30,11 @@ sys.path.append(now_dir)
 
 model_root = os.path.join(now_dir, "logs")
 audio_root = os.path.join(now_dir, "assets", "audios")
-custom_embedder_root = os.path.join(
-    now_dir, "rvc", "models", "embedders", "embedders_custom"
-)
-
 PRESETS_DIR = os.path.join(now_dir, "assets", "presets")
 FORMANTSHIFT_DIR = os.path.join(now_dir, "assets", "formant_shift")
 
-os.makedirs(custom_embedder_root, exist_ok=True)
 os.makedirs(audio_root, exist_ok=True)
 
-custom_embedder_root_relative = os.path.relpath(custom_embedder_root, now_dir)
 model_root_relative = os.path.relpath(model_root, now_dir)
 audio_root_relative = os.path.relpath(audio_root, now_dir)
 
@@ -87,13 +81,6 @@ audio_paths = [
     and root == audio_root_relative
     and "_output" not in name
 ]
-
-custom_embedders = [
-    os.path.join(dirpath, dirname)
-    for dirpath, dirnames, _ in os.walk(custom_embedder_root_relative)
-    for dirname in dirnames
-]
-
 
 def update_sliders(preset):
     with open(
@@ -325,41 +312,10 @@ def match_index(model_file_value):
     return ""
 
 
-def create_folder_and_move_files(folder_name, bin_file, config_file):
-    if not folder_name:
-        return "Folder name must not be empty."
-
-    folder_name = os.path.basename(folder_name)
-    target_folder = os.path.join(custom_embedder_root, folder_name)
-    normalized_target_folder = os.path.abspath(target_folder)
-    normalized_custom_embedder_root = os.path.abspath(custom_embedder_root)
-
-    if not normalized_target_folder.startswith(normalized_custom_embedder_root):
-        return "Invalid folder name. Folder must be within the custom embedder root directory."
-
-    os.makedirs(target_folder, exist_ok=True)
-
-    if bin_file:
-        shutil.copy(bin_file, os.path.join(target_folder, os.path.basename(bin_file)))
-
-    if config_file:
-        shutil.copy(config_file, os.path.join(target_folder, os.path.basename(config_file)))
-
-    return f"Files moved to folder {target_folder}"
-
-
 def refresh_formant():
     json_files = list_json_files(FORMANTSHIFT_DIR)
     return gr.update(choices=json_files)
 
-
-def refresh_embedders_folders():
-    custom_embedders = [
-        os.path.join(dirpath, dirname)
-        for dirpath, dirnames, _ in os.walk(custom_embedder_root_relative)
-        for dirname in dirnames
-    ]
-    return custom_embedders
 
 def get_speakers_id(model, sub_model_name=None):
     if not model or not os.path.exists(os.path.join(now_dir, model)):
@@ -439,7 +395,7 @@ def inference_tab():
             f0_method, audio, output_path, model_file, index_file,
             split_audio, autotune, autotune_strength,
             clean_audio, clean_strength, export_format,
-            embedder_model, embedder_model_custom,
+            embedder_model,
             formant_shifting, formant_qfrency, formant_timbre,
             sid, seed, bundle_submodel,
             index_k, index_power, index_continuity,
@@ -467,7 +423,7 @@ def inference_tab():
                 split_audio, autotune, autotune_strength,
                 clean_audio, clean_strength, export_format,
                 None,
-                embedder_model, embedder_model_custom,
+                embedder_model,
                 formant_shifting, formant_qfrency, formant_timbre,
                 sid, seed, bundle_submodel,
                 index_k, index_power, index_continuity,
@@ -792,39 +748,10 @@ def inference_tab():
                 embedder_model = gr.Radio(
                     label=_("Embedder Model"),
                     info=_("Model used for speaker features."),
-                    choices=[
-                        "contentvec",
-                        "spin_v1",
-                        "spin_v2",
-                        "spin_wavlm_512",
-                        "custom",
-                    ],
+                    choices=["contentvec", "spin_v1", "spin_v2"],
                     value="contentvec",
                     interactive=True,
                 )
-                with gr.Column(visible=False) as embedder_custom:
-                    with gr.Accordion(_("Custom Embedder"), open=True):
-                        with gr.Row():
-                            embedder_model_custom = gr.Dropdown(
-                                label=_("Select Custom Embedder"),
-                                choices=refresh_embedders_folders(),
-                                interactive=True,
-                                allow_custom_value=True,
-                            )
-                            refresh_embedders_button = gr.Button(_("Refresh embedders"))
-                        folder_name_input = gr.Textbox(label=_("Folder Name"), interactive=True)
-                        with gr.Row():
-                            bin_file_upload = gr.File(
-                                label=_("Upload .bin"),
-                                type="filepath",
-                                interactive=True,
-                            )
-                            config_file_upload = gr.File(
-                                label=_("Upload .json"),
-                                type="filepath",
-                                interactive=True,
-                            )
-                        move_files_button = gr.Button(_("Move files to custom embedder"))
 
         convert_button1 = gr.Button(_("Convert"))
 
@@ -1076,13 +1003,7 @@ def inference_tab():
                 embedder_model_batch = gr.Radio(
                     label=_("Embedder Model"),
                     info=_("Model used for speaker features."),
-                    choices=[
-                        "contentvec",
-                        "spin_v1",
-                        "spin_v2",
-                        "spin_wavlm_512",
-                        "custom",
-                    ],
+                    choices=["contentvec", "spin_v1", "spin_v2"],
                     value="contentvec",
                     interactive=True,
                 )
@@ -1090,31 +1011,6 @@ def inference_tab():
                     label=_("Edited F0 curve"),
                     visible=True,
                 )
-                with gr.Column(visible=False) as embedder_custom_batch:
-                    with gr.Accordion(_("Custom Embedder"), open=True):
-                        with gr.Row():
-                            embedder_model_custom_batch = gr.Dropdown(
-                                label=_("Select Custom Embedder"),
-                                choices=refresh_embedders_folders(),
-                                interactive=True,
-                                allow_custom_value=True,
-                            )
-                            refresh_embedders_button_batch = gr.Button(_("Refresh embedders"))
-                        folder_name_input_batch = gr.Textbox(
-                            label=_("Folder Name"), interactive=True
-                        )
-                        with gr.Row():
-                            bin_file_upload_batch = gr.File(
-                                label=_("Upload .bin"),
-                                type="filepath",
-                                interactive=True,
-                            )
-                            config_file_upload_batch = gr.File(
-                                label=_("Upload .json"),
-                                type="filepath",
-                                interactive=True,
-                            )
-                        move_files_button_batch = gr.Button(_("Move files to custom embedder"))
 
         convert_button_batch = gr.Button(_("Convert"))
         stop_button = gr.Button(_("Stop convert"), visible=False)
@@ -1128,11 +1024,6 @@ def inference_tab():
 
     def toggle_visible(checkbox):
         return {"visible": checkbox, "__type__": "update"}
-
-    def toggle_visible_embedder_custom(embedder_model):
-        if embedder_model == "custom":
-            return {"visible": True, "__type__": "update"}
-        return {"visible": False, "__type__": "update"}
 
     def enable_stop_convert_button():
         return {"visible": False, "__type__": "update"}, {
@@ -1278,44 +1169,6 @@ def inference_tab():
         inputs=[],
         outputs=[],
     )
-    embedder_model.change(
-        fn=toggle_visible_embedder_custom,
-        inputs=[embedder_model],
-        outputs=[embedder_custom],
-        show_progress="hidden",
-    )
-    embedder_model_batch.change(
-        fn=toggle_visible_embedder_custom,
-        inputs=[embedder_model_batch],
-        outputs=[embedder_custom_batch],
-        show_progress="hidden",
-    )
-    move_files_button.click(
-        fn=create_folder_and_move_files,
-        inputs=[folder_name_input, bin_file_upload, config_file_upload],
-        outputs=[],
-    )
-    refresh_embedders_button.click(
-        fn=lambda: gr.update(choices=refresh_embedders_folders()),
-        inputs=[],
-        outputs=[embedder_model_custom],
-        show_progress="hidden",
-    )
-    move_files_button_batch.click(
-        fn=create_folder_and_move_files,
-        inputs=[
-            folder_name_input_batch,
-            bin_file_upload_batch,
-            config_file_upload_batch,
-        ],
-        outputs=[],
-    )
-    refresh_embedders_button_batch.click(
-        fn=lambda: gr.update(choices=refresh_embedders_folders()),
-        inputs=[],
-        outputs=[embedder_model_custom_batch],
-        show_progress="hidden",
-    )
     convert_button1.click(
         fn=run_single_infer,
         inputs=[
@@ -1336,7 +1189,6 @@ def inference_tab():
             clean_strength,
             export_format,
             embedder_model,
-            embedder_model_custom,
             formant_shifting,
             formant_qfrency,
             formant_timbre,
@@ -1371,7 +1223,6 @@ def inference_tab():
             export_format_batch,
             f0_file_batch,
             embedder_model_batch,
-            embedder_model_custom_batch,
             formant_shifting_batch,
             formant_qfrency_batch,
             formant_timbre_batch,

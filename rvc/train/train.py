@@ -114,6 +114,7 @@ from losses import (
     feature_loss,
     kl_loss,
     mel_low_frequency_weights,
+    mel_frequency_tilt_weights,
     BandWeightedSpectralLoss,
     MultiScaleSTFTLoss,
 )
@@ -808,6 +809,25 @@ def _cache_mean(cache) -> float:
     return torch.stack(list(cache)).mean().item()
 
 
+def _branch_separation(disc_real_outputs, disc_generated_outputs):
+    """Per-head ``mean(real logit) - mean(fake logit)``, detached.
+
+    Under SAN a head returns ``(function, direction)`` rather than one tensor;
+    the function output is the one the generator is scored by, so it is the one
+    whose separation means anything.
+    """
+
+    def logits(output):
+        return (output[0] if isinstance(output, (list, tuple)) else output).detach()
+
+    return torch.stack(
+        [
+            logits(dr).float().mean() - logits(dg).float().mean()
+            for dr, dg in zip(disc_real_outputs, disc_generated_outputs)
+        ]
+    )
+
+
 def _clip_or_sample_grad_norm(
     parameters,
     max_norm,
@@ -911,6 +931,69 @@ def _cpu_state_dict(source):
     }
 
 
+#: Bands the held-out spectral deficit is reported over, in Hz.  Split where a
+#: vocoder's error changes character rather than evenly: below 4 kHz is where
+#: the mel scale already spends most of its bins, and the two top bands are the
+#: ones a mel L1 charges 4-6x less for than the same defect at 1-3 kHz.  A band
+#: starting at or above Nyquist is dropped and the last one is clipped to it, so
+#: the same list serves every shipped sample rate.
+HOLDOUT_DEFICIT_BANDS = (
+    (1000, 2000),
+    (2000, 4000),
+    (4000, 6000),
+    (6000, 8000),
+    (8000, 10000),
+    (10000, 13000),
+    (13000, 16000),
+)
+
+
+def _deficit_band_edges(sample_rate):
+    """``(low, high, label)`` per band that fits under this rate's Nyquist."""
+
+    nyquist = float(sample_rate) / 2.0
+    edges = []
+    for low, high in HOLDOUT_DEFICIT_BANDS:
+        if low >= nyquist:
+            break
+        edges.append((float(low), min(float(high), nyquist), f"{low // 1000}k"))
+    return edges
+
+
+def _band_deficit_db(generated, target, sample_rate):
+    """How much energy the generator is missing per band, in dB, per band label.
+
+    Negative is the generator below the reference, which is the direction a
+    vocoder fails in.  ``mel_l1`` cannot answer this: it is one number over a
+    warped axis, so a 14 dB hole above 10 kHz and a 2 dB error at 1 kHz reach
+    it as comparable contributions -- which is the whole reason the band
+    weighting exists.  Averaged in dB per item rather than over pooled energy,
+    or one loud excerpt would decide the figure for the set.
+    """
+
+    generated = generated.float().flatten(0, -2) if generated.ndim > 2 else generated.float()
+    target = target.float().flatten(0, -2) if target.ndim > 2 else target.float()
+    spectrum_g = torch.fft.rfft(generated, dim=-1).abs().pow(2)
+    spectrum_t = torch.fft.rfft(target, dim=-1).abs().pow(2)
+    freqs = torch.fft.rfftfreq(
+        generated.shape[-1], 1.0 / float(sample_rate), device=generated.device
+    )
+
+    deficits = {}
+    for low, high, label in _deficit_band_edges(sample_rate):
+        band = (freqs >= low) & (freqs < high)
+        if not bool(band.any()):
+            continue
+        # The floor is what keeps a silent excerpt from reporting -inf and
+        # taking the whole average with it.
+        energy_g = spectrum_g[..., band].sum(-1).clamp_min(1e-12)
+        energy_t = spectrum_t[..., band].sum(-1).clamp_min(1e-12)
+        deficits[label] = float(
+            (10.0 * torch.log10(energy_g / energy_t)).mean()
+        )
+    return deficits
+
+
 def _holdout_metrics(
     net_g,
     excerpts,
@@ -945,6 +1028,8 @@ def _holdout_metrics(
     was_training = model.training
     model.eval()
     totals = {"mel_l1": 0.0}
+    for _, _, label in _deficit_band_edges(config.data.sample_rate):
+        totals[f"band_deficit_{label}"] = 0.0
     if want_latent:
         totals["latent_gap"] = 0.0
         totals["latent_posterior"] = 0.0
@@ -1044,6 +1129,12 @@ def _holdout_metrics(
                 )
                 prior_mel = wave_to_mel(config, prior_wave[..., :length], num_mels=None)
                 totals["mel_l1"] += float(F.l1_loss(prior_mel, target_mel))
+                for label, deficit in _band_deficit_db(
+                    prior_wave[..., :length],
+                    wave[..., :length],
+                    config.data.sample_rate,
+                ).items():
+                    totals[f"band_deficit_{label}"] += deficit
                 if posterior_wave is not None:
                     posterior_mel = wave_to_mel(
                         config, posterior_wave[..., :length], num_mels=None
@@ -2209,26 +2300,59 @@ def run(
     mel_low_emphasis_hz = float(
         getattr(config.train, "mel_low_emphasis_hz", 1000.0)
     )
+    # Undoes part of the mel scale's bin density, which is what decides how the
+    # L1's gradient is split across frequency: 0-2 kHz holds 45% of the bins
+    # and 12.5% of the spectrum, and that ratio is the same at every scale in
+    # the multi-scale set.  0.0 is off, and off is what a config predating this
+    # key gets -- see ``mel_frequency_tilt_weights``.
+    mel_frequency_tilt = float(getattr(config.train, "mel_frequency_tilt", 0.0))
+    mel_frequency_tilt_max_ratio = float(
+        getattr(config.train, "mel_frequency_tilt_max_ratio", 8.0)
+    )
 
     def _make_mel_distance():
-        # ``mel_distance``/``mel_low_emphasis`` were only ever wired up for the
-        # ChouwaGAN stack; every other vocoder always took this branch
-        # regardless of the configured value.  Preserved exactly rather than
-        # generalised, since making Huber/MSE/weighting actually apply here
-        # would be a behaviour change to what RefineGAN/HiFi-GAN train on.
-        base, weighted = torch.nn.L1Loss, False
-        if not weighted or mel_low_emphasis == 1.0:
+        # ``mel_distance`` was only ever wired up for the ChouwaGAN stack;
+        # every other vocoder always took the plain-L1 branch regardless of the
+        # configured value.  Preserved rather than generalised, since making
+        # Huber/MSE actually apply here would be a behaviour change to what
+        # RefineGAN/HiFi-GAN train on.
+        #
+        # The band weighting is the one part that is reachable now, because it
+        # is the only lever that reaches the multi-scale mel's frequency
+        # allocation at all: the scale set cannot, the clamp floor is not what
+        # is binding, and both weightings are normalised to a mean of 1 so
+        # turning one on does not move the loss scale the adversarial balance
+        # reads.  Both default to their neutral value, so a config that does
+        # not mention them trains exactly as before.
+        base = torch.nn.L1Loss
+        weighted = mel_low_emphasis != 1.0 or mel_frequency_tilt != 0.0
+        if not weighted:
             return base()
 
         def _weights(num_mels: int):
-            return mel_low_frequency_weights(
+            weights = mel_frequency_tilt_weights(
                 num_mels=num_mels,
                 sample_rate=config.data.sample_rate,
                 mel_fmin=config.data.mel_fmin,
                 mel_fmax=config.data.mel_fmax,
-                emphasis=mel_low_emphasis,
-                cutoff_hz=mel_low_emphasis_hz,
+                tilt=mel_frequency_tilt,
+                max_ratio=mel_frequency_tilt_max_ratio,
             )
+            if mel_low_emphasis != 1.0:
+                # Multiplied, then renormalised: the two answer different
+                # questions -- one says the bottom matters more than the mel
+                # bin count says, the other says the top does -- and composing
+                # them keeps either usable on its own.
+                weights = weights * mel_low_frequency_weights(
+                    num_mels=num_mels,
+                    sample_rate=config.data.sample_rate,
+                    mel_fmin=config.data.mel_fmin,
+                    mel_fmax=config.data.mel_fmax,
+                    emphasis=mel_low_emphasis,
+                    cutoff_hz=mel_low_emphasis_hz,
+                )
+                weights = weights / weights.mean()
+            return weights
 
         # The factory is what makes this usable by the multi-scale mel loss,
         # which evaluates the same distance at 5/10/20/40/80/160/320 bands.
@@ -2626,6 +2750,9 @@ def training_loop(
         "prior_detail_rms": deque(maxlen=rolling_loss_steps),
     }
     avg_rolling_cache["loss_kl"] = deque(maxlen=rolling_loss_steps)
+    # One separation per head per step.  Rank 0 only: it is a diagnostic, and
+    # the other ranks never write to the summary.
+    branch_disc_cache = deque(maxlen=rolling_loss_steps)
     kl_std_cache = deque(maxlen=rolling_loss_steps)
     kl_mean_cache = deque(maxlen=rolling_loss_steps)
     kl_active_cache = deque(maxlen=rolling_loss_steps)
@@ -2728,8 +2855,14 @@ def training_loop(
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 # The only pass that asks for the direction output: it is the
                 # one whose gradient trains the discriminator.
+                # ``combine_inputs``: the real and the fake side go through
+                # every branch as one batch of ``2B``.  Same numbers, half the
+                # kernel launches -- 149 ms -> 136 on a v4 at batch 8 over
+                # 0.4 s, at unchanged peak VRAM.  Only this pass can ask for
+                # it; the generator's runs the real side under ``no_grad``,
+                # and half a batch cannot be.
                 y_d_hat_r, y_d_hat_g, _, _ = net_d(
-                    y, y_hat.detach(), san_training=san_active
+                    y, y_hat.detach(), san_training=san_active, combine_inputs=True
                 )
 
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
@@ -2760,6 +2893,18 @@ def training_loop(
                 optim_d.step()
             if san_active:
                 _normalize_san_weights(net_d)
+
+            # Per-head separation, which the aggregate loss cannot show: nine
+            # heads are summed into ``loss_disc``, and a head that has stopped
+            # separating and a head that has learned the *opposite* of its job
+            # both leave that sum where it was.  The loss halves are no
+            # substitute -- each is a "how wrong" measure, so a head that is
+            # confidently wrong about fakes and a head that is right about them
+            # move the same term in opposite directions for the same reason.
+            # What answers the question is the raw logits: how much higher this
+            # head scores real audio than the generator's output.
+            if rank == 0:
+                branch_disc_cache.append(_branch_separation(y_d_hat_r, y_d_hat_g))
 
             # Temp accumulation
             _loss_disc_acc.append(loss_disc.detach())
@@ -3121,6 +3266,16 @@ def training_loop(
                 holdout_loss = metrics["mel_l1"]
                 if rank == 0 and math.isfinite(holdout_loss):
                     writer.add_scalar("holdout/mel_l1", holdout_loss, global_step)
+                    # Read these against ``mel_l1``, not instead of it: the
+                    # deficits say where the reconstruction is wrong and the L1
+                    # says how much it costs.  A spectral reweighting that is
+                    # buying the top bands with the bottom ones shows up as the
+                    # top deficits closing while ``mel_l1`` fails to move.
+                    for key, value in metrics.items():
+                        if key.startswith("band_deficit_") and math.isfinite(value):
+                            writer.add_scalar(
+                                f"holdout/{key}", value, global_step
+                            )
                     writer.add_scalar("holdout/best", overtrain_monitor.best, global_step)
                     writer.add_scalar(
                         "holdout/smoothed", overtrain_monitor.smoothed, global_step
@@ -3327,6 +3482,28 @@ def training_loop(
                         # Calculate mean
                         val = torch.stack(list(queue)).mean().item() if torch.is_tensor(queue[0]) else sum(queue)/len(queue)
                         scalar_dict_rolling[label] = val
+
+                # Per-head separation: the mean logit on real audio minus the
+                # mean on the generator's output.  Positive is a head doing its
+                # job, ~0 is one that has stopped separating, and *negative* is
+                # a head that scores the generator above real audio -- which
+                # does not merely stop helping, it pays the generator to keep
+                # whatever that head is reading.  The run this was added for
+                # spent 87k steps with every head between -0.05 and +0.02 on
+                # exactly the spectral defect it never fixed, the three
+                # spectrogram heads significantly on the wrong side of zero,
+                # while ``loss_disc`` sat at 20.0 throughout.
+                if branch_disc_cache:
+                    branch_mean = torch.stack(list(branch_disc_cache)).mean(0)
+                    labels = getattr(
+                        net_d.module if hasattr(net_d, "module") else net_d,
+                        "branch_labels",
+                        (),
+                    )
+                    for index, label in enumerate(labels[: branch_mean.shape[0]]):
+                        scalar_dict_rolling[
+                            f"disc_sep_{rolling_loss_steps}/{label}"
+                        ] = branch_mean[index].item()
 
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
 

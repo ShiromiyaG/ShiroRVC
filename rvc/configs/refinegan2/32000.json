@@ -17,6 +17,7 @@
         "validation_preview_height": 5.8,
         "segment_size": 12800,
         "c_mel": 45,
+        "mel_frequency_tilt": 0.5,
         "c_kl": 1.0,
         "holdout_fraction": 0.02,
         "holdout_min_slices": 16,

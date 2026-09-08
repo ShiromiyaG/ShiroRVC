@@ -22,7 +22,6 @@ AUDIO_DIR = ASSETS_DIR / "audios"
 DATASET_DIR = ASSETS_DIR / "datasets"
 PRESET_DIR = ASSETS_DIR / "training_presets"
 FORMANT_DIR = ASSETS_DIR / "formant_shift"
-CUSTOM_EMBEDDER_DIR = ROOT / "rvc" / "models" / "embedders" / "embedders_custom"
 #: Where the Gradio tab drops user-supplied pretrained weights, and therefore
 #: where the native interface has to look for them too -- the two must offer
 #: the same files or "the one I downloaded" is missing from one of them.

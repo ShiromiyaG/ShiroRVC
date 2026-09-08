@@ -89,7 +89,7 @@ class HubertModelWithFinalProj(HubertModel):
         self.final_proj = nn.Linear(config.hidden_size, config.classifier_proj_size)
 
 
-def load_embedder_model(embedder_model, custom_embedder=None):
+def load_embedder_model(embedder_model):
     logging.getLogger("transformers").setLevel(logging.ERROR)
     logging.getLogger("torch").setLevel(logging.ERROR)
 
@@ -98,7 +98,6 @@ def load_embedder_model(embedder_model, custom_embedder=None):
         "contentvec": os.path.join(embedder_root, "contentvec"),
         "spin_v1": os.path.join(embedder_root, "spin_v1"),
         "spin_v2": os.path.join(embedder_root, "spin_v2"),
-        "spin_wavlm_512": os.path.join(embedder_root, "spin_wavlm_512"),
     }
 
     online_embedders = {
@@ -109,56 +108,26 @@ def load_embedder_model(embedder_model, custom_embedder=None):
         "contentvec": "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec/config.json",
     }
 
-    if embedder_model == "custom":
-        if os.path.exists(custom_embedder):
-            model_path = custom_embedder
-        else:
-            warning(
-                f"Custom embedder not found at {custom_embedder}; using contentvec.",
-                tag="[INFER]",
-            )
-            model_path = embedding_list["contentvec"]
-    elif embedder_model == "spin_wavlm_512":
-        # Not a HuBERT, so it leaves before the shared tail below.  The weights
-        # are a Lightning checkpoint that has to be converted once; the
-        # converter is idempotent and checks the bundle it finds, so this is
-        # also what repairs a half-written one.
-        from rvc.lib.embedders import SpinWavLMModel
-        from rvc.lib.tools.convert_spin_wavlm import ensure_converted
-
-        model_path = embedding_list[embedder_model]
-        ensure_converted(model_path)
-        model = SpinWavLMModel(model_path)
-        return model, model.audio_requires_normalization
-    elif embedder_model == "spin_v1":
-        model_path = embedding_list[embedder_model]
-        bin_file = os.path.join(model_path, "pytorch_model.bin")
-        json_file = os.path.join(model_path, "config.json")
-    elif embedder_model == "spin_v2":
-        model_path = embedding_list[embedder_model]
-        bin_file = os.path.join(model_path, "pytorch_model.bin")
-        json_file = os.path.join(model_path, "config.json")
-    else:
-        if embedder_model not in embedding_list:
-            warning(
-                f"Unknown embedder {embedder_model!r}; using contentvec.",
-                tag="[INFER]",
-            )
-            embedder_model = "contentvec"
-        model_path = embedding_list[embedder_model]
-        bin_file = os.path.join(model_path, "pytorch_model.bin")
-        json_file = os.path.join(model_path, "config.json")
-        os.makedirs(model_path, exist_ok=True)
-        if not os.path.exists(bin_file):
-            url = online_embedders.get(embedder_model)
-            if url is not None:
-                info(f"Downloading the {embedder_model} weights.", tag="[INFER]")
-                wget.download(url, out=bin_file)
-        if not os.path.exists(json_file):
-            url = config_files.get(embedder_model)
-            if url is not None:
-                info(f"Downloading the {embedder_model} config.", tag="[INFER]")
-                wget.download(url, out=json_file)
+    if embedder_model not in embedding_list:
+        warning(
+            f"Unknown embedder {embedder_model!r}; using contentvec.",
+            tag="[INFER]",
+        )
+        embedder_model = "contentvec"
+    model_path = embedding_list[embedder_model]
+    bin_file = os.path.join(model_path, "pytorch_model.bin")
+    json_file = os.path.join(model_path, "config.json")
+    os.makedirs(model_path, exist_ok=True)
+    if not os.path.exists(bin_file):
+        url = online_embedders.get(embedder_model)
+        if url is not None:
+            info(f"Downloading the {embedder_model} weights.", tag="[INFER]")
+            wget.download(url, out=bin_file)
+    if not os.path.exists(json_file):
+        url = config_files.get(embedder_model)
+        if url is not None:
+            info(f"Downloading the {embedder_model} config.", tag="[INFER]")
+            wget.download(url, out=json_file)
 
     model = HubertModelWithFinalProj.from_pretrained(model_path)
 
@@ -173,58 +142,36 @@ def load_embedder_model(embedder_model, custom_embedder=None):
 
 
 #: Feature width of each embedder, which is what reaches the synthesizer as
-#: ``text_enc_hidden_dim``.  ``spin_wavlm_512`` is 256 wide -- the 512 in its
-#: name is SPIN's cluster count, not the width -- so a model trained against it
-#: is not weight-compatible with a 768-wide one.
+#: ``text_enc_hidden_dim``.  ``spin_v1`` is 256 wide, so a model trained
+#: against it is not weight-compatible with a 768-wide one.
 EMBEDDER_FEATURE_DIMS = {
     "contentvec": 768,
     "spin_v1": 256,
     "spin_v2": 768,
-    "spin_wavlm_512": 256,
 }
 
 
-def embedder_feature_dim(embedder_model, custom_embedder=None, default=768):
+def embedder_feature_dim(embedder_model, default=768):
     """How wide this embedder's features are, without loading it.
 
-    A custom embedder is read from its ``config.json``; anything unrecognised
-    falls back to ``default`` rather than raising, because this is called on
-    paths where guessing wrong is recoverable and stopping is not.
+    Anything unrecognised falls back to ``default`` rather than raising,
+    because this is called on paths where guessing wrong is recoverable and
+    stopping is not.
     """
-    if embedder_model in EMBEDDER_FEATURE_DIMS:
-        return EMBEDDER_FEATURE_DIMS[embedder_model]
-    if embedder_model == "custom" and custom_embedder:
-        try:
-            with open(
-                os.path.join(custom_embedder, "config.json"), encoding="utf-8"
-            ) as handle:
-                return int(json.load(handle).get("hidden_size", default))
-        except (OSError, ValueError, TypeError):
-            return default
-    return default
+    return EMBEDDER_FEATURE_DIMS.get(embedder_model, default)
 
 
 def extract_features(model, source, version, do_normalize=False):
     """v1 (256-D) takes layer-9 hidden states through final_proj; v2 (768-D) uses
     the last hidden state directly. do_normalize layer-norms the waveform first,
     matching what ContentVec/HuBERT expects.
-
-    ``SpinWavLMModel`` is neither: it applies its own projection inside
-    ``forward`` and takes the waveform positionally, so it is dispatched on the
-    module rather than on ``version`` -- the RVC version says nothing about
-    which embedder produced the features.
     """
-    from rvc.lib.embedders import SpinWavLMModel
-
     if do_normalize:
         # Over the sample axis only.  ``source.shape`` normalised across the
         # whole tensor, which is the same thing for the (1, T) inputs this used
         # to get and silently wrong for a batch, where it would mix every clip
         # into every other clip's statistics.
         source = F.layer_norm(source, source.shape[-1:])
-
-    if isinstance(model, SpinWavLMModel):
-        return model(source)["last_hidden_state"]
 
     if version == "v1":
         outputs = model(

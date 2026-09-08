@@ -235,11 +235,11 @@ FEATURE_PRECISIONS = {"fp32": np.float32, "fp16": np.float16}
 
 
 def process_file_embedding(
-    files, embedder_model, embedder_model_custom, device_num, device, n_threads,
+    files, embedder_model, device_num, device, n_threads,
     feature_precision="fp32",
 ):
     dtype = FEATURE_PRECISIONS.get(feature_precision, np.float32)
-    model, do_normalize = load_embedder_model(embedder_model, embedder_model_custom)
+    model, do_normalize = load_embedder_model(embedder_model)
     model = model.to(device).float()
     model.eval()
     if device == "cpu":
@@ -321,7 +321,7 @@ def process_file_embedding(
 
 
 def run_embedding_extraction(
-    files, devices, embedder_model, embedder_model_custom, threads,
+    files, devices, embedder_model, threads,
     feature_precision="fp32",
 ):
     devices_str = ", ".join(devices)
@@ -336,7 +336,6 @@ def run_embedding_extraction(
                 process_file_embedding,
                 files[i :: len(devices)],
                 embedder_model,
-                embedder_model_custom,
                 i,
                 devices[i],
                 threads // len(devices),
@@ -427,13 +426,12 @@ if __name__ == "__main__":
     # trained against spin_v1 still run.
     if embedder_model == "spin_v1":
         raise ValueError(
-            "spin_v1 can no longer be used for training; choose contentvec, "
-            "spin_v2 or custom. Existing spin_v1 models still run at inference."
+            "spin_v1 can no longer be used for training; choose contentvec or "
+            "spin_v2. Existing spin_v1 models still run at inference."
         )
-    embedder_model_custom = sys.argv[8] if len(sys.argv) > 8 else None
-    include_mutes = int(sys.argv[9]) if len(sys.argv) > 9 else 2
-    remove_16k_slices = sys.argv[10].lower() == "true" if len(sys.argv) > 10 else False
-    feature_precision = sys.argv[11] if len(sys.argv) > 11 else "fp32"
+    include_mutes = int(sys.argv[8]) if len(sys.argv) > 8 else 2
+    remove_16k_slices = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
+    feature_precision = sys.argv[10] if len(sys.argv) > 10 else "fp32"
     if feature_precision not in FEATURE_PRECISIONS:
         warning(
             f"Unknown feature precision {feature_precision!r}; using fp32.",
@@ -446,16 +444,13 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(exp_dir, "f0_voiced"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "extracted"), exist_ok=True)
 
-    chosen_embedder_model = (
-        embedder_model_custom if embedder_model == "custom" else embedder_model
-    )
     file_path = os.path.join(exp_dir, "model_info.json")
     if os.path.exists(file_path):
         with open(file_path, "r") as f:
             data = json.load(f)
     else:
         data = {}
-    data["embedder_model"] = chosen_embedder_model
+    data["embedder_model"] = embedder_model
     with open(file_path, "w") as f:
         json.dump(data, f, indent=4)
 
@@ -485,14 +480,11 @@ if __name__ == "__main__":
         files,
         devices,
         embedder_model,
-        embedder_model_custom,
         num_processes,
         feature_precision,
     )
 
-    generate_config(
-        sample_rate, exp_dir, vocoder_arch, embedder_model, embedder_model_custom
-    )
+    generate_config(sample_rate, exp_dir, vocoder_arch, embedder_model)
     generate_filelist(exp_dir, sample_rate, include_mutes, embedder_model, vocoder_arch)
 
     if remove_16k_slices:

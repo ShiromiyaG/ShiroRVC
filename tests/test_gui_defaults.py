@@ -35,7 +35,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 NOT_A_DEFAULT = {
     "model_name", "dataset_path", "gpu", "training_gpu", "extract_gpu",
     "multiple_gpu", "g_pretrained_path", "d_pretrained_path", "sample_rate",
-    "sampling_rate", "embedder_model_custom", "batch_size", "cpu_threads",
+    "sampling_rate", "batch_size", "cpu_threads",
     "vocoder_arch", "custom_lr_g", "custom_lr_d",
     # Chosen from what the hardware reports.
     "use_tf32", "use_checkpointing",

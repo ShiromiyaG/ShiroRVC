@@ -63,7 +63,6 @@ def build(
     destination: Path,
     f0_method: str,
     embedder: str,
-    embedder_custom: str | None,
     device: str,
     seconds: float | None,
     write_audio: bool,
@@ -103,7 +102,7 @@ def build(
     f0_coarse = pitch.coarse_f0(f0_fine)
 
     # --- embedder features, at half the f0 rate; the trainer repeats them by 2.
-    model, do_normalize = load_embedder_model(embedder, embedder_custom)
+    model, do_normalize = load_embedder_model(embedder)
     model = model.to(device).float().eval()
     with torch.inference_mode():
         frames = torch.from_numpy(audio).to(device).float().view(1, -1)
@@ -195,7 +194,6 @@ def main() -> int:
         help="must match the dataset's embedder, or the features mean something "
              "else to the model (default: contentvec)",
     )
-    parser.add_argument("--embedder-custom", default=None)
     parser.add_argument(
         "--no-audio", action="store_true",
         help="skip ref_audio.wav; the preview then has no mel comparison",
@@ -229,7 +227,6 @@ def main() -> int:
         destination=args.output_dir,
         f0_method=args.f0_method,
         embedder=args.embedder,
-        embedder_custom=args.embedder_custom,
         device=device,
         seconds=args.seconds,
         write_audio=not args.no_audio,

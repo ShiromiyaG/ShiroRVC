@@ -416,6 +416,9 @@ msgstr "Convertendo…"
 msgid "Copy"
 msgstr "Copiar"
 
+msgid "Correction mode"
+msgstr ""
+
 msgid "Could not read that preset file: {}"
 msgstr "Não foi possível ler esse arquivo de predefinição: {}"
 
@@ -437,9 +440,6 @@ msgstr "Criar pacote de modelo"
 msgid "Creates logs/<name>/. Reuse a name to continue a run."
 msgstr "Cria logs/<nome>/. Reutilize um nome para continuar uma execução."
 
-msgid "Custom Embedder"
-msgstr "Embedder personalizado"
-
 msgid "Custom Pretrained"
 msgstr "Pré-treinado personalizado"
 
@@ -448,9 +448,6 @@ msgstr "Pré-treinado D personalizado"
 
 msgid "Custom Pretrained G"
 msgstr "Pré-treinado G personalizado"
-
-msgid "Custom embedder"
-msgstr "Embedder personalizado"
 
 msgid "Custom lr for gen and disc"
 msgstr "LR personalizada para gerador e discriminador"
@@ -581,6 +578,9 @@ msgstr "Embedders e modelos de pitch"
 msgid "Empty saves to logs using the first model name."
 msgstr "Vazio salva em logs usando o nome do primeiro modelo."
 
+msgid "Enable RMVPE high-register correction"
+msgstr ""
+
 msgid "Enable cuDNN benchmark mode."
 msgstr "Ativa o modo benchmark do cuDNN."
 
@@ -689,6 +689,9 @@ msgstr "Status da extração."
 msgid "F0 Curve"
 msgstr "Curva de F0"
 
+msgid "F0 ceiling (Hz)"
+msgstr ""
+
 msgid "F0 curve file"
 msgstr "Arquivo da curva de F0"
 
@@ -755,11 +758,11 @@ msgstr "Primeiro modelo"
 msgid "Fit to window"
 msgstr "Ajustar à janela"
 
+msgid "Fixes the octave errors rmvpe.pt makes above ~1040 Hz (flutes, high strings, whistle register) with a second pass on octave-down-resampled audio. Off by default; when disabled RMVPE behaves exactly as before."
+msgstr ""
+
 msgid "Fold the chart away and give the width to the steps."
 msgstr "Recolhe o gráfico e cede a largura para as etapas."
-
-msgid "Folder Name"
-msgstr "Nome da pasta"
 
 msgid "Folder containing input audio."
 msgstr "Pasta com o áudio de entrada."
@@ -769,9 +772,6 @@ msgstr "Pasta com o áudio de treinamento."
 
 msgid "Folder for converted audio."
 msgstr "Pasta para o áudio convertido."
-
-msgid "Folder under rvc/models/embedders/embedders_custom."
-msgstr "Pasta dentro de rvc/models/embedders/embedders_custom."
 
 msgid "Folder with audio to convert"
 msgstr "Pasta com o áudio a converter"
@@ -901,6 +901,9 @@ msgstr "Valores mais altos aplicam uma limpeza mais forte."
 
 msgid "Higher values snap pitch to the chromatic grid."
 msgstr "Valores mais altos prendem o pitch à grade cromática."
+
+msgid "Highest pitch written in true_pitch mode. Models trained on stock RMVPE labels cannot synthesize above ~1250 Hz; raise it only for models trained with the correction enabled."
+msgstr ""
 
 msgid "Hold a few whole source recordings out of training and score them as it goes. Training loss keeps falling while a model overtrains, so this is the only signal that can see it. Exports the last good weights. Turns itself off on datasets too small to spare any."
 msgstr "Reserva algumas gravações inteiras fora do treinamento e as avalia ao longo dele. A perda de treinamento continua caindo enquanto um modelo entra em overtraining, então este é o único sinal capaz de enxergar isso. Exporta os últimos pesos bons. Desliga-se sozinho em datasets pequenos demais para dispensar gravações."
@@ -1150,9 +1153,6 @@ msgstr "Modelo usado para extrair características de conteúdo independentes do
 
 msgid "Move existing checkpoints aside"
 msgstr "Mover os checkpoints existentes para o lado"
-
-msgid "Move files to custom embedder"
-msgstr "Mover arquivos para o embedder personalizado"
 
 msgid "Moved {} checkpoint(s) into `{}/`."
 msgstr "{} checkpoint(s) movidos para `{}/`."
@@ -1412,6 +1412,9 @@ msgstr "Quefrência do deslocamento de formantes"
 msgid "RMS Volume Envelope"
 msgstr "Envelope de volume RMS"
 
+msgid "RMVPE high-register correction"
+msgstr ""
+
 msgid "RMVPE is the recommended default. CREPE is an alternative for clean audio."
 msgstr "RMVPE é o padrão recomendado. CREPE é uma alternativa para áudio limpo."
 
@@ -1459,9 +1462,6 @@ msgstr "Atualizar pré-treinados personalizados"
 
 msgid "Refresh Presets"
 msgstr "Atualizar predefinições"
-
-msgid "Refresh embedders"
-msgstr "Atualizar embedders"
 
 msgid "Refresh models, indexes and audios"
 msgstr "Atualizar modelos, indexes e áudios"
@@ -1585,9 +1585,6 @@ msgstr "Seed para saída reproduzível. Use 0 para saída aleatória."
 
 msgid "Select Audio Input"
 msgstr "Selecionar entrada de áudio"
-
-msgid "Select Custom Embedder"
-msgstr "Selecionar embedder personalizado"
 
 msgid "Select Custom Preset"
 msgstr "Selecionar predefinição personalizada"
@@ -2019,12 +2016,6 @@ msgstr "Descarrega este áudio."
 msgid "Upload"
 msgstr "Enviar"
 
-msgid "Upload .bin"
-msgstr "Enviar .bin"
-
-msgid "Upload .json"
-msgstr "Enviar .json"
-
 msgid "Upload Audio"
 msgstr "Enviar áudio"
 
@@ -2222,6 +2213,9 @@ msgstr "threads, amostras mudas, precisão, limpeza"
 
 msgid "torch.compile the vocoder"
 msgstr "compilar o vocoder com torch.compile"
+
+msgid "true_pitch writes the real pitch, capped at the F0 ceiling. fold only repairs wrong-octave frames using half-pitch drives; use it with models trained on uncorrected labels to keep their timbre."
+msgstr ""
 
 msgid "unrecognised -- this config predates the current registry"
 msgstr "não reconhecida -- este config é anterior ao registro atual"

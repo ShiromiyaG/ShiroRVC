@@ -208,6 +208,11 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.use_san = bool(use_san)
         self.supports_san = self.use_san
         self.sample_rate = int(sample_rate)
+        # Read by ``forward``: spectral norm's power iteration advances once
+        # per weight access, so a batched pass would run it once where two
+        # separate passes run it twice.  That is a change to the training
+        # dynamics, not an optimisation, so the batched path is off there.
+        self.use_spectral_norm = bool(use_spectral_norm)
         self.use_checkpointing = use_checkpointing
         branches = []
         if self.use_msd:
@@ -252,6 +257,23 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
         self.discriminators = torch.nn.ModuleList(branches)
 
+    @property
+    def branch_labels(self) -> tuple:
+        """One name per entry of ``discriminators``, in the same order.
+
+        Built from what ``__init__`` actually assembled rather than from a
+        preset, so a config that turns a family off or replaces a period set
+        still gets labels that line up with the branches -- which is the whole
+        point of having them, since they exist to name a per-branch diagnostic.
+        """
+
+        labels = ["msd"] if self.use_msd else []
+        labels += [f"period_{p}" for p in self.periods]
+        labels += [f"resolution_{n_fft}" for n_fft, _, _ in self.resolutions]
+        if self.use_univhd:
+            labels.append("univhd")
+        return tuple(labels)
+
     def enable_compile(self, mode: str = "default") -> bool:
         """Compile the paired real/fake forward, replacing ``forward`` in place.
 
@@ -268,8 +290,9 @@ class MPD_MSD_Combined(torch.nn.Module):
         recomputing ``g * v / ||v||`` for every convolution on every forward,
         which is exactly what a fused graph stops paying separately.
 
-        ``no_grad_real`` is a Python ``bool``, so Dynamo guards on it and keeps
-        one graph per value rather than branching inside either.  Checkpointing
+        ``no_grad_real`` and ``combine_inputs`` are Python ``bool``s, so Dynamo
+        guards on them and keeps one graph per combination rather than
+        branching inside any of them.  Checkpointing
         is the case that is *not* compiled: it is a fallback for a card that
         cannot hold the activations, and pairing it with compilation trades a
         known-good path for an untested one.
@@ -313,7 +336,14 @@ class MPD_MSD_Combined(torch.nn.Module):
         self._compile_mode = mode
         return True
 
-    def forward(self, y, y_hat, no_grad_real: bool = False, san_training: bool = False):
+    def forward(
+        self,
+        y,
+        y_hat,
+        no_grad_real: bool = False,
+        san_training: bool = False,
+        combine_inputs: bool = False,
+    ):
         """``no_grad_real`` runs the real branch under ``no_grad``.
 
         The generator update needs the real side only as a *target*: its logits
@@ -327,6 +357,32 @@ class MPD_MSD_Combined(torch.nn.Module):
 
         Off by default because the discriminator update *does* need it: that is
         the pass whose gradient trains ``net_d``.
+
+        ``combine_inputs`` runs the real and the fake side as one batch of
+        ``2B`` instead of two batches of ``B``.  Nothing in any branch mixes
+        samples -- there is no batch normalisation here, and ``weight_norm``,
+        the STFTs, the harmonic bank and ``san_tail`` are all per-sample -- so
+        the outputs are the same numbers, reached in half the kernel launches
+        and with one ``weight_norm`` recompute per convolution instead of two.
+        Measured on an RTX 5060 at batch 8 over 0.4 s, discriminator update
+        only, fwd+bwd: v2 124 -> 113 ms, v3 161 -> 150, v4 149 -> 136, v4 with
+        SAN 151 -> 140, all at peak VRAM within 1% of the paired path
+        (``torch.split`` returns views, and the real side's activations were
+        already being held alive across the fake pass).  Checkpointing is the
+        one case that trades memory for the time: 194 -> 178 ms at +360 MiB,
+        because one checkpoint boundary now holds a ``2B`` input instead of two
+        boundaries holding ``B`` each.
+
+        Upstream pairs this with ``parametrize.cached()``.  That was measured
+        here too and is worth nothing once the passes are batched (-0.0%,
+        because batching already halves the ``weight_norm`` recomputes) while
+        holding every materialised weight alive for the whole forward
+        (+250 MiB on v2), so it is not used.
+
+        It is mutually exclusive with ``no_grad_real`` -- half a batch cannot
+        be under ``no_grad`` -- which is why only the discriminator update
+        asks for it, and it is off under spectral norm for the reason given at
+        ``self.use_spectral_norm``.
         """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
         checkpointing = self.training and self.use_checkpointing
@@ -335,6 +391,39 @@ class MPD_MSD_Combined(torch.nn.Module):
         # move, so requesting it would build a graph with no consumer -- the
         # same waste ``no_grad_real`` exists to avoid.
         san = bool(san_training) and self.use_san
+        combined = combine_inputs and not no_grad_real and not self.use_spectral_norm
+
+        if combined:
+            paired = torch.cat((y, y_hat), dim=0)
+            sizes = (y.shape[0], y_hat.shape[0])
+            for d in self.discriminators:
+                if checkpointing:
+                    y_d, fmap = checkpoint(
+                        d, paired, san_training=san, use_reentrant=False
+                    )
+                else:
+                    y_d, fmap = d(paired, san_training=san)
+                # Under SAN a branch returns ``[function, direction]`` rather
+                # than one tensor, and both halves have to be split.
+                if isinstance(y_d, (list, tuple)):
+                    split = [torch.split(part, sizes, dim=0) for part in y_d]
+                    y_d_r = [part[0] for part in split]
+                    y_d_g = [part[1] for part in split]
+                else:
+                    y_d_r, y_d_g = torch.split(y_d, sizes, dim=0)
+                fmap_r, fmap_g = [], []
+                for feature in fmap:
+                    feature_r, feature_g = torch.split(feature, sizes, dim=0)
+                    fmap_r.append(feature_r)
+                    fmap_g.append(feature_g)
+
+                y_d_rs.append(y_d_r)
+                y_d_gs.append(y_d_g)
+                fmap_rs.append(fmap_r)
+                fmap_gs.append(fmap_g)
+
+            return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
         for d in self.discriminators:
             # The other two arms add no context manager at all, and not
             # ``enable_grad``: an outer ``no_grad`` (the validation path) must

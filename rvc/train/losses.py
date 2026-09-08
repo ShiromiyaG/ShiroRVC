@@ -279,6 +279,100 @@ def mel_low_frequency_weights(
     return torch.from_numpy(weights.astype(np.float32))
 
 
+def mel_frequency_tilt_weights(
+    num_mels: int,
+    sample_rate: int,
+    mel_fmin: float = 0.0,
+    mel_fmax: float | None = None,
+    tilt: float = 0.0,
+    max_ratio: float = 8.0,
+) -> Tensor:
+    """Per-mel-bin weights that undo part of the mel scale's own bin density.
+
+    An L1 over log-mel gives every bin a gradient of the same magnitude, so the
+    share of the objective a frequency region receives is its share of the
+    *bins*, not of the spectrum, and not of how wrong it is.  The mel scale
+    puts those bins at the bottom: over 0-16 kHz, 0-2 kHz is 12.5% of the
+    spectrum and 45% of the bins, while 10-16 kHz is 37.5% of the spectrum and
+    12% of them.  That split is identical at 40, 80, 160, 320 and 640 bins --
+    it is a property of the warping, not of the resolution -- which is why no
+    choice of scale set in the multi-scale loss moves it.
+
+    ``tilt`` interpolates between the two ways of counting.  Each bin is
+    weighted by its own bandwidth raised to ``tilt``: at 0.0 the weights are
+    flat and this is exactly the unweighted loss, at 1.0 every *hertz* pulls
+    equally and the mel warping is cancelled outright.  In between is a
+    deliberate compromise -- the warping is a perceptual statement worth
+    keeping some of, and the top bands are also where a vocoder's errors are
+    least audible per dB.
+
+    What it buys, measured on a held-out validation clip at 32 kHz with the
+    multi-scale set (40/256 .. 640/4096): the penalty the loss charges for one
+    and the same -6 dB shelf, by where the shelf is, each column normalised to
+    its own 1-3 kHz value --
+
+        shelf at      tilt 0    tilt 0.35   tilt 0.5   tilt 1.0
+        1-3 kHz        1.000      1.000       1.000      1.000
+        3-6 kHz        0.633      0.865       0.986      1.512
+        6-10 kHz       0.458      0.773       0.964      1.849
+        10-13 kHz      0.232      0.447       0.591      0.993
+        13-16 kHz      0.155      0.324       0.443      0.666
+
+    Unweighted, an identical defect costs 4.3x less at 10-13 kHz than at
+    1-3 kHz and 6.5x less at 13-16 kHz.  0.5 roughly triples what the top two
+    bands charge without reordering them; 1.0 overshoots -- 6-10 kHz ends up
+    charging more than 1-3 kHz -- because a band's weight there follows its
+    width in hertz and those bands are wide.  The loss value on a real
+    generated/reference pair moves +10% between tilt 0 and 0.5, which is the
+    part that reaches ``adv_to_rec_ratio``.
+
+    ``max_ratio`` caps how far the extremes may separate.  Without it the
+    bottom bins, which are a few tens of hertz wide, take weights near zero at
+    high tilt and the loss stops constraining the fundamental at all.
+
+    Normalised to a mean of 1, like ``mel_low_frequency_weights`` and for the
+    same reason: the mel term feeds the adaptive adversarial balance through
+    ``adv_to_rec_ratio``, so the weighting must change *which* bins are heard
+    and not the scale of the term.  Note that this holds the weights' mean, not
+    the loss value -- on an error spectrum that is itself tilted, a tilted
+    weighting does move the number, which is the point of it.
+    """
+
+    if num_mels <= 0:
+        raise ValueError("mel_frequency_tilt_weights needs at least one bin")
+    if tilt < 0.0:
+        raise ValueError("mel_frequency_tilt_weights tilt must not be negative")
+    if max_ratio < 1.0:
+        raise ValueError("mel_frequency_tilt_weights max_ratio must be >= 1")
+
+    if tilt == 0.0:
+        return torch.ones(int(num_mels), dtype=torch.float32)
+
+    top = float(sample_rate) / 2.0 if mel_fmax is None else float(mel_fmax)
+    # ``+2`` and the trim are how ``librosa.filters.mel`` places centres; the
+    # untrimmed array is also what gives the first and last bin a neighbour to
+    # measure a bandwidth against.
+    edges = librosa.mel_frequencies(
+        n_mels=int(num_mels) + 2, fmin=float(mel_fmin), fmax=top, htk=False
+    )
+    # A triangular mel filter spans its two neighbouring centres, so this is
+    # the filter's own width rather than a finite difference standing in for
+    # one.
+    bandwidth = edges[2:] - edges[:-2]
+    bandwidth = np.maximum(bandwidth, 1e-6)
+
+    weights = bandwidth ** float(tilt)
+    # Cap around the geometric mean so the clip is symmetric in the log domain
+    # the weights live in; clipping around the arithmetic mean would tighten
+    # one end harder than the other.
+    centre = float(np.exp(np.log(weights).mean()))
+    limit = float(max_ratio) ** 0.5
+    weights = np.clip(weights, centre / limit, centre * limit)
+
+    weights = weights / weights.mean()
+    return torch.from_numpy(weights.astype(np.float32))
+
+
 class BandWeightedSpectralLoss(nn.Module):
     """A mel distance whose per-bin reduction is weighted, not uniform.
 

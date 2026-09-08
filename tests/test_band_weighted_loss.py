@@ -23,6 +23,7 @@ pytest.importorskip("librosa", reason="rvc.train.losses imports it", exc_type=Im
 
 from rvc.train.losses import (  # noqa: E402
     BandWeightedSpectralLoss,
+    mel_frequency_tilt_weights,
     mel_low_frequency_weights,
 )
 
@@ -152,3 +153,66 @@ def test_a_mismatch_without_a_factory_is_still_rejected():
     )
     with pytest.raises(ValueError, match="mel bins"):
         loss(torch.randn(2, 5, 7), torch.randn(2, 5, 7))
+
+
+def _tilt(num_mels=BINS, tilt=0.5, **kw):
+    return mel_frequency_tilt_weights(
+        num_mels=num_mels, sample_rate=SR, mel_fmin=0.0, mel_fmax=None,
+        tilt=tilt, **kw
+    )
+
+
+def test_the_tilt_is_off_by_default_and_at_zero():
+    """A config that does not mention the key must train exactly as before."""
+    assert torch.equal(_tilt(tilt=0.0), torch.ones(BINS))
+    assert torch.equal(
+        mel_frequency_tilt_weights(num_mels=BINS, sample_rate=SR), torch.ones(BINS)
+    )
+
+
+def test_the_tilt_leaves_the_loss_scale_alone():
+    for tilt in (0.0, 0.35, 0.5, 1.0):
+        assert _tilt(tilt=tilt).mean().item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_tilt_moves_weight_from_the_bottom_to_the_top():
+    """The whole point: the mel scale's bin density decides the L1's gradient
+    split, and 0-2 kHz holds 45% of the bins against 12.5% of the spectrum."""
+    import librosa
+
+    centres = librosa.mel_frequencies(n_mels=BINS + 2, fmin=0.0, fmax=SR / 2)[1:-1]
+    low = centres < 2000.0
+    high = centres >= 10000.0
+    flat, tilted = _tilt(tilt=0.0), _tilt(tilt=0.5)
+    assert tilted[low].mean() < flat[low].mean()
+    assert tilted[high].mean() > flat[high].mean()
+    # Monotone in frequency, so no band sits on a reversal of the objective.
+    assert torch.all(tilted[1:] >= tilted[:-1] - 1e-6)
+
+
+def test_the_tilt_is_defined_by_frequency_not_by_bin_count():
+    """Multi-scale mel hands the same distance 40..640 bands, and the weighting
+    has to mean the same thing at each."""
+    import librosa
+
+    for bands in (40, 80, 160, 320, 640):
+        weights = _tilt(num_mels=bands)
+        centres = librosa.mel_frequencies(n_mels=bands + 2, fmin=0.0, fmax=SR / 2)[1:-1]
+        high = weights[centres >= 10000.0].mean().item()
+        assert high == pytest.approx(1.9, abs=0.25)
+
+
+def test_the_tilt_cap_bounds_the_spread():
+    """Uncapped, the bottom bins are tens of hertz wide and take weights near
+    zero, and the loss stops constraining the fundamental at all."""
+    weights = _tilt(tilt=1.0, max_ratio=4.0)
+    assert weights.max().item() / weights.min().item() <= 4.0 + 1e-5
+
+
+def test_the_tilt_rejects_nonsense():
+    with pytest.raises(ValueError):
+        _tilt(tilt=-0.1)
+    with pytest.raises(ValueError):
+        _tilt(max_ratio=0.5)
+    with pytest.raises(ValueError):
+        _tilt(num_mels=0)

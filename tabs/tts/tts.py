@@ -13,11 +13,9 @@ sys.path.append(now_dir)
 from core import run_tts_script, import_voice_converter
 from tabs.inference.inference import (
     change_choices,
-    create_folder_and_move_files,
     get_indexes,
     get_speakers_id,
     match_index,
-    refresh_embedders_folders,
     extract_model_and_epoch,
     names,
     default_weight,
@@ -300,41 +298,10 @@ def tts_tab():
             embedder_model = gr.Radio(
                 label=_("Embedder Model"),
                 info=_("Model used for learning speaker embedding."),
-                choices=[
-                    "contentvec",
-                    "spin_v1",
-                    "spin_v2",
-                    "spin_wavlm_512",
-                    "custom",
-                ],
+                choices=["contentvec", "spin_v1", "spin_v2"],
                 value="contentvec",
                 interactive=True,
             )
-            with gr.Column(visible=False) as embedder_custom:
-                with gr.Accordion(_("Custom Embedder"), open=True):
-                    with gr.Row():
-                        embedder_model_custom = gr.Dropdown(
-                            label=_("Select Custom Embedder"),
-                            choices=refresh_embedders_folders(),
-                            interactive=True,
-                            allow_custom_value=True,
-                        )
-                        refresh_embedders_button = gr.Button(_("Refresh embedders"))
-                    folder_name_input = gr.Textbox(
-                        label=_("Folder Name"), interactive=True
-                    )
-                    with gr.Row():
-                        bin_file_upload = gr.File(
-                            label=_("Upload .bin"),
-                            type="filepath",
-                            interactive=True,
-                        )
-                        config_file_upload = gr.File(
-                            label=_("Upload .json"),
-                            type="filepath",
-                            interactive=True,
-                        )
-                    move_files_button = gr.Button(_("Move files to custom embedder"))
             f0_file = gr.File(
                 label=_("Edited F0 curve"),
                 visible=True,
@@ -351,11 +318,6 @@ def tts_tab():
 
     def toggle_visible(checkbox):
         return {"visible": checkbox, "__type__": "update"}
-
-    def toggle_visible_embedder_custom(embedder_model):
-        if embedder_model == "custom":
-            return {"visible": True, "__type__": "update"}
-        return {"visible": False, "__type__": "update"}
 
     autotune.change(
         fn=toggle_visible,
@@ -378,23 +340,6 @@ def tts_tab():
         fn=process_input,
         inputs=[txt_file],
         outputs=[input_tts_path, txt_file],
-    )
-    embedder_model.change(
-        fn=toggle_visible_embedder_custom,
-        inputs=[embedder_model],
-        outputs=[embedder_custom],
-        show_progress="hidden",
-    )
-    move_files_button.click(
-        fn=create_folder_and_move_files,
-        inputs=[folder_name_input, bin_file_upload, config_file_upload],
-        outputs=[],
-    )
-    refresh_embedders_button.click(
-        fn=lambda: gr.update(choices=refresh_embedders_folders()),
-        inputs=[],
-        outputs=[embedder_model_custom],
-        show_progress="hidden",
     )
     convert_button.click(
         fn=run_tts_script,
@@ -421,7 +366,6 @@ def tts_tab():
             export_format,
             f0_file,
             embedder_model,
-            embedder_model_custom,
             sid,
             seed,
             index_k,

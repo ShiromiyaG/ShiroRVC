@@ -19,11 +19,11 @@ from . import paths
 # the backend validates anyway, so mirroring them costs nothing and keeps the
 # GUI's first paint free of backend imports.
 F0_METHODS = ["rmvpe", "crepe", "crepe-tiny", "fcpe"]
-EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2", "spin_wavlm_512", "custom"]
+EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2"]
 #: Training is the smaller set.  ``spin_v1`` was retired as a *training*
 #: choice; it stays above because a model already trained against it still has
 #: to run, and the embedder is read off the checkpoint at inference.
-TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2", "spin_wavlm_512", "custom"]
+TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2"]
 EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
 #: Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; first entry is the default.
 OPTIMIZERS = ["AdamW", "Sched-Free AdamW", "Muon", "Lion"]
@@ -278,14 +278,6 @@ def list_experiment_speakers(model_name: str) -> list[int]:
         except ValueError:
             continue
     return sorted(found)
-
-
-def list_custom_embedders() -> list[str]:
-    """Folders holding a user-supplied embedder."""
-    root = paths.CUSTOM_EMBEDDER_DIR
-    if not root.is_dir():
-        return []
-    return sorted(paths.relative(p) for p in root.iterdir() if p.is_dir())
 
 
 def list_custom_pretraineds(kind: str) -> list[str]:

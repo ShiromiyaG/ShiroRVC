@@ -238,23 +238,11 @@ class TrainingPage(Page):
         self.extract_embedder.refresh_button.hide()
         self.extract_embedder.set_items(catalog.TRAINING_EMBEDDER_MODELS)
 
-        self.extract_custom_embedder = SearchableCombo()
-        self.extract_custom_embedder.set_items(catalog.list_custom_embedders())
-        self.extract_custom_embedder.refreshRequested.connect(
-            lambda: self.extract_custom_embedder.set_items(catalog.list_custom_embedders())
-        )
-        self.extract_custom_field = Field(_("Custom embedder"), self.extract_custom_embedder, "")
-        self.extract_custom_field.hide()
-        self.extract_embedder.currentTextChanged.connect(
-            lambda value: self.extract_custom_field.setVisible(value == "custom")
-        )
-
         row = QHBoxLayout()
         row.setSpacing(12)
         row.addWidget(Field(_("Pitch algorithm"), self.extract_f0, _("Must match what you will use at inference time.")))
         row.addWidget(Field(_("Embedder"), self.extract_embedder, ""))
         card.body.addLayout(row)
-        card.add(self.extract_custom_field)
 
         self.extract_gpu = SearchableCombo(editable=False)
         self.extract_gpu.refresh_button.hide()
@@ -777,7 +765,6 @@ class TrainingPage(Page):
                 "sample_rate": int(self.sample_rate.text()),
                 "vocoder_arch": self.vocoder.value(),
                 "embedder_model": self.extract_embedder.text(),
-                "embedder_model_custom": self.extract_custom_embedder.text() or None,
                 "include_mutes": int(self.include_mutes.value()),
                 "remove_16k_slices": self.remove_16k.isChecked(),
                 "feature_precision": self.feature_precision.text(),

@@ -173,17 +173,6 @@ class ConversionSettings(QWidget):
         self.embedder = SearchableCombo(editable=False)
         self.embedder.refresh_button.hide()
         self.embedder.set_items(catalog.EMBEDDER_MODELS)
-        self.embedder.currentTextChanged.connect(self._on_embedder_changed)
-
-        self.custom_embedder = SearchableCombo()
-        self.custom_embedder.refreshRequested.connect(
-            lambda: self.custom_embedder.set_items(catalog.list_custom_embedders())
-        )
-        self.custom_embedder.set_items(catalog.list_custom_embedders())
-        self.custom_embedder_field = Field(
-            _("Custom embedder"), self.custom_embedder, _("Folder under rvc/models/embedders/embedders_custom.")
-        )
-        self.custom_embedder_field.hide()
 
         self.export_format = SearchableCombo(editable=False)
         self.export_format.refresh_button.hide()
@@ -242,7 +231,6 @@ class ConversionSettings(QWidget):
         row.addWidget(Field(_("Pitch algorithm"), self.f0_method, _("rmvpe is the recommended default.")))
         layout.addLayout(row)
         layout.addWidget(Field(_("Embedder"), self.embedder, _("Model used to extract speaker-independent content features.")))
-        layout.addWidget(self.custom_embedder_field)
 
         # -- everything else, folded away like the Gradio tab's accordion --
         self.advanced = Collapsible(
@@ -322,9 +310,6 @@ class ConversionSettings(QWidget):
             for widget in dependants:
                 widget.setEnabled(toggle.isChecked())
 
-    def _on_embedder_changed(self, value: str) -> None:
-        self.custom_embedder_field.setVisible(value == "custom")
-
     def values(self) -> dict:
         return {
             "pitch": int(self.pitch.value()),
@@ -340,7 +325,6 @@ class ConversionSettings(QWidget):
             "filter_radius": self.filter_radius.value(),
             "f0_method": self.f0_method.text(),
             "embedder_model": self.embedder.text(),
-            "embedder_model_custom": self.custom_embedder.text() or None,
             "export_format": self.export_format.text(),
             "split_audio": self.split_audio.isChecked(),
             "clean_audio": self.clean_audio.isChecked(),

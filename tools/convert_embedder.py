@@ -5,7 +5,7 @@ The embedder reaches the synthesizer through exactly one weight.
 hidden_channels)`` and nothing else in the network is a function of
 ``embedding_dim`` -- not the transformer encoder above it, not the flow, not the
 posterior encoder, not the decoder, and not any discriminator.  So a model
-trained against ``spin_wavlm_512`` (256-wide) differs from a ``contentvec`` one
+trained against ``spin_v1`` (256-wide) differs from a ``contentvec`` one
 (768-wide) by a single ``[192, 256]`` vs ``[192, 768]`` tensor out of the whole
 generator, and swapping embedders is a question of what to put in that tensor
 rather than a question of retraining.
@@ -74,7 +74,7 @@ Usage:
     python tools/convert_embedder.py \\
         --checkpoint logs/pretrains/pretrain_G.pth \\
         --output logs/pretrains/pretrain_contentvec_G.pth \\
-        --source-embedder spin_wavlm_512 \\
+        --source-embedder spin_v1 \\
         --target-embedder contentvec \\
         --audio-dir logs/pretrain/sliced_audios_16k
 """
@@ -133,8 +133,8 @@ def collect_audio(audio_dir, limit, seed):
     return files[:limit] if limit > 0 else files
 
 
-def build_embedder(name, custom_path, device):
-    model, do_normalize = load_embedder_model(name, custom_path)
+def build_embedder(name, device):
+    model, do_normalize = load_embedder_model(name)
     model = model.to(device).float().eval()
     return model, do_normalize
 
@@ -173,11 +173,9 @@ def main():
     parser.add_argument(
         "--source-embedder",
         required=True,
-        help=f"Embedder the checkpoint was trained with ({', '.join(EMBEDDER_FEATURE_DIMS)}, custom).",
+        help=f"Embedder the checkpoint was trained with ({', '.join(EMBEDDER_FEATURE_DIMS)}).",
     )
     parser.add_argument("--target-embedder", required=True, help="Embedder to retarget onto.")
-    parser.add_argument("--source-custom", default=None, help="Path, when --source-embedder is 'custom'.")
-    parser.add_argument("--target-custom", default=None, help="Path, when --target-embedder is 'custom'.")
     parser.add_argument(
         "--audio-dir",
         required=True,
@@ -229,8 +227,8 @@ def main():
     bias_src = state_dict[EMB_PHONE_BIAS].float()
     hidden_channels, dim_src_ckpt = weight_src.shape
 
-    dim_src = embedder_feature_dim(args.source_embedder, args.source_custom)
-    dim_tgt = embedder_feature_dim(args.target_embedder, args.target_custom)
+    dim_src = embedder_feature_dim(args.source_embedder)
+    dim_tgt = embedder_feature_dim(args.target_embedder)
     # The checkpoint is the authority on what it was trained with; --source is
     # what the user believes.  Disagreement means the fit would be built from
     # the wrong old projection, which produces a plausible file that is silently
@@ -260,8 +258,8 @@ def main():
         sys.exit(1)
     info(f"{len(fit_files)} clips to fit, {len(score_files)} held out.", tag="[RETARGET]")
 
-    model_src, norm_src = build_embedder(args.source_embedder, args.source_custom, device)
-    model_tgt, norm_tgt = build_embedder(args.target_embedder, args.target_custom, device)
+    model_src, norm_src = build_embedder(args.source_embedder, device)
+    model_tgt, norm_tgt = build_embedder(args.target_embedder, device)
     weight_src_dev = weight_src.to(device)
     bias_src_dev = bias_src.to(device)
 

@@ -98,7 +98,6 @@ def run_infer_script(
     export_format: str,
     f0_file: str,
     embedder_model: str,
-    embedder_model_custom: str = None,
     formant_shifting: bool = False,
     formant_qfrency: float = 1.0,
     formant_timbre: float = 1.0,
@@ -132,7 +131,6 @@ def run_infer_script(
         "export_format": export_format,
         "f0_file": f0_file,
         "embedder_model": embedder_model,
-        "embedder_model_custom": embedder_model_custom,
         "formant_shifting": formant_shifting,
         "formant_qfrency": formant_qfrency,
         "formant_timbre": formant_timbre,
@@ -182,7 +180,6 @@ def run_batch_infer_script(
     export_format: str,
     f0_file: str,
     embedder_model: str,
-    embedder_model_custom: str = None,
     formant_shifting: bool = False,
     formant_qfrency: float = 1.0,
     formant_timbre: float = 1.0,
@@ -215,7 +212,6 @@ def run_batch_infer_script(
         "export_format": export_format,
         "f0_file": f0_file,
         "embedder_model": embedder_model,
-        "embedder_model_custom": embedder_model_custom,
         "formant_shifting": formant_shifting,
         "formant_qfrency": formant_qfrency,
         "formant_timbre": formant_timbre,
@@ -257,7 +253,6 @@ def run_tts_script(
     export_format: str,
     f0_file: str,
     embedder_model: str,
-    embedder_model_custom: str = None,
     sid: int = 0,
     seed: int = 0,
     index_k: int = 8,
@@ -307,7 +302,6 @@ def run_tts_script(
         export_format=export_format,
         f0_file=f0_file,
         embedder_model=embedder_model,
-        embedder_model_custom=embedder_model_custom,
         sid=sid,
         seed=seed,
         formant_shifting=None,
@@ -377,7 +371,6 @@ def run_extract_script(
     sample_rate: int,
     vocoder_arch: str,
     embedder_model: str,
-    embedder_model_custom: str = None,
     include_mutes: int = 2,
     remove_16k_slices: bool = False,
     feature_precision: str = "fp32",
@@ -404,7 +397,6 @@ def run_extract_script(
                 sample_rate,
                 vocoder_arch,
                 embedder_model,
-                embedder_model_custom,
                 include_mutes,
                 remove_16k_slices,
                 feature_precision,
@@ -964,18 +956,10 @@ def inference_options(overrides: dict | None = None) -> list:
         ),
         click.option(
             "--embedder_model",
-            type=click.Choice(
-                ["contentvec", "spin_v1", "spin_v2", "spin_wavlm_512", "custom"]
-            ),
+            type=click.Choice(["contentvec", "spin_v1", "spin_v2"]),
             default='contentvec',
             show_default=True,
             help="Choose the model used for generating speaker embeddings.",
-        ),
-        click.option(
-            "--embedder_model_custom",
-            type=str,
-            default=None,
-            help="Specify the path to a custom model for speaker embedding. Only applicable if 'embedder_model' is set to 'custom'.",
         ),
         click.option(
             "--f0_file",
@@ -1215,16 +1199,10 @@ EXTRACT_OWN = [
         # No ``spin_v1``: it is not trainable any more.  Inference keeps it, so
         # models already trained against it still run -- see
         # ``TRAINING_EMBEDDER_MODELS`` in ``gui/services/catalog.py``.
-        type=click.Choice(["contentvec", "spin_v2", "spin_wavlm_512", "custom"]),
+        type=click.Choice(["contentvec", "spin_v2"]),
         default='contentvec',
         show_default=True,
         help="Choose the model used for generating speaker embeddings.",
-    ),
-    click.option(
-        "--embedder_model_custom",
-        type=str,
-        default=None,
-        help="Specify the path to a custom model for speaker embedding. Only applicable if 'embedder_model' is set to 'custom'.",
     ),
     click.option(
         "--include_mutes",
