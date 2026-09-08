@@ -9,5 +9,10 @@
     },
     "flask_server": false,
     "version": "1.0.0",
-    "model_author": "None"
+    "model_author": "None",
+    "rmvpe_high_register": {
+        "enabled": false,
+        "mode": "true_pitch",
+        "f0_ceil": 1250
+    }
 }

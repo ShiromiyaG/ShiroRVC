@@ -511,15 +511,15 @@ def train_tab():
                     normalization_mode = gr.Radio(
                         label=_("Loudness Normalization"),
                         info=_(NORMALIZATION_INFO),
-                        choices=["none", "post_peak", "pre_loudness"],
-                        value="post_peak",
+                        choices=["none", "post_peak", "pre_peak_rvc", "pre_loudness"],
+                        value="pre_peak_rvc",
                         interactive=True,
                         visible=True,
                         key='normalization_mode'
                     )
             with gr.Row():
                 rms_norm_db = gr.Slider(
-                    -24.0, -3.0, -18.0, step=1.0,
+                    -24.0, -3.0, -16.0, step=1.0,
                     label=_("Target Level (LUFS)"),
                     info=_(PREPROCESS_RMS_VALUE_INFO),
                     interactive=True,
@@ -638,6 +638,7 @@ def train_tab():
                 choices=[
                     "contentvec",
                     "spin_v2",
+                    "spin_wavlm_512",
                     "custom",
                 ],
                 value="contentvec",

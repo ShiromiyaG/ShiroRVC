@@ -127,14 +127,23 @@ def test_unavailable_reason_names_the_missing_piece(monkeypatch):
     assert vad.unavailable_reason() is None
 
 
-def test_the_option_is_offered_by_both_interfaces():
-    """A cutter the backend accepts but no interface lists is unreachable."""
+def test_the_option_is_offered_by_every_interface():
+    """A cutter the backend accepts but no interface lists is unreachable.
+
+    Three interfaces reach ``preprocess_training_set``, not two: the native
+    GUI, the Gradio tab and the CLI.  The CLI was the one that got missed --
+    its ``click.Choice`` rejected the mode outright, so the only way to run it
+    was to call the function directly.
+    """
     from gui.services import catalog
 
     assert "New Automatic" in catalog.CUT_PREPROCESS
 
     source = (ROOT / "tabs" / "train" / "train.py").read_text(encoding="utf-8")
     assert '"Skip", "Simple", "Automatic", "New Automatic"' in source
+
+    cli = (ROOT / "core.py").read_text(encoding="utf-8")
+    assert 'click.Choice(["Skip", "Simple", "Automatic", "New Automatic"])' in cli
 
 
 def test_the_weights_are_a_download_prerequisite():
@@ -165,3 +174,36 @@ def test_both_automatic_modes_share_one_chunker():
     body = source[source.index('if cut_preprocess == "Skip"'):]
     body = body[: body.index("except Exception")]
     assert body.count("self.chunk_segments(") == 2
+
+
+def test_threaded_detect_matches_upstream():
+    """The decomposed path has to agree with ``FireRedVad.detect`` exactly.
+
+    Threaded mode reimplements what ``detect`` does -- extract, split at
+    ``chunk_max_frame``, forward, postprocess -- so that the front-end can be
+    per-thread and the forward can be batched.  A reimplementation that drifts
+    would move speech boundaries, which shows up as a subtly worse dataset and
+    nothing else.  Pinned against the real model, on CPU, over a tone that
+    produces more than one span.
+    """
+    if vad.unavailable_reason() is not None:
+        pytest.skip("FireRedVAD is not installed here")
+
+    sr = 16000
+    audio = np.concatenate(
+        [_tone(0.6, sr), np.zeros(int(0.5 * sr), np.float32), _tone(0.6, sr)]
+    )
+
+    engine = vad._load(use_gpu=False)
+    scaled = np.clip(audio * 32768.0, -32768.0, 32767.0)
+    expected, _ = engine.detect(scaled)
+
+    previous_engine, previous_threaded = vad._ENGINE, vad._THREADED
+    vad._ENGINE, vad._DEVICE, vad._THREADED = engine, "cpu", True
+    try:
+        actual, _ = vad._detect(scaled)
+    finally:
+        vad._ENGINE, vad._THREADED = previous_engine, previous_threaded
+
+    assert actual["timestamps"] == expected["timestamps"]
+    assert actual["dur"] == expected["dur"]

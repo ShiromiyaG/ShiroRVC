@@ -23,6 +23,22 @@ pid_data = {"process_pids": []}
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 
+# ``expandable_segments`` lets the caching allocator grow one virtual segment
+# instead of handing out fixed-size blocks, which is what stops a large
+# transient request from failing against a heap that has enough free memory but
+# none of it contiguous.  The requests that hit this are cuDNN's benchmark
+# workspaces: the collate pads to the per-batch max, so nearly every step is a
+# new input shape, cuDNN re-autotunes for each one, and autotuning probes
+# algorithms whose workspaces run to gigabytes.  Without this the allocator
+# recovers by flushing its whole cache and retrying -- training survives, but
+# pays a full re-warm each time.
+#
+# Linux-only: the backend is unimplemented on Windows, where setting it makes
+# the allocator raise on the first allocation rather than fall back.  An
+# existing value is left alone so the setting stays overridable from outside.
+if sys.platform.startswith("linux") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -102,7 +118,7 @@ from losses import (
     MultiScaleSTFTLoss,
 )
 
-from mel_processing import MultiScaleMelSpectrogramLoss
+from mel_processing import build_ms_mel_loss
 
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
@@ -574,7 +590,17 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
         shuffle=True
     )
 
-    collate_fn = TextAudioCollateMultiNSFsid()
+    # Quantise the padded batch length to a grid instead of the exact per-batch
+    # maximum.  The buckets above are 100 frames wide, so a 32-frame grid turns
+    # each of them into ~3 shapes rather than one per batch -- enough for
+    # ``cudnn.benchmark`` and ``torch.compile`` to stay warm, while the padding
+    # it adds averages 16 frames against bucket lengths of hundreds.  The true
+    # lengths still ride along in the batch, so nothing downstream sees the
+    # difference.
+    collate_fn = TextAudioCollateMultiNSFsid(
+        pad_multiple=int(getattr(config.data, "pad_multiple", 32)),
+        hop_length=config.data.hop_length,
+    )
     train_loader = DataLoader(
         train_dataset,
         num_workers=4,
@@ -1908,12 +1934,35 @@ def get_reference_sample(train_loader, device, config):
         os.path.isfile(os.path.join(reference_path, "ref_f0f.npy")),
     ])
 
+    # The reference is embedder-specific, and nothing about the filename says
+    # which embedder wrote it.  Handing 768-wide features to a 256-wide text
+    # encoder used to reach ``F.linear`` and die there -- "mat1 and mat2 shapes
+    # cannot be multiplied" -- a few thousand steps into a run, at the first
+    # preview rather than at startup.  Checked here instead, and the run
+    # continues on a reference taken from the dataset, which is right by
+    # construction.
+    if use_custom_ref:
+        expected_dim = int(getattr(config.model, "text_enc_hidden_dim", 768))
+        features = np.load(os.path.join(reference_path, "ref_feats.npy"))
+        if features.ndim != 2 or features.shape[1] != expected_dim:
+            found = "x".join(str(size) for size in features.shape)
+            warning(
+                f"logs/reference/ref_feats.npy is {found} but this model's text "
+                f"encoder takes {expected_dim}-wide features; it was made with a "
+                f"different embedder. Falling back to a reference from the "
+                f"dataset. To use your own, rebuild it with the embedder this "
+                f"model trains on: python tools/make_reference.py <audio> "
+                f"--embedder <name>",
+                tag="[REFERENCE]",
+            )
+            use_custom_ref = False
+
     if use_custom_ref:
         info("Using custom reference input from 'logs/reference/'.", tag="[REFERENCE]")
         reference_audio = None
         reference_source = reference_path
 
-        phone = torch.FloatTensor(np.repeat(np.load(os.path.join(reference_path, "ref_feats.npy")), 2, axis=0)).unsqueeze(0).to(device)
+        phone = torch.FloatTensor(np.repeat(features, 2, axis=0)).unsqueeze(0).to(device)
         pitch = torch.LongTensor(np.load(os.path.join(reference_path, "ref_f0c.npy"))).unsqueeze(0).to(device)
         pitchf = torch.FloatTensor(np.load(os.path.join(reference_path, "ref_f0f.npy"))).unsqueeze(0).to(device)
 
@@ -2075,6 +2124,7 @@ def main():
         old_session_cleanup(now_dir, model_name)
     start()
 
+
 def run(
     rank,
     n_gpus,
@@ -2193,20 +2243,16 @@ def run(
             weight_factory=_weights,
         ).to(device)
 
+
+    def _make_ms_mel_loss():
+        return build_ms_mel_loss(sample_rate, loss_fn=_make_mel_distance())
+
     if spectral_loss == "L1 Mel Loss":
         fn_spectral_loss = _make_mel_distance()
         if swap_l1_to_ms:
-            fn_spectral_loss_ms = MultiScaleMelSpectrogramLoss(
-                sample_rate=sample_rate,
-                safe_log=False,
-                loss_fn=_make_mel_distance(),
-            )
+            fn_spectral_loss_ms = _make_ms_mel_loss()
     elif spectral_loss == "Multi-Scale Mel Loss":
-        fn_spectral_loss = MultiScaleMelSpectrogramLoss(
-            sample_rate=sample_rate,
-            safe_log=False,
-            loss_fn=_make_mel_distance(),
-        )
+        fn_spectral_loss = _make_ms_mel_loss()
     elif spectral_loss == "Hybrid L1":
         fn_spectral_loss = _make_mel_distance()
         fn_spectral_loss2 = MultiScaleSTFTLoss()
@@ -2819,7 +2865,7 @@ def training_loop(
                         swap_progress = min(1.0, max(0.0, (global_step - swap_start_step) / max(1, swap_duration_steps)))
                         swap_alpha = 0.5 * (1.0 - math.cos(math.pi * swap_progress))  # smooth 0->1 ramp
                         loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
-                        loss_ms_mel = fn_spectral_loss_ms(y, y_hat) * config.train.c_mel / 3.0
+                        loss_ms_mel = fn_spectral_loss_ms(y, y_hat) * config.train.c_mel
                         loss_spectral = (1.0 - swap_alpha) * loss_l1_mel + swap_alpha * loss_ms_mel
                         loss_spectral_parts = {
                             "loss_spectral_l1_mel": loss_l1_mel,
@@ -2831,7 +2877,7 @@ def training_loop(
                     else:
                         loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
                 elif spectral_loss == "Multi-Scale Mel Loss":
-                    loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0 # * 15
+                    loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel
                 elif spectral_loss == "Hybrid L1":
                     # L1 Mel
                     y_mel = wave_to_mel(
@@ -3215,11 +3261,22 @@ def training_loop(
                         )
                 else:
                     writer.add_scalar("Grad_Norm_Diag/G_Skipped", 1, global_step)
+            # Same guard as the two norms above, and for the same reason: on
+            # an AMP overflow step the unscaled grads are ``inf``, the scaler
+            # throws the step away, but the per-module metric is still measured
+            # from them.  These are sampled once every
+            # ``metrics_update_interval`` steps into a ``rolling_loss_steps``
+            # window, so a single poisoned sample turns the logged average NaN
+            # for ``metrics_update_interval * rolling_loss_steps`` steps --
+            # 400, against the 50 the G/D series would lose.
             for key, value in module_grad_metrics.items():
+                value = value.detach()
+                if not torch.isfinite(value):
+                    continue
                 avg_rolling_cache.setdefault(
                     key,
                     deque(maxlen=rolling_loss_steps),
-                ).append(value.detach())
+                ).append(value)
 
             if rank == 0 and global_step % rolling_loss_steps == 0:
                 scalar_dict_rolling = {}

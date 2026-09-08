@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import soxr
@@ -97,6 +98,7 @@ def load_embedder_model(embedder_model, custom_embedder=None):
         "contentvec": os.path.join(embedder_root, "contentvec"),
         "spin_v1": os.path.join(embedder_root, "spin_v1"),
         "spin_v2": os.path.join(embedder_root, "spin_v2"),
+        "spin_wavlm_512": os.path.join(embedder_root, "spin_wavlm_512"),
     }
 
     online_embedders = {
@@ -116,6 +118,18 @@ def load_embedder_model(embedder_model, custom_embedder=None):
                 tag="[INFER]",
             )
             model_path = embedding_list["contentvec"]
+    elif embedder_model == "spin_wavlm_512":
+        # Not a HuBERT, so it leaves before the shared tail below.  The weights
+        # are a Lightning checkpoint that has to be converted once; the
+        # converter is idempotent and checks the bundle it finds, so this is
+        # also what repairs a half-written one.
+        from rvc.lib.embedders import SpinWavLMModel
+        from rvc.lib.tools.convert_spin_wavlm import ensure_converted
+
+        model_path = embedding_list[embedder_model]
+        ensure_converted(model_path)
+        model = SpinWavLMModel(model_path)
+        return model, model.audio_requires_normalization
     elif embedder_model == "spin_v1":
         model_path = embedding_list[embedder_model]
         bin_file = os.path.join(model_path, "pytorch_model.bin")
@@ -158,17 +172,59 @@ def load_embedder_model(embedder_model, custom_embedder=None):
     return model, do_normalize
 
 
+#: Feature width of each embedder, which is what reaches the synthesizer as
+#: ``text_enc_hidden_dim``.  ``spin_wavlm_512`` is 256 wide -- the 512 in its
+#: name is SPIN's cluster count, not the width -- so a model trained against it
+#: is not weight-compatible with a 768-wide one.
+EMBEDDER_FEATURE_DIMS = {
+    "contentvec": 768,
+    "spin_v1": 256,
+    "spin_v2": 768,
+    "spin_wavlm_512": 256,
+}
+
+
+def embedder_feature_dim(embedder_model, custom_embedder=None, default=768):
+    """How wide this embedder's features are, without loading it.
+
+    A custom embedder is read from its ``config.json``; anything unrecognised
+    falls back to ``default`` rather than raising, because this is called on
+    paths where guessing wrong is recoverable and stopping is not.
+    """
+    if embedder_model in EMBEDDER_FEATURE_DIMS:
+        return EMBEDDER_FEATURE_DIMS[embedder_model]
+    if embedder_model == "custom" and custom_embedder:
+        try:
+            with open(
+                os.path.join(custom_embedder, "config.json"), encoding="utf-8"
+            ) as handle:
+                return int(json.load(handle).get("hidden_size", default))
+        except (OSError, ValueError, TypeError):
+            return default
+    return default
+
+
 def extract_features(model, source, version, do_normalize=False):
     """v1 (256-D) takes layer-9 hidden states through final_proj; v2 (768-D) uses
     the last hidden state directly. do_normalize layer-norms the waveform first,
     matching what ContentVec/HuBERT expects.
+
+    ``SpinWavLMModel`` is neither: it applies its own projection inside
+    ``forward`` and takes the waveform positionally, so it is dispatched on the
+    module rather than on ``version`` -- the RVC version says nothing about
+    which embedder produced the features.
     """
+    from rvc.lib.embedders import SpinWavLMModel
+
     if do_normalize:
         # Over the sample axis only.  ``source.shape`` normalised across the
         # whole tensor, which is the same thing for the (1, T) inputs this used
         # to get and silently wrong for a batch, where it would mix every clip
         # into every other clip's statistics.
         source = F.layer_norm(source, source.shape[-1:])
+
+    if isinstance(model, SpinWavLMModel):
+        return model(source)["last_hidden_state"]
 
     if version == "v1":
         outputs = model(

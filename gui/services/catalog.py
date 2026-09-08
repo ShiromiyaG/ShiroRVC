@@ -19,11 +19,11 @@ from . import paths
 # the backend validates anyway, so mirroring them costs nothing and keeps the
 # GUI's first paint free of backend imports.
 F0_METHODS = ["rmvpe", "crepe", "crepe-tiny", "fcpe"]
-EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2", "custom"]
+EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2", "spin_wavlm_512", "custom"]
 #: Training is the smaller set.  ``spin_v1`` was retired as a *training*
 #: choice; it stays above because a model already trained against it still has
 #: to run, and the embedder is read off the checkpoint at inference.
-TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2", "custom"]
+TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2", "spin_wavlm_512", "custom"]
 EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
 #: Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; first entry is the default.
 OPTIMIZERS = ["AdamW", "Sched-Free AdamW", "Muon", "Lion"]
@@ -48,12 +48,22 @@ CUT_PREPROCESS = ["Skip", "Simple", "Automatic", "New Automatic"]
 #: dynamics between phrases; ``post_rms`` additionally has a -40 dBFS gate that
 #: is scale-dependent.  See ``rvc/train/preprocess/loudness.py``.
 #:
-#: ``pre_loudness`` is the default: one gain per source recording, so
-#: recordings match each other and the dynamics inside one survive.  It runs
-#: after slicing like everything else; the name is about intent.  Measuring
-#: before slicing is not the same thing and is measurably worse -- see
-#: ``rvc/train/preprocess/loudness.py``.
-NORMALIZATION_MODES = ["none", "post_peak", "pre_loudness"]
+#: The ``pre_`` prefix is about the *scope of the gain*, not about running
+#: earlier: one factor per source recording, so recordings match each other and
+#: the dynamics inside one survive.  Both listed modes run after slicing like
+#: everything else.
+#:
+#: ``pre_peak_rvc`` is the default: stock RVC's peak blend, at recording scope.
+#: It anchors the *peak*, so the loudness it lands on is whatever the crest
+#: factor of the material allows -- two datasets normalised this way match each
+#: other in headroom, not in perceived volume.
+#:
+#: ``pre_loudness`` anchors BS.1770 loudness instead, which is what perceived
+#: volume follows and what makes recordings match each other by ear.  Prefer it
+#: when levels have to be consistent across a many-speaker set; the peak then
+#: lands wherever the crest factor puts it, which for compressed material is
+#: well below the ceiling and is not a fault.
+NORMALIZATION_MODES = ["none", "post_peak", "pre_peak_rvc", "pre_loudness"]
 LOADING_RESAMPLING = ["librosa", "ffmpeg"]
 DATASET_FORMATS = ["WAV", "FLAC", "MP3", "OGG", "M4A"]
 

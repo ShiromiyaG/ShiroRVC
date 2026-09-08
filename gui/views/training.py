@@ -188,9 +188,9 @@ class TrainingPage(Page):
         self.normalization = SearchableCombo(editable=False)
         self.normalization.refresh_button.hide()
         self.normalization.set_items(catalog.NORMALIZATION_MODES)
-        self.normalization.set_text("post_peak")
+        self.normalization.set_text("pre_peak_rvc")
 
-        self.rms_db = SliderSpin(-32, -6, 0.5, decimals=1, value=-18.0)
+        self.rms_db = SliderSpin(-32, -6, 0.5, decimals=1, value=-16.0)
 
         self.resampling = SearchableCombo(editable=False)
         self.resampling.refresh_button.hide()

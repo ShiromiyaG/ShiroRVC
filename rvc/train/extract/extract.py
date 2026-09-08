@@ -33,7 +33,7 @@ install_rich_print()
 
 from rvc.lib.utils import load_audio_16k, load_embedder_model, extract_features
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
-from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE
+from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE, load_high_register_settings
 from rvc.configs.config import Config
 
 # Load config
@@ -57,8 +57,17 @@ class FeatureInput:
                 device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
             )
         elif f0_method == "rmvpe":
+            # Training labels must be the TRUE pitch, never fold-mode values
+            # (fold is an inference-side trick for models trained on stock
+            # octave-folded labels).  Only relevant when the corrector is
+            # enabled in assets/config.json.
+            high_register = load_high_register_settings()
+            high_register["mode"] = "true_pitch"
             self.model = RMVPE(
-                device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
+                device=self.device,
+                sample_rate=self.sample_rate,
+                hop_size=self.hop_size,
+                high_register=high_register,
             )
         elif f0_method == "fcpe":
             self.model = FCPE(
@@ -481,7 +490,9 @@ if __name__ == "__main__":
         feature_precision,
     )
 
-    generate_config(sample_rate, exp_dir, vocoder_arch)
+    generate_config(
+        sample_rate, exp_dir, vocoder_arch, embedder_model, embedder_model_custom
+    )
     generate_filelist(exp_dir, sample_rate, include_mutes, embedder_model, vocoder_arch)
 
     if remove_16k_slices:

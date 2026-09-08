@@ -38,6 +38,7 @@ PRESETS_DIR = os.path.join(now_dir, "assets", "presets")
 FORMANTSHIFT_DIR = os.path.join(now_dir, "assets", "formant_shift")
 
 os.makedirs(custom_embedder_root, exist_ok=True)
+os.makedirs(audio_root, exist_ok=True)
 
 custom_embedder_root_relative = os.path.relpath(custom_embedder_root, now_dir)
 model_root_relative = os.path.relpath(model_root, now_dir)
@@ -272,6 +273,7 @@ def save_to_wav(record_button):
         new_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".wav"
         target_path = os.path.join(audio_root_relative, os.path.basename(new_name))
 
+        os.makedirs(audio_root_relative, exist_ok=True)
         shutil.move(path_to_file, target_path)
         return target_path, gr.update()
 
@@ -284,6 +286,7 @@ def save_to_wav2(upload_audio):
     if os.path.exists(target_path):
         os.remove(target_path)
 
+    os.makedirs(audio_root_relative, exist_ok=True)
     shutil.copy(file_path, target_path)
     return target_path, gr.update()
 
@@ -793,6 +796,7 @@ def inference_tab():
                         "contentvec",
                         "spin_v1",
                         "spin_v2",
+                        "spin_wavlm_512",
                         "custom",
                     ],
                     value="contentvec",
@@ -1076,6 +1080,7 @@ def inference_tab():
                         "contentvec",
                         "spin_v1",
                         "spin_v2",
+                        "spin_wavlm_512",
                         "custom",
                     ],
                     value="contentvec",

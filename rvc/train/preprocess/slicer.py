@@ -35,10 +35,26 @@ class Slicer:
             end_idx = min(waveform.shape[0], end * self.hop_size)
             return waveform[start_idx:end_idx]
 
+    def _span(self, waveform, begin, end):
+        """The ``(start, end)`` sample offsets ``_apply_slice`` would cut."""
+        total = waveform.shape[1] if len(waveform.shape) > 1 else waveform.shape[0]
+        return begin * self.hop_size, min(total, end * self.hop_size)
+
     def slice(self, waveform):
+        """The segments themselves, for a caller that only wants the audio."""
+        return [waveform[..., a:b] for a, b in self.slice_spans(waveform)]
+
+    def slice_spans(self, waveform):
+        """Where the segments are, as ``(start, end)`` sample offsets.
+
+        The offsets rather than the arrays because the caller needs them: it
+        cuts the same spans out of a 16 kHz copy of the file, and a bare array
+        has forgotten where it came from.
+        """
         samples = waveform.mean(axis=0) if len(waveform.shape) > 1 else waveform
+        total = samples.shape[0]
         if samples.shape[0] <= self.min_length:
-            return [waveform]
+            return [(0, total)]
 
         rms_list = get_rms(
             y=samples, frame_length=self.win_size, hop_length=self.hop_size
@@ -123,23 +139,23 @@ class Slicer:
             sil_tags.append((pos, total_frames + 1))
 
         if not sil_tags:
-            return [waveform]
+            return [(0, total)]
         else:
-            chunks = []
+            spans = []
             if sil_tags[0][0] > 0:
-                chunks.append(self._apply_slice(waveform, 0, sil_tags[0][0]))
+                spans.append(self._span(waveform, 0, sil_tags[0][0]))
 
             for i in range(len(sil_tags) - 1):
-                chunks.append(
-                    self._apply_slice(waveform, sil_tags[i][1], sil_tags[i + 1][0])
+                spans.append(
+                    self._span(waveform, sil_tags[i][1], sil_tags[i + 1][0])
                 )
 
             if sil_tags[-1][1] < total_frames:
-                chunks.append(
-                    self._apply_slice(waveform, sil_tags[-1][1], total_frames)
+                spans.append(
+                    self._span(waveform, sil_tags[-1][1], total_frames)
                 )
 
-            return chunks
+            return spans
 
 
 def get_rms(

@@ -35,6 +35,58 @@ def relative_to_root(path: str) -> str:
     return relative.replace(os.sep, "/")
 
 
+def ensure_spin_wavlm_mute(mute_base_path: str) -> None:
+    """Rebuild ``logs/mute_spin_wavlm_512`` when it is not there.
+
+    The folder is shipped, like the one beside it for every other embedder, so
+    this is normally a no-op -- it returns on finding the feature.  It is what
+    produced the shipped copy, and what repairs a tree where the folder was
+    deleted or a half-written one was left behind.
+
+    Everything except the feature is copied from ``logs/mute`` and is
+    byte-identical to what the other mute folders hold: the silence is the same
+    silence, and its pitch is the same absence of pitch.  Only ``mute.npy``
+    differs, because only it depends on the embedder -- 256 values per frame
+    here against 768 for spin_v2.
+
+    Note that rebuilding costs the embedder download and conversion (835 MB),
+    which is why the fixture is shipped rather than left to be generated.
+    """
+    import numpy as np
+    import torch
+
+    from rvc.lib.utils import load_audio_16k, load_embedder_model, extract_features
+
+    feature_path = os.path.join(mute_base_path, "extracted", "mute.npy")
+    if os.path.isfile(feature_path):
+        return
+
+    source_base = os.path.join(current_directory, "logs", "mute")
+    for folder in ("f0", "f0_voiced", "sliced_audios", "sliced_audios_16k"):
+        source = os.path.join(source_base, folder)
+        if not os.path.isdir(source):
+            continue
+        destination = os.path.join(mute_base_path, folder)
+        os.makedirs(destination, exist_ok=True)
+        for name in os.listdir(source):
+            target = os.path.join(destination, name)
+            if not os.path.isfile(target):
+                shutil.copyfile(os.path.join(source, name), target)
+
+    audio_path = os.path.join(source_base, "sliced_audios_16k", "mute.wav")
+    if not os.path.isfile(audio_path):
+        raise FileNotFoundError(audio_path)
+
+    info("Generating the SPIN WavLM mute feature.", tag="[EXTRACT]")
+    model, do_normalize = load_embedder_model("spin_wavlm_512")
+    model = model.float().eval()
+    audio = torch.from_numpy(load_audio_16k(audio_path)).float().view(1, -1)
+    with torch.no_grad():
+        feature = extract_features(model, audio, "v2", do_normalize)
+    os.makedirs(os.path.dirname(feature_path), exist_ok=True)
+    np.save(feature_path, feature.squeeze(0).cpu().numpy(), allow_pickle=False)
+
+
 def ensure_mute_audio(mute_base_path: str, sample_rate: int) -> str:
     target_path = os.path.join(
         mute_base_path,
@@ -80,7 +132,39 @@ def ensure_mute_audio(mute_base_path: str, sample_rate: int) -> str:
     return target_path
 
 
-def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
+def apply_embedder_width(config_save_path: str, embedder_model: str,
+                         embedder_custom: str | None = None) -> None:
+    """Set ``text_enc_hidden_dim`` to the width the chosen embedder produces.
+
+    The shipped configs all say 768, which is right for contentvec and spin_v2
+    and wrong for anything else.  Left wrong, the text encoder is built with a
+    768-wide input and the first batch of 256-wide features fails to matmul --
+    or worse, a resumed run silently keeps the stale width.
+    """
+    from rvc.lib.utils import embedder_feature_dim
+
+    feature_dim = embedder_feature_dim(embedder_model, embedder_custom)
+    try:
+        with open(config_save_path, encoding="utf-8") as handle:
+            config_data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if config_data.get("model", {}).get("text_enc_hidden_dim") == feature_dim:
+        return
+    config_data.setdefault("model", {})["text_enc_hidden_dim"] = feature_dim
+    with open(config_save_path, "w", encoding="utf-8") as handle:
+        json.dump(config_data, handle, indent=4)
+        handle.write("\n")
+    info(
+        f"Text encoder width set to {feature_dim} for embedder "
+        f"'{embedder_model}'.",
+        tag="[EXTRACT]",
+    )
+
+
+def generate_config(sample_rate: int, model_path: str, vocoder_arch: str,
+                    embedder_model: str = "contentvec",
+                    embedder_custom: str | None = None):
     from rvc.configs.vocoders import normalize_vocoder
 
     vocoder_arch = normalize_vocoder(vocoder_arch)
@@ -88,6 +172,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     config_save_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_save_path):
         shutil.copyfile(config_path, config_save_path)
+        apply_embedder_width(config_save_path, embedder_model, embedder_custom)
         success(f"Config saved at {config_save_path}", tag="[EXTRACT]")
         return
 
@@ -118,6 +203,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
         )
     else:
         info(f"Config already exists at {config_save_path}", tag="[EXTRACT]")
+    apply_embedder_width(config_save_path, embedder_model, embedder_custom)
 
 def generate_filelist(
     model_path: str, sample_rate: int, include_mutes: int = 2, embedder_model: str = "contentvec", vocoder_arch: str = "hifi"
@@ -171,10 +257,14 @@ def generate_filelist(
         mute_folder = "mute"
     elif embedder_model == "spin_v1":
         mute_folder = "mute_spin_v1"
+    elif embedder_model == "spin_wavlm_512":
+        mute_folder = "mute_spin_wavlm_512"
     else:
         mute_folder = "mute_spin_v2"
 
     mute_base_path = os.path.join(current_directory, "logs", mute_folder)
+    if embedder_model == "spin_wavlm_512" and include_mutes > 0:
+        ensure_spin_wavlm_mute(mute_base_path)
 
     sids = []
     

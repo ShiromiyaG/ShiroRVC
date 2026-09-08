@@ -437,7 +437,16 @@ class VoiceConverter:
             self.use_f0 = True
 
             self.version = self.active_cpt.get("version", "v1")
-            self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
+            # The width the model was actually built with, read off the text
+            # encoder's own input layer.  The version rule below is only a
+            # fallback: it holds for contentvec and the spin_v* pair, and is
+            # wrong for any embedder whose width is not tied to the RVC
+            # version -- spin_wavlm_512 is 256-wide under version "v2".
+            emb_phone = self.active_cpt["weight"].get("enc_p.emb_phone.weight")
+            if emb_phone is not None:
+                self.text_enc_hidden_dim = int(emb_phone.shape[1])
+            else:
+                self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
             self.vocoder = normalize_vocoder(
                 self.active_cpt.get(
                     "vocoder_id",

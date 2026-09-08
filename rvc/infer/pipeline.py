@@ -478,6 +478,9 @@ class Pipeline:
             file_index, loaded_index, index_meta_payload, index_rate
         )
 
+        # Zero-phase, and the training preprocessor's ``high_pass`` matches it
+        # deliberately -- see the note there.  Changing this one silently
+        # invalidates every model trained against the other.
         audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
 

@@ -22,7 +22,10 @@ sys.path.insert(0, str(ROOT))
 from rvc.train.preprocess.loudness import (  # noqa: E402
     ABSOLUTE_GATE_LUFS,
     apply_gain_with_ceiling,
+    block_powers,
     integrated_lufs,
+    limit_peaks,
+    loudness_from_blocks,
     loudness_gain,
 )
 
@@ -184,13 +187,23 @@ def test_the_ceiling_reports_what_it_cost():
 def test_the_retired_modes_still_run_but_are_not_offered():
     """Three modes level every slice independently and are no longer offered;
     all three stay reachable so an experiment whose config names one re-runs
-    unchanged."""
+    unchanged.
+
+    ``pre_peak_rvc`` is the recording-scope version of ``post_peak_rvc`` and is
+    offered; the per-slice one it replaces is not.  The ``pre_``/``post_``
+    prefix is about the scope of the gain, not about when the pass runs.
+    """
 
     from gui.services import catalog
 
-    assert catalog.NORMALIZATION_MODES == ["none", "post_peak", "pre_loudness"]
+    assert catalog.NORMALIZATION_MODES == [
+        "none",
+        "post_peak",
+        "pre_peak_rvc",
+        "pre_loudness",
+    ]
 
-    offered = '"none", "post_peak", "pre_loudness"'
+    offered = '"none", "post_peak", "pre_peak_rvc", "pre_loudness"'
     assert offered in (ROOT / "core.py").read_text(encoding="utf-8")
     assert offered in (ROOT / "tabs" / "train" / "train.py").read_text(encoding="utf-8")
 
@@ -306,6 +319,47 @@ def _write_dataset(tmp_path, sample_rate, recordings):
     return sorted(names)
 
 
+def _level_recordings(preprocess, tmp_path, files, sample_rate, target_lufs,
+                      ceiling_db=-1.0):
+    """Run the shipped ``pre_loudness`` path over ``files`` in ``tmp_path``.
+
+    The 16 kHz copies the worker also rewrites are made here rather than
+    faked, so the ceiling assertions cover both.  Returns
+    ``{source_key: (loudness, peak)}`` measured from the files on disk
+    afterwards, plus the overshoots the worker reported.
+    """
+    import soundfile as sf
+
+    gt_dir = tmp_path / "sliced_audios"
+    k16_dir = tmp_path / "sliced_audios_16k"
+    gt_dir.mkdir(exist_ok=True)
+    k16_dir.mkdir(exist_ok=True)
+    by_source = {}
+    for name in files:
+        audio, rate = sf.read(tmp_path / name)
+        sf.write(gt_dir / name, audio.astype(np.float32), rate)
+        sf.write(k16_dir / name, audio[::2].astype(np.float32), rate // 2)
+        by_source.setdefault(preprocess.source_key(name), []).append(name)
+
+    overshoots = {}
+    for key, names in sorted(by_source.items()):
+        _written, overshoot, _short = preprocess._apply_source_gain_worker(
+            (key, sorted(names), str(gt_dir), str(k16_dir), ceiling_db, target_lufs)
+        )
+        overshoots[key] = overshoot
+
+    result = {}
+    for key, names in by_source.items():
+        powers, peak = [], 0.0
+        for name in sorted(names):
+            for directory in (gt_dir, k16_dir):
+                peak = max(peak, float(np.abs(sf.read(directory / name)[0]).max()))
+            audio, rate = sf.read(gt_dir / name)
+            powers.append(block_powers(audio, rate))
+        result[key] = (loudness_from_blocks(np.concatenate(powers)), peak)
+    return result, overshoots
+
+
 def test_recordings_are_matched_and_their_inner_dynamics_survive(tmp_path):
     """The whole point of the mode, as two numbers.
 
@@ -326,32 +380,33 @@ def test_recordings_are_matched_and_their_inner_dynamics_survive(tmp_path):
     import soundfile as sf
 
     before = {f: integrated_lufs(sf.read(tmp_path / f)[0], sample_rate) for f in files}
-    gains, effective, summary = preprocess.plan_source_gains(
-        str(tmp_path), files, -18.0, 1
-    )
-    assert summary is None, "there is headroom here; nothing should be limited"
-    assert effective == -18.0
-
-    after = {
-        f: before[f] + 20 * math.log10(gains[preprocess.source_key(f)])
-        for f in files
-    }
 
     def group(values, key):
         return [values[f] for f in files if preprocess.source_key(f) == key]
 
-    # Between recordings: 18 dB apart, then together.
     gap_before = abs(np.mean(group(before, "0_0")) - np.mean(group(before, "0_1")))
-    gap_after = abs(np.mean(group(after, "0_0")) - np.mean(group(after, "0_1")))
     assert gap_before == pytest.approx(18.0, abs=0.5)
-    assert gap_after < 0.01
+
+    result, overshoots = _level_recordings(
+        preprocess, tmp_path, files, sample_rate, -18.0
+    )
+    assert set(overshoots.values()) == {None}, "there is headroom here"
+
+    # Between recordings: 18 dB apart, then on top of each other at the target.
+    for key in ("0_0", "0_1"):
+        assert result[key][0] == pytest.approx(-18.0, abs=0.05)
 
     # Within a recording: untouched, because one gain scales all of its slices.
+    gt_dir = tmp_path / "sliced_audios"
     for key in ("0_0", "0_1"):
+        after = {
+            f: integrated_lufs(sf.read(gt_dir / f)[0], sample_rate)
+            for f in files if preprocess.source_key(f) == key
+        }
         span_before = max(group(before, key)) - min(group(before, key))
-        span_after = max(group(after, key)) - min(group(after, key))
+        span_after = max(after.values()) - min(after.values())
         assert span_before == pytest.approx(12.0, abs=0.5)
-        assert span_after == pytest.approx(span_before, abs=1e-6)
+        assert span_after == pytest.approx(span_before, abs=1e-4)
 
 
 def test_per_slice_normalisation_is_what_flattens_them(tmp_path):
@@ -377,10 +432,16 @@ def test_per_slice_normalisation_is_what_flattens_them(tmp_path):
     assert max(levelled) - min(levelled) < 0.01
 
 
-def test_a_recording_short_of_headroom_pulls_the_target_down_for_everyone(tmp_path):
-    """A dataset where some sources reached the target and others were quietly
-    limited is not level-matched, which was the entire point.  So the target
-    comes down for all of them instead."""
+def test_a_recording_short_of_headroom_is_limited_not_matched_down(tmp_path):
+    """A recording whose peaks leave no headroom used to pull the target down
+    for the whole dataset, so that nothing had to be limited.  It now reaches
+    the target like everything else and its peaks are ducked instead.
+
+    The old rule traded 22 dB of dataset level for 0.03% of samples; this is
+    the same guarantee -- matched, under the ceiling -- bought the other way.
+    """
+
+    import soundfile as sf
 
     preprocess = _preprocess()
     sample_rate = 32000
@@ -390,39 +451,203 @@ def test_a_recording_short_of_headroom_pulls_the_target_down_for_everyone(tmp_pa
         (0, 1): [-1.0, -1.0],
     })
 
-    gains, effective, summary = preprocess.plan_source_gains(
-        str(tmp_path), files, -6.0, 1, ceiling_db=-1.0
+    result, overshoots = _level_recordings(
+        preprocess, tmp_path, files, sample_rate, -6.0
     )
-    assert summary is not None
-    assert summary["num_sources"] == 2
-    assert effective < -6.0
+    # Both peak past the ceiling at this target, and both are limited for it.
+    assert all(value is not None for value in overshoots.values())
+
+    reached = {key: value[0] for key, value in result.items()}
+    peaks = [value[1] for value in result.values()]
+
+    # Matched, and at the target rather than 22 dB under it: the solver puts
+    # them there despite the limiter taking energy back out.
+    assert max(reached.values()) - min(reached.values()) < 0.1
+    for value in reached.values():
+        assert value == pytest.approx(-6.0, abs=0.1)
+    # And nothing exceeds the ceiling, in either copy.
+    assert max(peaks) <= 10 ** (-1.0 / 20) + 1e-6
+
+
+def test_one_clicky_outlier_does_not_drag_the_whole_dataset_down(tmp_path):
+    """The headroom limit is set by a recording's *peak*, so a single click
+    used to decide the level for everyone.
+
+    Measured on a real 116 h set: taking the worst of 24119 recordings gave
+    -40.6 LUFS against a -18 target, 22 dB thrown away for one outlier with a
+    39.6 dB crest.  The click is now ducked and nobody moves.
+    """
 
     import soundfile as sf
 
-    reached = [
-        integrated_lufs(
-            sf.read(tmp_path / f)[0] * gains[preprocess.source_key(f)], sample_rate
+    preprocess = _preprocess()
+    sample_rate = 32000
+    files = _write_dataset(
+        tmp_path, sample_rate, {(0, i): [-24.0] for i in range(9)}
+    )
+    t = np.arange(int(1.2 * sample_rate)) / sample_rate
+    clicky = 0.5 * np.sin(2 * math.pi * 220.0 * t) * 10 ** (-24.0 / 20)
+    clicky[len(clicky) // 2] = 0.99          # one sample, ~30 dB above the rest
+    sf.write(tmp_path / "0_9_0.wav", clicky.astype(np.float32), sample_rate)
+    files = sorted(files + ["0_9_0.wav"])
+
+    result, overshoots = _level_recordings(
+        preprocess, tmp_path, files, sample_rate, -10.0
+    )
+
+    # The ordinary signal has a 6.6 dB crest, so at -10 LUFS it is clear of a
+    # -1 dBFS ceiling; the clicky one has 35.3 dB and is not.  Under the old
+    # rule that one recording would have set -36.3 LUFS for all ten.
+    assert overshoots["0_9"] is not None
+    assert [k for k, v in overshoots.items() if v is not None] == ["0_9"]
+
+    # Every one of them lands on target -- the outlier included, because the
+    # gain is solved against what the limiter leaves rather than against the
+    # measurement the click inflated.
+    for key, (loudness, _peak) in result.items():
+        assert loudness == pytest.approx(-10.0, abs=0.1), key
+    assert max(peak for _l, peak in result.values()) <= 10 ** (-1.0 / 20) + 1e-6
+
+
+def test_the_gain_is_solved_against_the_limited_result(tmp_path):
+    """Ducking a peak removes energy the loudness measurement had counted, so
+    the gain that hits the target before limiting lands under it afterwards.
+
+    On the real dataset the tail of that is severe: a recording of eating
+    sounds came out 10.0 dB short, whispers 0.7-1.1 dB.  The worker solves for
+    the gain whose *limited* result measures the target, so the recording that
+    needs the limiter most is not the one left quietest.
+    """
+
+    import soundfile as sf
+
+    preprocess = _preprocess()
+    sample_rate = 32000
+    gt_dir = tmp_path / "sliced_audios"
+    k16_dir = tmp_path / "sliced_audios_16k"
+    gt_dir.mkdir()
+    k16_dir.mkdir()
+
+    # A recording whose energy is mostly in transients: the limiter has to take
+    # a lot out, which is exactly the case one round of gain gets wrong.
+    t = np.arange(int(1.2 * sample_rate)) / sample_rate
+    audio = 0.5 * np.sin(2 * math.pi * 220.0 * t) * 10 ** (-30.0 / 20)
+    audio[::1500] = 0.4                       # a spike every 47 ms
+    names = ["0_0_0.wav", "0_0_1.wav"]
+    for name in names:
+        sf.write(gt_dir / name, audio.astype(np.float32), sample_rate)
+        sf.write(k16_dir / name, audio[::2].astype(np.float32), 16000)
+
+    # What one round of gain would have reached: the gain that puts the
+    # *unlimited* recording on target, which is where the worker starts.
+    powers = [block_powers(sf.read(gt_dir / n)[0], sample_rate) for n in names]
+    unsolved = 10 ** ((-18.0 - loudness_from_blocks(np.concatenate(powers))) / 20)
+    powers = [
+        block_powers(
+            limit_peaks(
+                sf.read(gt_dir / n)[0] * unsolved, sample_rate, ceiling_db=-1.0
+            ),
+            sample_rate,
         )
-        for f in files
+        for n in names
     ]
-    # Still matched -- that is what lowering the target bought.
-    assert max(reached) - min(reached) < 0.05
-    # And nothing exceeds the ceiling.
-    for f in files:
-        peak = np.abs(sf.read(tmp_path / f)[0] * gains[preprocess.source_key(f)]).max()
-        assert peak <= 10 ** (-1.0 / 20) + 1e-6
+    naive = loudness_from_blocks(np.concatenate(powers))
+    assert naive < -18.0 - 1.0, "the fixture is not exercising the solver"
+
+    preprocess._apply_source_gain_worker(
+        ("0_0", names, str(gt_dir), str(k16_dir), -1.0, -18.0)
+    )
+
+    powers = [
+        block_powers(sf.read(gt_dir / n)[0], sample_rate) for n in names
+    ]
+    assert loudness_from_blocks(np.concatenate(powers)) == pytest.approx(
+        -18.0, abs=preprocess.GAIN_SOLVE_TOLERANCE_DB + 0.01
+    )
+    # The ceiling still holds, in both copies.
+    for directory in (gt_dir, k16_dir):
+        for name in names:
+            assert np.abs(sf.read(directory / name)[0]).max() <= 10 ** (-1 / 20) + 1e-6
 
 
-def test_the_per_source_mode_is_the_default():
-    """``pre_loudness`` is named for what its result is equivalent to --
-    normalising the recording before it was sliced -- not for when it runs,
-    which is after slicing like every other mode here."""
+def test_a_recording_that_saturates_below_the_target_says_so(tmp_path):
+    """Past a point the limiter has flattened a recording and no further gain
+    raises its loudness, so a target above that point is simply unreachable.
+
+    Measured on one recording of the real dataset -- 34.3 dB of crest, sparse
+    transients over near-silence -- which tops out at -17.3 LUFS however hard
+    it is driven.  The worker reports the shortfall rather than leaving it to
+    be noticed later as a quiet outlier.
+    """
+
+    import soundfile as sf
+
+    preprocess = _preprocess()
+    sample_rate = 32000
+    gt_dir = tmp_path / "sliced_audios"
+    k16_dir = tmp_path / "sliced_audios_16k"
+    gt_dir.mkdir()
+    k16_dir.mkdir()
+
+    # Short bursts separated by silence: the peaks carry essentially all of
+    # the energy, so once the limiter has flattened them there is nothing left
+    # for more gain to raise.  (Spikes over a noise floor do *not* saturate --
+    # the floor keeps scaling linearly for ever.)
+    audio = np.zeros(int(2.0 * sample_rate), dtype=np.float64)
+    burst = int(0.005 * sample_rate)
+    for start in range(0, len(audio) - burst, int(0.2 * sample_rate)):
+        t = np.arange(burst) / sample_rate
+        audio[start:start + burst] = (
+            0.5 * np.sin(2 * math.pi * 300.0 * t) * np.hanning(burst)
+        )
+    names = ["0_0_0.wav"]
+    for name in names:
+        sf.write(gt_dir / name, audio.astype(np.float32), sample_rate)
+        sf.write(k16_dir / name, audio[::2].astype(np.float32), 16000)
+
+    _written, _overshoot, shortfall = preprocess._apply_source_gain_worker(
+        ("0_0", names, str(gt_dir), str(k16_dir), -0.3, -3.0)
+    )
+    assert shortfall is not None and shortfall > 0.1
+
+    # It still went as loud as it goes, and still under the ceiling.
+    powers = [block_powers(sf.read(gt_dir / n)[0], sample_rate) for n in names]
+    assert loudness_from_blocks(np.concatenate(powers)) == pytest.approx(
+        -3.0 - shortfall, abs=0.2
+    )
+    for directory in (gt_dir, k16_dir):
+        assert np.abs(sf.read(directory / names[0])[0]).max() <= 10 ** (-0.3 / 20) + 1e-6
+
+
+def test_a_recording_scope_mode_is_the_default_everywhere():
+    """The default is ``pre_peak_rvc``, and it has to be the same one in all
+    four places that carry one.
+
+    Both offered ``pre_`` modes are named for what their result is equivalent
+    to -- normalising the recording before it was sliced -- not for when they
+    run, which is after slicing like every other mode here.  What matters for
+    the default is that it is *some* recording-scope mode: a per-slice default
+    would flatten the dynamics between phrases of every dataset built without
+    touching the setting.
+
+    Pinned across all four surfaces because they used to disagree -- the CLI
+    signature said ``pre_loudness`` while its own flag and both UIs said
+    ``post_peak``, so the default depended on how preprocessing was started.
+    """
 
     from gui.services import catalog
 
-    assert catalog.NORMALIZATION_MODES[-1] == "pre_loudness"
+    assert catalog.NORMALIZATION_MODES[-2] == "pre_peak_rvc"
+
     core = (ROOT / "core.py").read_text(encoding="utf-8")
-    assert 'normalization_mode: str = "pre_loudness"' in core
+    assert 'normalization_mode: str = "pre_peak_rvc"' in core
+    assert "default='pre_peak_rvc'" in core
+
+    gradio = (ROOT / "tabs" / "train" / "train.py").read_text(encoding="utf-8")
+    assert 'value="pre_peak_rvc"' in gradio
+
+    gui = (ROOT / "gui" / "views" / "training.py").read_text(encoding="utf-8")
+    assert 'set_text("pre_peak_rvc")' in gui
 
 
 def test_measuring_before_slicing_would_be_worse():
@@ -480,3 +705,21 @@ def test_measuring_before_slicing_would_be_worse():
     # And it is not a constant offset that could simply be calibrated out: it
     # moves with the recording's own pause and noise structure.
     assert noisy_gaps < quiet_gaps - 0.15
+
+
+def test_recording_scope_modes_do_not_get_a_second_pass():
+    """A recording-scope mode writes its slices back in its own branch.
+
+    The generic per-slice pass that follows has to skip those modes.  It used
+    to skip only ``pre_loudness`` by name, so adding ``pre_peak_rvc`` sent it
+    through both: harmless numerically -- ``_apply_post_norm`` has no branch
+    for it and returns the audio untouched -- but a full re-read and re-write
+    of the dataset to apply nothing, which on a 100-hour set is not free.
+    """
+
+    source = (ROOT / "rvc" / "train" / "preprocess" / "preprocess.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'RECORDING_SCOPE_MODES = ("pre_loudness", "pre_peak_rvc")' in source
+    assert "if normalization_mode not in RECORDING_SCOPE_MODES:" in source
+    assert 'if normalization_mode != "pre_loudness":' not in source

@@ -178,7 +178,20 @@ def loudness_gain(audio: np.ndarray, sample_rate: int, target_lufs: float) -> fl
     return float(10.0 ** ((target_lufs - measured) / 20.0))
 
 
-def apply_gain_with_ceiling(audio: np.ndarray, gain: float, ceiling_db: float = -1.0):
+#: Peak ceiling for a levelled slice, in dBFS.
+#:
+#: -1.0 dBFS is the broadcast convention, and it is margin for two things that
+#: do not happen here: inter-sample peaks that appear when a signal is
+#: reconstructed or resampled, and lossy codecs that overshoot on encode.  The
+#: files this writes are float32 WAV read straight by the trainer.  What the
+#: margin is still for is the FLAC path, which clips to [-1, 1] before writing
+#: PCM_24 -- a ceiling at exactly 0 would clip on rounding -- so this keeps
+#: enough for that and hands the rest back as level.
+CEILING_DB = -0.3
+
+
+def apply_gain_with_ceiling(audio: np.ndarray, gain: float,
+                            ceiling_db: float = CEILING_DB):
     """Scale by ``gain``, then pull back if the peak would exceed ``ceiling_db``.
 
     Returns ``(audio, limited_by_db)``; ``limited_by_db`` is 0.0 when the
@@ -194,3 +207,81 @@ def apply_gain_with_ceiling(audio: np.ndarray, gain: float, ceiling_db: float = 
         scaled = scaled * (ceiling / peak)
         return scaled, 20.0 * math.log10(peak / ceiling)
     return scaled, 0.0
+
+
+#: Half-length of the limiter's gain window, in milliseconds.  Both the attack
+#: and the release, since the window is symmetric.  1.5 ms is chosen against
+#: what actually overshoots here: at -18 LUFS on a 116 h speech set only 0.034%
+#: of samples clear a -1 dBFS ceiling, and they arrive as isolated transients
+#: rather than sustained passages, so a short symmetric window ducks the
+#: plosive and leaves the syllable around it alone.  A broadcast-style long
+#: release would pull down the whole word to hold back one click.
+LIMITER_WINDOW_MS = 1.5
+
+
+def limit_peaks(
+    audio: np.ndarray,
+    sample_rate: int,
+    ceiling_db: float = CEILING_DB,
+    window_ms: float = LIMITER_WINDOW_MS,
+) -> np.ndarray:
+    """Hold ``audio`` under ``ceiling_db`` by ducking peaks, not by rescaling.
+
+    The alternative -- :func:`apply_gain_with_ceiling` -- divides the *whole*
+    signal by its own worst peak, so one transient decides the level of
+    everything around it.  Across a dataset that compounds: matching every
+    recording to the one with the worst crest factor cost 22 dB on a real
+    116 h set.  Ducking 0.03% of the samples instead costs nothing measurable
+    and lets every recording sit at its target.
+
+    The envelope is a sliding minimum of the per-sample required gain, then a
+    Hann smoothing of the same length.  That pairing is what makes the result
+    provably under the ceiling rather than approximately under it: for an
+    offset ``k`` inside the Hann support, the minimum taken at ``n - k`` spans
+    a window that still contains ``n``, so every term being averaged is at most
+    the gain sample ``n`` itself requires -- and a weighted mean of terms that
+    are each ``<= required[n]``, with weights summing to one, cannot exceed it.
+
+    A dtype note: the gain envelope is built in float64 and applied before the
+    caller casts back, because a float32 ``ceiling / peak`` can round *up* by
+    an ulp and put the result a hair over a ceiling the caller then asserts on.
+    """
+
+    audio = np.asarray(audio, dtype=np.float64)
+    if audio.size == 0:
+        return audio
+
+    ceiling = 10.0 ** (ceiling_db / 20.0)
+    magnitude = np.abs(audio)
+    peak = float(magnitude.max())
+    if peak <= ceiling:
+        return audio
+
+    # Half-window in samples, forced odd so the window is centred; at least one
+    # sample either side, or the "min window contains n" argument above fails.
+    half = max(1, int(round(sample_rate * window_ms / 1000.0)))
+    length = 2 * half + 1
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        required = np.where(magnitude > ceiling, ceiling / magnitude, 1.0)
+
+    # Sliding minimum.  The padding goes on ``required`` -- twice the half
+    # window, so the envelope is defined for the ``half`` positions either side
+    # of the signal that the smoothing then reads -- and never on the envelope
+    # itself.  Padding the envelope was the first version of this and it breaks
+    # the guarantee above at the edges: the smoothing there averages in ones
+    # that no ``required`` sample justifies, and a full-scale sine came out at
+    # -0.78 dBFS against a -1.0 ceiling.
+    #
+    # Ones rather than a reflection: a slice is a fragment of a longer
+    # recording, and inventing a mirrored transient just outside it would duck
+    # audio that never needed it.
+    pad = np.ones(2 * half, dtype=np.float64)
+    padded = np.concatenate((pad, required, pad))
+    envelope = np.lib.stride_tricks.sliding_window_view(padded, length).min(axis=1)
+
+    window = np.hanning(length + 2)[1:-1]
+    window /= window.sum()
+    smoothed = np.convolve(envelope, window, mode="valid")
+
+    return audio * smoothed

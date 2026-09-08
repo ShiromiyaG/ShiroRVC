@@ -129,16 +129,27 @@ def test_the_resolution_branch_reads_a_spectrogram():
 # --------------------------------------------------------------------------
 
 
-def test_refinegan2_trains_against_a_single_scale_mel_loss():
-    """Applio picks the multi-scale mel loss for RefineGAN; this config does
-    not.  The two are not interchangeable at the same ``c_mel``: the
-    multi-scale branch divides by three and the single-scale one does not, so
-    the effective weight is 45 here against 15 there.  Pinned in the config
-    because that is where the choice is made -- the fork selects the loss by
-    key rather than by vocoder name."""
+def test_refinegan2_trains_against_the_multi_scale_mel_loss():
+    """Applio picks the multi-scale mel loss for RefineGAN and so does this,
+    but not the same one.
+
+    Applio's is seven resolutions summed and divided by three, and the coarse
+    end of that tilts it toward low frequency: destroying the harmonic comb
+    band by band, it charges 0.73 of what the single-scale L1 does at
+    12-15 kHz against 1.00 at 1-3 kHz.  This fork runs 256..4096 with a
+    divisor to match, which measures 0.92 against 1.00 over the same range,
+    and is ahead of the L1 on timing (1.65 at 1 ms of jitter) and on pitch
+    (1.13) while staying within 3% elsewhere.  See ``MS_MEL_WINDOWS`` in
+    ``rvc/train/mel_processing.py`` for the tables and how they were measured.
+
+    The two losses are not interchangeable at the same ``c_mel``: the
+    multi-scale branch carries ``MS_MEL_DIVISOR`` in its ``output_scale`` and
+    the single-scale one does not, so the effective weight is ~20 here against
+    45 there.  Pinned in the config because that is where the choice is made --
+    the fork selects the loss by key rather than by vocoder name."""
 
     train = json.loads(CONFIG.read_text())["train"]
-    assert train["spectral_loss"] == "L1 Mel Loss"
+    assert train["spectral_loss"] == "Multi-Scale Mel Loss"
     assert train["c_mel"] == 45
 
 

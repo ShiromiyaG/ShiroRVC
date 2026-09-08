@@ -44,6 +44,7 @@ assets/datasets/*
 assets/audios/audio-others/
 assets/training_presets/
 logs/*
+temp/
 !logs/.gitkeep
 !logs/run_tensorboard_in_model_folder.bat
 !logs/run_tensorboard_in_model_folder.sh
@@ -52,6 +53,7 @@ logs/*
 !logs/mute/
 !logs/mute_spin_v1/
 !logs/mute_spin_v2/
+!logs/mute_spin_wavlm_512/
 logs/reference/
 rvc/models/pretraineds/
 rvc/models/pretraineds/hifi-gan
@@ -65,3 +67,7 @@ rvc/models/embedders/spin_v2/pytorch_model.bin
 rvc/models/embedders/contentvec/pytorch_model.bin
 rvc/models/embedders/spin_v1/config.json
 rvc/models/embedders/spin_v2/config.json
+# spin_wavlm_512 is downloaded as an 835 MB Lightning checkpoint and converted
+# on first use, so the whole directory is build output -- the encoder, its
+# projection head and the three configs the converter writes beside them.
+rvc/models/embedders/spin_wavlm_512/

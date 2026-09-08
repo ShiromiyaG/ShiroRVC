@@ -304,6 +304,7 @@ def tts_tab():
                     "contentvec",
                     "spin_v1",
                     "spin_v2",
+                    "spin_wavlm_512",
                     "custom",
                 ],
                 value="contentvec",

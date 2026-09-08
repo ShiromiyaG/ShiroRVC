@@ -221,17 +221,52 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         return len(self.audiopaths_and_text)
 
 
+def _round_up(value, multiple):
+    """Smallest multiple of ``multiple`` that is >= ``value`` (identity at 1)."""
+
+    if multiple <= 1:
+        return int(value)
+    return int(-(-int(value) // int(multiple)) * int(multiple))
+
+
 class TextAudioCollateMultiNSFsid:
-    def __init__(self, return_ids=False):
+    """Pads a batch to a common length, quantised to a fixed grid.
+
+    Padding to the exact per-batch maximum makes almost every step a new input
+    shape.  That is what ``cudnn.benchmark`` charges for: it re-runs algorithm
+    autotuning per shape, and autotuning probes algorithms whose workspaces run
+    to gigabytes, so a long-utterance batch can ask the allocator for more than
+    the card has free and force a full cache flush mid-epoch.  ``torch.compile``
+    pays the same toll as recompiles.
+
+    Rounding the padded length up to ``pad_multiple`` frames collapses the
+    length buckets ([50..900] frames here) to roughly one shape each, so both
+    caches are warm after the first pass.  It only ever *grows* the padding, and
+    the true ``spec_lengths``/``wave_lengths`` are returned unchanged, so masks
+    and slice bounds are unaffected -- the extra frames are zeros no loss ever
+    reads.  ``pad_multiple=1`` restores the exact per-batch behaviour.
+
+    ``hop_length`` is what keeps the waveform on the same grid as the
+    spectrogram: the wave is quantised to ``pad_multiple * hop_length`` samples
+    so its shape count matches the spectrogram's instead of multiplying it.
+    """
+
+    def __init__(self, return_ids=False, pad_multiple=1, hop_length=1):
         self.return_ids = return_ids
+        self.pad_multiple = max(1, int(pad_multiple))
+        self.hop_length = max(1, int(hop_length))
 
     def __call__(self, batch):
         _, ids_sorted_decreasing = torch.sort(
             torch.LongTensor([x[0].size(1) for x in batch]), dim=0, descending=True
         )
 
-        max_spec_len = max([x[0].size(1) for x in batch])
-        max_wave_len = max([x[1].size(1) for x in batch])
+        max_spec_len = _round_up(
+            max([x[0].size(1) for x in batch]), self.pad_multiple
+        )
+        max_wave_len = _round_up(
+            max([x[1].size(1) for x in batch]), self.pad_multiple * self.hop_length
+        )
         spec_lengths = torch.LongTensor(len(batch))
         wave_lengths = torch.LongTensor(len(batch))
         spec_padded = torch.FloatTensor(len(batch), batch[0][0].size(0), max_spec_len)
@@ -239,7 +274,9 @@ class TextAudioCollateMultiNSFsid:
         spec_padded.zero_()
         wave_padded.zero_()
 
-        max_phone_len = max([x[2].size(0) for x in batch])
+        max_phone_len = _round_up(
+            max([x[2].size(0) for x in batch]), self.pad_multiple
+        )
         phone_lengths = torch.LongTensor(len(batch))
         phone_padded = torch.FloatTensor(
             len(batch), max_phone_len, batch[0][2].shape[1]

@@ -335,10 +335,10 @@ def run_preprocess_script(
     clean_strength: float,
     chunk_len: float,
     overlap_len: float,
-    normalization_mode: str = "pre_loudness",
+    normalization_mode: str = "pre_peak_rvc",
     loading_resampling: str = "librosa",
     dataset_format: str = "WAV",
-    rms_norm_db: float = -18.0
+    rms_norm_db: float = -16.0
 ):
     preprocess_script_path = os.path.join("rvc", "train", "preprocess", "preprocess.py")
     command = [
@@ -964,7 +964,9 @@ def inference_options(overrides: dict | None = None) -> list:
         ),
         click.option(
             "--embedder_model",
-            type=click.Choice(["contentvec", "spin_v1", "spin_v2", "custom"]),
+            type=click.Choice(
+                ["contentvec", "spin_v1", "spin_v2", "spin_wavlm_512", "custom"]
+            ),
             default='contentvec',
             show_default=True,
             help="Choose the model used for generating speaker embeddings.",
@@ -1111,10 +1113,14 @@ PREPROCESS_OWN = [
     ),
     click.option(
         "--cut_preprocess",
-        type=click.Choice(["Skip", "Simple", "Automatic"]),
+        type=click.Choice(["Skip", "Simple", "Automatic", "New Automatic"]),
         default='Simple',
         show_default=True,
-        help="Cut the dataset into smaller segments for faster preprocessing.",
+        help=(
+            "How to cut the dataset into segments. 'Automatic' finds silence by "
+            "RMS energy; 'New Automatic' uses FireRedVAD, which decides from the "
+            "audio rather than its level and needs its weights downloaded."
+        ),
     ),
     click.option(
         "--process_effects",
@@ -1153,8 +1159,8 @@ PREPROCESS_OWN = [
     ),
     click.option(
         "--normalization_mode",
-        type=click.Choice(["none", "post_peak", "pre_loudness"]),
-        default='post_peak',
+        type=click.Choice(["none", "post_peak", "pre_peak_rvc", "pre_loudness"]),
+        default='pre_peak_rvc',
         show_default=True,
         help="Normalization mode.",
     ),
@@ -1209,7 +1215,7 @@ EXTRACT_OWN = [
         # No ``spin_v1``: it is not trainable any more.  Inference keeps it, so
         # models already trained against it still run -- see
         # ``TRAINING_EMBEDDER_MODELS`` in ``gui/services/catalog.py``.
-        type=click.Choice(["contentvec", "spin_v2", "custom"]),
+        type=click.Choice(["contentvec", "spin_v2", "spin_wavlm_512", "custom"]),
         default='contentvec',
         show_default=True,
         help="Choose the model used for generating speaker embeddings.",
@@ -1606,8 +1612,9 @@ def tts(**kwargs):
 @apply_options(PREPROCESS_OWN)
 def preprocess(**kwargs):
     """Preprocess a dataset for training."""
-    # run_preprocess_script names this argument differently from its flag.
-    kwargs["noise_reduction_strength"] = kwargs.pop("clean_strength")
+    # run_preprocess_script names this argument differently from its flag:
+    # the flag is --noise_reduction_strength, the parameter is clean_strength.
+    kwargs["clean_strength"] = kwargs.pop("noise_reduction_strength")
     run_preprocess_script(**kwargs)
 
 

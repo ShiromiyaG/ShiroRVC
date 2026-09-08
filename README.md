@@ -206,12 +206,18 @@ MPD + MSD discriminator.
 
 <table>
 <tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
-<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v1</code> · <code>spin_v2</code> · custom</td></tr>
+<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v1</code> · <code>spin_v2</code> · <code>spin_wavlm_512</code> · custom</td></tr>
 <tr><td><b>Optimizers</b></td><td>AdamW · Sched-Free AdamW · Muon · Lion</td></tr>
 <tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel · hybrid L1</td></tr>
 <tr><td><b>LR schedulers</b></td><td>exponential decay per step or epoch · cosine annealing · none</td></tr>
 <tr><td><b>Export formats</b></td><td>WAV · MP3 · FLAC · OGG · M4A</td></tr>
 </table>
+
+`spin_wavlm_512` is [Lyery](https://github.com/redpanda343/redpanda-rvc)'s
+SPIN WavLM, downloaded and converted on first use. Its features are 256-wide
+rather than 768 — the 512 is SPIN's cluster count, not the width — so a model
+trained against it needs its own pretrained, and cannot start from a 768-wide
+one.
 
 Training writes live TensorBoard diagnostics for KL rate and per-dimension
 usage, per-module gradient norms, GAN balance and a held-out split that is the
@@ -224,6 +230,10 @@ only signal able to see overtraining.
 - **[Applio](https://github.com/IAHispano/Applio)** - The base for this fork.
 - **[dr87 / spin-for-rvc](https://github.com/dr87/spin-for-rvc)** — the `spin_v1`
   and `spin_v2` content embedders.
+- **[Lyery / redpanda-rvc](https://github.com/redpanda343/redpanda-rvc)** — the
+  `spin_wavlm_512` content embedder. Lyery trained the
+  [SPIN WavLM 512 checkpoint](https://huggingface.co/lyery/spin-wavlm512) and
+  wrote the integration this port is based on.
 - **[FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)** (Apache-2.0) — the
   neural voice-activity detector behind the **New Automatic** cutting mode.
 - [Retrieval-based Voice Conversion WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
