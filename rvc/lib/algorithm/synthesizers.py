@@ -169,6 +169,13 @@ class Synthesizer(torch.nn.Module):
                 source_bandwidth=float(
                     decoder_config.get("refinegan2_source_bandwidth", 1.0)
                 ),
+                # Absent means 0.003 -- what every run before this key existed
+                # was trained against.  See ``RefineGAN2Generator`` for the
+                # sweep; it moves the excitation's voiced dither, so a
+                # checkpoint and its config have to agree on it.
+                source_noise_std=float(
+                    decoder_config.get("refinegan2_source_noise_std", 0.003)
+                ),
                 # Absent means *on* here, while absent means *off* in
                 # ``decoder_layout``.  That asymmetry is deliberate and the two
                 # defaults answer different questions: a config written today

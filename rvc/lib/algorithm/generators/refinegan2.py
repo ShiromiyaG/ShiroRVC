@@ -527,6 +527,7 @@ class RefineGAN2Generator(nn.Module):
         source_gain: bool = False,
         source_bandwidth: float = 1.0,
         source_normalize: bool = True,
+        source_noise_std: float = 0.003,
     ):
         super().__init__()
         self.sample_rate = int(sample_rate)
@@ -598,10 +599,44 @@ class RefineGAN2Generator(nn.Module):
         # Invisible in the same way, and a larger change than the bandwidth:
         # it moves the excitation's level by 13-23 dB depending on the note.
         self.source_normalize = bool(source_normalize)
+        # The dither the excitation carries in *voiced* frames, and the only
+        # stochastic material the decoder is given there.  0.003 against a
+        # harmonic RMS of ``wave_amp / sqrt(2)`` is -27.4 dB, while the band
+        # above 10 kHz in real voiced speech is barely harmonic at all: its
+        # floor between the partials sits 2.6 dB under them.  A decoder short
+        # of that floor -- measured at 11.1 dB down on the valleys against 7.1
+        # on the peaks -- is short of it partly because it was never handed
+        # any, and no reconstruction loss can ask for it: the minimiser of an
+        # L1 against an unpredictable component is less of that component.
+        #
+        # Swept on a 4-epoch pretrain at 32 kHz, rendered through ``infer``
+        # (deficits in dB, MS mel on the same pairs):
+        #
+        #   noise_std   whole set 10k   worst twelfth 10k   MS mel (all / worst)
+        #     0.003         -2.00            -9.96          0.723 / 0.762
+        #     0.01          -1.21            -8.28          0.713 / 0.723
+        #     0.03          +0.61            -4.85          0.781 / 0.782
+        #     0.06          +3.17            -0.54          0.944 / 0.948
+        #
+        # 0.01 is better on both axes at once, which is why it is worth having
+        # as a knob.  What does *not* work, measured on the same 80 excerpts,
+        # is shaping the dither instead of raising it: a first-order difference
+        # tilts it +11.8 dB towards the top and does flatten the bands (10 kHz
+        # -0.17, 2 kHz +0.06 against white 0.01's -1.15 and +0.60), but the MS
+        # mel goes the wrong way, 0.739 against 0.713, and the band's own
+        # peak-to-valley contrast does not improve -- 15.33 against 15.38, with
+        # the reference at 15.90.  White at the right level beats shaped at any
+        # level tried.  0.03 buys half the remaining tail and pays for it in the
+        # bands below 6 kHz, where it overshoots.  Note the sweep is a *level*
+        # the trunk downstream was not trained against, so it measures whether
+        # the material propagates, not what training at that level converges
+        # to.
+        self.source_noise_std = float(source_noise_std)
         self.m_source = BlitGenerator(
             sample_rate,
             bandwidth=source_bandwidth,
             normalize=source_normalize,
+            noise_std=source_noise_std,
         )
 
         # ``start_channels``, not a literal 16.  It was hardcoded here while

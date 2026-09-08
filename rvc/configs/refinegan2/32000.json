@@ -18,6 +18,7 @@
         "segment_size": 12800,
         "c_mel": 45,
         "mel_frequency_tilt": 0.5,
+        "hf_floor_negative_weight": 0.0,
         "c_kl": 1.0,
         "holdout_fraction": 0.02,
         "holdout_min_slices": 16,
@@ -100,6 +101,7 @@
         "refinegan2_start_channels": 16,
         "refinegan2_leaky_relu_slope": 0.2,
         "refinegan2_source_gain": true,
+        "refinegan2_source_noise_std": 0.01,
         "architecture_id": "vits_gaussian_v1"
     }
 }

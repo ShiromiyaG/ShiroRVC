@@ -116,6 +116,7 @@ from losses import (
     mel_low_frequency_weights,
     mel_frequency_tilt_weights,
     BandWeightedSpectralLoss,
+    HighFrequencyFloorNegative,
     MultiScaleSTFTLoss,
 )
 
@@ -807,6 +808,29 @@ def _cache_mean(cache) -> float:
     one place the window actually has to reach the host.
     """
     return torch.stack(list(cache)).mean().item()
+
+
+def _split_branch_outputs(outputs, sizes):
+    """Split every branch's output along the batch axis into ``len(sizes)`` groups.
+
+    The discriminator batches its fake side into one pass, so a second class of
+    fake -- the synthetic negative -- rides in the same tensor and has to come
+    back out before the losses can weight the two differently.  Under SAN a
+    branch returns ``(function, direction)`` rather than one tensor, and both
+    halves are split.
+    """
+
+    groups = [[] for _ in sizes]
+    for output in outputs:
+        if isinstance(output, (list, tuple)):
+            parts = [torch.split(half, sizes, dim=0) for half in output]
+            for index in range(len(sizes)):
+                groups[index].append([half[index] for half in parts])
+        else:
+            parts = torch.split(output, sizes, dim=0)
+            for index in range(len(sizes)):
+                groups[index].append(parts[index])
+    return groups
 
 
 def _branch_separation(disc_real_outputs, disc_generated_outputs):
@@ -2371,6 +2395,28 @@ def run(
     def _make_ms_mel_loss():
         return build_ms_mel_loss(sample_rate, loss_fn=_make_mel_distance())
 
+    # Synthetic negative for the discriminator: real audio with its
+    # high-frequency noise floor pulled down, scored as fake.  0.0 is off, and
+    # off is what a config predating this key gets.  See
+    # ``HighFrequencyFloorNegative`` for what it is for and what was measured
+    # without it; the weight is below 1.0 because this is a regulariser on the
+    # discriminator's opinion and not its task, and it is a starting point
+    # rather than a measured optimum.
+    hf_floor_weight = max(
+        0.0, float(getattr(config.train, "hf_floor_negative_weight", 0.0))
+    )
+    fn_hf_floor_negative = None
+    if hf_floor_weight > 0.0:
+        fn_hf_floor_negative = HighFrequencyFloorNegative(
+            sample_rate=sample_rate,
+            gamma_range=tuple(
+                getattr(config.train, "hf_floor_negative_gamma", (1.3, 2.0))
+            ),
+            cutoff_range=tuple(
+                getattr(config.train, "hf_floor_negative_cutoff", (6000.0, 11000.0))
+            ),
+        ).to(device)
+
     if spectral_loss == "L1 Mel Loss":
         fn_spectral_loss = _make_mel_distance()
         if swap_l1_to_ms:
@@ -2599,6 +2645,8 @@ def run(
             fn_spectral_loss2,
             fn_spectral_loss_ms,
             holdout_set=holdout_set,
+            fn_hf_floor_negative=fn_hf_floor_negative,
+            hf_floor_weight=hf_floor_weight,
             probe_set=probe_set,
             overtrain_monitor=overtrain_monitor,
             holdout_interval=interval,
@@ -2675,6 +2723,8 @@ def training_loop(
     n_gpus,
     fn_spectral_loss2=None,
     fn_spectral_loss_ms=None,
+    fn_hf_floor_negative=None,
+    hf_floor_weight=0.0,
     holdout_set=None,
     probe_set=None,
     overtrain_monitor=None,
@@ -2753,6 +2803,7 @@ def training_loop(
     # One separation per head per step.  Rank 0 only: it is a diagnostic, and
     # the other ranks never write to the summary.
     branch_disc_cache = deque(maxlen=rolling_loss_steps)
+    branch_neg_cache = deque(maxlen=rolling_loss_steps)
     kl_std_cache = deque(maxlen=rolling_loss_steps)
     kl_mean_cache = deque(maxlen=rolling_loss_steps)
     kl_active_cache = deque(maxlen=rolling_loss_steps)
@@ -2861,9 +2912,21 @@ def training_loop(
                 # 0.4 s, at unchanged peak VRAM.  Only this pass can ask for
                 # it; the generator's runs the real side under ``no_grad``,
                 # and half a batch cannot be.
+                #
+                # The synthetic negative rides in the same tensor rather than
+                # in a second call: the real side is then computed once for
+                # both, so the pass is ``3B`` instead of ``2B`` and not ``4B``.
+                fake = y_hat.detach()
+                if fn_hf_floor_negative is not None:
+                    fake = torch.cat((fake, fn_hf_floor_negative(y)), dim=0)
                 y_d_hat_r, y_d_hat_g, _, _ = net_d(
-                    y, y_hat.detach(), san_training=san_active, combine_inputs=True
+                    y, fake, san_training=san_active, combine_inputs=True
                 )
+                y_d_hat_neg = None
+                if fn_hf_floor_negative is not None:
+                    y_d_hat_g, y_d_hat_neg = _split_branch_outputs(
+                        y_d_hat_g, (y_hat.shape[0], y.shape[0])
+                    )
 
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 disc_loss_parts = discriminator_loss(
@@ -2874,6 +2937,19 @@ def training_loop(
                     per_branch=False,
                 )
                 loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
+                if y_d_hat_neg is not None:
+                    # Only the fake half of the second call is wanted: the real
+                    # half is the same logits already charged for above, and
+                    # counting them twice would double the weight on one side
+                    # of a two-sided loss.
+                    loss_hf_floor = discriminator_loss(
+                        y_d_hat_r,
+                        y_d_hat_neg,
+                        san_direction_weight=san_direction_weight,
+                        normalize=False,
+                        per_branch=False,
+                    )[2]
+                    loss_disc = loss_disc + hf_floor_weight * loss_hf_floor
 
             optim_d.zero_grad(set_to_none=True)
             if grad_scaler is not None:
@@ -2905,6 +2981,12 @@ def training_loop(
             # head scores real audio than the generator's output.
             if rank == 0:
                 branch_disc_cache.append(_branch_separation(y_d_hat_r, y_d_hat_g))
+                if y_d_hat_neg is not None:
+                    # The series this switch exists to move: without it the
+                    # heads that can see the floor sat at -0.13 and -0.82.
+                    branch_neg_cache.append(
+                        _branch_separation(y_d_hat_r, y_d_hat_neg)
+                    )
 
             # Temp accumulation
             _loss_disc_acc.append(loss_disc.detach())
@@ -3493,17 +3575,22 @@ def training_loop(
                 # exactly the spectral defect it never fixed, the three
                 # spectrogram heads significantly on the wrong side of zero,
                 # while ``loss_disc`` sat at 20.0 throughout.
-                if branch_disc_cache:
-                    branch_mean = torch.stack(list(branch_disc_cache)).mean(0)
-                    labels = getattr(
-                        net_d.module if hasattr(net_d, "module") else net_d,
-                        "branch_labels",
-                        (),
-                    )
+                labels = getattr(
+                    net_d.module if hasattr(net_d, "module") else net_d,
+                    "branch_labels",
+                    (),
+                )
+                for prefix, cache in (
+                    (f"disc_sep_{rolling_loss_steps}", branch_disc_cache),
+                    (f"disc_sep_floor_{rolling_loss_steps}", branch_neg_cache),
+                ):
+                    if not cache:
+                        continue
+                    branch_mean = torch.stack(list(cache)).mean(0)
                     for index, label in enumerate(labels[: branch_mean.shape[0]]):
-                        scalar_dict_rolling[
-                            f"disc_sep_{rolling_loss_steps}/{label}"
-                        ] = branch_mean[index].item()
+                        scalar_dict_rolling[f"{prefix}/{label}"] = branch_mean[
+                            index
+                        ].item()
 
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
 
