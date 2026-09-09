@@ -44,6 +44,8 @@ def extract_model(
     architecture,
     pitch_guidance=True,
     version="v2",
+    weights_step=None,
+    weights_source=None,
 ):
     try:
         architecture = "RVC"
@@ -118,6 +120,12 @@ def extract_model(
 
         opt["epoch"] = epoch
         opt["step"] = step
+        # Where the tensors came from, which is not always ``step``: the
+        # trainer can hand over a snapshot the holdout monitor took earlier and
+        # has not replaced since, and nothing else in the file records that.
+        # ``weights_step`` is None when the weights are current.
+        opt["weights_step"] = weights_step if weights_step is not None else step
+        opt["weights_source"] = weights_source or "live weights"
         opt["sr"] = sr
         opt["f0"] = True
         opt["version"] = version
@@ -141,20 +149,30 @@ def extract_model(
         # Since fork uses new API for weight norm ( parametrizations )
         # and mainline RVC ( Original ), W-okada and such rely on old API, we're performing keys conversion.
         #
-        #   Old API:  .weight_g / .weight_v
-        #   New API:  .parametrizations.weight.original0 (direction) / .original1 (gain)
+        #   Old API:  .weight_g (gain) / .weight_v (direction)
+        #   New API:  .parametrizations.weight.original0 (gain) / .original1 (direction)
+        #
+        # The pairing is fixed by ``torch.nn.utils.parametrizations.weight_norm``,
+        # whose own ``_load_from_state_dict`` hook maps ``weight_g -> original0``
+        # and ``weight_v -> original1``.  That hook is why an old-API export
+        # still loads here: writing the names the other way round produces a
+        # file that fails every one of these tensors on a size check.
 
         NEW_TO_OLD = [
-            (".parametrizations.weight.original1", ".weight_g"),
-            (".parametrizations.weight.original0", ".weight_v"),
+            (".parametrizations.weight.original0", ".weight_g"),
+            (".parametrizations.weight.original1", ".weight_v"),
         ]
         OLD_TO_NEW = [
-            (".weight_g", ".parametrizations.weight.original1"),
-            (".weight_v", ".parametrizations.weight.original0"),
+            (".weight_g", ".parametrizations.weight.original0"),
+            (".weight_v", ".parametrizations.weight.original1"),
         ]
 
-        has_new = any("parametrizations.weight.original" in k for k in opt)
-        has_old = any(k.endswith(".weight_v") or k.endswith(".weight_g") for k in opt)
+        # The tensor names live one level down, under ``weight``; testing ``opt``
+        # itself only ever sees "weight", "config", "epoch"... so both flags
+        # were always False and neither conversion could fire.
+        tensor_keys = opt["weight"]
+        has_new = any("parametrizations.weight.original" in k for k in tensor_keys)
+        has_old = any(k.endswith((".weight_v", ".weight_g")) for k in tensor_keys)
 
         if architecture == "RVC" and has_new: # RVC Arch models TRAIN with new api, but are SAVED with old-API compatibility in mind.
             for old, new in NEW_TO_OLD:

@@ -142,6 +142,30 @@ class Synthesizer(torch.nn.Module):
             # ``sample_rate`` and the trunk is built from ``upsample_rates``,
             # whose product is the hop.  So the registry decides which rates
             # ship, rather than a constant here.
+            # Both described the full-band BLIT this decoder no longer has:
+            # one capped the fraction of Nyquist it filled, the other held its
+            # energy rather than its peak constant across the range.  The sine
+            # fills a single bin, so neither has anything to act on.  Named
+            # here rather than dropped silently -- a config key that quietly
+            # stops doing anything is the same class of bug as one that changes
+            # the signal path invisibly, which is what these two were.
+            retired = [
+                key
+                for key in (
+                    "refinegan2_source_bandwidth",
+                    "refinegan2_source_normalize",
+                )
+                if key in decoder_config
+            ]
+            if retired:
+                raise ValueError(
+                    f"{', '.join(retired)} configure the BLIT excitation, which "
+                    f"was replaced by the sine on 2026-09-08. Remove the "
+                    f"key(s): this decoder's source fills one bin, so there is "
+                    f"no band to cap and no energy to normalise. A checkpoint "
+                    f"trained with the BLIT will not load here either -- "
+                    f"``excitation_source`` reports that separately."
+                )
             supported = tuple(int(rate) for rate in vocoder_spec["sample_rates"])
             if int(sr) not in supported:
                 raise ValueError(
@@ -163,30 +187,12 @@ class Synthesizer(torch.nn.Module):
                 source_gain=bool(
                     decoder_config.get("refinegan2_source_gain", False)
                 ),
-                # Absent means 1.0 -- the full-band BLIT every run before this
-                # key existed was trained against.  It is not a default anyone
-                # should ship: see ``BlitGenerator.bandwidth``.
-                source_bandwidth=float(
-                    decoder_config.get("refinegan2_source_bandwidth", 1.0)
-                ),
                 # Absent means 0.003 -- what every run before this key existed
                 # was trained against.  See ``RefineGAN2Generator`` for the
                 # sweep; it moves the excitation's voiced dither, so a
                 # checkpoint and its config have to agree on it.
                 source_noise_std=float(
                     decoder_config.get("refinegan2_source_noise_std", 0.003)
-                ),
-                # Absent means *on* here, while absent means *off* in
-                # ``decoder_layout``.  That asymmetry is deliberate and the two
-                # defaults answer different questions: a config written today
-                # and naming nothing should get the sane excitation, while a
-                # checkpoint naming nothing was demonstrably trained before the
-                # normalisation existed.  An old config resuming an old
-                # checkpoint therefore raises rather than silently changing the
-                # source level by 13-23 dB, which is the whole point of the
-                # guard.
-                source_normalize=bool(
-                    decoder_config.get("refinegan2_source_normalize", True)
                 ),
             )
         else:

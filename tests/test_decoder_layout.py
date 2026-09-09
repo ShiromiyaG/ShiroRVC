@@ -124,15 +124,13 @@ def test_the_layout_round_trips_through_a_checkpoint():
         "upsample_rates": [5, 4, 4, 4],
         "source_gain": False,
         "source_bands": 0,
-        # ``_generator`` names no bandwidth, so this is the constructor
-        # default -- the full-band BLIT, which is also what a checkpoint
-        # written before the key existed was trained against.
+        # Both are pinned since the sine replaced the BLIT on 2026-09-08.  A
+        # source that fills one bin has no band to cap and no energy to hold
+        # constant, so the layout reports what a sine run implies rather than
+        # whatever a config asked for -- and the two no longer disagree
+        # between a config and a checkpoint, because neither can vary.
         "source_bandwidth": 1.0,
-        # ``_generator`` names neither, so both are constructor defaults.  The
-        # two disagree on purpose: absent in a *config* means normalised,
-        # absent in a *checkpoint* means not, because nothing written before
-        # the flag existed could have been.
-        "source_normalize": True,
+        "source_normalize": False,
         # The per-stage interpolation schedule, ascending with the rate: the
         # last stage's image is the one that reaches the output (path gain
         # -19.9 dB against -49.5 and -59.3 for stages 2 and 1) and it is the
@@ -186,16 +184,15 @@ def test_a_checkpoint_without_the_key_is_read_as_the_old_layout(sample_rate):
 
     # The old layout is the old *filter* too: the interpolation design is as
     # invisible to ``load_state_dict`` as the ordering is, so a run that kept
-    # one and changed the other is not "the old layout".  It is the old
-    # *excitation* for the same reason: ``source_normalize`` owns no state-dict
-    # key either, and the constructor default is the sane one for a config
-    # written today rather than the one a keyless checkpoint was trained with.
+    # one and changed the other is not "the old layout".  The excitation no
+    # longer needs saying here: with the sine there is nothing to normalise,
+    # so a keyless checkpoint and a decoder built today agree on that field by
+    # construction rather than by matching two deliberately opposed defaults.
     old = torch.nn.Module()
     old.dec = _generator(
         LEGACY_UPSAMPLE_RATES[sample_rate],
         rate=sample_rate,
         upsample_filter=LEGACY_UPSAMPLE_FILTER,
-        source_normalize=False,
     )
     old.sr = sample_rate
     assert_decoder_layout_matches(old, {})
@@ -781,38 +778,46 @@ def test_the_shipped_bandwidth_stays_above_the_floor(sample_rate):
     assert 0.4 <= model.get("refinegan2_source_bandwidth", 1.0) <= 1.0
 
 
-def test_the_bandwidth_is_invisible_in_the_weights_so_the_layout_carries_it():
-    """``BlitGenerator`` owns one scalar parameter at every bandwidth, so a
-    full-band checkpoint loads into a band-limited decoder without raising and
-    trains on from a source it was never fitted to."""
+def test_the_retired_blit_keys_are_refused_rather_than_ignored():
+    """``source_bandwidth`` and ``source_normalize`` went with the BLIT on
+    2026-09-08.  Both described a source that fills a band; the sine fills one
+    bin, so neither has anything to act on.
 
-    full = _generator((5, 4, 4, 4))
-    narrow = RefineGAN2Generator(
-        sample_rate=32000, upsample_rates=(5, 4, 4, 4), num_mels=192,
-        gin_channels=256, upsample_initial_channel=512, source_bandwidth=0.5,
-    )
-    # Nothing about the state dict says which is which.
-    assert narrow.load_state_dict(full.state_dict(), strict=True) is not None
-    assert {k: v.shape for k, v in full.state_dict().items()} == {
-        k: v.shape for k, v in narrow.state_dict().items()
-    }
+    They used to be carried by ``decoder_layout`` precisely because they were
+    invisible in the weights -- a full-band checkpoint loaded into a
+    band-limited decoder without raising.  Accepting them now and quietly
+    doing nothing would be the same failure wearing the opposite mask, so
+    ``Synthesizer`` names them instead.
+    """
 
-    model = torch.nn.Module()
-    model.dec = narrow
-    model.sr = 32000
-    assert decoder_layout(model)["source_bandwidth"] == 0.5
-    with pytest.raises(ValueError, match="source_bandwidth"):
-        assert_decoder_layout_matches(
-            model, {"decoder_layout": decoder_layout_of(full)}
+    from rvc.lib.algorithm.synthesizers import Synthesizer
+
+    model = json.loads(CONFIGS[32000].read_text())["model"]
+    data = json.loads(CONFIGS[32000].read_text())["data"]
+
+    def build(extra):
+        cfg = dict(model, **extra)
+        return Synthesizer(
+            data["filter_length"] // 2 + 1, 32, cfg["inter_channels"],
+            cfg["hidden_channels"], cfg["filter_channels"], cfg["n_heads"],
+            cfg["n_layers"], cfg["kernel_size"], cfg["p_dropout"],
+            cfg["resblock"], cfg["resblock_kernel_sizes"],
+            cfg["resblock_dilation_sizes"], cfg["upsample_rates"],
+            cfg["upsample_initial_channel"], cfg["upsample_kernel_sizes"],
+            cfg["spk_embed_dim"], cfg["gin_channels"], data["sample_rate"],
+            use_f0=True, text_enc_hidden_dim=768, vocoder="refinegan2",
+            vocoder_config=cfg,
         )
-    # Absent means the full-band source: the cap postdates the excitation, so
-    # a layout that names every other field and omits this one is a 1.0 run.
-    # (A layout of ``None`` is a different case entirely -- it means the whole
-    # legacy arrangement, old stage ordering and flat filters included.)
-    model.dec = full
-    aged = decoder_layout_of(full)
-    del aged["source_bandwidth"]
-    assert_decoder_layout_matches(model, {"decoder_layout": aged})
+
+    # The shipped config names neither, and builds the sine.
+    assert build({}).dec.source_type == "sine"
+
+    for key, value in (
+        ("refinegan2_source_bandwidth", 0.5),
+        ("refinegan2_source_normalize", True),
+    ):
+        with pytest.raises(ValueError, match=key):
+            build({key: value})
 
 
 def test_turning_the_normalisation_off_restores_the_old_excitation_exactly():
@@ -839,30 +844,25 @@ def test_turning_the_normalisation_off_restores_the_old_excitation_exactly():
     assert abs(20 * np.log10(loud / quiet)) < 0.5
 
 
-def test_the_normalisation_is_invisible_in_the_weights_too():
-    """Same contract as the bandwidth, and a larger change: 13-23 dB of source
-    level depending on the note.  ``BlitGenerator`` owns one scalar parameter
-    either way, so only ``decoder_layout`` can tell the two apart."""
+def test_a_blit_checkpoint_does_not_load_into_the_sine():
+    """The source swap is invisible to a shape check but not to the guard.
 
-    def build(normalize):
-        return RefineGAN2Generator(
-            sample_rate=32000, upsample_rates=(5, 4, 4, 4), num_mels=192,
-            gin_channels=256, upsample_initial_channel=512,
-            source_normalize=normalize,
-        )
+    ``SineGenerator`` owns ``merge.0.weight`` and ``BlitGenerator`` owns
+    ``gain``, so the two state dicts differ -- but the generator resumes
+    non-strictly, which is exactly the path that would leave a new module at
+    its random init.  ``excitation_source`` is what names it.
+    """
 
-    on, off = build(True), build(False)
-    assert off.load_state_dict(on.state_dict(), strict=True) is not None
+    from rvc.train.utils import assert_excitation_matches, excitation_source
 
     model = torch.nn.Module()
-    model.dec = off
+    model.dec = _generator((5, 4, 4, 4))
     model.sr = 32000
-    assert decoder_layout(model)["source_normalize"] is False
-    with pytest.raises(ValueError, match="source_normalize"):
-        assert_decoder_layout_matches(
-            model, {"decoder_layout": decoder_layout_of(on)}
-        )
-    # Absent means off: nothing written before the flag existed was normalised.
-    aged = decoder_layout_of(off)
-    del aged["source_normalize"]
-    assert_decoder_layout_matches(model, {"decoder_layout": aged})
+    assert excitation_source(model) == "sine"
+
+    with pytest.raises(ValueError, match="blit"):
+        assert_excitation_matches(model, {"excitation_source": "blit"})
+
+    # Absent means ``sine``: every checkpoint predating the key is one, and
+    # that is what this decoder builds again.
+    assert_excitation_matches(model, {})

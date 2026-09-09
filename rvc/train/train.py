@@ -1341,18 +1341,32 @@ class _OvertrainMonitor:
 def _deliverable_weights(overtrain_monitor, ema, model_g):
     """The weights this run would hand you if it stopped right now: holdout
     best, then EMA, then live weights, in order of how much each source
-    knows. Returns ``(state_dict, label)``.
+    knows. Returns ``(state_dict, label, source_step)``.
+
+    ``source_step`` is the step the weights are actually *from*, which is not
+    the step the export is named after. The holdout branch only replaces its
+    snapshot when the metric improves, so once it plateaus every later export
+    returns the same tensors while the filename and the ``epoch``/``step``
+    fields keep counting up -- six consecutive exports came back bit-identical
+    that way. ``None`` means "as of now"; the caller writes it into the file so
+    the staleness is readable after the run's console has scrolled away.
     """
     if overtrain_monitor is not None and overtrain_monitor.state_dict is not None:
-        return overtrain_monitor.state_dict, f"holdout best @ {overtrain_monitor.best_step}"
+        return (
+            overtrain_monitor.state_dict,
+            f"holdout best @ {overtrain_monitor.best_step}",
+            overtrain_monitor.best_step,
+        )
     if ema is not None:
-        return ema.cpu_state_dict(), f"EMA ({ema.updates} updates)"
+        # The shadow is a running average ending at the current step, so it is
+        # current even though it is not any single step's weights.
+        return ema.cpu_state_dict(), f"EMA ({ema.updates} updates)", None
     # A copy, not ``model_g.state_dict()`` itself: that hands back live
     # parameter tensors, so anything mutating the weights before the export is
     # written -- a schedule-free optimizer returning to its training iterate,
     # for one -- would change what has already been chosen.  The other two
     # branches already return CPU copies.
-    return _cpu_state_dict(model_g), "live weights"
+    return _cpu_state_dict(model_g), "live weights", None
 
 
 def _checkpoint_extra(grad_scaler):
@@ -3746,7 +3760,7 @@ def training_loop(
             # Preview whatever this run would actually hand over, so the audio
             # you judge it by is the audio the exported model produces.
             model_g = net_g.module if hasattr(net_g, "module") else net_g
-            preview_sd, preview_label = _deliverable_weights(
+            preview_sd, preview_label, _preview_step = _deliverable_weights(
                 overtrain_monitor, ema, model_g
             )
             if preview_label != "live weights":
@@ -3904,10 +3918,21 @@ def training_loop(
             # iterate.  This is the exported .pth -- the file that gets used for
             # inference -- so it is the last place that read may go unaveraged.
             with averaged_weights((optimizer_choice_g, optim_g)):
-                ckpt, ckpt_label = _deliverable_weights(
+                ckpt, ckpt_label, ckpt_step = _deliverable_weights(
                     overtrain_monitor, ema, model_g
                 )
             success(f"Weights: {ckpt_label}", tag="[EXPORT]")
+            # The file is named after ``global_step`` whatever it contains, so
+            # say it out loud when the two have parted company: without this
+            # the only symptom is consecutive exports whose weights never
+            # change while their names keep advancing.
+            if ckpt_step is not None and ckpt_step != global_step:
+                warning(
+                    f"Exported weights are from step {ckpt_step}, "
+                    f"{global_step - ckpt_step} steps behind this export's name "
+                    f"({ckpt_label}). Recorded in the file as 'weights_step'.",
+                    tag="[EXPORT]",
+                )
 
             for m in model_add:
                 if not os.path.exists(m):
@@ -3922,6 +3947,8 @@ def training_loop(
                         hps=config,
                         vocoder=vocoder,
                         architecture=architecture,
+                        weights_step=ckpt_step,
+                        weights_source=ckpt_label,
                     )
 
         if stop_was_requested():

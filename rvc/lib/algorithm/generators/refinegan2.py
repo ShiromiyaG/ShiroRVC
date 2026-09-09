@@ -220,6 +220,143 @@ class ParallelResBlock(nn.Module):
         return torch.stack([block(x) for block in self.blocks], dim=0).mean(dim=0)
 
 
+class SineGenerator(nn.Module):
+    """Sine + additive-noise harmonic excitation source.
+
+    Restored 2026-09-08, replacing the full-band BLIT. The BLIT had been
+    adopted chasing inharmonic lines that were later traced to the ``AdaIN``
+    activations, which no excitation reaches, and it was never measured
+    against the sine on the probe that ranked the sources.
+
+    What that probe said, on a fixed trunk over 3 seeds (held-out multi-scale
+    mel, lower better): sine 1.9714 -> **1.7418** with ``source_gain`` on,
+    bank 1.7357 -> 1.8057, comb 1.9649 -> 1.8363. Sine + gain was the best
+    arrangement anyone measured here.
+
+    What the BLIT cost, measured 2026-09-08 at f0=440, 32 kHz, each source
+    relative to its own 300-600 Hz band: the BLIT is flat to Nyquist (-0.4 to
+    -2.2 dB from 1 to 15.5 kHz) while a real voice rolls off (-5.5 at 1-2 kHz
+    to -33.8 at 12-15.5 kHz). This source is 45 dB down above the fundamental,
+    so what reaches the top of the band is the decoder's, not the source's.
+    That matters because ``source_gain`` is one scalar per frame: it sets the
+    excitation's *level* and cannot impose a *tilt*, so a flat source arrives
+    unshaped wherever the trunk does not reach -- measured as +18 dB against
+    the reference at 4.4-5 kHz, with the crossover exactly at the trunk's
+    3960 Hz ceiling.
+
+    ``comb`` and ``bank`` were removed on 2026-09-03 and are not coming back:
+    the artefact they were traded against was the ``AdaIN`` activations, and
+    neither had beaten the sine once the excitation gain was on.
+    ``excitation_source`` in ``rvc/train/utils.py`` names the mismatch if a
+    ``blit`` checkpoint is loaded here, since the state dicts differ -- this
+    one owns ``merge.0.weight`` and the BLIT owns ``gain``.
+    """
+
+
+    def __init__(
+        self,
+        samp_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        noise_std=0.003,
+        voiced_threshold=0,
+    ):
+        super(SineGenerator, self).__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.harmonic_num = harmonic_num
+        self.dim = self.harmonic_num + 1
+        self.sampling_rate = samp_rate
+        self.voiced_threshold = voiced_threshold
+
+        self.merge = nn.Sequential(
+            nn.Linear(self.dim, 1, bias=False),
+            nn.Tanh(),
+        )
+        # One scalar decides the excitation's amplitude, and it used to be
+        # drawn from ``U(-1, 1)`` -- ``nn.Linear``'s default init at
+        # ``fan_in = 1``.  With ``harmonic_num = 0`` this layer has nothing to
+        # merge: it is that draw multiplying the source, and nothing downstream
+        # normalises it.  Over 200 seeds it landed anywhere in +-0.99, negative
+        # in 48% of them and under 0.1 in 14%, a 719x spread between the
+        # loudest and the quietest; measured on the excitation itself, five
+        # seeds gave RMS 0.0005 / 0.0364 / 0.0162 / 0.0700 / 0.0084 -- 132x,
+        # with the low end a source that is effectively muted while the trunk
+        # tries to learn from it.
+        #
+        # ``sine_amp`` is what states the intended amplitude, so 1.0 is what
+        # lets it: RMS 0.0707 on every seed instead of one seed in seven
+        # starting an order of magnitude down.  It also pins the ``Tanh``
+        # above at -61.6 dB against its best linear fit, which is the whole
+        # reason that ``Tanh`` needs no attention -- at 3x the gain it is
+        # -42.9, and what it makes there is harmonic anyway.
+        #
+        # This is not the fresh-pretrain kind of change: ``merge.0.weight`` is
+        # a state-dict key, so a resumed run loads what it learned and only new
+        # runs start anywhere different.
+        #
+        # At ``dim > 1`` the harmonics sum rather than replace each other and
+        # the ``Tanh`` is what bounds the total -- which is what it is for in
+        # the source module this comes from.  That path is unused here.
+        nn.init.ones_(self.merge[0].weight)
+
+    def _f02uv(self, f0):
+        uv = torch.ones_like(f0)
+        uv = uv * (f0 > self.voiced_threshold)
+        return uv
+
+    def _f02sine(self, f0_values):
+        """f0_values: (batchsize, length, dim), dim = fundamental + overtones."""
+        # rad_values is F0 in rad mod 1 (the integer cycle count doesn't affect phase)
+        rad_values = (f0_values / self.sampling_rate) % 1
+
+        # random initial phase per harmonic, none for the fundamental
+        rand_ini = torch.rand(
+            f0_values.shape[0], f0_values.shape[2], device=f0_values.device
+        )
+        rand_ini[:, 0] = 0
+        rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+
+        tmp_over_one = torch.cumsum(rad_values, 1) % 1
+        tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
+        cumsum_shift = torch.zeros_like(rad_values)
+        cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
+
+        sines = torch.sin(torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * np.pi)
+
+        return sines
+
+    # Inductor cannot compile this body.  ``_f02sine`` is a cumsum over the
+    # sample axis, and Inductor lowers it to a ``SplitScan`` whose codegen
+    # raises ``TypeError: list indices must be integers or slices, not
+    # NoneType`` -- reproduced on torch 2.10 + cu130, RTX 5060.  A failure
+    # inside the compiled region takes the *whole* decoder down with it, so
+    # ``enable_decoder_compile`` fell back to eager for every step.
+    #
+    # Everything up to ``merge`` runs under ``no_grad`` and is a pure function
+    # of f0, so keeping it out of the graph costs no fusion.
+    @torch.compiler.disable
+    def forward(self, f0):
+        with torch.no_grad():
+            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
+            # fundamental component
+            f0_buf[:, :, 0] = f0[:, :, 0]
+            for idx in np.arange(self.harmonic_num):
+                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+
+            sine_waves = self._f02sine(f0_buf) * self.sine_amp
+
+            uv = self._f02uv(f0)
+
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            noise = noise_amp * torch.randn_like(sine_waves)
+
+            sine_waves = sine_waves * uv + noise
+
+        # merge with grad
+        return self.merge(sine_waves)
+
+
 class BlitGenerator(nn.Module):
     """Band-limited impulse train excitation.
 
@@ -492,16 +629,13 @@ class RefineGAN2Generator(nn.Module):
         source_gain (bool, optional): Scale the excitation by an intensity
             envelope projected from the conditioning, as RefineGAN's paper
             does with the mel. Defaults to False.
-        source_bandwidth (float, optional): Fraction of Nyquist the BLIT
-            fills, and the only control this decoder has over aliasing that
-            works on the cause rather than on each site. Defaults to 1.0 -- the
-            true BLIT, and the worst case for every nonlinearity downstream.
-            The shipped configs do not set it; see :class:`BlitGenerator` for
-            what lowering it buys, what it costs, and why 0.4 is the floor.
-        source_normalize (bool, optional): Hold the excitation's energy
-            constant across the pitch range instead of its peak. See
-            :class:`BlitGenerator`. Defaults to True; False is the pre
-            2026-09-04 excitation exactly.
+        ``source_bandwidth`` and ``source_normalize`` are gone with the BLIT
+        (2026-09-08). Both described a source that fills a band and needs
+        capping and levelling; this one fills a single bin. They are refused
+        by name in ``Synthesizer`` rather than accepted and ignored, because a
+        config knob that changes nothing is the same failure as one that
+        changes something invisibly -- which is what those two were, and what
+        ``decoder_layout`` was carrying them for.
 
     Every pointwise nonlinearity here is a plain ``leaky_relu`` at its own
     rate.  The anti-aliased activations this decoder used to wrap them in are
@@ -525,8 +659,6 @@ class RefineGAN2Generator(nn.Module):
         rolloff: "float | Sequence[float]" = DEFAULT_UPSAMPLE_ROLLOFF,
         filter_beta: "float | Sequence[float]" = DEFAULT_UPSAMPLE_BETA,
         source_gain: bool = False,
-        source_bandwidth: float = 1.0,
-        source_normalize: bool = True,
         source_noise_std: float = 0.003,
     ):
         super().__init__()
@@ -584,21 +716,24 @@ class RefineGAN2Generator(nn.Module):
         # still fails the compile.
         self.upp = int(np.prod(upsample_rates))
 
-        # The excitation.  ``comb`` and ``sine`` are both gone: the sine made
-        # the trunk manufacture every harmonic out of activation products, and
-        # the comb's truncated sinc left a step at every period edge.  The BLIT
-        # is what the comb was reaching for, in closed form.
+        # The excitation.  Back to the sine on 2026-09-08: the BLIT delivers a
+        # flat spectrum to Nyquist, ``source_gain`` is a single scalar per
+        # frame and so can move its level but not its tilt, and above the
+        # trunk's ceiling nothing else shapes it -- measured +18 dB against the
+        # reference at 4.4-5 kHz.  See ``SineGenerator`` for the numbers and
+        # for the probe that ranked the sources.
         # ``excitation_source`` in ``rvc/train/utils.py`` names the mismatch if
-        # an old checkpoint is loaded, since the state dicts differ.
-        self.source_type = "blit"
-        # Invisible to ``load_state_dict``: ``BlitGenerator`` owns one scalar
-        # parameter whatever the bandwidth, so a checkpoint trained against a
-        # full-band source loads into a band-limited one without a murmur.
-        # ``rvc.train.utils.decoder_layout`` reports this for that reason.
-        self.source_bandwidth = float(source_bandwidth)
-        # Invisible in the same way, and a larger change than the bandwidth:
-        # it moves the excitation's level by 13-23 dB depending on the note.
-        self.source_normalize = bool(source_normalize)
+        # a ``blit`` checkpoint is loaded, since the state dicts differ.
+        self.source_type = "sine"
+        # Both are ``BlitGenerator``'s and neither reaches the sine, which
+        # fills one bin and normalises nothing.  They stay in the signature so
+        # existing configs keep loading, and they are still reported by
+        # ``rvc.train.utils.decoder_layout`` at the values a sine run implies:
+        # a source occupying no band it has to be capped out of, and no energy
+        # normalisation.  Reporting the caller's numbers instead would let a
+        # config claim a bandwidth this source does not have.
+        self.source_bandwidth = 1.0
+        self.source_normalize = False
         # The dither the excitation carries in *voiced* frames, and the only
         # stochastic material the decoder is given there.  0.003 against a
         # harmonic RMS of ``wave_amp / sqrt(2)`` is -27.4 dB, while the band
@@ -632,10 +767,8 @@ class RefineGAN2Generator(nn.Module):
         # the material propagates, not what training at that level converges
         # to.
         self.source_noise_std = float(source_noise_std)
-        self.m_source = BlitGenerator(
+        self.m_source = SineGenerator(
             sample_rate,
-            bandwidth=source_bandwidth,
-            normalize=source_normalize,
             noise_std=source_noise_std,
         )
 
@@ -850,7 +983,9 @@ class RefineGAN2Generator(nn.Module):
         if f0.dim() == 2:
             f0 = f0.unsqueeze(1)
         f0 = self._expand_f0(f0, f0_size * self.upp)
-        har_source = self.m_source(f0)
+        # ``SineGenerator`` works in (batch, time, dim) -- ``dim`` is the
+        # harmonic axis, 1 here -- while the trunk is channel-first throughout.
+        har_source = self.m_source(f0.transpose(1, 2)).transpose(1, 2)
         har_source = self._apply_source_gain(har_source, mel)
         x = self.pre_conv(har_source)
         downs = []

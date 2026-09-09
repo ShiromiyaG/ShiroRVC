@@ -39,11 +39,13 @@ def test_it_reaches_the_source():
     assert _generator(source_noise_std=0.01).m_source.noise_std == pytest.approx(0.01)
 
 
-#: ``BlitGenerator.forward`` wants ``(batch, 1, samples)`` at the *output*
-#: rate -- the phase is a cumsum over the last axis, so a transposed f0 gives
-#: back noise with no partials in it and every assertion below still passes.
+#: ``SineGenerator.forward`` wants ``(batch, samples, dim)`` at the *output*
+#: rate, ``dim`` being the harmonic axis -- the phase is a cumsum over the
+#: sample axis, so a transposed f0 gives back noise with no partials in it and
+#: every assertion below still passes.  ``RefineGAN2Generator.forward`` does
+#: this transpose too; the trunk itself is channel-first throughout.
 def _excitation(noise_std, f0_hz, samples=32000):
-    f0 = torch.full((1, 1, samples), float(f0_hz))
+    f0 = torch.full((1, samples, 1), float(f0_hz))
     with torch.no_grad():
         return _generator(source_noise_std=noise_std).m_source(f0)
 
