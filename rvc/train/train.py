@@ -708,18 +708,30 @@ def get_d_model(config, vocoder, use_checkpointing):
         value = getattr(config.model, name, None)
         return default if value is None else value
 
-    from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined
+    from rvc.lib.algorithm.discriminators.multi import (
+        DISCRIMINATOR_VERSIONS,
+        MPD_MSD_Combined,
+    )
 
-    # ``mpd_msd`` is Applio's v2 (8 periods); ``mpd_msd_v3`` is what it picks
-    # for RefineGAN (5 periods + 3 multi-resolution spectrogram branches).
-    # ``d_version`` overrides the default -- v3 does not fit an 8 GB card at
-    # batch 8 (6.42 GiB / 5912 ms/step vs v2's 4.64 GiB / 498 ms/step).  The
-    # RefineGAN2 config names ``v4`` explicitly: v3 minus its longest period
-    # branch, which buys back the time and memory the decoder's anti-aliased
-    # activations spend.  The default below stays ``v3`` so a config predating
-    # that key builds what it always did.
-    version = "v3" if discriminator_id == "mpd_msd_v3" else "v2"
-    version = str(getattr(config.model, "d_version", None) or version)
+    # The registry names the branch layout directly -- ``v2`` is Applio's (8
+    # periods), ``v3`` is what it picks for RefineGAN (5 periods + 3
+    # multi-resolution spectrogram branches) -- so this only has to check that
+    # the name exists.  Checked rather than passed through: it used to be
+    # ``"v3" if id == "mpd_msd_v3" else "v2"``, which handed Applio's v2 to any
+    # id it did not recognise, and a vocoder registered against the wrong name
+    # would have trained against the wrong discriminator with nothing said.
+    #
+    # ``d_version`` overrides it: v3 does not fit an 8 GB card at batch 8
+    # (6.42 GiB / 5912 ms/step against v2's 4.64 GiB / 498 ms/step), and the
+    # RefineGAN2 config names ``v4`` -- v3 minus its longest period branch.
+    # The registry stays at ``v3`` so a config predating that key builds what
+    # it always did.
+    if discriminator_id not in DISCRIMINATOR_VERSIONS:
+        raise ValueError(
+            f"Unknown discriminator {discriminator_id!r} for vocoder "
+            f"{vocoder!r}; known: {sorted(DISCRIMINATOR_VERSIONS)}."
+        )
+    version = str(getattr(config.model, "d_version", None) or discriminator_id)
     # ``d_use_*`` switches a whole family off; ``d_periods``/``d_resolutions``
     # replace its content when it's on (``None`` keeps the preset's).
     return MPD_MSD_Combined(
@@ -756,6 +768,13 @@ def get_d_model(config, vocoder, use_checkpointing):
         univhd_f_min=float(setting("d_univhd_f_min", 80.0)),
         univhd_channels=int(setting("d_univhd_channels", 32)),
         univhd_half_harmonic=bool(setting("d_univhd_half_harmonic", True)),
+        # ``None`` keeps the version's pinned weight; a config key overrides it
+        # on any version.  See ``UNIVHD_WEIGHT_BY_VERSION``.
+        univhd_weight=(
+            None
+            if setting("d_univhd_weight", None) is None
+            else float(setting("d_univhd_weight", None))
+        ),
     )
 
 
@@ -2483,6 +2502,10 @@ def run(
         speaker_layout.reset_pretrained,
     )
 
+    # Before the compile: the fence is a plain attribute read inside
+    # ``forward``, so Dynamo guards on it and a policy set afterwards would
+    # only take effect on a recompile.
+
     enable_vocoder_compile(net_g, device, rank)
     enable_frontend_compile(net_g, config, device, rank)
     enable_discriminator_compile(net_d, config, device, rank)
@@ -2832,6 +2855,12 @@ def training_loop(
     # the other ranks never write to the summary.
     branch_disc_cache = deque(maxlen=rolling_loss_steps)
     branch_neg_cache = deque(maxlen=rolling_loss_steps)
+    # Per-head share of ``loss_adv``, which ``disc_sep`` cannot stand in for:
+    # the generator's term saturates in the logit gap, so a head separating an
+    # order of magnitude better than the rest is not paying an order of
+    # magnitude more of the objective.  This is the series a branch weight is
+    # actually tuned against.
+    branch_adv_cache = deque(maxlen=rolling_loss_steps)
     kl_std_cache = deque(maxlen=rolling_loss_steps)
     kl_mean_cache = deque(maxlen=rolling_loss_steps)
     kl_active_cache = deque(maxlen=rolling_loss_steps)
@@ -2860,6 +2889,23 @@ def training_loop(
             net_d.module if hasattr(net_d, "module") else net_d, "supports_san", False
         )
     )
+    # Per-branch loss weights, read once: they are constants of the assembled
+    # discriminator, not of the step.  ``None`` on a discriminator that weights
+    # nothing, so an unweighted run takes exactly the path it took before
+    # weighting existed.
+    model_d = net_d.module if hasattr(net_d, "module") else net_d
+    branch_weights = (
+        tuple(model_d.branch_weights)
+        if getattr(model_d, "uses_branch_weights", False)
+        else None
+    )
+    if rank == 0 and branch_weights is not None:
+        weighted = ", ".join(
+            f"{label} {weight:g}"
+            for label, weight in zip(model_d.branch_labels, branch_weights)
+            if weight != 1.0
+        )
+        info(f"Discriminator branch weights: {weighted}.", tag="[INIT]")
     kl_active_threshold = max(
         0.0,
         float(getattr(config.train, "kl_active_threshold", 0.01)),
@@ -2956,6 +3002,7 @@ def training_loop(
                     san_direction_weight=san_direction_weight,
                     normalize=False,
                     per_branch=False,
+                    branch_weights=branch_weights,
                 )
                 loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
                 if y_d_hat_neg is not None:
@@ -2969,6 +3016,7 @@ def training_loop(
                         san_direction_weight=san_direction_weight,
                         normalize=False,
                         per_branch=False,
+                        branch_weights=branch_weights,
                     )[2]
                     loss_disc = loss_disc + hf_floor_weight * loss_hf_floor
 
@@ -3125,18 +3173,32 @@ def training_loop(
                         loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
                 elif spectral_loss == "Multi-Scale Mel Loss":
                     loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel
-                loss_fm = feature_loss(fmap_r, fmap_g, normalize=False) * 2.0
+                loss_fm = (
+                    feature_loss(
+                        fmap_r,
+                        fmap_g,
+                        normalize=False,
+                        branch_weights=branch_weights,
+                    )
+                    * 2.0
+                )
 
                 # Generator loss.  ``y_d_hat_g`` comes from the *generator*
                 # update's forward, which never sets ``san_training``, so these
                 # are plain logits and ``san_direction_weight`` is inert -- the
                 # direction output is the discriminator's business alone.
-                loss_adv = generator_loss(
+                loss_adv, branch_adv = generator_loss(
                     y_d_hat_g,
                     normalize=False,
                     san_direction_weight=san_direction_weight,
                     use_softplus=san_active,
+                    branch_weights=branch_weights,
+                    per_branch=True,
                 )
+                if rank == 0:
+                    # Detached scalars the loss has already formed, so this is
+                    # a stack of nine numbers and not a second pass.
+                    branch_adv_cache.append(branch_adv)
 
                 loss_kl, raw_kl = kl_loss(
                     z_p,
@@ -3573,6 +3635,9 @@ def training_loop(
                 for prefix, cache in (
                     (f"disc_sep_{rolling_loss_steps}", branch_disc_cache),
                     (f"disc_sep_floor_{rolling_loss_steps}", branch_neg_cache),
+                    # Post-weight, so the series sums to ``loss_adv`` and a
+                    # head's share can be read off it directly.
+                    (f"adv_sep_{rolling_loss_steps}", branch_adv_cache),
                 ):
                     if not cache:
                         continue

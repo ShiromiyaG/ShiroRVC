@@ -166,11 +166,7 @@ class Synthesizer(torch.nn.Module):
                     f"trained with the BLIT will not load here either -- "
                     f"``excitation_source`` reports that separately."
                 )
-            supported = tuple(int(rate) for rate in vocoder_spec["sample_rates"])
-            if int(sr) not in supported:
-                raise ValueError(
-                    f"{vocoder_spec['label']} supports {supported}, not {int(sr)}."
-                )
+            self._assert_rate_supported(vocoder_spec, sr)
             self.dec = generators.RefineGAN2Generator(
                 sample_rate=int(sr),
                 upsample_rates=tuple(upsample_rates),
@@ -258,6 +254,25 @@ class Synthesizer(torch.nn.Module):
 
         # [Speaker Embedding] maps identity to global conditioning (g)
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
+
+    @staticmethod
+    def _assert_rate_supported(vocoder_spec, sr):
+        """Refuse a rate the registry does not list for this vocoder.
+
+        Nothing in these decoders is tied to a rate by construction -- the
+        excitation reads ``sample_rate`` and the trunk is built from
+        ``upsample_rates``, whose product is the hop -- so what ships is a
+        registry decision rather than a constant here.  What makes the check
+        necessary is that the ``v4`` discriminator these vocoders pair with has
+        a frozen period set at 32 kHz only, so a run at another rate would
+        build a generator that trains against nothing.
+        """
+
+        supported = tuple(int(rate) for rate in vocoder_spec["sample_rates"])
+        if int(sr) not in supported:
+            raise ValueError(
+                f"{vocoder_spec['label']} supports {supported}, not {int(sr)}."
+            )
 
     def _remove_weight_norm_from(self, module):
         for child in list(module.modules()):

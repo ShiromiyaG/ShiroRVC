@@ -173,31 +173,29 @@ catalog falls back to English silently rather than raising.
 <summary><b>The voice engines</b></summary>
 
 ShiroRVC ships two vocoders — the part that turns the model's internal
-representation back into sound.
+representation back into sound. Both run on the same VITS skeleton
+(`enc_q` + flow + `c_kl`) and are handed the sliced latent `z`, not a mel.
 
 | | **HiFi-GAN** | **RefineGAN** |
 |---|---|---|
-| Sample rates | 32 / 40 / 48 kHz | 32 / 44.1 kHz |
-| Frontend | Original VITS (flow + posterior) | Original VITS (flow + posterior) |
+| Sample rates | 32 / 40 / 48 kHz | 32 kHz |
+| Frontend | Original VITS (flow + posterior) | ← |
 | Generator | NSF HiFi-GAN | Pulse template refined through parallel ResBlocks |
-| Discriminator | MPD + MSD | MPD + MSD |
-| Decoder size | 15.7 M | 13.2 M |
-| Discriminator size | 71.4 M | 71.4 M |
+| Discriminator | MPD + MSD (`v2`) | `v4` + UnivHD |
+| Decoder size | 15.0 M | 13.2 M |
+| Discriminator size | 71.4 M | 39.1 M |
 
 **HiFi-GAN** is the well-tested option inherited from the original RVC, and the
 right choice if you want results that behave predictably.
 
 **RefineGAN** is [Applio](https://github.com/IAHispano/Applio)'s decoder, ported
-unchanged and configured for 32 / 44.1 kHz (`[3, 3, 7, 7]` upsampling against a
-441-sample hop at 44.1 kHz). It works the other way around from HiFi-GAN's NSF:
+unchanged and configured for 32 kHz (`[5, 4, 4, 4]` upsampling against a
+320-sample hop). It works the other way around from HiFi-GAN's NSF:
 instead of upsampling a latent and adding a source, it builds a sine excitation
 at the full rate, downsamples it into a channel pyramid with Kaiser-windowed
 resampling, and refines the latent against that pyramid through parallel
 multi-kernel ResBlocks, concatenating the matching excitation scale at every
 step.
-
-It runs on the stock VITS skeleton — `enc_q` + flow + `c_kl` — and on the plain
-MPD + MSD discriminator.
 
 </details>
 

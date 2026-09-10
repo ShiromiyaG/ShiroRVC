@@ -285,7 +285,7 @@ def test_the_discriminator_version_is_overridable_from_the_config():
 
     def resolve(config_model):
         # Mirrors ``_build_d_model``: the registry chooses, ``d_version`` wins.
-        version = "v3" if get_discriminator_id("refinegan2") == "mpd_msd_v3" else "v2"
+        version = get_discriminator_id("refinegan2")
         return str(getattr(config_model, "d_version", None) or version)
 
     assert resolve(types.SimpleNamespace()) == "v3"

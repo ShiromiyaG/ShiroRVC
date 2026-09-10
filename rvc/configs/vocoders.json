@@ -10,7 +10,7 @@
         ],
         "pretrained_dir": "hifi-gan",
         "generator": "hifi_nsf",
-        "discriminator": "mpd_msd",
+        "discriminator": "v2",
         "architecture_id": "hifi_gan_nsf_v1"
     },
     "refinegan2": {
@@ -22,7 +22,7 @@
         ],
         "pretrained_dir": "refinegan2",
         "generator": "refinegan2",
-        "discriminator": "mpd_msd_v3",
+        "discriminator": "v3",
         "architecture_id": "vits_gaussian_v1",
         "aliases": [
             "refinegan",

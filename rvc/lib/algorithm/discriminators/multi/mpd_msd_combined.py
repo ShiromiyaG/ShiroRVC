@@ -1,5 +1,6 @@
 import math
 import traceback
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -103,6 +104,58 @@ DISCRIMINATOR_VERSIONS = {
 }
 
 
+#: How much of the objective UnivHD is allowed to be, per version.
+#:
+#: ``1.0`` -- the paper's additive setting, and what every version outside this
+#: table gets -- is wrong for the branch set ``v4`` actually runs, and the
+#: pretrain that showed it is the argument for the number here.  ``disc_sep``
+#: is ``mean(real logit) - mean(fake logit)`` per branch, i.e. how decisively a
+#: head is separating.  Measured on a 32 kHz pretrain over these nine branches,
+#: SAN on, rolling mean over 50 steps, between steps 2k and 8.5k:
+#:
+#:     branch            separation
+#:     univhd               5.1 - 7.7
+#:     msd                  0.7 - 2.1
+#:     period_3             0.8 - 1.0
+#:     period_5             0.4 - 0.6
+#:     period_7             0.3 - 0.7
+#:     period_11            0.5 - 0.8
+#:     resolution_512       0.3
+#:     resolution_1024      0.2 - 0.3
+#:     resolution_2048      0.2 - 0.3
+#:
+#: An order of magnitude clear of the other eight, and it stayed there for the
+#: whole window rather than converging toward them.  Because the generator's
+#: term is ``(1 - dg)^2``, a head separating by ~6 contributes a term ~10x an
+#: average branch's, so one of nine heads was most of ``loss_adv`` -- and the
+#: gradient it put into the decoder is most of what drove that run's decoder
+#: grad norm to 8-15 x 10^3.
+#:
+#: ``0.15`` is chosen to leave UnivHD the loudest single head without leaving
+#: it the only one: it is roughly the ratio between that separation and the
+#: rest, so the branch stops being most of the term while still outweighing
+#: any one of the other eight.  It is a starting point, not a fixed point --
+#: ``d_univhd_weight`` overrides it on any version, and ``disc_sep_50/univhd``
+#: against the other branches is the series that says whether it landed.
+#:
+#: Only ``v4`` is listed.  ``v1``-``v3`` predate UnivHD here and nothing has
+#: been trained with it on them, so there is no measurement behind a number for
+#: them and they keep the paper's 1.0.
+UNIVHD_WEIGHT_BY_VERSION = {
+    "v4": 0.15,
+}
+
+#: What a branch with no entry in a weight table is worth: the plain sum every
+#: HiFi-GAN-lineage discriminator has always used.
+DEFAULT_BRANCH_WEIGHT = 1.0
+
+
+def univhd_weight_for(version: str) -> float:
+    """The default UnivHD weight for a version; 1.0 where none is pinned."""
+
+    return float(UNIVHD_WEIGHT_BY_VERSION.get(str(version), DEFAULT_BRANCH_WEIGHT))
+
+
 def periods_for(version: str, sample_rate: int):
     """The frozen set for a version at a rate; raises rather than guessing."""
 
@@ -138,6 +191,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         univhd_f_min: float = 80.0,
         univhd_channels: int = 32,
         univhd_half_harmonic: bool = True,
+        univhd_weight: Optional[float] = None,
     ):
         """``version`` picks a preset; the overrides edit it branch by branch.
 
@@ -201,6 +255,18 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.use_msd = bool(use_msd)
         self.use_fast_mpd = bool(use_fast_mpd)
         self.use_univhd = bool(use_univhd)
+        # ``None`` means "whatever the version pins", the same convention the
+        # branch overrides above use; an explicit number wins on any version.
+        self.univhd_weight = (
+            univhd_weight_for(version)
+            if univhd_weight is None
+            else float(univhd_weight)
+        )
+        if self.univhd_weight < 0.0:
+            raise ValueError(
+                f"univhd_weight is a loss weight and cannot be negative; "
+                f"received {self.univhd_weight}."
+            )
         # ``train.py`` reads this to decide whether the losses take their SAN
         # form; it is an attribute rather than a lookup on the branches so a
         # discriminator that is *asked* for SAN and could not build it cannot
@@ -273,6 +339,40 @@ class MPD_MSD_Combined(torch.nn.Module):
         if self.use_univhd:
             labels.append("univhd")
         return tuple(labels)
+
+    @property
+    def branch_weights(self) -> tuple:
+        """One loss weight per entry of ``discriminators``, in the same order.
+
+        ``None`` is not an option here even when every weight is 1.0: the
+        losses take this as a positional list and a tuple that is one entry
+        short would silently weight the wrong branches.  Built from the same
+        assembly ``branch_labels`` walks, so the two cannot drift apart.
+
+        The generator's adversarial term, the feature-matching term and the
+        discriminator's own loss all take these.  See
+        ``UNIVHD_WEIGHT_BY_VERSION`` for the one branch that is not 1.0 and the
+        measurements behind it.
+        """
+
+        count = len(self.discriminators)
+        weights = [DEFAULT_BRANCH_WEIGHT] * count
+        if self.use_univhd:
+            # UnivHD appends itself last -- see ``__init__`` -- which is also
+            # what ``branch_labels`` records.
+            weights[-1] = self.univhd_weight
+        return tuple(weights)
+
+    @property
+    def uses_branch_weights(self) -> bool:
+        """Whether any branch is weighted away from 1.0.
+
+        Lets a caller skip passing the weights entirely on the common case, so
+        an unweighted run builds exactly the graph it built before this
+        existed.
+        """
+
+        return any(w != DEFAULT_BRANCH_WEIGHT for w in self.branch_weights)
 
     def enable_compile(self, mode: str = "default") -> bool:
         """Compile the paired real/fake forward, replacing ``forward`` in place.

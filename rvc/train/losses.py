@@ -8,16 +8,47 @@ from torch.nn import functional as F
 from torch import Tensor
 from typing import Tuple
 
-def feature_loss(fmap_r, fmap_g, normalize=False):
-    terms = [
-        torch.mean(torch.abs(rl - gl))
-        for dr, dg in zip(fmap_r, fmap_g)
-        for rl, gl in zip(dr, dg)
-    ]
+def _branch_weight(branch_weights, index):
+    """``branch_weights[index]`` as a float, or 1.0 when no weighting is asked for.
+
+    A plain Python number rather than a tensor: these are per-branch constants
+    the caller reads once off the discriminator, and keeping them out of the
+    graph is what makes an unweighted call byte-identical to the code that had
+    no weighting at all.
+    """
+
+    if branch_weights is None:
+        return 1.0
+    return float(branch_weights[index])
+
+
+def feature_loss(fmap_r, fmap_g, normalize=False, branch_weights=None):
+    """Feature matching, optionally weighted per discriminator branch.
+
+    ``branch_weights`` is one number per entry of ``fmap_r``, in branch order --
+    ``MPD_MSD_Combined.branch_weights`` is exactly that.  It scales the whole
+    branch, every layer of it, because a branch's feature-matching pull and its
+    adversarial pull are the same branch's opinion and down-weighting only one
+    of them would leave the generator chasing features from a head whose score
+    it was told to discount.
+    """
+
+    terms = []
+    weights = []
+    for index, (dr, dg) in enumerate(zip(fmap_r, fmap_g)):
+        weight = _branch_weight(branch_weights, index)
+        for rl, gl in zip(dr, dg):
+            terms.append(weight * torch.mean(torch.abs(rl - gl)))
+            weights.append(weight)
     if not terms:
         return torch.zeros((), device=fmap_r[0][0].device)
     loss = sum(terms)
-    return loss / len(terms) if normalize else loss
+    if not normalize:
+        return loss
+    # The weighted analogue of dividing by the term count: with the default
+    # weights this is ``len(terms)`` and the two agree exactly.
+    total = sum(weights)
+    return loss / total if total else loss
 
 
 def discriminator_loss(
@@ -26,21 +57,34 @@ def discriminator_loss(
     san_direction_weight=1.0,
     normalize=False,
     per_branch=False,
+    branch_weights=None,
 ):
     """Discriminator loss, aggregated across all MPD/MSD heads.
 
     With ``per_branch``, a fourth element is appended: a detached
     ``(heads, 2)`` tensor of each head's ``(real, fake)`` contribution before
     the ``normalize`` division -- the aggregate alone hides which head (e.g.
-    a period vs. a spectrogram branch) is collapsing.
+    a period vs. a spectrogram branch) is collapsing.  That tensor is reported
+    *unweighted*: it exists to say what a head is doing, and scaling it by the
+    weight the head was given would hide exactly the state the weight is there
+    to manage.
+
+    ``branch_weights`` scales each head's contribution to the trained
+    objective, in branch order.  Weighting the discriminator's own loss as well
+    as the generator's is deliberate: a head the generator is told to discount
+    but that still trains at full rate keeps pulling away, and the gap it opens
+    is what the weight was meant to close.
     """
     loss = 0
     loss_real = 0
     loss_fake = 0
     branch_losses = [] if per_branch else None
     branch_count = 0
-    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+    weight_total = 0.0
+    for index, (dr, dg) in enumerate(zip(disc_real_outputs, disc_generated_outputs)):
         branch_count += 1
+        weight = _branch_weight(branch_weights, index)
+        weight_total += weight
         if isinstance(dr, (list, tuple)):
             dr_fun, dr_dir = dr
             dg_fun, dg_dir = dg
@@ -62,18 +106,23 @@ def discriminator_loss(
         else:
             r_loss = torch.mean((1 - dr.float()) ** 2)
             g_loss = torch.mean(dg.float() ** 2)
-        loss += r_loss + g_loss
-        loss_real += r_loss
-        loss_fake += g_loss
         if branch_losses is not None:
             branch_losses.append(
                 torch.stack((r_loss.detach(), g_loss.detach()))
             )
+        if weight != 1.0:
+            r_loss = weight * r_loss
+            g_loss = weight * g_loss
+        loss += r_loss + g_loss
+        loss_real += r_loss
+        loss_fake += g_loss
 
     if normalize and branch_count:
-        loss = loss / branch_count
-        loss_real = loss_real / branch_count
-        loss_fake = loss_fake / branch_count
+        divisor = weight_total if branch_weights is not None else branch_count
+        if divisor:
+            loss = loss / divisor
+            loss_real = loss_real / divisor
+            loss_fake = loss_fake / divisor
     if branch_losses is not None:
         return loss, loss_real, loss_fake, torch.stack(branch_losses)
     return loss, loss_real, loss_fake
@@ -84,12 +133,36 @@ def generator_loss(
     normalize=False,
     san_direction_weight=1.0,
     use_softplus=False,
+    branch_weights=None,
+    per_branch=False,
 ):
     """
     Generator loss with LSGAN as the default and optional SAN softplus loss.
+
+    ``branch_weights`` scales each head's term, in branch order; see
+    ``MPD_MSD_Combined.branch_weights`` for where they come from and why one
+    head needs them.
+
+    With ``per_branch``, a second element is appended: a detached ``(heads,)``
+    tensor of each head's contribution, **after** its weight and before the
+    ``normalize`` division.  Weighted, unlike ``discriminator_loss``'s
+    per-branch tensor, and the difference is the point of each.  That one
+    reports what a head *is* -- a state a weight must not disguise.  This one
+    reports what a head *costs the generator*, which is the quantity a weight
+    is chosen against, so reading it post-weight is what makes it an answer
+    rather than an input to a mental multiplication.
+
+    Why it is not derivable from ``disc_sep``: separation is a logit gap and
+    this is a saturating function of it, so a head separating 50x better than
+    another does not contribute 50x the term.  Judging a weight off the
+    separations alone is exactly the arithmetic this series exists to remove.
     """
     losses = []
-    for dg in disc_outputs:
+    weights = []
+    branch_terms = [] if per_branch else None
+    for index, dg in enumerate(disc_outputs):
+        weight = _branch_weight(branch_weights, index)
+        weights.append(weight)
         if isinstance(dg, (list, tuple)):
             if use_softplus:
                 dg = dg[0]
@@ -99,18 +172,31 @@ def generator_loss(
                     l = l + float(san_direction_weight) * torch.mean(
                         (1 - dg[1].float()) ** 2
                     )
+                l = weight * l if weight != 1.0 else l
                 losses.append(l)
+                if branch_terms is not None:
+                    branch_terms.append(l.detach())
                 continue
         if use_softplus:
             l = torch.mean(F.softplus(1.0 - dg.float()).square())
         else:
             l = torch.mean((1 - dg.float()) ** 2)
+        l = weight * l if weight != 1.0 else l
         losses.append(l)
+        if branch_terms is not None:
+            branch_terms.append(l.detach())
 
     if not losses:
-        return torch.zeros(())
+        empty = torch.zeros(())
+        return (empty, empty.reshape(0)) if per_branch else empty
     loss = sum(losses)
-    return loss / len(losses) if normalize else loss
+    if normalize:
+        total = sum(weights)
+        if total:
+            loss = loss / total
+    if branch_terms is not None:
+        return loss, torch.stack(branch_terms)
+    return loss
 
 
 def _compress_envelope(value: Tensor, floor: float) -> Tensor:

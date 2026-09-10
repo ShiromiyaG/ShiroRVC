@@ -218,12 +218,14 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
 def excitation_source(model):
     """A short name for the decoder's excitation, or ``None`` if it has no say.
 
-    Only ``blit`` is built since 2026-09-04, but the guard stays: every removed
-    source owned different state-dict keys (``bank`` a ``phase_offset`` sized by
-    its harmonic count, ``sine`` a ``merge`` conv, ``comb`` none at all) and the
-    generator resumes *non-strictly*, so such a checkpoint loads into this
-    synthesiser without raising and leaves the new modules at their random init.
-    A sentence beats training on from a silently wrong excitation.
+    Only ``sine`` is built since 2026-09-08, when ``SineGenerator`` replaced
+    the band-limited impulse train, but the guard stays: every source this
+    fork tried owned different
+    state-dict keys (``bank`` a ``phase_offset`` sized by its harmonic count,
+    ``blit`` a ``gain``, ``comb`` none at all) and the generator resumes
+    *non-strictly*, so such a checkpoint loads into this synthesiser without
+    raising and leaves the new modules at their random init.  A sentence beats
+    training on from a silently wrong excitation.
 
     Note this guard is coarser than it looks: it names the *kind* of source,
     not its design.  A BLIT's bandwidth leaves no key either, and that one is
@@ -244,9 +246,9 @@ def assert_excitation_matches(model, checkpoint_dict, origin="checkpoint"):
         raise ValueError(
             f"Excitation mismatch: this run builds '{expected}' but the "
             f"{origin} was trained with '{found}'. The 'comb' and 'bank' "
-            f"sources were removed on 2026-09-03 and 'sine' was replaced by "
-            f"the band-limited impulse train on 2026-09-04, so such a "
-            f"checkpoint cannot be resumed -- start a fresh run."
+            f"sources were removed on 2026-09-03 and 'blit' was replaced by "
+            f"the sine on 2026-09-08, so such a checkpoint cannot be resumed "
+            f"-- start a fresh run."
         )
 
 

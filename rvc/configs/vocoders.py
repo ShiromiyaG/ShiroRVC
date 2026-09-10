@@ -80,7 +80,15 @@ def get_vocoder_sample_rates(vocoder):
 
 
 def get_discriminator_id(vocoder):
-    return get_vocoder_spec(vocoder).get("discriminator", "mpd_msd")
+    """The branch layout a vocoder trains against, named as in
+    ``DISCRIMINATOR_VERSIONS``.
+
+    ``v2`` is Applio's (8 periods) and the default a registry entry that names
+    nothing gets, because that is what every vocoder predating this field was
+    trained with.  A config's ``d_version`` overrides it.
+    """
+
+    return get_vocoder_spec(vocoder).get("discriminator", "v2")
 
 
 def get_architecture_id(vocoder, options=None):
