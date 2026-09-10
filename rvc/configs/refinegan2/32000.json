@@ -102,6 +102,8 @@
         "refinegan2_leaky_relu_slope": 0.2,
         "refinegan2_source_gain": true,
         "refinegan2_source_noise_std": 0.01,
+        "refinegan2_source_harmonics": 0,
+        "refinegan2_source_tilt": 1.0,
         "architecture_id": "vits_gaussian_v1"
     }
 }

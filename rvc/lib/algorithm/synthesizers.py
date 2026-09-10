@@ -194,6 +194,17 @@ class Synthesizer(torch.nn.Module):
                 source_noise_std=float(
                     decoder_config.get("refinegan2_source_noise_std", 0.003)
                 ),
+                # Absent means 0 -- one partial, which is what every
+                # checkpoint before 2026-09-09 was trained on.  The count
+                # sizes ``m_source.merge.0.weight`` so a mismatch is a load
+                # error; the tilt leaves no key and is caught by
+                # ``decoder_layout`` instead.
+                source_harmonics=int(
+                    decoder_config.get("refinegan2_source_harmonics", 0)
+                ),
+                source_tilt=float(
+                    decoder_config.get("refinegan2_source_tilt", 1.0)
+                ),
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")

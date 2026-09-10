@@ -1,9 +1,14 @@
 """The excitation, and the guard that survives the two sources being removed.
 
-RefineGAN's excitation is ``SineGenerator(sample_rate)`` with the default
-``harmonic_num=0`` -- one sine at the fundamental, a ``Linear(1, 1)`` and a
-tanh.  Every partial above f0 is manufactured by the trunk out of feature maps
-on the frame grid.
+RefineGAN's excitation is a ``SineGenerator``.  At the ``harmonic_num=0`` it
+shipped with -- one sine at the fundamental, a ``Linear(1, 1)`` and a tanh --
+every partial above f0 was manufactured by the trunk out of feature maps on the
+frame grid, and that is what stopped working: under ``[5, 4, 4, 4]`` the trunk
+was linear only to 3960 Hz, so the render had no harmonics above ~6 kHz.  Since
+2026-09-09 the source carries ``source_harmonics`` partials on a
+``j ** -source_tilt`` slope, which is the part that separates it from the flat
+BLIT that was removed for arriving 18 dB too bright.  The count is still 0 by
+default, because that is what every checkpoint before then was trained on.
 
 ``comb`` (fish-diffusion's band-limited impulse train) and ``bank`` (a
 phase-randomised harmonic bank with a conditioning-driven envelope) were
@@ -22,6 +27,7 @@ checkpoint from either removed source instead of silently leaving
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -151,3 +157,134 @@ def test_the_merge_weight_still_comes_from_the_checkpoint():
     trained = {"merge.0.weight": torch.full_like(source.merge[0].weight, -0.42)}
     source.load_state_dict(trained, strict=True)
     assert source.merge[0].weight.item() == pytest.approx(-0.42)
+
+
+# --------------------------------------------------------------------------
+# the harmonic source (2026-09-09)
+# --------------------------------------------------------------------------
+
+
+def test_one_partial_stays_bit_identical():
+    """``harmonic_num = 0`` is what every checkpoint before 2026-09-09 was
+    trained on, so the tilt and the Nyquist fade must be exact identities
+    there -- not "close enough".  ``harmonic_gain`` is ``[1.0]``, no
+    fundamental sits within 10% of Nyquist, and the noise divisor is
+    ``sqrt(1)``."""
+
+    source = SineGenerator(SR)
+    assert source.harmonic_gain.tolist() == [1.0]
+    assert source.dim == 1
+
+    f0 = torch.full((1, 4096, 1), 220.0)
+    assert torch.equal(source._nyquist_fade(f0), torch.ones_like(f0))
+
+    torch.manual_seed(0)
+    got = source(f0)
+    torch.manual_seed(0)
+    # The pre-2026-09-09 body, inlined: no gain, no fade, no divisor.
+    with torch.no_grad():
+        waves = source._f02sine(f0.clone()) * source.sine_amp
+        uv = source._f02uv(f0)
+        amp = uv * source.noise_std + (1 - uv) * source.sine_amp / 3
+        waves = waves * uv + amp * torch.randn_like(waves)
+    assert torch.equal(got, source.merge(waves))
+
+
+def test_the_partials_arrive_on_the_intended_slope():
+    """The whole difference from the BLIT.  A flat source measured +18 dB
+    against the reference at 4.4-5 kHz because ``source_gain`` is one scalar
+    per frame and cannot impose a tilt; this one carries its own."""
+
+    f0 = 220.0
+    for tilt in (0.0, 1.0):
+        source = SineGenerator(SR, harmonic_num=15, harmonic_tilt=tilt)
+        signal = _excitation(source, f0)
+        for order in (2, 4, 8, 16):
+            expected = -20.0 * math.log10(order**tilt)
+            assert _harmonic_db(signal, f0, order) == pytest.approx(
+                expected, abs=1.5
+            ), f"tilt {tilt}, partial {order}"
+
+
+def test_a_partial_past_nyquist_is_removed_not_folded():
+    """``_f02sine`` takes ``f / sr`` mod 1, so an unmasked partial above
+    Nyquist does not vanish -- it aliases down to ``sr - j*f0`` as a line that
+    walks against f0, which is the artefact this decoder spent three
+    excitation rewrites chasing."""
+
+    # At f0=1500 with 16 partials the top two are out of band (22500 and
+    # 24000 against a 22050 Hz Nyquist) and fold back to 21600 and 20100 --
+    # neither of which is a multiple of 1500, so any energy in those bins is
+    # the alias and nothing else.
+    f0 = 1500.0
+    aliases = {15: 21600.0, 16: 20100.0}
+
+    measured = {}
+    for fade in (True, False):
+        source = SineGenerator(SR, harmonic_num=15)
+        if not fade:
+            source._nyquist_fade = lambda buf: torch.ones_like(buf)
+        signal = _excitation(source, f0)
+        spectrum = torch.fft.rfft(
+            signal[4096:4096 + 8192] * torch.hann_window(8192)
+        ).abs()
+        reference = spectrum[int(round(f0 / SR * 8192))]
+
+        def _db(hz):
+            bin_index = int(round(hz / SR * 8192))
+            return 20 * torch.log10(spectrum[bin_index] / reference).item()
+
+        measured[fade] = {order: _db(hz) for order, hz in aliases.items()}
+        # Order 13 is at 19500 Hz, below where the taper starts (19845), so it
+        # must be untouched at its tilted level either way.
+        assert _db(13 * f0) == pytest.approx(-20.0 * math.log10(13), abs=1.0)
+
+    # The fade is doing the work, and the failure it prevents is loud: without
+    # it both folds arrive at roughly the level the partial would have had.
+    for order in aliases:
+        assert measured[True][order] < -50.0
+        assert measured[False][order] > -30.0
+
+
+def test_the_count_and_the_tilt_are_both_pinned_by_the_layout():
+    """The count is a state-dict shape, so a load already refuses it.  The
+    tilt is a non-persistent buffer and would load silently -- it is the same
+    invisible-signal-path case as the stage ordering."""
+
+    sys.path.insert(0, str(ROOT / "rvc" / "train"))
+    from utils import assert_decoder_layout_matches, decoder_layout
+
+    def _holder(**design):
+        return type("M", (), {
+            "dec": RefineGAN2Generator(
+                sample_rate=SR, upsample_rates=(3, 3, 7, 7), **design
+            ),
+            "sr": SR,
+        })()
+
+    rich = _holder(source_harmonics=31, source_tilt=1.0)
+    layout = decoder_layout(rich)
+    assert layout["source_harmonics"] == 31
+    assert layout["source_tilt"] == 1.0
+    assert_decoder_layout_matches(rich, {"decoder_layout": layout})
+
+    # The shape does change with the count, so the load guard is not the only
+    # thing here -- but the tilt leaves the state dict byte-identical.
+    assert rich.dec.m_source.merge[0].weight.shape == (1, 32)
+    steeper = _holder(source_harmonics=31, source_tilt=1.5)
+    assert (
+        rich.dec.state_dict()["m_source.merge.0.weight"].shape
+        == steeper.dec.state_dict()["m_source.merge.0.weight"].shape
+    )
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(steeper, {"decoder_layout": layout})
+
+    # A checkpoint that names neither is a pre-2026-09-09 run, which is the
+    # bare sine -- not "whatever this run happens to build".
+    with pytest.raises(ValueError, match="Decoder layout mismatch"):
+        assert_decoder_layout_matches(
+            rich,
+            {"decoder_layout": {k: v for k, v in layout.items()
+                                if not k.startswith("source_harm")
+                                and k != "source_tilt"}},
+        )

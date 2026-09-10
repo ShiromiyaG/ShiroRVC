@@ -306,6 +306,15 @@ def decoder_layout(model):
         # range.  Worth 13-23 dB of source level depending on the note, and
         # like the bandwidth it owns no state-dict key.
         "source_normalize": bool(getattr(decoder, "source_normalize", False)),
+        # The excitation's harmonic slope: partial ``j`` at ``j ** -tilt``.
+        # The *count* sizes ``m_source.merge.0.weight`` and so a strict load
+        # already refuses a mismatch, but the tilt is a non-persistent buffer
+        # and changes every partial's level while leaving the state dict
+        # byte-identical -- the same contract as ``upsample_filter`` below.
+        # The count rides along so the message names both rather than leaving
+        # the tilt to explain a shape error.
+        "source_harmonics": int(getattr(decoder, "source_harmonics", 0)),
+        "source_tilt": float(getattr(decoder, "source_tilt", 1.0)),
         # Imaging, not aliasing: what the interpolation filter leaves of the
         # spectral copies zero-stuffing makes.  It is just as invisible to
         # ``load_state_dict`` as the stage ordering, and with the anti-aliased
@@ -332,6 +341,8 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             "source_bands": 0,
             "source_bandwidth": 1.0,
             "source_normalize": False,
+            "source_harmonics": 0,
+            "source_tilt": 1.0,
             "upsample_filter": None,
         }
     imaging = found.get("upsample_filter") or None
@@ -346,6 +357,12 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
         # Absent means off: the normalisation postdates the excitation, so a
         # checkpoint that names nothing was trained on the unit-peak kernel.
         "source_normalize": bool(found.get("source_normalize", False)),
+        # Absent means the one-partial sine at the tilt a single partial
+        # cannot express: every run before 2026-09-09 is that, and reading
+        # the tilt as "whatever this run builds" would let a harmonic-rich
+        # checkpoint load into a bare one without a word.
+        "source_harmonics": int(found.get("source_harmonics", 0)),
+        "source_tilt": float(found.get("source_tilt", 1.0)),
     }
     # Absent means the flat legacy design, sized to the checkpoint's own stage
     # count -- every RefineGAN run ever had these upsamplers, so unlike the
@@ -380,7 +397,7 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             f"{origin} was trained with {found}. The stage ordering does not "
             f"appear in any weight, so this is the only thing that can tell "
             f"them apart. Set upsample_rates / refinegan2_source_gain / "
-            f"refinegan2_source_bandwidth / refinegan2_source_normalize to "
+            f"refinegan2_source_harmonics / refinegan2_source_tilt to "
             f"match, or start a fresh run. ``upsample_filter`` is "
             f"[widths, rolloffs, betas] per stage for the trunk's "
             f"interpolation filters and is not a config key: a mismatch there "

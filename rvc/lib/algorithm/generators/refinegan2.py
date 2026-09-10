@@ -250,8 +250,55 @@ class SineGenerator(nn.Module):
     ``excitation_source`` in ``rvc/train/utils.py`` names the mismatch if a
     ``blit`` checkpoint is loaded here, since the state dicts differ -- this
     one owns ``merge.0.weight`` and the BLIT owns ``gain``.
+
+    ``harmonic_num`` (2026-09-09)
+    ----------------------------
+    At 0 -- the default this shipped with, and Applio's -- the excitation is
+    one partial, so *every* harmonic in the output is manufactured by the
+    trunk.  This knob was added while chasing renders whose harmonics stopped
+    around 6 kHz, on the theory that one partial under the trunk's 3960 Hz
+    ceiling left nothing to build on above it.
+
+    It ships at 0 because that theory did not survive measurement: overfitting
+    a single clip, this decoder at ``harmonic_num=0`` reproduces a target's
+    harmonic contrast to within 0.7 dB all the way to 13 kHz, under either
+    stage layout.  See ``RefineGAN2Generator`` for the table.  A source short
+    of partials is not what costs a *trained* model its high harmonics, so
+    this is an escape hatch rather than a fix -- raising it puts scaffolding
+    into the source, where it is alias-free and in tune by construction.  Two
+    things make that different from the BLIT, which also filled the band and
+    was removed for it:
+
+    ``harmonic_tilt`` gives partial ``j`` an amplitude of ``j ** -tilt``, so
+    the source arrives with a slope instead of flat.  1.0 is a sawtooth's
+    -6 dB/octave, and it lands close to a real voice on the same measurement
+    that condemned the BLIT (levels relative to the 300-600 Hz band, f0=200):
+
+        band          real voice    tilt 1.0    BLIT
+        1-2 kHz          -5.5         -9.1       -0.4
+        12-15.5 kHz     -33.8        -28.9       -2.2
+
+    Within ~5 dB across the whole band against the BLIT's +33 dB at the top.
+    A single power law cannot match both ends -- a voice's slope steepens with
+    frequency and this one does not -- which is what the knob is for; 1.17
+    matches the top and costs 5 dB at 1-2 kHz.
+
+    And a partial above Nyquist is *removed*, not folded: ``_f02sine`` takes
+    ``f / sr`` mod 1, so ``j * f0`` past ``sr / 2`` aliases down onto the band
+    as an inharmonic line that walks against f0.  The fade below zeroes it
+    over the top ``NYQUIST_TAPER`` of the band rather than switching it off,
+    because a hard gate clicks every time f0 drifts across the boundary.
+
+    ``dim`` sizes ``merge.0.weight``, so this is a state-dict shape and a
+    fresh pretrain -- and ``decoder_layout`` carries ``harmonic_tilt``, which
+    is *not* in the state dict at any count.
     """
 
+    #: Fraction of Nyquist over which a partial fades out instead of being
+    #: switched off.  f0 moves between frames, so a hard mask makes the top
+    #: partial blink on and off around the boundary -- a click at the frame
+    #: rate on exactly the harmonics that are hardest to hear it in.
+    NYQUIST_TAPER = 0.1
 
     def __init__(
         self,
@@ -260,6 +307,7 @@ class SineGenerator(nn.Module):
         sine_amp=0.1,
         noise_std=0.003,
         voiced_threshold=0,
+        harmonic_tilt=1.0,
     ):
         super(SineGenerator, self).__init__()
         self.sine_amp = sine_amp
@@ -268,6 +316,18 @@ class SineGenerator(nn.Module):
         self.dim = self.harmonic_num + 1
         self.sampling_rate = samp_rate
         self.voiced_threshold = voiced_threshold
+        self.harmonic_tilt = float(harmonic_tilt)
+
+        # Non-persistent: ``m_source`` owns exactly one state-dict key and
+        # that is pinned by a test.  A buffer that changes the signal and
+        # leaves no key is a ``decoder_layout`` field, like the upsamplers'
+        # interpolation design -- see ``rvc/train/utils.py``.
+        orders = torch.arange(1, self.dim + 1, dtype=torch.float32)
+        self.register_buffer(
+            "harmonic_gain",
+            orders ** (-self.harmonic_tilt),
+            persistent=False,
+        )
 
         self.merge = nn.Sequential(
             nn.Linear(self.dim, 1, bias=False),
@@ -297,13 +357,35 @@ class SineGenerator(nn.Module):
         #
         # At ``dim > 1`` the harmonics sum rather than replace each other and
         # the ``Tanh`` is what bounds the total -- which is what it is for in
-        # the source module this comes from.  That path is unused here.
+        # the source module this comes from.  Ones is still the right init
+        # there: ``harmonic_gain`` has already set each partial's level, so
+        # this layer only has to add them up, and the sum stays small enough
+        # for the ``Tanh`` to leave alone.  At tilt 1.0 the partials are
+        # phase-randomised, so the total is ``sine_amp * sqrt(sum 1/j^2)``,
+        # which converges: measured 0.0707 RMS at 1 partial, 0.0890 at 16 and
+        # 0.0898 at 32 -- 2.1 dB, and bounded above by 0.0907 at any count.
+        # The ``Tanh``'s departure from its best linear fit follows: -61.6 dB
+        # at 1, -47.1 at 16, -53.8 at 32 (it tracks the peak factor of the
+        # phase draw, not the count).  What it makes is harmonic and lands on
+        # partials the source already has.
         nn.init.ones_(self.merge[0].weight)
 
     def _f02uv(self, f0):
         uv = torch.ones_like(f0)
         uv = uv * (f0 > self.voiced_threshold)
         return uv
+
+    def _nyquist_fade(self, f0_buf):
+        """Per-partial gain that reaches 0 at Nyquist. 1.0 everywhere at dim 1.
+
+        ``f0_buf`` holds each partial's own frequency, so this is read off the
+        partial rather than off the fundamental: which harmonics survive
+        depends on the note, and at ``harmonic_num = 0`` nothing is ever near
+        the boundary and this is exactly ``ones``.
+        """
+
+        nyquist = self.sampling_rate / 2.0
+        return ((nyquist - f0_buf) / (nyquist * self.NYQUIST_TAPER)).clamp(0.0, 1.0)
 
     def _f02sine(self, f0_values):
         """f0_values: (batchsize, length, dim), dim = fundamental + overtones."""
@@ -345,11 +427,24 @@ class SineGenerator(nn.Module):
                 f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
 
             sine_waves = self._f02sine(f0_buf) * self.sine_amp
+            # Both are identity at ``harmonic_num = 0``: ``harmonic_gain`` is
+            # ``[1.0]`` and no fundamental sits within 10% of Nyquist.  So a
+            # single-partial run computes what it always did, bit for bit.
+            sine_waves = sine_waves * self.harmonic_gain
+            sine_waves = sine_waves * self._nyquist_fade(f0_buf)
 
             uv = self._f02uv(f0)
 
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-            noise = noise_amp * torch.randn_like(sine_waves)
+            # ``merge`` sums ``dim`` independent draws, so without this the
+            # dither the decoder actually receives would grow as sqrt(dim) --
+            # ``noise_std`` would silently mean 0.057 at 32 partials instead of
+            # the 0.01 the sweep in ``RefineGAN2Generator`` chose, which is past
+            # where that sweep measured the low bands starting to suffer.  With
+            # it, the merged level is ``noise_std`` at every harmonic count (at
+            # initialisation, where ``merge`` is ones), so the sweep keeps
+            # meaning what it measured and the two knobs stay independent.
+            noise = noise_amp * torch.randn_like(sine_waves) / self.dim**0.5
 
             sine_waves = sine_waves * uv + noise
 
@@ -616,19 +711,28 @@ class BlitGenerator(nn.Module):
 
 class RefineGAN2Generator(nn.Module):
     """
-    RefineGAN2: RefineGAN with its signal-path defects fixed, on a BLIT source.
+    RefineGAN2: RefineGAN with its signal-path defects fixed.
 
     Downsamples/upchannels the excitation, fuses it with the latent, and
-    upsamples through parallel residual blocks.  Against the original:
-    a band-limited impulse train instead of the sine or the truncated-sinc
-    comb, descending stage rates, a windowed-sinc interpolation filter that
-    crops its own group delay, an excitation gain projected from the
-    conditioning, and f0 interpolated in log with a hard voiced/unvoiced gate.
+    upsamples through parallel residual blocks.  Against the original: a
+    tilted harmonic sine instead of the truncated-sinc comb, a windowed-sinc
+    interpolation filter that crops its own group delay, an excitation gain
+    projected from the conditioning, and f0 interpolated in log with a hard
+    voiced/unvoiced gate.
 
     Args:
         source_gain (bool, optional): Scale the excitation by an intensity
             envelope projected from the conditioning, as RefineGAN's paper
             does with the mel. Defaults to False.
+        source_harmonics (int, optional): Partials *above* the fundamental in
+            the excitation. 0 -- one sine, everything else manufactured by the
+            trunk -- is what every checkpoint before 2026-09-09 was trained on
+            and is kept as the default so those still build. It sizes
+            ``m_source.merge.0.weight``, so it cannot change on a resume.
+        source_tilt (float, optional): Partial ``j`` gets amplitude
+            ``j ** -tilt``. 1.0 is a sawtooth's -6 dB/octave and is within
+            ~5 dB of a real voice across the band. Leaves no state-dict key,
+            so ``decoder_layout`` carries it. Defaults to 1.0.
         ``source_bandwidth`` and ``source_normalize`` are gone with the BLIT
         (2026-09-08). Both described a source that fills a band and needs
         capping and levelling; this one fills a single bin. They are refused
@@ -660,6 +764,8 @@ class RefineGAN2Generator(nn.Module):
         filter_beta: "float | Sequence[float]" = DEFAULT_UPSAMPLE_BETA,
         source_gain: bool = False,
         source_noise_std: float = 0.003,
+        source_harmonics: int = 0,
+        source_tilt: float = 1.0,
     ):
         super().__init__()
         self.sample_rate = int(sample_rate)
@@ -696,15 +802,68 @@ class RefineGAN2Generator(nn.Module):
                 f"exceed 1.0, received {self.rolloff}."
             )
 
-        # Descending order, as every HiFi-GAN variant uses.  A stage's
-        # anti-image filter keeps ``rolloff`` of the rate it reads, so the last
-        # residual block synthesises everything above ``rolloff * rate[-2] / 2``
-        # from scratch: ``320 = 4*4*4*5`` as ``[4,4,4,5]`` puts that ceiling at
-        # 2880 Hz, as ``[5,4,4,4]`` at 3600.
+        # A stage's anti-image filter keeps ``rolloff`` of the rate it *reads*,
+        # so the last residual block synthesises everything above
+        # ``rolloff[-1] * (sr / rate[-1]) / 2`` from scratch.  That ceiling is
+        # set by the *last* factor, not by the ordering, and descending order
+        # alone does nothing for it -- ``[5, 4, 4, 4]`` and ``[4, 4, 4, 5]``
+        # are both descending-or-not arrangements of the same multiset and put
+        # it at 3960 and 3168 Hz.  Factorising 320 differently is what moves
+        # it.  Measured per stage on a 0.4 s segment ("edge" is the fraction of
+        # the stage's output that ``AntiAliasedUpsample1d``'s padding changes
+        # by more than 1%, against the same input embedded in a real
+        # continuation):
         #
-        # A reorder is invisible in the state dict -- all tensors keep their
-        # keys and shapes -- so ``rvc.train.utils.decoder_layout`` writes it
-        # into the checkpoint.
+        #   [5,4,4,4]  stage 0 x5   in    100 Hz    40 smp  121 taps  edge 29.6%
+        #              stage 1 x4   in    500       200     193       10.8%
+        #              stage 2 x4   in   2000       800     257        3.1%
+        #              stage 3 x4   in   8000      3200     385        1.0%   passes 3960 Hz
+        #
+        #   [10,8,2,2] stage 0 x10  in    100 Hz    40 smp  241 taps  edge 31.7%
+        #              stage 1 x8   in   1000       400     385        5.1%
+        #              stage 2 x2   in   8000      3200     129        0.8%   passes 3880 Hz
+        #              stage 3 x2   in  16000      6400     193        0.6%   passes 7920 Hz
+        #
+        # ``[10,8,2,2]`` shipped for one day (2026-09-09) on the theory that
+        # the ceiling was why renders lost their harmonics above ~6 kHz: at
+        # ``[5,4,4,4]`` exactly one residual block runs above 4 kHz and it is
+        # handed a signal cut at 3960 Hz, while ``[10,8,2,2]`` puts blocks at
+        # 16 kHz *and* 32 kHz and feeds the last one content to 7920 Hz.
+        #
+        # **That theory is wrong, and the ceiling is not the constraint.**
+        # Measured by overfitting a single 3 s clip (f0 297, 83% voiced) with
+        # ``z`` as a free parameter -- one target, so an L1 has no averaging to
+        # hide behind and its minimiser is the target itself, harmonic peaks
+        # included.  6000 steps, ``source_harmonics=0``, harmonic contrast in
+        # dB (partials above the floor between them), overfit vs target:
+        #
+        #     band        [10,8,2,2]   [5,4,4,4]   target
+        #     1-2 kHz        14.8        14.9       15.5
+        #     2-4 kHz        11.7        11.6       11.9
+        #     4-6 kHz         9.4         9.4        9.4
+        #     6-8 kHz         6.2         6.1        6.2
+        #     8-10 kHz        5.2         5.2        5.1
+        #     10-13 kHz       3.8          --        3.6
+        #
+        # Both layouts reproduce the target to within 0.7 dB everywhere, to
+        # 13 kHz, from a one-partial excitation.  The final residual block
+        # regenerates harmonics well past the ceiling without help, so the
+        # 3960 Hz figure is real and simply not binding.  The same probe run
+        # with ``build_ms_mel_loss`` -- the actual training reconstruction loss
+        # -- lands within 0.2 dB in every band, so that loss is not the
+        # constraint either.  Whatever costs a trained model its high
+        # harmonics is upstream of this decoder, and no arrangement of these
+        # stages addresses it.
+        #
+        # So the shipped layout stays ``[5,4,4,4]``.  The table above is kept
+        # because the numbers are real and the next person to reach for a
+        # refactorisation should see that it was tried and measured, not
+        # merely argued about.
+        #
+        # A reorder or a refactorisation is invisible in the state dict -- all
+        # tensors keep their keys and shapes, since channel counts follow the
+        # stage index and not the rate -- so
+        # ``rvc.train.utils.decoder_layout`` writes it into the checkpoint.
         #
         # ``int``, not the ``np.int64`` ``np.prod`` returns.  Dynamo wraps a
         # numpy scalar used inside a traced function as a *CPU* tensor, and one
@@ -722,6 +881,20 @@ class RefineGAN2Generator(nn.Module):
         # trunk's ceiling nothing else shapes it -- measured +18 dB against the
         # reference at 4.4-5 kHz.  See ``SineGenerator`` for the numbers and
         # for the probe that ranked the sources.
+        #
+        # ``source_harmonics`` can put partials back into the source, with a
+        # tilt this time -- the difference from the BLIT -- but ships at 0.
+        # The overfit above says why: at ``harmonics=0`` this decoder already
+        # reproduces a target's harmonic contrast to 13 kHz, so a source short
+        # of partials is not what a trained model's missing harmonics are made
+        # of.  The knob is here for when something measures otherwise.
+        #
+        # Note what the tilt does *not* fix.  The BLIT was removed for arriving
+        # flat, and ``harmonic_tilt`` answers that; it does not answer the
+        # other half of the objection in ``source_gain`` below -- a source that
+        # hands the trunk its harmonics for free lets the trunk stop consulting
+        # ``z``, and the KL falls because the decoder needs less.  32 tilted
+        # partials are much closer to the BLIT there than one sine is.
         # ``excitation_source`` in ``rvc/train/utils.py`` names the mismatch if
         # a ``blit`` checkpoint is loaded, since the state dicts differ.
         self.source_type = "sine"
@@ -767,9 +940,21 @@ class RefineGAN2Generator(nn.Module):
         # the material propagates, not what training at that level converges
         # to.
         self.source_noise_std = float(source_noise_std)
+        # How many partials the excitation carries, and how steeply they fall.
+        # 0 is what this shipped with and what every checkpoint before
+        # 2026-09-09 was trained on; ``source_harmonics`` sizes
+        # ``m_source.merge.0.weight``, so it cannot be changed on a resume.
+        # ``source_tilt`` leaves no key at all and rides in
+        # ``decoder_layout``.  See ``SineGenerator`` for what the source looks
+        # like at each, and the stage table below for why 0 stopped being
+        # survivable once the trunk's ceiling was the only thing above it.
+        self.source_harmonics = int(source_harmonics)
+        self.source_tilt = float(source_tilt)
         self.m_source = SineGenerator(
             sample_rate,
+            harmonic_num=self.source_harmonics,
             noise_std=source_noise_std,
+            harmonic_tilt=self.source_tilt,
         )
 
         # ``start_channels``, not a literal 16.  It was hardcoded here while
@@ -879,8 +1064,15 @@ class RefineGAN2Generator(nn.Module):
             # Was ``nn.Upsample(mode="linear")``, whose triangular kernel
             # rejects the first image by only 1.7-9.6 dB, stamping the frame
             # grid into the waveform as a mirrored partial either side of every
-            # harmonic.  The down path already uses a windowed sinc; this makes
-            # the up path agree with it.
+            # harmonic.  Measured at x2 from 16 kHz, a partial at 7500 Hz comes
+            # back with a mirror at 8500 Hz only 2.6 dB down -- a line that
+            # walks *against* f0 as pitch moves.  The down path already uses a
+            # windowed sinc; this makes the up path agree with it.
+            #
+            # A trained ``ConvTranspose1d`` here -- HiFi-GAN's arrangement, and
+            # ``hifigan_nsf``'s -- was tried on 2026-09-09 and removed: nothing
+            # measured says this filter is what limits the decoder, and the
+            # overfit probe above says it is not.
             self.upsample_blocks.append(
                 AntiAliasedUpsample1d(
                     rate,

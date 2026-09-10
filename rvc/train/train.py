@@ -117,7 +117,6 @@ from losses import (
     mel_frequency_tilt_weights,
     BandWeightedSpectralLoss,
     HighFrequencyFloorNegative,
-    MultiScaleSTFTLoss,
 )
 
 from mel_processing import build_ms_mel_loss
@@ -188,8 +187,8 @@ config = load_config_from_json(config_save_path)
 config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
 
 exp_decay_gamma = float(getattr(config.train, "lr_decay", 0.999875))
-# Belongs to the vocoder, not the run: a 128-band mel can't resolve a harmonic
-# comb above ~2 kHz, so RefineGAN needs the MS-STFT term ("Hybrid L1") while
+# Belongs to the vocoder, not the run: a single-scale mel cannot resolve a
+# harmonic comb far above ~2 kHz, so RefineGAN wants the multi-scale mel while
 # HiFi-GAN uses the plain mel it was designed around.
 spectral_loss = str(getattr(config.train, "spectral_loss", "L1 Mel Loss"))
 # "End at this fraction of the starting LR"; the per-epoch gamma is derived
@@ -2314,7 +2313,6 @@ def run(
         info(f"Linear warmup: {effective_warmup_steps(train_loader)} steps ({warmup_tag}).", tag="[INIT]")
 
     # Spectral loss init
-    fn_spectral_loss2 = None
     fn_spectral_loss_ms = None
 
     # RefineGAN's compressed-mel distance.  A plain L1 has a gradient of
@@ -2438,8 +2436,26 @@ def run(
     elif spectral_loss == "Multi-Scale Mel Loss":
         fn_spectral_loss = _make_ms_mel_loss()
     elif spectral_loss == "Hybrid L1":
-        fn_spectral_loss = _make_mel_distance()
-        fn_spectral_loss2 = MultiScaleSTFTLoss()
+        # Removed 2026-09-09.  It was a single-scale mel plus an MS-STFT term,
+        # and it read as "the multi-scale mel, with high-frequency resolution
+        # added" when it was really "the multi-scale mel replaced by an 80-bin
+        # one".  At 32 kHz that mel is 561 Hz wide at 6 kHz -- 1.9 harmonics at
+        # f0 297, so blind to harmonic contrast exactly where the MS-STFT term
+        # was supposed to help -- and the two carried separate weights
+        # (``c_mel`` at 45 against ``ms_stft_weight`` at 1.0) that had to be
+        # balanced by hand.  "Multi-Scale Mel Loss" reaches 640 bins at window
+        # 4096 and needs none of that: measured by overfitting a single clip,
+        # it drives harmonic contrast to within 0.2 dB of the target in every
+        # band up to 13 kHz.
+        print_error(
+            "'Hybrid L1' was removed on 2026-09-09: its single-scale 80-bin "
+            "mel is coarser at the top of the band than the multi-scale mel "
+            "it replaced, and the MS-STFT term beside it was reintroducing "
+            "resolution that 'Multi-Scale Mel Loss' already has. Use "
+            "'Multi-Scale Mel Loss'. Exiting.",
+            tag="[INIT]",
+        )
+        sys.exit(1)
     else:
         print_error(f"Unknown spectral loss {spectral_loss!r}. Exiting.", tag="[INIT]")
         sys.exit(1)
@@ -2656,7 +2672,6 @@ def run(
             reference_source,
             fn_spectral_loss,
             n_gpus,
-            fn_spectral_loss2,
             fn_spectral_loss_ms,
             holdout_set=holdout_set,
             fn_hf_floor_negative=fn_hf_floor_negative,
@@ -2735,7 +2750,6 @@ def training_loop(
     reference_source,
     fn_spectral_loss,
     n_gpus,
-    fn_spectral_loss2=None,
     fn_spectral_loss_ms=None,
     fn_hf_floor_negative=None,
     hf_floor_weight=0.0,
@@ -2849,13 +2863,6 @@ def training_loop(
     kl_active_threshold = max(
         0.0,
         float(getattr(config.train, "kl_active_threshold", 0.01)),
-    )
-
-    # Only read by the "Hybrid L1" spectral loss.  Left at 1.0 so the option
-    # behaves exactly as before unless it is raised deliberately.
-    ms_stft_weight = max(
-        0.0,
-        float(getattr(config.train, "ms_stft_weight", 1.0)),
     )
 
     with progress_task(
@@ -3089,8 +3096,7 @@ def training_loop(
 
                 # Spectral loss.  The component terms are logged separately
                 # where a mode has more than one, because the combined series
-                # cannot show which half is actually moving -- and for
-                # "Hybrid L1" the balance between them is the thing to tune.
+                # cannot show which half is actually moving.
                 loss_spectral_parts: dict[str, torch.Tensor] = {}
                 if spectral_loss == "L1 Mel Loss":
                     y_mel = wave_to_mel(
@@ -3119,36 +3125,6 @@ def training_loop(
                         loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
                 elif spectral_loss == "Multi-Scale Mel Loss":
                     loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel
-                elif spectral_loss == "Hybrid L1":
-                    # L1 Mel
-                    y_mel = wave_to_mel(
-                        config, y, num_mels=None,
-                        for_loss=False,
-                    )
-                    y_hat_mel = wave_to_mel(
-                        config, y_hat, num_mels=None,
-                        for_loss=False,
-                    )
-                    loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel # * 45
-                    # MS-STFT.  Weighted, because the mel term it sits beside
-                    # carries c_mel (45 by default): at a hardcoded 1.0 the
-                    # multi-resolution term -- the only part of this loss that
-                    # resolves high frequencies directly -- contributes almost
-                    # nothing to the gradient it is there to provide.
-                    loss_ms_stft = (
-                        fn_spectral_loss2(y_hat.float(), y.float()) * ms_stft_weight
-                    )
-                    # Loss
-                    loss_spectral = loss_l1_mel + loss_ms_stft
-                    # Logged post-weight, which is what the sum above actually
-                    # sees: the point of these two series is to show whether
-                    # ``ms_stft_weight`` is high enough for the
-                    # MS-STFT term to matter beside a mel term carrying c_mel.
-                    loss_spectral_parts = {
-                        "loss_spectral_l1_mel": loss_l1_mel,
-                        "loss_spectral_ms_stft": loss_ms_stft,
-                    }
-
                 loss_fm = feature_loss(fmap_r, fmap_g, normalize=False) * 2.0
 
                 # Generator loss.  ``y_d_hat_g`` comes from the *generator*

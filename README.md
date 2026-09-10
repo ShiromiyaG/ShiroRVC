@@ -208,7 +208,7 @@ MPD + MSD discriminator.
 <tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
 <tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v1</code> · <code>spin_v2</code></td></tr>
 <tr><td><b>Optimizers</b></td><td>AdamW · Sched-Free AdamW · Muon · Lion</td></tr>
-<tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel · hybrid L1</td></tr>
+<tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel</td></tr>
 <tr><td><b>LR schedulers</b></td><td>exponential decay per step or epoch · cosine annealing · none</td></tr>
 <tr><td><b>Export formats</b></td><td>WAV · MP3 · FLAC · OGG · M4A</td></tr>
 </table>

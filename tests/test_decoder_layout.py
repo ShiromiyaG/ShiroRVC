@@ -131,6 +131,12 @@ def test_the_layout_round_trips_through_a_checkpoint():
         # between a config and a checkpoint, because neither can vary.
         "source_bandwidth": 1.0,
         "source_normalize": False,
+        # The excitation's harmonic slope.  The count is a state-dict shape,
+        # but the tilt is a non-persistent buffer that scales every partial,
+        # so it travels here for the same reason ``upsample_filter`` does.
+        # Defaults are the one-partial source every run before 2026-09-09 had.
+        "source_harmonics": 0,
+        "source_tilt": 1.0,
         # The per-stage interpolation schedule, ascending with the rate: the
         # last stage's image is the one that reaches the output (path gain
         # -19.9 dB against -49.5 and -59.3 for stages 2 and 1) and it is the
@@ -231,11 +237,24 @@ def test_the_trainer_guards_both_doors():
 
 
 @pytest.mark.parametrize("sample_rate", sorted(CONFIGS))
-def test_the_shipped_config_puts_the_big_stage_first(sample_rate):
-    """A stage's anti-image filter keeps ``rolloff`` of the rate it reads, so
+def test_the_shipped_config_factorises_the_hop_the_way_it_always_did(sample_rate):
+    """The stage rates, and the ceiling they imply -- pinned, not optimised.
+
+    A stage's anti-image filter keeps ``rolloff`` of the rate it *reads*, so
     the final residual block synthesises everything above
-    ``rolloff * rate[-2] / 2`` from scratch.  Descending order maximises that
-    ceiling; it is also what every HiFi-GAN variant does."""
+    ``rolloff[-1] * (sr / rate[-1]) / 2`` from scratch: 3960 Hz here.  This
+    test used to assert that descending order maximised that, which is false --
+    the ceiling follows the *last* factor alone, and every arrangement of
+    ``{4, 4, 4, 5}`` gives 3960 or 3168.
+
+    ``[10, 8, 2, 2]`` shipped for a day to raise it to 7920, on the theory that
+    the ceiling was why renders lost their harmonics above ~6 kHz.  An overfit
+    probe refuted it: both layouts reproduce a target's harmonic contrast to
+    within 0.7 dB up to 13 kHz from a one-partial source, so the ceiling is
+    real and not binding.  See ``RefineGAN2Generator`` for the table.  The
+    layout is therefore back to what every checkpoint was trained on, and this
+    test exists to pin it rather than to argue it is optimal.
+    """
 
     model = json.loads(CONFIGS[sample_rate].read_text())["model"]
     rates = model["upsample_rates"]
@@ -243,12 +262,40 @@ def test_the_shipped_config_puts_the_big_stage_first(sample_rate):
     import math
 
     assert math.prod(rates) == sample_rate // 100
-    assert rates == sorted(rates, reverse=True)
     assert sorted(rates) == sorted(LEGACY_UPSAMPLE_RATES[sample_rate])
+    assert rates == sorted(rates, reverse=True)
     # The kernel sizes travel with the rates, even though RefineGAN does not
     # read them -- a config whose two halves disagree is a trap for the next
     # decoder that does.
     assert model["upsample_kernel_sizes"] == [2 * r for r in rates]
+
+
+@pytest.mark.parametrize("sample_rate", sorted(CONFIGS))
+def test_the_shipped_config_leaves_the_source_at_one_partial(sample_rate):
+    """The knob exists; 0 is the shipped value, and deliberately.
+
+    ``source_harmonics`` was added while chasing renders whose harmonics
+    stopped near 6 kHz, and shipped at 31 for a day.  It is at 0 because the
+    premise did not survive: overfitting one clip, this decoder at 0 partials
+    reproduces a target's harmonic contrast to within 0.7 dB up to 13 kHz --
+    so the source is not what a trained model's missing harmonics are made of.
+    See ``RefineGAN2Generator`` for the table.
+
+    There is a second reason not to raise it casually.  A source that hands
+    the trunk its harmonics for free is the case ``source_gain``'s comment
+    already reasons about: the trunk stops consulting ``z``, and the KL falls
+    because the decoder needs less rather than because the prior caught up.
+    The BLIT was that source, and 32 tilted partials are much closer to it
+    than one sine is.  Raising this costs a pretrain, so it wants a
+    measurement first.
+    """
+
+    model = json.loads(CONFIGS[sample_rate].read_text())["model"]
+    assert model["refinegan2_source_harmonics"] == 0
+    # The tilt only bites at harmonics > 0, but it travels in the config so a
+    # run that raises the count does not silently get a flat source -- which is
+    # the BLIT, and what it was removed for.
+    assert model["refinegan2_source_tilt"] > 0.0
 
 
 @pytest.mark.parametrize("sample_rate", sorted(CONFIGS))
