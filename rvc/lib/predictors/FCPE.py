@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.utils.parametrizations import weight_norm
+import rvc.lib.torchaudio_guard  # noqa: F401 -- must precede torchaudio
 from torchaudio.transforms import Resample
 import os
 import librosa

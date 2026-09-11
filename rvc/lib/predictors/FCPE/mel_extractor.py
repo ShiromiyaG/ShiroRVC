@@ -2,6 +2,7 @@ import torch
 import torch.utils.data
 import numpy as np
 import torch.nn.functional as F
+import rvc.lib.torchaudio_guard  # noqa: F401 -- must precede torchaudio
 from torchaudio.transforms import Resample
 
 import os

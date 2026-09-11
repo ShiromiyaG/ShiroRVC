@@ -2,6 +2,7 @@ from typing import Sequence
 
 import numpy as np
 import torch
+import rvc.lib.torchaudio_guard  # noqa: F401 -- must precede torchaudio
 import torchaudio
 from torch import nn
 from torch.nn import functional as F

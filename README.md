@@ -73,6 +73,24 @@ requirements.
 > the project folder, and doing so leaves files your normal user cannot change
 > afterwards.
 
+### Installing into an existing Python environment
+
+Cloud GPU templates (RunPod, Vast.ai, Jupyter images) usually come with their
+own torch. Running `pip install -r requirements.txt` there replaces torch but
+leaves the template's torchaudio, and the two end up built for different CUDA
+versions. When that happens, the app stops at startup with
+`PyTorch and TorchAudio were compiled with different CUDA versions`. To avoid
+it, remove the preinstalled stack and install it from PyTorch's index first:
+
+```bash
+pip uninstall -y torch torchaudio torchvision
+pip install torch==2.13.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
+```
+
+These are CUDA 13 builds, so the machine needs NVIDIA driver 580 or newer
+(`nvidia-smi` shows the version).
+
 ## Three ways to use it
 
 All three drive the same engine and share the same `logs/` folder, so a voice
