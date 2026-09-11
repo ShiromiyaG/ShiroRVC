@@ -238,22 +238,25 @@ def test_the_trainer_guards_both_doors():
 
 @pytest.mark.parametrize("sample_rate", sorted(CONFIGS))
 def test_the_shipped_config_factorises_the_hop_the_way_it_always_did(sample_rate):
-    """The stage rates, and the ceiling they imply -- pinned, not optimised.
+    """The stage rates, and the boundary they put inside the band.
 
-    A stage's anti-image filter keeps ``rolloff`` of the rate it *reads*, so
-    the final residual block synthesises everything above
-    ``rolloff[-1] * (sr / rate[-1]) / 2`` from scratch: 3960 Hz here.  This
-    test used to assert that descending order maximised that, which is false --
-    the ceiling follows the *last* factor alone, and every arrangement of
-    ``{4, 4, 4, 5}`` gives 3960 or 3168.
+    A stage's anti-image filter keeps ``rolloff`` of the rate it *reads*, and
+    the stage mirrors around half of it.  What is pinned here is where that
+    mirror lands, because it is the one thing a factorisation decides: the
+    last factor alone sets it, so every arrangement of ``{4, 4, 4, 5}`` puts it
+    at 3960 or 3168 Hz, and ``[10, 8, 2, 2]`` puts it at 7920.
 
-    ``[10, 8, 2, 2]`` shipped for a day to raise it to 7920, on the theory that
-    the ceiling was why renders lost their harmonics above ~6 kHz.  An overfit
-    probe refuted it: both layouts reproduce a target's harmonic contrast to
-    within 0.7 dB up to 13 kHz from a one-partial source, so the ceiling is
-    real and not binding.  See ``RefineGAN2Generator`` for the table.  The
-    layout is therefore back to what every checkpoint was trained on, and this
-    test exists to pin it rather than to argue it is optimal.
+    ``[10, 8, 2, 2]`` was tried twice and reverted twice.  The first time
+    (2026-09-09) it was to raise that mirror, on the theory that the ceiling
+    under it was why renders lost their harmonics above ~6 kHz; an overfit
+    probe refuted it -- both layouts reproduce a target's harmonic contrast to
+    within 0.7 dB up to 13 kHz.  The second time (2026-09-10) it was for
+    inharmonic content instead, which contrast cannot see, after renders showed
+    three lines between 3 and 5 kHz around the 3960 Hz mirror.  That one was
+    reverted on cost: the decoder measured ~2x for a mechanism the layout only
+    half addresses, since a residual block folds around half the rate it runs
+    at and a block runs at 8000 Hz under either factorisation.  See
+    ``RefineGAN2Generator``; this test pins the outcome, not the reasoning.
     """
 
     model = json.loads(CONFIGS[sample_rate].read_text())["model"]

@@ -34,6 +34,27 @@ from rvc.lib.algorithm.resampling import (
 #:     w32 r0.97 b6.0   -68.0 /  -2.0   257
 #:     w48 r0.99 b9.0   -94.4 /  -0.1   385
 #:
+#: The last stage's rolloff came down from 0.99 to 0.97 on 2026-09-10.  The row
+#: above measures the image of a partial at 0.95 of the input Nyquist, which is
+#: deep in the stopband; the image that matters is the one from content just
+#: *under* the mirror, which lands just over it, inside the transition band
+#: where the design has barely started attenuating.  Read off the kernel's own
+#: response, as a fraction of the mirror -- the numbers are the same at any
+#: factor, since the kernel is defined in normalised frequency, so at
+#: ``[5,4,4,4]``'s last stage the mirror is 4000 Hz and these land at 4050 and
+#: 4150:
+#:
+#:     rolloff   mirror+1.25%   +3.75%   |   -6.25%   -1.25%
+#:     0.99         -17.8       -47.1    |   -0.01     -5.22
+#:     0.97         -38.8      -127.0    |   -0.42    -14.44
+#:     0.95         -90.7       -92.9    |   -2.70    -32.26
+#:
+#: 21 dB on the near image for 0.4 dB at 6% under the mirror is the trade 0.97
+#: takes.  0.95 buys another 52 dB and starts costing real passband, so it is
+#: where to go next if the near image is still what a measurement finds.  At
+#: ``[5,4,4,4]`` this also lowers the ceiling the last block synthesises from,
+#: 3960 -> 3880 Hz, which the overfit probe above says is not binding.
+#:
 #: Injecting a known sinusoid after each ``upsample_blocks[k]`` and subtracting
 #: a clean render gives the path gain from that stage to the output directly:
 #:
@@ -60,7 +81,7 @@ from rvc.lib.algorithm.resampling import (
 #:     stage 2  800 in, 257 taps    3.9%
 #:     stage 3 3200 in, 385 taps    0.3%
 DEFAULT_UPSAMPLE_WIDTH = (12, 24, 32, 48)
-DEFAULT_UPSAMPLE_ROLLOFF = (0.90, 0.95, 0.97, 0.99)
+DEFAULT_UPSAMPLE_ROLLOFF = (0.90, 0.95, 0.97, 0.97)
 DEFAULT_UPSAMPLE_BETA = (6.0, 6.0, 6.0, 9.0)
 
 #: The excitation gain is one channel, so its upsample chain is free whatever
@@ -68,7 +89,7 @@ DEFAULT_UPSAMPLE_BETA = (6.0, 6.0, 6.0, 9.0)
 #: but *multiplied* onto every harmonic as a sideband.  It gets the last
 #: stage's design at every stage rather than the trunk's schedule.
 SOURCE_GAIN_WIDTH = 48
-SOURCE_GAIN_ROLLOFF = 0.99
+SOURCE_GAIN_ROLLOFF = 0.97
 SOURCE_GAIN_BETA = 9.0
 
 
@@ -855,10 +876,30 @@ class RefineGAN2Generator(nn.Module):
         # harmonics is upstream of this decoder, and no arrangement of these
         # stages addresses it.
         #
-        # So the shipped layout stays ``[5,4,4,4]``.  The table above is kept
-        # because the numbers are real and the next person to reach for a
-        # refactorisation should see that it was tried and measured, not
-        # merely argued about.
+        # So the shipped layout stays ``[5,4,4,4]`` -- and it stayed after a
+        # second attempt at ``[10,8,2,2]`` on 2026-09-10, for a reason the
+        # table above does not cover.  That attempt was not the ceiling
+        # argument returning: it was about *inharmonic* content, which
+        # harmonic contrast is blind to because contrast measures the partials
+        # and not what sits between them.  Renders at ``[5,4,4,4]`` showed
+        # three lines between 3 and 5 kHz, straddling the 3960 Hz mirror the
+        # last factor of 4 puts there, and two mechanisms live at a stage
+        # boundary: the stage's own ``leaky_relu`` mirrors ``j*f0`` above the
+        # boundary back down, with nothing after it to filter, and the
+        # upsampler images content just under the mirror to just over it.
+        #
+        # It was reverted on cost against coverage.  Cost: the decoder measured
+        # ~2x for fwd+bwd, because the residual blocks then run at 1000 / 8000
+        # / 16000 / 32000 Hz instead of 500 / 2000 / 8000 / 32000.  Coverage:
+        # a block folds around half the rate it runs at, and *a block runs at
+        # 8000 Hz in both* -- so the 4 kHz fold is created either way and only
+        # moves one stage earlier.  What the refactorisation actually buys is
+        # the last upsampler's imaging boundary, and the rolloff below buys the
+        # same thing for nothing.
+        #
+        # The table is kept because the numbers are real and the next person to
+        # reach for a refactorisation should see that it was tried, measured,
+        # and what each attempt did and did not address.
         #
         # A reorder or a refactorisation is invisible in the state dict -- all
         # tensors keep their keys and shapes, since channel counts follow the
@@ -1181,8 +1222,31 @@ class RefineGAN2Generator(nn.Module):
         har_source = self._apply_source_gain(har_source, mel)
         x = self.pre_conv(har_source)
         downs = []
-        for block, (old_size, new_size) in zip(self.downsample_blocks, self.df0):
-            x = F.leaky_relu(x, self.leaky_relu_slope)
+        for index, (block, (old_size, new_size)) in enumerate(
+            zip(self.downsample_blocks, self.df0)
+        ):
+            # Only the first site is an activation.  Every pointwise
+            # nonlinearity folds about the Nyquist of *its own* rate, and the
+            # down path runs at 32000 / 8000 / 2000 / 500 Hz, so the sites past
+            # the first are three fold generators sitting on the excitation --
+            # the one signal in this decoder that arrives alias-free and in
+            # tune by construction.  Bisected on a 35k checkpoint with constant
+            # ``z`` and constant f0, excess over a matched control at
+            # ``8000 - k*f0``:
+            #
+            #     har_source / pre_conv / downs[0] / decimate / block   ~ -2 dB
+            #     act(x) at 8000 Hz                                    +38.4 dB
+            #
+            # The first one earns its place: it runs at ``sample_rate``, where
+            # there is no band to fold into, and rectifying the sine is what
+            # *creates* the harmonics the pyramid then band-limits.  Applying
+            # ``leaky_relu`` again at 8 kHz to a signal that is already
+            # rectified and already cut at 4 kHz adds nothing a linear conv
+            # cannot do, and the products it makes land straight above that
+            # stage's Nyquist.  Removing the sites costs negative time, where a
+            # filter could only ever attenuate what they make.
+            if index == 0:
+                x = F.leaky_relu(x, self.leaky_relu_slope)
             downs.append(x)
             x = self._decimate(x, int(f0_size * old_size), int(f0_size * new_size))
             x = block(x)
@@ -1198,14 +1262,36 @@ class RefineGAN2Generator(nn.Module):
             self.upsample_conv_blocks,
             reversed(downs),
         ):
-            x = F.leaky_relu(x, self.leaky_relu_slope)
-
+            # The activation runs on the upsampler's *output*, not its input.
+            # A pointwise nonlinearity folds about the Nyquist of its own rate,
+            # and what decides how much it makes is how full the band already
+            # is: on the input it sees a band ``upsample_conv_blocks`` has just
+            # filled -- occupancy 1/1, where second-order products land
+            # straight above Nyquist -- while on the output the same content
+            # occupies 1/factor of a band ``factor`` times wider, so the fold
+            # is deferred to a much higher order.  Under ``[5, 4, 4, 4]`` this
+            # moves the four sites from 100 / 500 / 2000 / 8000 Hz to 500 /
+            # 2000 / 8000 / 32000, and the one that mattered -- 8000 Hz, whose
+            # mirror is the 4 kHz this decoder's inharmonic lines sat around --
+            # goes from reading a full band to reading a quarter of one.
+            #
+            # Measured at no cost: the elementwise op covers 425 samples per
+            # frame instead of 106, which is invisible against the convolutions
+            # (medians 688.5 against 693.7 ms over ten randomised repetitions,
+            # ranges overlapping).
+            #
+            # What this does *not* touch: the ``leaky_relu`` pairs inside every
+            # ``ResBlock``, which run after the band is filled by construction.
+            # Those are the generic case anti-aliasing exists for; these four
+            # were the ones that could simply be moved.
             if self.training and self.checkpointing:
                 x = checkpoint(ups, x, use_reentrant=False)
+                x = F.leaky_relu(x, self.leaky_relu_slope)
                 x = torch.cat([x, down], dim=1)
                 x = checkpoint(res, x, use_reentrant=False)
             else:
                 x = ups(x)
+                x = F.leaky_relu(x, self.leaky_relu_slope)
                 x = torch.cat([x, down], dim=1)
                 x = res(x)
 
