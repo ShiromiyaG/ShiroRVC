@@ -7,7 +7,6 @@ import re
 import socket
 import sys
 
-from itertools import islice
 from collections import deque
 from distutils.util import strtobool
 from random import randint, Random
@@ -235,6 +234,9 @@ phase_limit_reached = False
 overtrain_flagged = False
 overtrain_exported = False
 reset_optimizer_for_run = finetune_phase
+# True when this run continues from a G_/D_ checkpoint in the experiment folder
+# rather than starting from the pretrains (or from scratch).
+resumed_run = False
 use_lr_scheduler = lr_scheduler != "none"
 # Steps the GradScaler discarded for non-finite gradients. A steady run of
 # skips looks like a stalled loss otherwise. Cumulative across resumes.
@@ -1360,10 +1362,15 @@ class _OvertrainMonitor:
         return self.state_dict is not None and self.since_progress >= self.patience
 
 
-def _deliverable_weights(overtrain_monitor, ema, model_g):
+def _deliverable_weights(overtrain_monitor, ema, model_g, use_holdout=True):
     """The weights this run would hand you if it stopped right now: holdout
     best, then EMA, then live weights, in order of how much each source
     knows. Returns ``(state_dict, label, source_step)``.
+
+    ``use_holdout=False`` skips the holdout snapshot and returns the current
+    weights (EMA or live). The periodic exports use that, so they keep
+    tracking the run; the holdout best goes only into the separate
+    ``_pre-overtrain`` export.
 
     ``source_step`` is the step the weights are actually *from*, which is not
     the step the export is named after. The holdout branch only replaces its
@@ -1373,7 +1380,11 @@ def _deliverable_weights(overtrain_monitor, ema, model_g):
     that way. ``None`` means "as of now"; the caller writes it into the file so
     the staleness is readable after the run's console has scrolled away.
     """
-    if overtrain_monitor is not None and overtrain_monitor.state_dict is not None:
+    if (
+        use_holdout
+        and overtrain_monitor is not None
+        and overtrain_monitor.state_dict is not None
+    ):
         return (
             overtrain_monitor.state_dict,
             f"holdout best @ {overtrain_monitor.best_step}",
@@ -1744,6 +1755,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
     # a fresh run, on a pretrained start, and on every checkpoint written before
     # the key existed -- all three of which mean "start the controller cold".
     resumed_extra_d = {}
+    global reset_optimizer_for_run, resumed_run
     try:
         info("Starting the training ...", tag="[INIT]")
 
@@ -1763,6 +1775,11 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         d_checkpoint_path = get_highest_checkpoint("D_")
         resumed_g_path = g_checkpoint_path
         if g_checkpoint_path and d_checkpoint_path:
+            # A checkpoint of this run's own is a resume, pretrains or not: the
+            # fine-tune reset (fresh optimizer, epoch 1) belongs to the run that
+            # starts from the pretrain, not to every restart after it.
+            resumed_run = True
+            reset_optimizer_for_run = False
 
             # Move the models to an appropriate device ( And optionally wrap with DDP for multi-gpu )
             net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
@@ -1788,28 +1805,26 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             _, _, _, epoch_str, _ = load_checkpoint(
                 g_checkpoint_path,
                 net_g,
-                None if reset_optimizer_for_run else optim_g,
+                optim_g,
                 generator_strict_load,
             )
-            _, _, _, epoch_str, extra_d = load_checkpoint(
+            _, _, _, _, extra_d = load_checkpoint(
                 d_checkpoint_path,
                 net_d,
-                None if reset_optimizer_for_run else optim_d,
+                optim_d,
                 strict_load,
             )
             resumed_extra_d = extra_d or {}
 
             # resume_lr re-anchors G and/or D to the given base LR.
-            if not reset_optimizer_for_run:
-                apply_resume_lr_override(optim_g, optim_d)
-            elif rank == 0:
-                info("Fine-tune optimizer state reset.", tag="[INIT]")
+            apply_resume_lr_override(optim_g, optim_d)
 
-            #epoch_str += 1
-            #global_step = (epoch_str - 1) * len(train_loader)
-
+            # As in Applio: checkpoints are written at the end of an epoch, so
+            # the run continues with the next one.  The step comes from the
+            # filename rather than from ``epoch * len(train_loader)``: in a
+            # fine-tune it also counts the pretrain's steps.
+            epoch_str += 1
             global_step = int(os.path.basename(g_checkpoint_path).split("_")[-1].split(".")[0])
-            epoch_str = (global_step // len(train_loader)) + 1
             success(f"(G) & (D) resumed at global_step {global_step}, epoch {epoch_str - 1}.", tag="[RESUME]")
 
         else:
@@ -2540,10 +2555,14 @@ def run(
                     f"({amp_skipped_steps} steps skipped so far).",
                     tag="[RESUME]",
                 )
-    phase_start_step = global_step
-    phase_step = 0
+    # Where this phase began: the pretrain's step for a fine-tune, 0 from
+    # scratch.  Derived rather than taken from ``global_step`` so a resume
+    # carries on counting ``phase_step`` (and ``max_steps``) instead of
+    # restarting them.
+    phase_start_step = checkpoint_step_from_path(pretrainG) if finetune_phase else 0
+    phase_step = max(0, global_step - phase_start_step)
     phase_limit_reached = False
-    if finetune_phase:
+    if finetune_phase and not resumed_run:
         epoch_str = 1
 
     if rank == 0:
@@ -2600,7 +2619,9 @@ def run(
         exp_decay_gamma,
         total_epoch_count,
         epoch_str,
-        global_step,
+        # Steps into this phase: a fine-tune's schedule starts at the pretrain,
+        # not at step 0 of whatever run produced it.
+        global_step - phase_start_step,
         train_loader,
         fresh_start=reset_optimizer_for_run,
     )
@@ -2825,20 +2846,9 @@ def training_loop(
     if is_schedule_free(optimizer_choice_d):
         optim_d.train()
 
-    # Partial resume aligning
-    current_epoch_start_step = (epoch - 1) * len(train_loader)
-    start_batch_idx = (
-        0
-        if finetune_phase
-        else global_step - current_epoch_start_step
-    )
-    start_batch_idx = max(0, start_batch_idx)
-
-    if start_batch_idx > 0:
-        train_loader.batch_sampler.start_index = start_batch_idx
-
-    remaining_batches = len(train_loader) - start_batch_idx
-    data_iterator = islice(enumerate(train_loader), remaining_batches)
+    # Checkpoints are only written at epoch boundaries, so every epoch -- a
+    # resumed one included -- starts at its first batch.
+    data_iterator = enumerate(train_loader)
 
     epoch_recorder = EpochRecorder()
 
@@ -2924,7 +2934,7 @@ def training_loop(
     with progress_task(
         len(train_loader),
         f"Epoch {epoch}/{total_epoch_count}",
-        initial=start_batch_idx,
+        initial=0,
         training=True,
         disable=rank != 0,
     ) as (progress, task_id):
@@ -3484,7 +3494,8 @@ def training_loop(
                             f"{overtrain_monitor.since_progress} evaluations. "
                             f"The last good weights are step "
                             f"{overtrain_monitor.best_step} ({overtrain_monitor.best:.5f}); "
-                            f"they will be the ones exported.",
+                            f"they will be exported as an extra '_pre-overtrain' "
+                            f"model alongside the regular saves.",
                             tag="[OVERTRAIN]",
                         )
                         if stop_on_overtrain:
@@ -3825,7 +3836,7 @@ def training_loop(
             # you judge it by is the audio the exported model produces.
             model_g = net_g.module if hasattr(net_g, "module") else net_g
             preview_sd, preview_label, _preview_step = _deliverable_weights(
-                overtrain_monitor, ema, model_g
+                overtrain_monitor, ema, model_g, use_holdout=False
             )
             if preview_label != "live weights":
                 live_sd_g = {k: v.detach().clone() for k, v in model_g.state_dict().items()}
@@ -3947,7 +3958,7 @@ def training_loop(
             # Save small weight model
             if save_weight_models:
                 weight_model_name = small_model_naming(model_name, epoch, global_step)
-                model_add.append(os.path.join(experiment_dir, weight_model_name))
+                model_add.append((os.path.join(experiment_dir, weight_model_name), False))
 
         # Check completion
         if epoch >= total_epoch_count:
@@ -3958,7 +3969,7 @@ def training_loop(
             )
             # Final model
             weight_model_name = small_model_naming(model_name, epoch, global_step)
-            model_add.append(os.path.join(experiment_dir, weight_model_name))
+            model_add.append((os.path.join(experiment_dir, weight_model_name), False))
             done = True
 
         if phase_limit_reached:
@@ -3972,43 +3983,41 @@ def training_loop(
         # seen.  Latched on a flag rather than on the filename: the monitor can
         # still find a new best afterwards, and keying the guard off
         # ``best_step`` would then write a second copy under a second name.
+        # This is the only export that carries the holdout best; the periodic
+        # ones keep the current weights, so this file is an extra rather than
+        # a replacement for them.
         if overtrain_flagged and not overtrain_exported and overtrain_monitor is not None:
             overtrain_exported = True
             model_add.append(
-                os.path.join(
-                    experiment_dir,
-                    small_model_naming(
-                        f"{model_name}_pre-overtrain", epoch, overtrain_monitor.best_step
+                (
+                    os.path.join(
+                        experiment_dir,
+                        small_model_naming(
+                            f"{model_name}_pre-overtrain", epoch, overtrain_monitor.best_step
+                        ),
                     ),
+                    True,
                 )
             )
 
         if model_add:
             model_g = net_g.module if hasattr(net_g, "module") else net_g
-            # ``_deliverable_weights`` can fall through to the live weights, and
-            # under a schedule-free optimizer those are the extrapolated
-            # iterate.  This is the exported .pth -- the file that gets used for
-            # inference -- so it is the last place that read may go unaveraged.
-            with averaged_weights((optimizer_choice_g, optim_g)):
-                ckpt, ckpt_label, ckpt_step = _deliverable_weights(
-                    overtrain_monitor, ema, model_g
+            for m, use_holdout in model_add:
+                if os.path.exists(m):
+                    continue
+                # ``_deliverable_weights`` can fall through to the live weights,
+                # and under a schedule-free optimizer those are the extrapolated
+                # iterate.  This is the exported .pth -- the file that gets used
+                # for inference -- so it is the last place that read may go
+                # unaveraged.
+                with averaged_weights((optimizer_choice_g, optim_g)):
+                    ckpt, ckpt_label, ckpt_step = _deliverable_weights(
+                        overtrain_monitor, ema, model_g, use_holdout=use_holdout
+                    )
+                success(
+                    f"{os.path.basename(m)} <- {ckpt_label}", tag="[EXPORT]"
                 )
-            success(f"Weights: {ckpt_label}", tag="[EXPORT]")
-            # The file is named after ``global_step`` whatever it contains, so
-            # say it out loud when the two have parted company: without this
-            # the only symptom is consecutive exports whose weights never
-            # change while their names keep advancing.
-            if ckpt_step is not None and ckpt_step != global_step:
-                warning(
-                    f"Exported weights are from step {ckpt_step}, "
-                    f"{global_step - ckpt_step} steps behind this export's name "
-                    f"({ckpt_label}). Recorded in the file as 'weights_step'.",
-                    tag="[EXPORT]",
-                )
-
-            for m in model_add:
-                if not os.path.exists(m):
-                  with uninterruptible_save("weight model export"):
+                with uninterruptible_save("weight model export"):
                     extract_model(
                         ckpt=ckpt,
                         sr=sample_rate,
