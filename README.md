@@ -31,23 +31,7 @@ computer, or on a free cloud GPU.
 - **Bring in voices from elsewhere** — paste a link, drop in files you already
   have, or download ready-made starting points.
 
-## Getting started on Windows
-
-Download `ShiroRVC-Setup-win64-<version>.zip` from the
-[latest release](../../releases/latest), unzip it and run `ShiroRVC-Setup.exe`.
-
-The wizard downloads everything else for you and picks the right version for
-your graphics card automatically. It does not ask for administrator rights and
-writes nothing outside the folder you choose, so uninstalling is deleting that
-folder. Set aside about 14 GB of disk space.
-
-When it finishes, run `ShiroRVC.exe` from that folder.
-
-> Windows will likely warn you about an unrecognised app. That is because the
-> installer is not code-signed, which costs money we have not spent — not
-> because anything was detected. Every release lists checksums you can verify.
-
-### Installing from the source code
+## Getting started
 
 <table>
 <tr><th align="left">Windows</th><th align="left">Linux</th></tr>
@@ -55,6 +39,8 @@ When it finishes, run `ShiroRVC.exe` from that folder.
 <td>
 
 ```bat
+git clone https://github.com/ShiromiyaG/ShiroRVC.git
+cd ShiroRVC
 run-install.bat
 start-gui.bat
 ```
@@ -63,6 +49,8 @@ start-gui.bat
 <td>
 
 ```bash
+git clone https://github.com/ShiromiyaG/ShiroRVC.git
+cd ShiroRVC
 chmod +x run-install.sh start-gui.sh
 ./run-install.sh
 ./start-gui.sh
@@ -74,7 +62,12 @@ chmod +x run-install.sh start-gui.sh
 
 This builds a self-contained environment in `env/`. Nothing is installed
 system-wide and no Python you already have is touched. The models it needs
-download by themselves the first time you launch it.
+download by themselves the first time you launch it. Set aside about 14 GB of
+disk space.
+
+To update later, run `git pull` inside the folder. If `requirements.txt`
+changed, run the installer script again so the environment picks up the new
+requirements.
 
 > **Note** — do not run either script as administrator or root. Both write into
 > the project folder, and doing so leaves files your normal user cannot change

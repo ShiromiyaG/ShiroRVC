@@ -5,7 +5,6 @@ literal, so that every consumer reads the same bytes:
 
 * ``app.py`` -- the Gradio interface's title
 * ``gui/`` -- the native interface's window title and about text
-* ``.github/workflows/release.yml`` -- what decides whether to cut a release
 
 It used to live in a plain-text ``VERSION`` file, for the release workflow's
 benefit: that workflow triggers on a path and reads the number with ``tr``, and
