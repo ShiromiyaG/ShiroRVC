@@ -96,6 +96,7 @@
         "d_version": "v4",
         "d_use_univhd": true,
         "d_use_fast_mpd": false,
+        "d_mrd_fp32_input": false,
         "d_use_san": true,
         "use_spectral_norm": false,
         "gin_channels": 256,

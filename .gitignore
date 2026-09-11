@@ -19,6 +19,7 @@ __pycache__/
 .nox/
 .uv-cache/
 .tmp
+CLAUDE.md
 build/
 dist/
 *.spec

@@ -753,6 +753,10 @@ def get_d_model(config, vocoder, use_checkpointing):
         # Opt-in, so an absent key builds the branches every existing
         # discriminator was trained with.
         use_fast_mpd=bool(setting("d_use_fast_mpd", False)),
+        # On by default: the spectrogram branches' STFT and first conv run
+        # outside FP16 autocast, where their unnormalised magnitude overflowed
+        # at a raised learning rate.  ``false`` restores the all-FP16 path.
+        mrd_fp32_input=bool(setting("d_mrd_fp32_input", True)),
         # UnivHD (arXiv 2512.03486) is opt-in and *additive*: it appends a
         # harmonic-order branch and removes nothing, which is how the paper
         # runs it.  Off by default because it is unmeasured on this fork -- the

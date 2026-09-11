@@ -2,6 +2,8 @@
 
 <img src="assets/logo-shirorvc.png" alt="ShiroRVC" width="570" />
 
+# **There still aren't any pretrains for RefineGAN v2.**
+
 **Turn one voice into another — speaking or singing.**
 
 Record yourself, convert it to a voice you have trained, and keep the melody,

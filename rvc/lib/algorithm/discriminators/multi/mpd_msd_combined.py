@@ -192,6 +192,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         univhd_channels: int = 32,
         univhd_half_harmonic: bool = True,
         univhd_weight: Optional[float] = None,
+        mrd_fp32_input: bool = True,
     ):
         """``version`` picks a preset; the overrides edit it branch by branch.
 
@@ -213,6 +214,11 @@ class MPD_MSD_Combined(torch.nn.Module):
         derived from it.  ``use_univhd`` appends the harmonic branch (arXiv
         2512.03486) for +9% time and memory and +0.33 M parameters -- additive,
         as the paper runs it.
+
+        ``mrd_fp32_input`` runs each spectrogram branch's STFT and first conv
+        outside FP16 autocast; see :meth:`DiscriminatorR.forward`.  It adds no
+        parameters, so a checkpoint loads either way, and without autocast it
+        changes nothing.
         """
 
         super().__init__()
@@ -254,6 +260,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.frequency_strides = tuple(int(s) for s in frequency_strides)
         self.use_msd = bool(use_msd)
         self.use_fast_mpd = bool(use_fast_mpd)
+        self.mrd_fp32_input = bool(mrd_fp32_input)
         self.use_univhd = bool(use_univhd)
         # ``None`` means "whatever the version pins", the same convention the
         # branch overrides above use; an explicit number wins on any version.
@@ -296,6 +303,7 @@ class MPD_MSD_Combined(torch.nn.Module):
                 use_spectral_norm=use_spectral_norm,
                 frequency_strides=self.frequency_strides,
                 use_san=self.use_san,
+                fp32_input=self.mrd_fp32_input,
             )
             for r in self.resolutions
         ]
@@ -762,10 +770,12 @@ class DiscriminatorR(torch.nn.Module):
         use_spectral_norm: bool = False,
         frequency_strides=(1, 1, 1),
         use_san: bool = False,
+        fp32_input: bool = True,
     ):
         super().__init__()
 
         self.resolution = resolution
+        self.fp32_input = bool(fp32_input)
         self.lrelu_slope = 0.1
         self.frequency_strides = tuple(int(s) for s in frequency_strides)
         if len(self.frequency_strides) != 3:
@@ -818,8 +828,26 @@ class DiscriminatorR(torch.nn.Module):
 
     def forward(self, x, san_training: bool = False):
         fmap = []
-        x = self.spectrogram(x).unsqueeze(1)
-        for layer in self.convs:
+        if self.fp32_input:
+            # The boxcar magnitude is linear and unnormalised -- a full-scale
+            # sine reads ``win_length / 2``, i.e. 120 to 600 here, against the
+            # [-1, 1] every period branch sees -- so under FP16 autocast this
+            # stage is where the activations and the weight gradient of the
+            # first conv run out of range first, and at a raised learning rate
+            # the branch diverges.  Only the STFT and ``convs[0]`` leave
+            # autocast: after one conv and a LeakyReLU the scale is the other
+            # branches', and the rest goes back to FP16.  Measured on an RTX
+            # 5060, v4 + UnivHD + SAN at batch 8 over 0.4 s, D update plus the
+            # generator's pass through D: 140.1 -> 148.5 ms, +0.8 GiB peak;
+            # the whole branch in FP32 was 200.6 ms, +1.2 GiB.
+            with torch.autocast(x.device.type, enabled=False):
+                x = self.spectrogram(x.float()).unsqueeze(1)
+                x = F.leaky_relu(self.convs[0](x), self.lrelu_slope)
+        else:
+            x = self.spectrogram(x).unsqueeze(1)
+            x = F.leaky_relu(self.convs[0](x), self.lrelu_slope)
+        fmap.append(x)
+        for layer in self.convs[1:]:
             x = F.leaky_relu(layer(x), self.lrelu_slope)
             fmap.append(x)
         return san_tail(self, x, fmap, san_training)

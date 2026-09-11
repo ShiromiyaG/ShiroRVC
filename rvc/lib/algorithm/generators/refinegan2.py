@@ -10,7 +10,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 from torch.utils.checkpoint import checkpoint
 
-from rvc.lib.algorithm.commons import init_weights, get_padding
+from rvc.lib.algorithm.commons import expand_f0, init_weights, get_padding
 from rvc.lib.algorithm.resampling import (
     AntiAliasedUpsample1d,
     filter_schedule,
@@ -1184,14 +1184,21 @@ class RefineGAN2Generator(nn.Module):
         descending chirp of every harmonic at once at every boundary.  Gating
         with a ``nearest`` ``uv`` keeps the boundary where the f0 estimator put
         it.
+
+        The first version of that gate left the chirp half in place: it
+        interpolated ``log f0`` with the ``log 1 = 0`` of the unvoiced frames
+        still in it, so the last half-frame before every voiced/unvoiced
+        boundary glided toward 1 Hz while the gate read voiced -- 200 Hz
+        reached 14.3 Hz at the frame edge, 157 of those 160 samples under
+        190 Hz.  Fixed 2026-09-11 by weighting the interpolation with the
+        voiced mask; see ``commons.expand_f0``.
+
+        Not a ``decoder_layout`` field.  It moves the excitation only within
+        half a frame of each boundary, and a checkpoint trained on the glide
+        should resume into the corrected source rather than be refused.
         """
 
-        voiced = (f0 > 0).to(f0.dtype)
-        # Interpolate the *pitch*, in log Hz, and the gate separately.
-        log_f0 = torch.log(f0.clamp_min(1.0))
-        log_f0 = F.interpolate(log_f0, size=length, mode="linear", align_corners=False)
-        voiced = F.interpolate(voiced, size=length, mode="nearest")
-        return torch.exp(log_f0) * voiced
+        return expand_f0(f0, length)
 
     def _apply_source_gain(self, har_source: torch.Tensor, mel: torch.Tensor):
         """Scale the excitation by an intensity envelope read off ``mel``.
