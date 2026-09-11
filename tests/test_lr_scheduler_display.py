@@ -96,11 +96,18 @@ def test_cosine_without_a_ratio_is_unchanged(capsys):
 
 def test_the_superseded_init_line_is_gone():
     """The announcement the panel made redundant, pinned so it stays removed."""
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
+    # Both halves of the scheduler wiring: the announcement lived in
+    # ``train.py``, and ``prepare_schedulers`` has since moved to
+    # ``schedules.py``, which is where it would come back.
+    sources = [
+        (ROOT / "rvc" / "train" / name).read_text(encoding="utf-8")
+        for name in ("train.py", "schedules.py")
+    ]
     # Only f-strings: the removed message was one, and docstrings never are, so
     # this cannot be tripped by prose explaining why the message went away.
     messages = [
         part.value
+        for source in sources
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.JoinedStr)
         for part in node.values

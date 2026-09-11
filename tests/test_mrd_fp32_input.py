@@ -56,5 +56,5 @@ def test_under_autocast_only_the_input_stage_leaves_fp16():
 
 
 def test_the_trainer_reads_the_flag_with_the_constructor_default():
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
+    source = (ROOT / "rvc" / "train" / "setup.py").read_text(encoding="utf-8")
     assert 'setting("d_mrd_fp32_input", True)' in source

@@ -1,6 +1,4 @@
 import os
-import copy
-import datetime
 import glob
 import math
 import re
@@ -8,12 +6,7 @@ import socket
 import sys
 
 from collections import deque
-from distutils.util import strtobool
-from random import randint, Random
-import signal
-import threading
-from contextlib import contextmanager, nullcontext
-from time import time as ttime
+from contextlib import nullcontext
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
@@ -46,11 +39,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.backends import cuda, cudnn
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast
 from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_
 from rvc.lib.terminal import (
     configure_logging,
     error as print_error,
@@ -62,8 +53,48 @@ from rvc.lib.terminal import (
     warning,
 )
 from rvc.train.ema import WeightEMA
+from rvc.train.overtrain import (
+    OvertrainMonitor,
+    carve_holdout,
+    deliverable_weights,
+    holdout_metrics_resilient,
+    materialise_holdout,
+)
+from rvc.train.diagnostics import (
+    branch_separation,
+    cache_mean,
+    clip_or_sample_grad_norm,
+    generator_gradient_metrics,
+    prior_gap,
+    split_branch_outputs,
+)
+from rvc.train.progress import EpochRecorder, emit_machine_progress
+from rvc.train.schedules import (
+    fit_eval_interval,
+    planned_step_count,
+    prepare_schedulers,
+)
+from rvc.train.setup import (
+    apply_resume_lr_override,
+    apply_training_freezes,
+    assert_resumable_architecture,
+    checkpoint_step_from_path,
+    enable_discriminator_compile,
+    enable_frontend_compile,
+    enable_vocoder_compile,
+    get_d_model,
+    get_g_model,
+    get_optimizers,
+    normalize_san_weights,
+    setup_models_for_training,
+)
+from rvc.train.stop import (
+    finish_stop,
+    install_stop_handlers,
+    stop_was_requested,
+    uninterruptible_save,
+)
 from rvc.train.optimizers import (
-    _make_optimizer,
     averaged_weights,
     is_schedule_free,
 )
@@ -71,15 +102,6 @@ from rvc.train.messages import (
     TENSORBOARD_VALIDATION_AUDIO_NAMES,
     TENSORBOARD_VALIDATION_FALLBACK_NAMESPACE,
     TENSORBOARD_MEDIA_SOURCE_NAME,
-    DISCRIMINATOR_COMPILE_ENABLED,
-    DISCRIMINATOR_COMPILE_NO_CUDA,
-    DISCRIMINATOR_COMPILE_NOT_SUPPORTED,
-    FRONTEND_COMPILE_ENABLED,
-    FRONTEND_COMPILE_NO_CUDA,
-    FRONTEND_COMPILE_NOT_SUPPORTED,
-    VOCODER_COMPILE_ENABLED,
-    VOCODER_COMPILE_NO_CUDA,
-    VOCODER_COMPILE_NOT_SUPPORTED,
 )
 
 install_rich_print()
@@ -122,10 +144,7 @@ from mel_processing import build_ms_mel_loss
 
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
-from rvc.configs.vocoders import (
-    get_discriminator_id,
-    normalize_vocoder,
-)
+from rvc.configs.vocoders import normalize_vocoder
 from rvc.train.run_spec import TrainRunSpec
 
 # argv[1] is the run spec written by the launcher (not the same indexing as
@@ -243,7 +262,6 @@ use_lr_scheduler = lr_scheduler != "none"
 amp_skipped_steps = 0
 
 
-
 # ========  Advanced / Manual and exp tweaks  ========================
 enable_persistent_workers = True
 
@@ -290,78 +308,6 @@ import logging
 logging.getLogger("torch").setLevel(logging.ERROR)
 
 
-# ----  Interruptible-only-at-safe-points shutdown  ----
-# The launcher asks for a stop with SIGTERM / CTRL_BREAK and only kills after a
-# grace period.  These handlers never terminate the process themselves: they
-# record the request and return, so a `torch.save` already in flight always runs
-# to completion and no checkpoint is ever left truncated.  The training loop
-# then acts on the flag at its next safe point.
-_stop_requested = threading.Event()
-_saving_depth = 0
-_saving_lock = threading.Lock()
-
-
-def stop_was_requested():
-    return _stop_requested.is_set()
-
-
-@contextmanager
-def uninterruptible_save(description):
-    """Mark a region that must reach the disk before the process may exit."""
-    global _saving_depth
-    with _saving_lock:
-        _saving_depth += 1
-    try:
-        yield
-    finally:
-        with _saving_lock:
-            _saving_depth -= 1
-        if _stop_requested.is_set():
-            info(f"{description} finished; the stop can proceed now.", tag="[TRAIN]")
-
-
-def _handle_stop_signal(signum, frame):
-    """Record a stop request. Deliberately does not exit."""
-    if _stop_requested.is_set():
-        return
-    _stop_requested.set()
-    with _saving_lock:
-        mid_write = _saving_depth > 0
-    if mid_write:
-        warning(
-            "Stop requested while writing a checkpoint - "
-            "finishing the write first, then exiting.",
-            tag="[TRAIN]",
-        )
-    else:
-        warning("Stop requested - exiting at the next safe point.", tag="[TRAIN]")
-
-
-def install_stop_handlers():
-    """Route the launcher's stop signals into the flag above."""
-    for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
-        try:
-            signal.signal(sig, _handle_stop_signal)
-        except (ValueError, OSError):
-            # Not the main thread, or unsupported on this platform.
-            pass
-
-
-def finish_stop(writer=None):
-    """Leave once nothing is being written."""
-    info("Stopping cleanly.", tag="[TRAIN]")
-    if writer is not None:
-        try:
-            writer.flush()
-            writer.close()
-        except Exception:
-            pass
-    os._exit(0)
-
-
 def eval_infer(net_g, reference):
     net_g.eval()
     with torch.no_grad():
@@ -370,26 +316,6 @@ def eval_infer(net_g, reference):
     net_g.train()
     return o
 
-class EpochRecorder:
-    """
-    Records the time elapsed per epoch.
-    """
-
-    def __init__(self):
-        self.last_time = ttime()
-
-    def record(self):
-        """
-        Records the elapsed time and returns a formatted string.
-        """
-        now_time = ttime()
-        elapsed_time = now_time - self.last_time
-        self.last_time = now_time
-        elapsed_time = round(elapsed_time, 1)
-        elapsed_time_str = str(datetime.timedelta(seconds=int(elapsed_time)))
-        current_time = datetime.datetime.now().strftime("%H:%M:%S")
-
-        return f"Current time: {current_time} | Time per epoch: {elapsed_time_str}"
 
 def setup_env_and_distr(rank, n_gpus, device, device_id, config):
     if n_gpus > 1 and device.type == "cuda":
@@ -404,189 +330,21 @@ def setup_env_and_distr(rank, n_gpus, device, device_id, config):
     if torch.cuda.is_available():
         torch.cuda.set_device(device_id)
 
-class _HoldoutSet:
-    """Fixed-length excerpts, kept in RAM and batched on demand.
-
-    Cropped to equal length rather than padded: padding silence into the mel
-    would put a batch-dependent constant into the metric. Held as excerpts
-    rather than pre-formed batches so :meth:`shrink` can re-batch them.
-    """
-
-    def __init__(self, items, batch_size, label="holdout"):
-        self.items = list(items)
-        self.batch_size = max(1, int(batch_size))
-        self.label = label
-        # Ground truth does not depend on the weights, so its mel is computed
-        # once for the life of the run rather than once per evaluation.  Keyed
-        # by length as well as by batch, so a decoder whose output length moves
-        # cannot silently be compared against the wrong excerpt.
-        self._target_mels = {}
-
-    def __len__(self):
-        return len(self.items)
-
-    @property
-    def frames(self):
-        return self.items[0][0].shape[0] if self.items else 0
-
-    def seconds(self, config):
-        return self.frames * config.data.hop_length / config.data.sample_rate
-
-    def batches(self):
-        for start in range(0, len(self.items), self.batch_size):
-            chunk = self.items[start : start + self.batch_size]
-            yield start // self.batch_size, self._collate(chunk)
-
-    @staticmethod
-    def _collate(chunk):
-        phone = torch.stack([item[0] for item in chunk])
-        pitch = torch.stack([item[1] for item in chunk])
-        pitchf = torch.stack([item[2] for item in chunk])
-        spectrogram = torch.stack([item[3] for item in chunk])
-        wave = torch.stack([item[4] for item in chunk])
-        sid = torch.cat([item[5] for item in chunk])
-        # Every excerpt is the same length by construction, which is the whole
-        # point: no padding, so no per-item lengths to carry.
-        frames = torch.full((len(chunk),), phone.shape[1], dtype=torch.long)
-        samples = torch.full((len(chunk),), wave.shape[-1], dtype=torch.long)
-        return (
-            phone,
-            frames,
-            pitch,
-            pitchf,
-            spectrogram,
-            frames,
-            wave,
-            samples,
-            sid,
-        )
-
-    def target_mel(self, index, length, factory):
-        cached = self._target_mels.get(index)
-        if cached is None or cached[0] != length:
-            cached = (length, factory())
-            self._target_mels[index] = cached
-        return cached[1]
-
-    def shrink(self):
-        """Halve the batch.  False once there is nothing left to halve."""
-        if self.batch_size <= 1:
-            return False
-        self.batch_size = max(1, self.batch_size // 2)
-        self._target_mels.clear()
-        return True
-
-
-def _uniform_excerpts(
-    dataset,
-    indices,
-    crop_frames,
-    config,
-    batch_size,
-    label="holdout",
-    fixed=False,
-    limit=None,
-):
-    """Load rows and crop them all to one shared length.
-
-    ``crop_frames`` is a ceiling rather than a demand: unless ``fixed``, the
-    crop lands at the lower quartile of what the rows actually carry, so three
-    excerpts in four survive it.  Taking the ceiling literally would leave the
-    set to whichever recording happened to be longest.
-
-    ``fixed`` is for the training probe, which has to be cropped exactly like
-    the holdout or the two numbers are not comparable.
-    """
-    hop = config.data.hop_length
-    rows = []
-    for index in indices:
-        spectrogram, wave, phone, pitch, pitchf, sid = dataset[index]
-        frames = min(spectrogram.shape[-1], phone.shape[0], wave.shape[-1] // hop)
-        if frames > 0:
-            rows.append((frames, spectrogram, wave, phone, pitch, pitchf, sid))
-    if not rows:
-        return None
-
-    if fixed:
-        crop = max(1, int(crop_frames))
-    else:
-        ordered = sorted(row[0] for row in rows)
-        crop = max(1, min(int(crop_frames), ordered[len(ordered) // 4]))
-
-    items = []
-    for frames, spectrogram, wave, phone, pitch, pitchf, sid in rows:
-        if frames < crop:
-            continue
-        # Cloned: the crops are views onto whole files, and keeping views would
-        # keep every one of those files resident for the life of the run.
-        items.append(
-            (
-                phone[:crop, :].clone(),
-                pitch[:crop].clone(),
-                pitchf[:crop].clone(),
-                spectrogram[:, :crop].clone(),
-                wave[:, : crop * hop].clone(),
-                sid.clone(),
-            )
-        )
-        if limit is not None and len(items) >= int(limit):
-            break
-    if not items:
-        return None
-    return _HoldoutSet(items, batch_size, label=label)
-
 
 def prepare_dataloaders(config, n_gpus, rank, batch_size):
     from data_utils import (
         DistributedBucketSampler,
         TextAudioCollateMultiNSFsid,
         TextAudioLoaderMultiNSFsid,
-        holdout_split_indices,
     )
 
     train_dataset = TextAudioLoaderMultiNSFsid(config.data, n_mel_bins=config.model.inter_channels)
 
-    # Carve a held-out set out of the dataset before anything else sees it.
-    # Training loss cannot detect overtraining by construction -- it keeps
-    # falling while generalisation rots -- so this is the only signal that can.
-    holdout_dataset = None
-    if overtrain_detector:
-        # The evaluation cost is seconds of audio to synthesise, so the budget
-        # is set in seconds.  ``lengths`` is in frames (see ``_filter``).
-        max_seconds = float(getattr(config.train, "holdout_max_seconds", 120.0))
-        train_indices, holdout_indices = holdout_split_indices(
-            train_dataset.audiopaths_and_text,
-            fraction=float(getattr(config.train, "holdout_fraction", 0.02)),
-            minimum=int(getattr(config.train, "holdout_min_slices", 16)),
-            maximum=int(getattr(config.train, "holdout_max_slices", 96)),
-            seed=int(getattr(config.train, "seed", 1234)),
-            lengths=train_dataset.lengths,
-            max_frames=(
-                max_seconds * config.data.sample_rate / config.data.hop_length
-                if max_seconds > 0
-                else None
-            ),
-        )
-        if holdout_indices:
-            rows = train_dataset.audiopaths_and_text
-            lengths = train_dataset.lengths
-            holdout_dataset = copy.copy(train_dataset)
-            holdout_dataset.audiopaths_and_text = [rows[i] for i in holdout_indices]
-            holdout_dataset.lengths = [lengths[i] for i in holdout_indices]
-            train_dataset.audiopaths_and_text = [rows[i] for i in train_indices]
-            train_dataset.lengths = [lengths[i] for i in train_indices]
-            if rank == 0:
-                sources = len({r[0].rsplit("_", 1)[0] for r in holdout_dataset.audiopaths_and_text})
-                info(
-                    f"{len(holdout_indices)} slices from {sources} source "
-                    f"recordings held out of {len(rows)} - never trained on.",
-                    tag="[HOLDOUT]",
-                )
-        elif rank == 0:
-            warning(
-                "Dataset too small to hold one out; overtrain detection is off.",
-                tag="[HOLDOUT]",
-            )
+    # Carve a held-out set out of the dataset before anything else sees it;
+    # everything that scores it lives in ``rvc.train.overtrain``.
+    holdout_dataset = carve_holdout(
+        config, train_dataset, rank, enabled=overtrain_detector
+    )
 
     train_sampler = DistributedBucketSampler(
         train_dataset,
@@ -620,790 +378,14 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
     )
     train_loader_safety(train_loader)
 
-    # Materialised once and kept: the point of a holdout is that every
-    # evaluation scores the exact same audio, and re-reading it through a
-    # loader each time would also cost more than the forward pass.
     holdout_set = None
     probe_set = None
     if holdout_dataset is not None and rank == 0:
-        crop_frames = max(
-            1,
-            int(
-                float(getattr(config.train, "holdout_crop_seconds", 3.0))
-                * config.data.sample_rate
-                / config.data.hop_length
-            ),
+        holdout_set, probe_set = materialise_holdout(
+            config, train_dataset, holdout_dataset
         )
-        eval_batch = int(getattr(config.train, "holdout_batch_size", 4))
-        holdout_set = _uniform_excerpts(
-            holdout_dataset,
-            range(len(holdout_dataset.audiopaths_and_text)),
-            crop_frames,
-            config,
-            eval_batch,
-            label="holdout",
-        )
-        if holdout_set is None:
-            warning(
-                "Held-out rows were all too short to score; detection is off.",
-                tag="[HOLDOUT]",
-            )
-        else:
-            info(
-                f"Scoring {len(holdout_set)} excerpts of "
-                f"{holdout_set.seconds(config):.1f}s each, batched "
-                f"{holdout_set.batch_size} at a time.",
-                tag="[HOLDOUT]",
-            )
-
-        # The same measurement on slices the model *has* been trained on.  The
-        # held-out curve alone mixes two movements -- the model is still
-        # learning, and it is starting to memorise -- and only their difference
-        # is overtraining.  Subtracting the probe removes the shared trend, so
-        # the turn shows up earlier and more cleanly than in the absolute
-        # number.  Same crop and same count as the holdout, or the two are not
-        # comparable; sampled deterministically, so a resume scores the same
-        # slices rather than leaking a fresh draw into the comparison.
-        if holdout_set is not None and bool(
-            getattr(config.train, "holdout_train_probe", True)
-        ):
-            pool = list(range(len(train_dataset.audiopaths_and_text)))
-            sampled = Random(int(getattr(config.train, "seed", 1234))).sample(
-                pool, min(len(pool), 2 * len(holdout_set))
-            )
-            probe_set = _uniform_excerpts(
-                train_dataset,
-                sampled,
-                holdout_set.frames,
-                config,
-                eval_batch,
-                label="train probe",
-                fixed=True,
-                limit=len(holdout_set),
-            )
 
     return train_loader, holdout_set, probe_set
-
-def get_g_model(config, sample_rate, vocoder, use_checkpointing):
-    from rvc.lib.algorithm.synthesizers import Synthesizer
-    model_config = config.model.__dict__.copy()
-    return Synthesizer(
-        config.data.filter_length // 2 + 1,
-        config.train.segment_size // config.data.hop_length,
-        **model_config,
-        use_f0 = True,
-        sr = sample_rate,
-        vocoder = vocoder,
-        checkpointing = use_checkpointing,
-    )
-
-def get_d_model(config, vocoder, use_checkpointing):
-    vocoder = normalize_vocoder(vocoder)
-    discriminator_id = get_discriminator_id(vocoder)
-    # JSON has no tuples, so a configured schedule arrives as nested lists.  The
-    # discriminators normalise them themselves; passing them through untouched
-    # keeps this function free of the branch layout.
-    def setting(name, default=None):
-        """``None``/absent means "use the default"; ``[]`` means "none of these".
-
-        This was ``value or default``, which collapsed the two: a config asking
-        for *no* period branches got the full set back, and there was no way to
-        turn a whole family off from JSON.
-        """
-
-        value = getattr(config.model, name, None)
-        return default if value is None else value
-
-    from rvc.lib.algorithm.discriminators.multi import (
-        DISCRIMINATOR_VERSIONS,
-        MPD_MSD_Combined,
-    )
-
-    # The registry names the branch layout directly -- ``v2`` is Applio's (8
-    # periods), ``v3`` is what it picks for RefineGAN (5 periods + 3
-    # multi-resolution spectrogram branches) -- so this only has to check that
-    # the name exists.  Checked rather than passed through: it used to be
-    # ``"v3" if id == "mpd_msd_v3" else "v2"``, which handed Applio's v2 to any
-    # id it did not recognise, and a vocoder registered against the wrong name
-    # would have trained against the wrong discriminator with nothing said.
-    #
-    # ``d_version`` overrides it: v3 does not fit an 8 GB card at batch 8
-    # (6.42 GiB / 5912 ms/step against v2's 4.64 GiB / 498 ms/step), and the
-    # RefineGAN2 config names ``v4`` -- v3 minus its longest period branch.
-    # The registry stays at ``v3`` so a config predating that key builds what
-    # it always did.
-    if discriminator_id not in DISCRIMINATOR_VERSIONS:
-        raise ValueError(
-            f"Unknown discriminator {discriminator_id!r} for vocoder "
-            f"{vocoder!r}; known: {sorted(DISCRIMINATOR_VERSIONS)}."
-        )
-    version = str(getattr(config.model, "d_version", None) or discriminator_id)
-    # ``d_use_*`` switches a whole family off; ``d_periods``/``d_resolutions``
-    # replace its content when it's on (``None`` keeps the preset's).
-    return MPD_MSD_Combined(
-        config.model.use_spectral_norm,
-        use_checkpointing=use_checkpointing,
-        version=version,
-        periods=[] if not setting("d_use_periods", True) else setting("d_periods"),
-        resolutions=(
-            [] if not setting("d_use_resolutions", True) else setting("d_resolutions")
-        ),
-        frequency_strides=setting("d_frequency_strides"),
-        use_msd=bool(setting("d_use_msd", True)),
-        # Opt-in, so an absent key builds the branches every existing
-        # discriminator was trained with.
-        use_fast_mpd=bool(setting("d_use_fast_mpd", False)),
-        # On by default: the spectrogram branches' STFT and first conv run
-        # outside FP16 autocast, where their unnormalised magnitude overflowed
-        # at a raised learning rate.  ``false`` restores the all-FP16 path.
-        mrd_fp32_input=bool(setting("d_mrd_fp32_input", True)),
-        # UnivHD (arXiv 2512.03486) is opt-in and *additive*: it appends a
-        # harmonic-order branch and removes nothing, which is how the paper
-        # runs it.  Off by default because it is unmeasured on this fork -- the
-        # gains it reports are on harmonic structure and F0RMSE for singing,
-        # not on the frame-rate mirroring, which its ERB bandwidths are too
-        # wide to separate above ~700 Hz.
-        sample_rate=int(config.data.sample_rate),
-        use_univhd=bool(setting("d_use_univhd", False)),
-        # SAN (arXiv 2301.12811): splits every branch's last projection into a
-        # unit-norm direction and a scale.  Off by default and unmeasured on
-        # this fork -- it changes conv_post's state-dict keys, so it is a
-        # fresh-run decision, and it changes the loss floor, so every number
-        # read off loss_disc has to be relearned.
-        use_san=bool(setting("d_use_san", False)),
-        univhd_n_fft=int(setting("d_univhd_n_fft", 2048)),
-        univhd_hop_length=int(setting("d_univhd_hop_length", 256)),
-        univhd_harmonics=int(setting("d_univhd_harmonics", 10)),
-        univhd_bins_per_octave=int(setting("d_univhd_bins_per_octave", 24)),
-        univhd_f_min=float(setting("d_univhd_f_min", 80.0)),
-        univhd_channels=int(setting("d_univhd_channels", 32)),
-        univhd_half_harmonic=bool(setting("d_univhd_half_harmonic", True)),
-        # ``None`` keeps the version's pinned weight; a config key overrides it
-        # on any version.  See ``UNIVHD_WEIGHT_BY_VERSION``.
-        univhd_weight=(
-            None
-            if setting("d_univhd_weight", None) is None
-            else float(setting("d_univhd_weight", None))
-        ),
-    )
-
-
-def _prior_gap(
-    model,
-    m_p,
-    x_mask,
-    ids_slice,
-    segment_size,
-    pitchf,
-    sid,
-    target,
-    full_output,
-    config,
-):
-    """Is the Gaussian posterior carrying anything the prior does not have?
-
-    Decodes twice -- once from the posterior sample ``z`` that produced
-    ``full_output``, once from the prior mean pushed through the flow -- and
-    returns the mel L1 gap between them.  A rate near zero in ``diag/kl_*`` is
-    ambiguous between "prior predicts posterior" (fine) and "posterior
-    collapsed" (not); a large gap here means the former, a small one the
-    latter.  Diagnostic only, under ``no_grad``: optimising this gap directly
-    would reward a destructive latent rather than an informative one.
-    """
-    with torch.no_grad():
-        speaker = model.emb_g(sid).unsqueeze(-1)
-        z_prior = model.flow(m_p * x_mask, x_mask, g=speaker, reverse=True) * x_mask
-        z_slice = commons.slice_segments(z_prior, ids_slice, segment_size, dim=3)
-        pitchf_slice = commons.slice_segments(pitchf, ids_slice, segment_size, dim=2)
-        prior_output = model.dec(z_slice, pitchf_slice, g=speaker)
-
-        target_mel = wave_to_mel(config, target)
-        full_error = F.l1_loss(
-            wave_to_mel(config, full_output).float(), target_mel.float()
-        )
-        prior_error = F.l1_loss(
-            wave_to_mel(config, prior_output).float(), target_mel.float()
-        )
-    return (prior_error - full_error).detach(), prior_error.detach()
-
-
-def _cache_mean(cache) -> float:
-    """Mean of a rolling cache of device scalars, in one transfer.
-
-    The caches these read are filled every step and read once per logging
-    interval, so they hold tensors rather than floats: a per-step ``.item()``
-    is a synchronisation in the middle of the training step, and this is the
-    one place the window actually has to reach the host.
-    """
-    return torch.stack(list(cache)).mean().item()
-
-
-def _split_branch_outputs(outputs, sizes):
-    """Split every branch's output along the batch axis into ``len(sizes)`` groups.
-
-    The discriminator batches its fake side into one pass, so a second class of
-    fake -- the synthetic negative -- rides in the same tensor and has to come
-    back out before the losses can weight the two differently.  Under SAN a
-    branch returns ``(function, direction)`` rather than one tensor, and both
-    halves are split.
-    """
-
-    groups = [[] for _ in sizes]
-    for output in outputs:
-        if isinstance(output, (list, tuple)):
-            parts = [torch.split(half, sizes, dim=0) for half in output]
-            for index in range(len(sizes)):
-                groups[index].append([half[index] for half in parts])
-        else:
-            parts = torch.split(output, sizes, dim=0)
-            for index in range(len(sizes)):
-                groups[index].append(parts[index])
-    return groups
-
-
-def _branch_separation(disc_real_outputs, disc_generated_outputs):
-    """Per-head ``mean(real logit) - mean(fake logit)``, detached.
-
-    Under SAN a head returns ``(function, direction)`` rather than one tensor;
-    the function output is the one the generator is scored by, so it is the one
-    whose separation means anything.
-    """
-
-    def logits(output):
-        return (output[0] if isinstance(output, (list, tuple)) else output).detach()
-
-    return torch.stack(
-        [
-            logits(dr).float().mean() - logits(dg).float().mean()
-            for dr, dg in zip(disc_real_outputs, disc_generated_outputs)
-        ]
-    )
-
-
-def _clip_or_sample_grad_norm(
-    parameters,
-    max_norm,
-    step,
-    sample_interval,
-):
-    max_norm = float(max_norm)
-    should_measure = math.isfinite(max_norm) or step % max(1, sample_interval) == 0
-    if not should_measure:
-        return None
-    return clip_grad_norm_(parameters, max_norm=max_norm)
-
-
-#: Wall-clock seconds between machine-readable progress lines.  Rich's bar is
-#: for a terminal; this is for whatever is reading the pipe.
-_MACHINE_PROGRESS_INTERVAL = 1.0
-_last_machine_progress = 0.0
-
-
-def _emit_machine_progress(
-    epoch, total_epochs, batch, total_batches, step, metrics, rank
-):
-    """Print one parseable progress line for a GUI front-end, when stdout isn't
-    a terminal (Rich's bar renders nothing there). Throttled by wall clock
-    rather than batch count, since batch rate varies widely by configuration.
-    """
-    global _last_machine_progress
-    if rank != 0:
-        return
-    try:
-        if sys.stdout.isatty():
-            return
-    except (AttributeError, ValueError):
-        return
-
-    now = ttime()
-    finished = batch >= total_batches
-    if not finished and now - _last_machine_progress < _MACHINE_PROGRESS_INTERVAL:
-        return
-    _last_machine_progress = now
-
-    print(
-        f"[PROGRESS] epoch={epoch}/{total_epochs} "
-        f"batch={batch}/{total_batches} step={step} "
-        f"{metrics or ''}".rstrip(),
-        flush=True,
-    )
-
-
-def planned_step_count(total_epoch_count: int, train_loader, max_steps: int = 0) -> int:
-    """How many optimizer steps this run will take.
-
-    Every schedule below this line is step-denominated but stated as an
-    absolute literal, so it means something different on an 8k fine-tune than
-    on a hundred-thousand-step pretrain; this is what :func:`fit_schedule` and
-    :func:`fit_eval_interval` rescale against.  Returns 0 when the budget is
-    unknown, which every caller treats as "leave the configured value alone".
-    """
-    per_epoch = max(1, len(train_loader))
-    planned = max(0, int(total_epoch_count)) * per_epoch
-    limit = max(0, int(max_steps))
-    if limit:
-        planned = min(planned, limit) if planned else limit
-    return planned
-
-
-def fit_schedule(configured: int, planned_steps: int, fraction: float, minimum: int = 1) -> int:
-    """Shrink a step-denominated schedule to fit inside the run.
-
-    Only ever shrinks: a run long enough for the configured value gets it back
-    untouched.  ``fraction`` is the share of the run the schedule may occupy.
-    """
-    configured = max(0, int(configured))
-    if planned_steps <= 0 or configured <= 0:
-        return configured
-    return max(minimum, min(configured, int(planned_steps * fraction)))
-
-
-def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int:
-    """An evaluation interval that lets ``patience`` actually be reached.
-
-    At one evaluation per 2000 steps, an 8k fine-tune only gets 4 evaluations
-    against a patience of 8, so the detector can never fire. Sizing for ~3x
-    patience keeps it a detector; only ever shrinks, like :func:`fit_schedule`.
-    """
-    configured = max(1, int(configured))
-    if planned_steps <= 0:
-        return configured
-    wanted = planned_steps // max(1, 3 * max(1, int(patience)))
-    return max(1, min(configured, wanted)) if wanted else configured
-
-
-def _cpu_state_dict(source):
-    """Detached CPU copy of a model's or a ``WeightEMA``'s weights."""
-    if hasattr(source, "cpu_state_dict"):
-        return source.cpu_state_dict()
-    module = source.module if hasattr(source, "module") else source
-    return {
-        key: tensor.detach().to("cpu", copy=True)
-        for key, tensor in module.state_dict().items()
-    }
-
-
-#: Bands the held-out spectral deficit is reported over, in Hz.  Split where a
-#: vocoder's error changes character rather than evenly: below 4 kHz is where
-#: the mel scale already spends most of its bins, and the two top bands are the
-#: ones a mel L1 charges 4-6x less for than the same defect at 1-3 kHz.  A band
-#: starting at or above Nyquist is dropped and the last one is clipped to it, so
-#: the same list serves every shipped sample rate.
-HOLDOUT_DEFICIT_BANDS = (
-    (1000, 2000),
-    (2000, 4000),
-    (4000, 6000),
-    (6000, 8000),
-    (8000, 10000),
-    (10000, 13000),
-    (13000, 16000),
-)
-
-
-def _deficit_band_edges(sample_rate):
-    """``(low, high, label)`` per band that fits under this rate's Nyquist."""
-
-    nyquist = float(sample_rate) / 2.0
-    edges = []
-    for low, high in HOLDOUT_DEFICIT_BANDS:
-        if low >= nyquist:
-            break
-        edges.append((float(low), min(float(high), nyquist), f"{low // 1000}k"))
-    return edges
-
-
-def _band_deficit_db(generated, target, sample_rate):
-    """How much energy the generator is missing per band, in dB, per band label.
-
-    Negative is the generator below the reference, which is the direction a
-    vocoder fails in.  ``mel_l1`` cannot answer this: it is one number over a
-    warped axis, so a 14 dB hole above 10 kHz and a 2 dB error at 1 kHz reach
-    it as comparable contributions -- which is the whole reason the band
-    weighting exists.  Averaged in dB per item rather than over pooled energy,
-    or one loud excerpt would decide the figure for the set.
-    """
-
-    generated = generated.float().flatten(0, -2) if generated.ndim > 2 else generated.float()
-    target = target.float().flatten(0, -2) if target.ndim > 2 else target.float()
-    spectrum_g = torch.fft.rfft(generated, dim=-1).abs().pow(2)
-    spectrum_t = torch.fft.rfft(target, dim=-1).abs().pow(2)
-    freqs = torch.fft.rfftfreq(
-        generated.shape[-1], 1.0 / float(sample_rate), device=generated.device
-    )
-
-    deficits = {}
-    for low, high, label in _deficit_band_edges(sample_rate):
-        band = (freqs >= low) & (freqs < high)
-        if not bool(band.any()):
-            continue
-        # The floor is what keeps a silent excerpt from reporting -inf and
-        # taking the whole average with it.
-        energy_g = spectrum_g[..., band].sum(-1).clamp_min(1e-12)
-        energy_t = spectrum_t[..., band].sum(-1).clamp_min(1e-12)
-        deficits[label] = float(
-            (10.0 * torch.log10(energy_g / energy_t)).mean()
-        )
-    return deficits
-
-
-def _holdout_metrics(
-    net_g,
-    excerpts,
-    config,
-    device,
-    want_latent=True,
-    noise_scale=0.0,
-):
-    """Score held-out audio down the *inference* path, in a single pass.
-
-    ``mel_l1`` scores the prior path, not the training forward: the training
-    path samples a posterior that has seen the target spectrogram, so a
-    memorising model would keep scoring well there after it stops
-    generalising.  Prior, posterior and their gap come from one pass over one
-    set of weights, so the numbers stay comparable.
-
-    ``noise_scale=0`` decodes the prior mean instead of ``infer``'s default
-    0.66666 draw, making the metric a pure function of the weights.  Plain L1
-    on the log-mel: the adversarial/feature-matching/KL terms are scored
-    against a discriminator and schedule that keep moving independently of
-    the generator.
-    """
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    # ``flow`` is what turns a prior draw into something the decoder can use;
-    # without it there is no inference path to rebuild by hand and ``infer`` is
-    # the only way in.  ``enc_q`` is dropped for export, which is the one state
-    # in which the posterior half cannot be measured at all.
-    manual_prior = getattr(model, "flow", None) is not None
-    want_latent = (
-        want_latent and manual_prior and getattr(model, "enc_q", None) is not None
-    )
-    was_training = model.training
-    model.eval()
-    totals = {"mel_l1": 0.0}
-    for _, _, label in _deficit_band_edges(config.data.sample_rate):
-        totals[f"band_deficit_{label}"] = 0.0
-    if want_latent:
-        totals["latent_gap"] = 0.0
-        totals["latent_posterior"] = 0.0
-    count = 0
-
-    # The metric has to be a pure function of the weights, and the prior draw
-    # is noise: at ``noise_scale`` 0 there is none, and above it the seed is
-    # pinned so every evaluation sees the same draw.  Restoring the state
-    # afterwards keeps a variable number of draws from shifting the training
-    # stream underneath the run.
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = (
-        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    )
-    torch.manual_seed(0x5EED)
-    if cuda_rng_state is not None:
-        torch.cuda.manual_seed_all(0x5EED)
-
-    try:
-        # The same autocast the training step runs under, so the metric
-        # measures the model as it is actually being trained, and
-        # ``inference_mode`` rather than ``no_grad`` because nothing here is
-        # ever differentiated.
-        with torch.inference_mode(), autocast(
-            device_type="cuda", enabled=use_amp, dtype=amp_dtype
-        ):
-            for index, batch in excerpts.batches():
-                # Not named ``spec``: ``test_run_spec`` audits every
-                # ``spec.<field>`` in this file against the run spec, and a
-                # local of that name collides with the check.
-                (
-                    phone,
-                    phone_lengths,
-                    pitch,
-                    pitchf,
-                    holdout_spec,
-                    holdout_spec_lengths,
-                    wave,
-                    wave_lengths,
-                    sid,
-                ) = batch
-                phone = phone.to(device, non_blocking=True)
-                phone_lengths = phone_lengths.to(device, non_blocking=True)
-                pitch = pitch.to(device, non_blocking=True)
-                pitchf = pitchf.to(device, non_blocking=True)
-                sid = sid.to(device, non_blocking=True)
-                wave = wave.to(device, non_blocking=True)
-
-                g = model.emb_g(sid).unsqueeze(-1)
-                if manual_prior:
-                    m_p, logs_p, x_mask = model.enc_p(
-                        phone=phone, pitch=pitch, lengths=phone_lengths
-                    )
-                    z_p = m_p
-                    if noise_scale:
-                        z_p = (
-                            m_p
-                            + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale
-                        )
-                    z_prior = model.flow(z_p * x_mask, x_mask, g=g, reverse=True)
-                    z_prior = z_prior * x_mask
-                    frames = min(z_prior.shape[-1], pitchf.shape[-1])
-                    prior_wave = model.dec(
-                        z_prior[..., :frames], pitchf[..., :frames], g=g
-                    )
-                else:
-                    prior_wave, *_ = model.infer(
-                        phone, phone_lengths, pitch, pitchf, sid, 0
-                    )
-                    frames = pitchf.shape[-1]
-
-                posterior_wave = None
-                if want_latent:
-                    holdout_spec = holdout_spec.to(device, non_blocking=True)
-                    holdout_spec_lengths = holdout_spec_lengths.to(
-                        device, non_blocking=True
-                    )
-                    z_q, _, _, spec_mask = model.enc_q(
-                        holdout_spec, holdout_spec_lengths, g=g
-                    )
-                    posterior_wave = model.dec(
-                        (z_q * spec_mask)[..., :frames], pitchf[..., :frames], g=g
-                    )
-
-                # The decoder rebuilds the waveform from frame-rate features,
-                # so its length lands within a hop of the excerpt rather than
-                # on it.
-                length = min(prior_wave.shape[-1], wave.shape[-1])
-                if posterior_wave is not None:
-                    length = min(length, posterior_wave.shape[-1])
-                if length <= config.data.filter_length:
-                    continue
-                target_mel = excerpts.target_mel(
-                    index,
-                    length,
-                    lambda: wave_to_mel(config, wave[..., :length], num_mels=None),
-                )
-                prior_mel = wave_to_mel(config, prior_wave[..., :length], num_mels=None)
-                totals["mel_l1"] += float(F.l1_loss(prior_mel, target_mel))
-                for label, deficit in _band_deficit_db(
-                    prior_wave[..., :length],
-                    wave[..., :length],
-                    config.data.sample_rate,
-                ).items():
-                    totals[f"band_deficit_{label}"] += deficit
-                if posterior_wave is not None:
-                    posterior_mel = wave_to_mel(
-                        config, posterior_wave[..., :length], num_mels=None
-                    )
-                    totals["latent_gap"] += float(F.l1_loss(prior_mel, posterior_mel))
-                    totals["latent_posterior"] += float(
-                        F.l1_loss(posterior_mel, target_mel)
-                    )
-                count += 1
-    finally:
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state_all(cuda_rng_state)
-        if was_training:
-            model.train()
-
-    if not count:
-        return {"mel_l1": float("nan")}
-    return {key: value / count for key, value in totals.items()}
-
-
-def _holdout_metrics_resilient(net_g, excerpts, config, device, **kwargs):
-    """:func:`_holdout_metrics`, but an oversized batch is halved, not fatal.
-
-    The evaluation decodes seconds of audio per item where a training step
-    decodes a fraction of one, so its batch can be the largest allocation in
-    the run despite storing no gradients -- and it would be a poor trade to
-    lose a training run to a diagnostic.
-    """
-    while True:
-        try:
-            return _holdout_metrics(net_g, excerpts, config, device, **kwargs)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            if not excerpts.shrink():
-                raise
-            warning(
-                f"{excerpts.label} evaluation ran out of memory; retrying at "
-                f"batch {excerpts.batch_size}.",
-                tag="[HOLDOUT]",
-            )
-
-
-class _OvertrainMonitor:
-    """Find the last point where held-out quality was still improving.
-
-    Overtraining isn't visible in the training loss, so this scores audio the
-    model has never trained on and watches for the minimum. Two things are
-    judged against a *noise band* rather than a fixed threshold (which means
-    something different in every run): the score is median-filtered over
-    ``smoothing`` evaluations before anything is decided on it, and
-    ``min_delta`` is a floor under a band computed as the residual spread of
-    recent scores about a trend line, so a still-improving run gets a narrow
-    band and a flat noisy one gets a wide one.
-
-    Weights to keep: lowest smoothed score; ties inside the band favour the
-    earlier step. Has the run stopped improving: the patience counter ignores
-    anything inside the band, so noise can't reset it forever.
-    """
-
-    def __init__(self, patience=8, min_delta=0.001, smoothing=3, noise_window=6):
-        self.patience = max(1, int(patience))
-        self.min_delta = max(0.0, float(min_delta))
-        self.smoothing = max(1, int(smoothing))
-        self.noise_window = max(4, int(noise_window))
-        #: Best *smoothed* score, and the step whose weights produced it.
-        self.best = float("inf")
-        self.best_step: int | None = None
-        self.state_dict: dict | None = None
-        #: Best single score ever seen.  Not a selection criterion; it is what
-        #: decides whether an evaluation is close enough to the running best to
-        #: be worth cloning weights for.
-        self.best_raw = float("inf")
-        # The last score good enough to count as progress.  Separate from
-        # ``best`` because it moves on a coarser ratchet.
-        self.patience_reference = float("inf")
-        self.since_progress = 0
-        self.history: list[tuple[int, float]] = []
-        self.smoothed = float("nan")
-        self.sigma = 0.0
-        # Once the run has been called, every further evaluation is paying for
-        # a number nothing acts on; see :meth:`backoff`.
-        self.interval_scale = 1
-        self._window = deque(maxlen=self.smoothing)
-
-    def _band(self, reference):
-        """How large a change has to be before it is evidence rather than noise."""
-        if not math.isfinite(reference):
-            return 0.0
-        return max(self.sigma, self.min_delta * abs(reference))
-
-    def _noise_sigma(self) -> float:
-        """Residual spread of recent scores about a trend line (not a mean: a
-        genuinely improving run has a large spread about its mean but a small
-        one about its slope). 0 until there are enough points to fit.
-        """
-        recent = [value for _, value in self.history[-self.noise_window :]]
-        count = len(recent)
-        if count < 4:
-            return 0.0
-        mean_x = (count - 1) / 2.0
-        mean_y = sum(recent) / count
-        variance_x = sum((index - mean_x) ** 2 for index in range(count))
-        covariance = sum(
-            (index - mean_x) * (value - mean_y) for index, value in enumerate(recent)
-        )
-        slope = covariance / variance_x if variance_x else 0.0
-        intercept = mean_y - slope * mean_x
-        residuals = [
-            value - (slope * index + intercept) for index, value in enumerate(recent)
-        ]
-        return math.sqrt(sum(r * r for r in residuals) / max(1, count - 2))
-
-    def update(self, source, value: float, step: int) -> bool:
-        """``source``: a model or a ``WeightEMA``. Returns whether this moved
-        the best. With a centred filter, the weights kept are the middle of
-        the window, not the newest evaluation -- otherwise a snapshot of the
-        live model would be credited with a score it never earned.
-        """
-        if not math.isfinite(value):
-            return False
-        self.history.append((int(step), float(value)))
-        self.sigma = self._noise_sigma()
-
-        # Only clone weights for evaluations close enough to the running best
-        # to still win one; a window entry without weights can never be
-        # selected.
-        competitive = (
-            not math.isfinite(self.best_raw)
-            or value <= self.best_raw + 2.0 * self._band(self.best_raw)
-        )
-        self._window.append(
-            (int(step), float(value), _cpu_state_dict(source) if competitive else None)
-        )
-        self.best_raw = min(self.best_raw, float(value))
-
-        if len(self._window) < self.smoothing:
-            # Until the window fills, behave unsmoothed rather than report a
-            # half-formed median.
-            self.smoothed = float(value)
-            center_step, _center_value, center_state = self._window[-1]
-        else:
-            scores = sorted(entry[1] for entry in self._window)
-            self.smoothed = scores[len(scores) // 2]
-            center_step, _center_value, center_state = self._window[
-                len(self._window) // 2
-            ]
-
-        improved = False
-        if center_state is not None and self.smoothed < self.best - self._band(
-            self.best
-        ):
-            improved = True
-            self.best = float(self.smoothed)
-            self.best_step = int(center_step)
-            self.state_dict = center_state
-
-        if self.smoothed < self.patience_reference - self._band(
-            self.patience_reference
-        ):
-            self.patience_reference = float(self.smoothed)
-            self.since_progress = 0
-        else:
-            self.since_progress += 1
-        return improved
-
-    def backoff(self, factor: int = 4) -> int:
-        """Evaluate less often once overtraining has already been flagged
-        (with ``stop_on_overtrain`` off, the run keeps going and a run can
-        still come back, so evaluation continues, just less often).
-        """
-        self.interval_scale = max(1, int(self.interval_scale * max(1, int(factor))))
-        return self.interval_scale
-
-    @property
-    def overtrained(self) -> bool:
-        return self.state_dict is not None and self.since_progress >= self.patience
-
-
-def _deliverable_weights(overtrain_monitor, ema, model_g, use_holdout=True):
-    """The weights this run would hand you if it stopped right now: holdout
-    best, then EMA, then live weights, in order of how much each source
-    knows. Returns ``(state_dict, label, source_step)``.
-
-    ``use_holdout=False`` skips the holdout snapshot and returns the current
-    weights (EMA or live). The periodic exports use that, so they keep
-    tracking the run; the holdout best goes only into the separate
-    ``_pre-overtrain`` export.
-
-    ``source_step`` is the step the weights are actually *from*, which is not
-    the step the export is named after. The holdout branch only replaces its
-    snapshot when the metric improves, so once it plateaus every later export
-    returns the same tensors while the filename and the ``epoch``/``step``
-    fields keep counting up -- six consecutive exports came back bit-identical
-    that way. ``None`` means "as of now"; the caller writes it into the file so
-    the staleness is readable after the run's console has scrolled away.
-    """
-    if (
-        use_holdout
-        and overtrain_monitor is not None
-        and overtrain_monitor.state_dict is not None
-    ):
-        return (
-            overtrain_monitor.state_dict,
-            f"holdout best @ {overtrain_monitor.best_step}",
-            overtrain_monitor.best_step,
-        )
-    if ema is not None:
-        # The shadow is a running average ending at the current step, so it is
-        # current even though it is not any single step's weights.
-        return ema.cpu_state_dict(), f"EMA ({ema.updates} updates)", None
-    # A copy, not ``model_g.state_dict()`` itself: that hands back live
-    # parameter tensors, so anything mutating the weights before the export is
-    # written -- a schedule-free optimizer returning to its training iterate,
-    # for one -- would change what has already been chosen.  The other two
-    # branches already return CPU copies.
-    return _cpu_state_dict(model_g), "live weights", None
 
 
 def _checkpoint_extra(grad_scaler):
@@ -1418,336 +400,6 @@ def _checkpoint_extra(grad_scaler):
         extra["grad_scaler"] = grad_scaler.state_dict()
         extra["amp_skipped_steps"] = int(amp_skipped_steps)
     return extra or None
-
-
-def _generator_gradient_metrics(net_g):
-    """Return gradient and gradient-to-parameter norms for generator subsystems."""
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    groups = {
-        "content_encoder": [],
-        "posterior": [],
-        "prior": [],
-        "decoder": [],
-        "speaker": [],
-        "other": [],
-    }
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if name.startswith("enc_p."):
-            group = "content_encoder"
-        elif name.startswith("enc_q."):
-            group = "posterior"
-        elif name.startswith("flow."):
-            group = "prior"
-        elif name.startswith("dec."):
-            group = "decoder"
-        elif name.startswith("emb_g."):
-            group = "speaker"
-        else:
-            group = "other"
-        groups[group].append(parameter)
-
-    metrics = {}
-    for group, parameters in groups.items():
-        if not parameters:
-            continue
-        parameter_norm = torch.sqrt(
-            sum(parameter.detach().float().square().sum() for parameter in parameters)
-        )
-        gradient_terms = [
-            parameter.grad.detach().float().square().sum()
-            for parameter in parameters
-            if parameter.grad is not None
-        ]
-        gradient_norm = (
-            torch.sqrt(sum(gradient_terms))
-            if gradient_terms
-            else parameter_norm.new_zeros(())
-        )
-        metrics[f"grad_norm_{group}"] = gradient_norm
-        metrics[f"grad_to_param_{group}"] = gradient_norm / parameter_norm.clamp_min(1e-8)
-    return metrics
-
-
-def build_decoder_param_groups(net_g, base_lr):
-    """
-    Build optimizer param groups with differential LR.
-
-    `dec_lr_scale` covers the decoder/vocoder, `vae_lr_scale` everything else
-    ( the frontend and the speaker embedding ).  Returns None when neither is
-    configured, so the optimizer falls back to a single group.
-    """
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    dec = getattr(model, "dec", None)
-    if dec is None:
-        return None
-
-    if dec_lr_scale is None and vae_lr_scale is None:
-        return None
-
-    # scale -> [params]  ( same scale == same effective LR )
-    groups = {}
-
-    def add(param, scale):
-        groups.setdefault(scale, []).append(param)
-
-    decoder_scale = dec_lr_scale if dec_lr_scale is not None else 1.0
-    rest_scale = vae_lr_scale if vae_lr_scale is not None else 1.0
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            add(param, decoder_scale if name.startswith("dec.") else rest_scale)
-
-    return [
-        {"params": params, "lr": base_lr * scale, "lr_scale": scale}
-        for scale, params in groups.items()
-    ]
-
-
-def get_optimizers(
-    net_g,
-    net_d,
-    config,
-    optimizer_choice_g,
-    optimizer_choice_d,
-    custom_lr_g,
-    custom_lr_d,
-    use_custom_lr,
-    total_epoch_count,
-    train_loader
-):
-    lr_g = custom_lr_g if use_custom_lr else config.train.learning_rate_g
-    lr_d = custom_lr_d if use_custom_lr else config.train.learning_rate_d
-    num_batches = len(train_loader)
-
-    g_param_groups = build_decoder_param_groups(net_g, lr_g)
-
-    optim_g = _make_optimizer(net_g, optimizer_choice_g, lr_g, num_epochs=total_epoch_count, num_batches=num_batches, param_groups=g_param_groups)
-    optim_d = _make_optimizer(
-        net_d,
-        optimizer_choice_d,
-        lr_d,
-        num_epochs=total_epoch_count,
-        num_batches=num_batches,
-        lazy_reg_interval=None,
-    )
-
-    return optim_g, optim_d
-
-
-def apply_frontend_freeze(net_g, rank):
-    """
-    Freeze the frontend for fine-tuning, driven by the `freeze_vae` flag.
-
-    Everything outside `dec.` and `emb_g.` is frozen, which means `enc_p`, the
-    posterior encoder and the flow.
-    """
-    if not freeze_vae:
-        if rank == 0:
-            info("Frontend: nothing frozen.", tag="[INIT]")
-        return
-
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    frozen_params = 0
-    for name, param in model.named_parameters():
-        if not name.startswith("dec.") and not name.startswith("emb_g.") and param.requires_grad:
-            param.requires_grad = False
-            frozen_params += param.numel()
-
-    if rank == 0:
-        info(f"Frontend frozen: everything but dec/emb_g ({frozen_params:,} params).", tag="[INIT]")
-
-
-def apply_training_freezes(net_g, rank):
-    apply_frontend_freeze(net_g, rank)
-
-
-def apply_resume_lr_override(optim_g, optim_d=None):
-    """Re-anchor G and/or D param groups to `resume_lr` after loading optimizer
-    state. Must run after load_checkpoint (needs the saved lr/initial_lr) and
-    before prepare_schedulers (which snapshots the new initial_lr). Each
-    group's saved decay ratio is preserved so the schedule keeps its position
-    while the value restarts at resume_lr x its per-group lr_scale.
-    """
-    if resume_lr is None:
-        return
-
-    targets = {"full": ("g", "d"), "g": ("g",), "d": ("d",)}.get(resume_lr_target, ("g", "d"))
-    optims = [(optim_g, "G")] if "g" in targets else []
-    if "d" in targets and optim_d is not None:
-        optims.append((optim_d, "D"))
-
-    for optim, label in optims:
-        for param_group in optim.param_groups:
-            saved_lr = param_group.get("lr", 0.0)
-            saved_initial = param_group.get("initial_lr", 0.0)
-            decay = (saved_lr / saved_initial) if saved_initial else 1.0
-            scale = param_group.get("lr_scale", 1.0)
-            new_lr = resume_lr * scale * param_group.get("lazy_reg_scale", 1.0)
-            param_group["lr"] = new_lr
-            param_group["initial_lr"] = new_lr / decay if decay else new_lr
-
-    parts = []
-    for optim, label in optims:
-        lrs = ", ".join("{:.2e}".format(g["lr"]) for g in optim.param_groups)
-        parts.append(f"{label}: {lrs}")
-    info(f"Resume LR override: base {resume_lr:.2e} -> " + " | ".join(parts), tag="[OVERRIDE]")
-
-
-def setup_models_for_training(net_g, net_d, device, device_id, n_gpus):
-    net_g = net_g.to(device_id) if device.type == "cuda" else net_g.to(device)
-    net_d = net_d.to(device_id) if device.type == "cuda" else net_d.to(device)
-
-    if n_gpus > 1 and device.type == "cuda":
-        net_g = DDP(net_g, device_ids=[device_id]) # find_unused_parameters=True)
-        net_d = DDP(
-            net_d,
-            device_ids=[device_id],
-            find_unused_parameters=bool(
-                getattr(net_d, "uses_branchwise_r1", False)
-            ),
-        )
-
-    return net_g, net_d
-
-
-def enable_vocoder_compile(net_g, device, rank):
-    if not compile_vocoder:
-        return False
-    if device.type != "cuda":
-        if rank == 0:
-            info(VOCODER_COMPILE_NO_CUDA, tag="[INIT]")
-        return False
-
-    cache_dir = os.path.join(current_dir, "logs", ".torchinductor")
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
-
-    mode = torch_compile_mode
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    enabled = model.enable_decoder_compile(mode=mode)
-    if not enabled and rank == 0:
-        info(VOCODER_COMPILE_NOT_SUPPORTED, tag="[INIT]")
-    if enabled and rank == 0:
-        info(VOCODER_COMPILE_ENABLED.format(mode=mode), tag="[INIT]")
-    return enabled
-
-
-def _normalize_san_weights(net_d):
-    """Put every SAN direction back on the unit sphere after ``optim_d.step``.
-
-    The projection is only unit-norm because it is *kept* there; an Adam step
-    moves it off, and a direction that is not a direction is the one thing the
-    method cannot tolerate.  A no-op when no branch carries a SAN head.
-    """
-
-    model = net_d.module if hasattr(net_d, "module") else net_d
-    for module in model.modules():
-        normalize = getattr(module, "normalize_weight", None)
-        if normalize is not None:
-            normalize()
-
-
-def enable_frontend_compile(net_g, config, device, rank):
-    """Compile the prior/posterior/flow, driven by ``compile_frontend``.
-
-    In the config rather than the run spec, for the same reason as
-    ``compile_discriminator``: what is compiled travels with the architecture,
-    not with the button the run was started from.  ``torch_compile_mode`` is not
-    consulted here either -- ``reduce-overhead`` records CUDA graphs, and these
-    modules see a different length almost every batch.
-    """
-
-    if not bool(getattr(config.train, "compile_frontend", False)):
-        return False
-    if device.type != "cuda":
-        if rank == 0:
-            info(FRONTEND_COMPILE_NO_CUDA, tag="[INIT]")
-        return False
-
-    cache_dir = os.path.join(current_dir, "logs", ".torchinductor")
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
-
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    enable = getattr(model, "enable_frontend_compile", None)
-    if enable is None:
-        if rank == 0:
-            info(FRONTEND_COMPILE_NOT_SUPPORTED, tag="[INIT]")
-        return False
-    enabled = enable(mode="default")
-    if not enabled and rank == 0:
-        info(FRONTEND_COMPILE_NOT_SUPPORTED, tag="[INIT]")
-    if enabled and rank == 0:
-        info(FRONTEND_COMPILE_ENABLED.format(mode="default"), tag="[INIT]")
-    return enabled
-
-
-def enable_discriminator_compile(net_d, config, device, rank):
-    """Compile the discriminator, driven by ``compile_discriminator`` in the
-    config (not a run-spec flag, since it travels with the architecture).
-    ``torch_compile_mode`` is not consulted: ``reduce-overhead`` records CUDA
-    graphs, which this loop can't support, so the mode is fixed to plain
-    fusion.
-    """
-    if not bool(getattr(config.train, "compile_discriminator", False)):
-        return False
-    if device.type != "cuda":
-        if rank == 0:
-            info(DISCRIMINATOR_COMPILE_NO_CUDA, tag="[INIT]")
-        return False
-
-    cache_dir = os.path.join(current_dir, "logs", ".torchinductor")
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
-
-    model = net_d.module if hasattr(net_d, "module") else net_d
-    enable = getattr(model, "enable_compile", None)
-    if enable is None:
-        if rank == 0:
-            info(DISCRIMINATOR_COMPILE_NOT_SUPPORTED, tag="[INIT]")
-        return False
-    enabled = enable(mode="default")
-    if enabled and rank == 0:
-        info(DISCRIMINATOR_COMPILE_ENABLED.format(mode="default"), tag="[INIT]")
-    return enabled
-
-
-def _assert_resumable_architecture(net_g, checkpoint_path):
-    """Refuse to resume from a checkpoint built for a different architecture.
-
-    Unlike the pretrained-path guard, a missing id here counts as a mismatch:
-    a resumed run predating the id is one of this fork's own old runs, whose
-    layout has since changed.
-    """
-    model = net_g.module if hasattr(net_g, "module") else net_g
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    # The excitation is checked whatever the id says, because the id is pinned
-    # to ``vits_gaussian_v1`` for every RefineGAN source on purpose -- see
-    # ``get_architecture_id`` -- and this stack resumes non-strictly.
-    assert_excitation_matches(model, checkpoint, origin="checkpoint")
-    # Same reasoning, and the same door: the stage ordering and the
-    # anti-aliased activations leave no trace in any weight either.
-    assert_decoder_layout_matches(model, checkpoint, origin="checkpoint")
-    expected = getattr(model, "architecture_id", None)
-    if not expected or expected == "vits_gaussian_v1":
-        return
-    found = checkpoint.get("architecture_id")
-    if found == expected:
-        return
-    raise ValueError(
-        f"Cannot resume from '{os.path.basename(checkpoint_path)}': it was "
-        f"written for architecture '{found or 'unknown'}', but this run builds "
-        f"'{expected}'. Move the old checkpoints out of the experiment folder "
-        f"to start this architecture fresh."
-    )
-
-
-def checkpoint_step_from_path(path):
-    if not path or path in ("", "None"):
-        return 0
-    match = re.search(r"(?:^|[\\/])G_(\d+)\.pth$", str(path))
-    return int(match.group(1)) if match else 0
 
 
 def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, device, device_id, n_gpus, rank, reset_pretrained_embeddings=False):
@@ -1789,10 +441,10 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
 
             # Apply decoder / frontend layer freezes for the selected phase.
-            apply_training_freezes(net_g, rank)
+            apply_training_freezes(net_g, rank, freeze_vae=freeze_vae)
 
             # Init the optimizers
-            optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
+            optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
 
             # Resuming loads the generator non-strictly for the VITS-latent
             # vocoders, so nothing downstream would complain if the checkpoint
@@ -1802,7 +454,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             # trained discriminator against a random generator.  The vocoders
             # share a config shape and a folder layout, which makes that one
             # edited ``vocoder`` field away.
-            _assert_resumable_architecture(net_g, g_checkpoint_path)
+            assert_resumable_architecture(net_g, g_checkpoint_path)
 
             # Load the model and optim states
             generator_strict_load = strict_load
@@ -1821,7 +473,9 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             resumed_extra_d = extra_d or {}
 
             # resume_lr re-anchors G and/or D to the given base LR.
-            apply_resume_lr_override(optim_g, optim_d)
+            apply_resume_lr_override(
+                optim_g, optim_d, resume_lr=resume_lr, resume_lr_target=resume_lr_target
+            )
 
             # As in Applio: checkpoints are written at the end of an epoch, so
             # the run continues with the next one.  The step comes from the
@@ -1929,10 +583,10 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
 
         # Apply decoder / vocoder layer freezes ( for fine-tuning )
-        apply_training_freezes(net_g, rank)
+        apply_training_freezes(net_g, rank, freeze_vae=freeze_vae)
 
         # Init the optimizers
-        optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
+        optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
 
     # Built after both branches so the shadow starts from the weights the run
     # is actually beginning with (resumed, pretrained, or fresh).
@@ -1972,128 +626,6 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             )
 
     return net_g, net_d, optim_g, optim_d, epoch_str, global_step, ema, resumed_extra_d
-
-
-def prepare_schedulers(
-    optim_g, optim_d,
-    use_lr_scheduler, lr_scheduler, exp_decay_gamma,
-    total_epoch_count, epoch_str, global_step, train_loader,
-    fresh_start=False,
-):
-    def _horizon_decay(final_ratio, total_units):
-        """Exponential decay reaching ``final_ratio`` at the end of the run,
-        so the same config gives the same endpoint at any run length. Progress
-        is clamped at 1.0 so a run extended past its horizon holds the final
-        LR instead of decaying straight through it.
-        """
-        ratio = min(1.0, max(1e-6, float(final_ratio)))
-        total = max(1, int(total_units))
-
-        def scale(unit):
-            return ratio ** min(1.0, max(0, unit) / total)
-
-        return scale
-
-    def _horizon_cosine(final_ratio, total_units):
-        """Cosine anneal from the starting LR to ``final_ratio`` of it.
-
-        Unlike stock ``CosineAnnealingLR``'s shared absolute ``eta_min``,
-        the endpoint here is a fraction of each group's own base LR -- G and D
-        start at different rates, and a shared floor would drive their ratio
-        to 1.0 by the end of the run, which is what keeps the discriminator
-        alive. Clamped past the horizon like ``_horizon_decay``.
-        """
-        ratio = min(1.0, max(1e-6, float(final_ratio)))
-        total = max(1, int(total_units))
-
-        def scale(unit):
-            progress = min(1.0, max(0, unit) / total)
-            return ratio + (1.0 - ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        return scale
-
-    scheduler_g, scheduler_d = None, None
-
-    num_batches_per_epoch = len(train_loader)
-
-    scheduler_resume_epoch = -1 if fresh_start else epoch_str - 1
-    scheduler_resume_step = -1 if fresh_start else global_step - 1
-
-    for param_group in optim_g.param_groups:
-        if 'initial_lr' not in param_group:
-            param_group['initial_lr'] = param_group['lr']
-    for param_group in optim_d.param_groups:
-        if 'initial_lr' not in param_group:
-            param_group['initial_lr'] = param_group['lr']
-
-    if use_lr_scheduler and (
-        is_schedule_free(optimizer_choice_g) or is_schedule_free(optimizer_choice_d)
-    ):
-        # Not an error -- the optimizer survives it, because its averaging
-        # weights key off ``lr_max`` rather than the current lr -- but a decay
-        # schedule is the thing schedule-free exists to remove, so a run using
-        # both is almost certainly a leftover setting.
-        warning(
-            f"'{lr_scheduler}' is set together with a schedule-free optimizer, "
-            "which is designed to run without one. The schedule will still be "
-            "applied; set the scheduler to 'none' if that was not intended.",
-            tag="[INIT]",
-        )
-
-    if use_lr_scheduler:
-        scheduler_name = (
-            "cosine annealing epoch"
-            if lr_scheduler == "cosine annealing"
-            else lr_scheduler
-        )
-
-        horizon_shapes = {
-            "exp decay epoch": _horizon_decay,
-            "exp decay step": _horizon_decay,
-            "cosine annealing epoch": _horizon_cosine,
-        }
-        if lr_final_ratio is not None and scheduler_name in horizon_shapes:
-            # Only one variant is stepped per optimizer step; the others are
-            # stepped per epoch, so the ratio has to land at the end of the run
-            # in whichever unit this scheduler counts.
-            per_epoch = scheduler_name != "exp decay step"
-            total_units = total_epoch_count * (1 if per_epoch else num_batches_per_epoch)
-            shape = horizon_shapes[scheduler_name](lr_final_ratio, total_units)
-            resume_at = scheduler_resume_epoch if per_epoch else scheduler_resume_step
-            scheduler_g = torch.optim.lr_scheduler.LambdaLR(
-                optim_g, shape, last_epoch=resume_at
-            )
-            scheduler_d = torch.optim.lr_scheduler.LambdaLR(
-                optim_d, shape, last_epoch=resume_at
-            )
-        elif scheduler_name == "exp decay epoch":
-            scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-                optim_g, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
-            )
-            scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-                optim_d, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
-            )
-        elif scheduler_name == "exp decay step":
-            scheduler_gamma = (
-                exp_decay_gamma
-                if exp_decay_step_raw
-                else exp_decay_gamma ** (1.0 / num_batches_per_epoch)
-            )
-            scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-                optim_g, gamma=scheduler_gamma, last_epoch=scheduler_resume_step
-            )
-            scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-                optim_d, gamma=scheduler_gamma, last_epoch=scheduler_resume_step
-            )
-        elif scheduler_name == "cosine annealing epoch":
-            scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optim_g, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch
-            )
-            scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optim_d, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch
-            )
-
-    return scheduler_g, scheduler_d
 
 
 def get_reference_sample(train_loader, device, config):
@@ -2211,9 +743,6 @@ def get_reference_sample(train_loader, device, config):
         reference_audio,
         reference_source,
     )
-
-
-
 
 
 def main():
@@ -2529,7 +1058,9 @@ def run(
     # ``forward``, so Dynamo guards on it and a policy set afterwards would
     # only take effect on a recompile.
 
-    enable_vocoder_compile(net_g, device, rank)
+    enable_vocoder_compile(
+        net_g, device, rank, enabled=compile_vocoder, mode=torch_compile_mode
+    )
     enable_frontend_compile(net_g, config, device, rank)
     enable_discriminator_compile(net_d, config, device, rank)
 
@@ -2628,6 +1159,10 @@ def run(
         global_step - phase_start_step,
         train_loader,
         fresh_start=reset_optimizer_for_run,
+        optimizer_choice_g=optimizer_choice_g,
+        optimizer_choice_d=optimizer_choice_d,
+        lr_final_ratio=lr_final_ratio,
+        exp_decay_step_raw=exp_decay_step_raw,
     )
 
     # Reference sample for live-infer
@@ -2682,7 +1217,7 @@ def run(
     # run, not an epoch.
     overtrain_monitor = None
     if holdout_set is not None and len(holdout_set):
-        overtrain_monitor = _OvertrainMonitor(
+        overtrain_monitor = OvertrainMonitor(
             patience=int(getattr(config.train, "overtrain_patience", 8)),
             min_delta=float(getattr(config.train, "overtrain_min_delta", 0.001)),
             smoothing=int(getattr(config.train, "overtrain_smoothing", 3)),
@@ -2990,7 +1525,6 @@ def training_loop(
                 y = commons.slice_segments(y, ids_slice * config.data.hop_length, config.train.segment_size, dim=3)
 
 
-
             # Discriminator update
             _loss_disc_acc, _loss_disc_real_acc, _loss_disc_fake_acc, _grad_norm_d_acc = [], [], [], []
 
@@ -3015,7 +1549,7 @@ def training_loop(
                 )
                 y_d_hat_neg = None
                 if fn_hf_floor_negative is not None:
-                    y_d_hat_g, y_d_hat_neg = _split_branch_outputs(
+                    y_d_hat_g, y_d_hat_neg = split_branch_outputs(
                         y_d_hat_g, (y_hat.shape[0], y.shape[0])
                     )
 
@@ -3050,7 +1584,7 @@ def training_loop(
                 grad_scaler.unscale_(optim_d)
             else:
                 loss_disc.backward()
-            grad_norm_d = _clip_or_sample_grad_norm(
+            grad_norm_d = clip_or_sample_grad_norm(
                 net_d.parameters(),
                 grad_clip_value_d,
                 global_step,
@@ -3061,7 +1595,7 @@ def training_loop(
             else:
                 optim_d.step()
             if san_active:
-                _normalize_san_weights(net_d)
+                normalize_san_weights(net_d)
 
             # Per-head separation, which the aggregate loss cannot show: nine
             # heads are summed into ``loss_disc``, and a head that has stopped
@@ -3073,12 +1607,12 @@ def training_loop(
             # What answers the question is the raw logits: how much higher this
             # head scores real audio than the generator's output.
             if rank == 0:
-                branch_disc_cache.append(_branch_separation(y_d_hat_r, y_d_hat_g))
+                branch_disc_cache.append(branch_separation(y_d_hat_r, y_d_hat_g))
                 if y_d_hat_neg is not None:
                     # The series this switch exists to move: without it the
                     # heads that can see the floor sat at -0.13 and -0.82.
                     branch_neg_cache.append(
-                        _branch_separation(y_d_hat_r, y_d_hat_neg)
+                        branch_separation(y_d_hat_r, y_d_hat_neg)
                     )
 
             # Temp accumulation
@@ -3152,7 +1686,7 @@ def training_loop(
                 # than silently trimmed.
                 and m_p.shape[-1] == z.shape[-1]
             ):
-                prior_gap_delta, prior_gap_error = _prior_gap(
+                prior_gap_delta, prior_gap_error = prior_gap(
                     model_g,
                     m_p,
                     x_mask,
@@ -3283,8 +1817,8 @@ def training_loop(
             else:
                 loss_gen_total.backward()
             if global_step % metrics_update_interval == 0:
-                module_grad_metrics = _generator_gradient_metrics(net_g)
-            grad_norm_g = _clip_or_sample_grad_norm(
+                module_grad_metrics = generator_gradient_metrics(net_g)
+            grad_norm_g = clip_or_sample_grad_norm(
                 net_g.parameters(),
                 grad_clip_value_g,
                 global_step,
@@ -3369,22 +1903,26 @@ def training_loop(
                     # better than any step it was made from -- so the thing
                     # being measured is also the thing worth keeping.
                     with ema.applied(net_g) as averaged:
-                        metrics = _holdout_metrics_resilient(
+                        metrics = holdout_metrics_resilient(
                             averaged,
                             holdout_set,
                             config,
                             device,
                             want_latent=want_latent,
                             noise_scale=noise_scale,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
                         )
                         if probe_set is not None:
-                            probe_score = _holdout_metrics_resilient(
+                            probe_score = holdout_metrics_resilient(
                                 averaged,
                                 probe_set,
                                 config,
                                 device,
                                 want_latent=False,
                                 noise_scale=noise_scale,
+                                use_amp=use_amp,
+                                amp_dtype=amp_dtype,
                             )["mel_l1"]
                     improved = overtrain_monitor.update(
                         ema, metrics["mel_l1"], global_step
@@ -3398,22 +1936,26 @@ def training_loop(
                     # bug the "keep the weights that were actually scored"
                     # contract in ``update`` exists to prevent.
                     with averaged_weights((optimizer_choice_g, optim_g)):
-                        metrics = _holdout_metrics_resilient(
+                        metrics = holdout_metrics_resilient(
                             net_g,
                             holdout_set,
                             config,
                             device,
                             want_latent=want_latent,
                             noise_scale=noise_scale,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
                         )
                         if probe_set is not None:
-                            probe_score = _holdout_metrics_resilient(
+                            probe_score = holdout_metrics_resilient(
                                 net_g,
                                 probe_set,
                                 config,
                                 device,
                                 want_latent=False,
                                 noise_scale=noise_scale,
+                                use_amp=use_amp,
+                                amp_dtype=amp_dtype,
                             )["mel_l1"]
                         improved = overtrain_monitor.update(
                             net_g.module if hasattr(net_g, "module") else net_g,
@@ -3519,7 +2061,6 @@ def training_loop(
                 # schedulers always advance.
                 scheduler_g.step()
                 scheduler_d.step()
-
 
 
             if not from_scratch:
@@ -3681,9 +2222,9 @@ def training_loop(
                     # ``rolling_loss_steps``, on a line that is already
                     # synchronising to write TensorBoard.
                     diag_scalars = {
-                        "diag/kl_std": _cache_mean(kl_std_cache),
-                        "diag/kl_mean_per_dim": _cache_mean(kl_mean_cache),
-                        "diag/kl_active_fraction": _cache_mean(kl_active_cache),
+                        "diag/kl_std": cache_mean(kl_std_cache),
+                        "diag/kl_mean_per_dim": cache_mean(kl_mean_cache),
+                        "diag/kl_active_fraction": cache_mean(kl_active_cache),
                     }
                     summarize(
                         writer=writer,
@@ -3779,7 +2320,7 @@ def training_loop(
                 advance=1,
                 metrics=progress_metrics,
             )
-            _emit_machine_progress(
+            emit_machine_progress(
                 epoch, total_epoch_count, batch_idx + 1, len(train_loader),
                 global_step, progress_metrics, rank,
             )
@@ -3839,7 +2380,7 @@ def training_loop(
             # Preview whatever this run would actually hand over, so the audio
             # you judge it by is the audio the exported model produces.
             model_g = net_g.module if hasattr(net_g, "module") else net_g
-            preview_sd, preview_label, _preview_step = _deliverable_weights(
+            preview_sd, preview_label, _preview_step = deliverable_weights(
                 overtrain_monitor, ema, model_g, use_holdout=False
             )
             if preview_label != "live weights":
@@ -4009,13 +2550,13 @@ def training_loop(
             for m, use_holdout in model_add:
                 if os.path.exists(m):
                     continue
-                # ``_deliverable_weights`` can fall through to the live weights,
+                # ``deliverable_weights`` can fall through to the live weights,
                 # and under a schedule-free optimizer those are the extrapolated
                 # iterate.  This is the exported .pth -- the file that gets used
                 # for inference -- so it is the last place that read may go
                 # unaveraged.
                 with averaged_weights((optimizer_choice_g, optim_g)):
-                    ckpt, ckpt_label, ckpt_step = _deliverable_weights(
+                    ckpt, ckpt_label, ckpt_step = deliverable_weights(
                         overtrain_monitor, ema, model_g, use_holdout=use_holdout
                     )
                 success(

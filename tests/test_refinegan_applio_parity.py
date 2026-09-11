@@ -804,7 +804,7 @@ def test_fast_mpd_is_off_unless_asked_for():
     assert not any(isinstance(b, FastDiscriminatorP) for b in default.discriminators)
 
     # And the trainer's own default agrees with the constructor's.
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
+    source = (ROOT / "rvc" / "train" / "setup.py").read_text(encoding="utf-8")
     assert 'setting("d_use_fast_mpd", False)' in source
 
 
@@ -876,7 +876,7 @@ def test_the_swap_cannot_load_the_wrong_checkpoint():
 def test_the_trainer_reads_the_flag():
     import ast
 
-    tree = ast.parse((ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "rvc" / "train" / "setup.py").read_text(encoding="utf-8"))
     names = {
         node.args[0].value
         for node in ast.walk(tree)

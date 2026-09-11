@@ -25,7 +25,7 @@ Three things a caller has to get right, all of them load-bearing:
   ``net_d`` loads strictly.
 * **``normalize_weight()`` after every optimizer step.** The direction is only
   on the sphere because it is put back there; an Adam step moves it off.
-  ``rvc.train.train._normalize_san_weights`` walks the discriminator for this.
+  ``rvc.train.setup.normalize_san_weights`` walks the discriminator for this.
 * **``san_training=True`` only in the discriminator update.** The generator
   update wants the plain scalar: the direction output is not something it is
   allowed to move, and asking for it there would build a graph nothing reads.

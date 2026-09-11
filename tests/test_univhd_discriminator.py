@@ -280,7 +280,7 @@ def test_the_trainer_s_call_site_matches_the_constructor():
     import inspect
 
     signature = set(inspect.signature(MPD_MSD_Combined.__init__).parameters)
-    tree = ast.parse((ROOT / "rvc" / "train" / "train.py").read_text())
+    tree = ast.parse((ROOT / "rvc" / "train" / "setup.py").read_text())
     calls = [
         node
         for node in ast.walk(tree)

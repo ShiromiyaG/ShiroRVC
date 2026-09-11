@@ -1,21 +1,10 @@
-"""``_split_branch_outputs`` from ``rvc/train/train.py``, imported by source.
+"""``split_branch_outputs``, from ``rvc/train/diagnostics.py``."""
 
-``train.py`` reads ``sys.argv[1]`` at import time, so the tests cannot import
-it directly; this lifts the one function out of the module by AST.
-"""
-
-import ast
+import sys
 from pathlib import Path
 
-import torch
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-_SOURCE = Path(__file__).resolve().parents[1] / "rvc" / "train" / "train.py"
-_TREE = ast.parse(_SOURCE.read_text(encoding="utf-8"))
-_FN = next(
-    node
-    for node in _TREE.body
-    if isinstance(node, ast.FunctionDef) and node.name == "_split_branch_outputs"
-)
-exec(compile(ast.Module(body=[_FN], type_ignores=[]), str(_SOURCE), "exec"))
+from rvc.train.diagnostics import split_branch_outputs  # noqa: E402
 
-split_branch_outputs = _split_branch_outputs
+__all__ = ["split_branch_outputs"]

@@ -88,7 +88,7 @@ def test_the_weight_starts_on_the_unit_sphere_with_the_norm_kept_as_scale(layer)
 
 
 def test_an_optimizer_step_moves_the_direction_off_the_sphere_and_normalize_puts_it_back():
-    """The reason ``_normalize_san_weights`` has to run every step.  Without
+    """The reason ``normalize_san_weights`` has to run every step.  Without
     it nothing raises and nothing looks wrong; the projection simply stops
     being a projection."""
 

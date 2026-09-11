@@ -219,7 +219,7 @@ def test_the_trainer_guards_both_doors():
 
     trees = [
         ast.parse((ROOT / "rvc" / "train" / name).read_text(encoding="utf-8"))
-        for name in ("train.py", "utils.py")
+        for name in ("train.py", "setup.py", "utils.py")
     ]
     called = [
         node

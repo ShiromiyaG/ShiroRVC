@@ -10,16 +10,14 @@ The monitor now median-filters the score and measures every decision against
 a noise band estimated from recent history, so a tie inside that band goes to
 the earlier step.
 
-``train.py`` reads a run spec from ``sys.argv[1]`` at import, so the class is
-lifted out with ``ast``, the same way ``test_run_spec.py`` reads that file.
+The monitor lives in ``rvc/train/overtrain.py``, which imports cleanly; only
+its weight-cloning helper is stubbed, so the tests can assert on *which*
+object was cloned rather than on tensors.
 """
 
 from __future__ import annotations
 
-import ast
-import math
 import sys
-from collections import deque
 from pathlib import Path
 
 import pytest
@@ -30,29 +28,13 @@ sys.path.insert(0, str(ROOT))
 
 @pytest.fixture(scope="module")
 def monitor_class():
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    node = next(
-        (
-            n
-            for n in tree.body
-            if isinstance(n, ast.ClassDef) and n.name == "_OvertrainMonitor"
-        ),
-        None,
-    )
-    assert node is not None, "train.py no longer defines _OvertrainMonitor"
-    namespace: dict = {
-        "math": math,
-        "deque": deque,
-        # The monitor's only dependency: it clones whatever it is handed.  What
-        # matters for these tests is *which* object it cloned, not the tensors.
-        "_cpu_state_dict": lambda source: {"scored": source},
-    }
-    exec(
-        compile(ast.Module(body=[node], type_ignores=[]), "train.py", "exec"),
-        namespace,
-    )
-    return namespace["_OvertrainMonitor"]
+    overtrain = pytest.importorskip("rvc.train.overtrain")
+    patch = pytest.MonkeyPatch()
+    # The monitor's only dependency: it clones whatever it is handed.  What
+    # matters for these tests is *which* object it cloned, not the tensors.
+    patch.setattr(overtrain, "cpu_state_dict", lambda source: {"scored": source})
+    yield overtrain.OvertrainMonitor
+    patch.undo()
 
 
 # The tail of the 44.1 kHz pretrain, from the last delta-significant

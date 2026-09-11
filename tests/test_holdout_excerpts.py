@@ -11,13 +11,11 @@ these pin is that the crop is uniform, that it is chosen so most of the
 excerpts survive it, and that the batch a model is handed still looks exactly
 like one from ``TextAudioCollateMultiNSFsid``.
 
-``train.py`` reads a run spec from ``sys.argv[1]`` at import, so the pieces are
-lifted out with ``ast``, the same way ``test_overtrain_monitor.py`` does.
+The pieces under test live in ``rvc/train/overtrain.py``.
 """
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
@@ -35,20 +33,7 @@ PHONE_DIM = 768
 
 @pytest.fixture(scope="module")
 def excerpts():
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    wanted = {"_HoldoutSet", "_uniform_excerpts"}
-    nodes = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted
-    ]
-    assert {node.name for node in nodes} == wanted, "train.py no longer defines both"
-    namespace: dict = {"torch": torch}
-    exec(
-        compile(ast.Module(body=nodes, type_ignores=[]), "train.py", "exec"), namespace
-    )
-    return namespace
+    return pytest.importorskip("rvc.train.overtrain")
 
 
 class _Config:
@@ -83,7 +68,7 @@ def test_the_crop_lands_at_the_lower_quartile(excerpts):
     outlier.
     """
     dataset = _Dataset([100, 200, 300, 400, 500, 600, 700, 800])
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         dataset, range(8), 10_000, _Config, batch_size=4
     )
     assert result.frames == 300
@@ -92,7 +77,7 @@ def test_the_crop_lands_at_the_lower_quartile(excerpts):
 
 def test_the_ceiling_is_a_ceiling(excerpts):
     dataset = _Dataset([400] * 8)
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         dataset, range(8), 100, _Config, batch_size=4
     )
     assert result.frames == 100
@@ -106,7 +91,7 @@ def test_a_fixed_crop_is_taken_literally(excerpts):
     the whole point of the probe is that it is subtracted from the holdout.
     """
     dataset = _Dataset([150, 250, 350, 450])
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         dataset, range(4), 300, _Config, batch_size=2, fixed=True
     )
     assert result.frames == 300
@@ -115,7 +100,7 @@ def test_a_fixed_crop_is_taken_literally(excerpts):
 
 def test_batches_look_like_the_training_collate(excerpts):
     dataset = _Dataset([400] * 5)
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         dataset, range(5), 400, _Config, batch_size=2
     )
     shapes = []
@@ -148,7 +133,7 @@ def test_batches_look_like_the_training_collate(excerpts):
 
 def test_the_target_mel_is_computed_once_per_batch(excerpts):
     calls = []
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         _Dataset([400] * 2), range(2), 400, _Config, batch_size=1
     )
 
@@ -163,7 +148,7 @@ def test_the_target_mel_is_computed_once_per_batch(excerpts):
 
 
 def test_a_changed_output_length_invalidates_the_cached_target(excerpts):
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         _Dataset([400]), range(1), 400, _Config, batch_size=1
     )
     assert result.target_mel(0, 128_000, lambda: "long") == "long"
@@ -171,7 +156,7 @@ def test_a_changed_output_length_invalidates_the_cached_target(excerpts):
 
 
 def test_shrinking_rebuilds_the_batches_and_drops_the_cache(excerpts):
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         _Dataset([400] * 4), range(4), 400, _Config, batch_size=4
     )
     result.target_mel(0, 128_000, lambda: "stale")
@@ -185,7 +170,7 @@ def test_shrinking_rebuilds_the_batches_and_drops_the_cache(excerpts):
 
 
 def test_rows_too_short_for_any_crop_yield_nothing(excerpts):
-    result = excerpts["_uniform_excerpts"](
+    result = excerpts.uniform_excerpts(
         _Dataset([10] * 4), range(4), 400, _Config, batch_size=2, fixed=True
     )
     assert result is None

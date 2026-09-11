@@ -71,12 +71,12 @@ def test_ignores_everything_else(line):
 
 
 def test_the_trainer_still_emits_this_format():
-    """Guards the producer side: the format lives in train.py's f-string.
+    """Guards the producer side: the format lives in the emitter's f-string.
 
-    Parsed out of the source rather than executed -- importing train.py runs a
-    module-level argv parse and pulls in torch.
+    Parsed out of the source rather than executed, so the guard costs nothing
+    and cannot be tripped by an import.
     """
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
+    source = (ROOT / "rvc" / "train" / "progress.py").read_text(encoding="utf-8")
     assert "[PROGRESS]" in source, "the trainer no longer emits progress lines"
 
     # Rebuild the literal the f-string would produce and check the parser eats
@@ -84,7 +84,7 @@ def test_the_trainer_still_emits_this_format():
     tree = ast.parse(source)
     emitter = next(
         node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_emit_machine_progress"
+        if isinstance(node, ast.FunctionDef) and node.name == "emit_machine_progress"
     )
     pieces = [
         part.value for part in ast.walk(emitter)
@@ -98,7 +98,7 @@ def test_the_trainer_still_emits_this_format():
 
 def test_only_prints_when_stdout_is_not_a_terminal():
     """An interactive run must keep seeing only rich's bar."""
-    source = (ROOT / "rvc" / "train" / "train.py").read_text(encoding="utf-8")
+    source = (ROOT / "rvc" / "train" / "progress.py").read_text(encoding="utf-8")
     assert re.search(r"sys\.stdout\.isatty\(\)", source), (
         "the progress line would flood an interactive terminal"
     )
