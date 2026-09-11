@@ -143,6 +143,7 @@ class VoiceConverter:
         index_k: int = 8,
         index_power: float = 2.0,
         index_continuity: float = 0.5,
+        noise_scale: float = None,
         **kwargs,
     ):
         """silence_gate_db: input level (dBFS) under which output is faded out. The
@@ -150,6 +151,9 @@ class VoiceConverter:
         direction depends on the rest of the chunk, and the decoder renders that
         as hiss; this keeps it out of passages the input says are empty. None or
         -inf disables the gate.
+
+        noise_scale: scale of the prior draw the model decodes. None uses the
+        model's own default (0.3 for RefineGAN2, 0.66666 otherwise).
         """
         if not model_path:
             print_error("No model provided. Aborting conversion.", tag="[INFER]")
@@ -242,6 +246,7 @@ class VoiceConverter:
                         index_meta_payload=self.loaded_index_meta,
                         retrieval_config=retrieval_config,
                         do_normalize=self.hubert_do_normalize,
+                        noise_scale=noise_scale,
                     )
                     converted_chunks.append(audio_opt)
                     chunk_progress.advance(chunk_task)

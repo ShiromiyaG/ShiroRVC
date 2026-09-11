@@ -89,6 +89,8 @@ class Synthesizer(torch.nn.Module):
         self.vocoder = vocoder_id
         self.sr = sr
         self.architecture_id = "vits_gaussian_v1"
+        # Scale of the prior draw ``infer`` decodes when the caller names none.
+        self.prior_noise_scale = 0.66666
 
         # Every model key beyond this constructor's own signature is vocoder
         # configuration -- the frontend's, the decoder's or the discriminator's.
@@ -167,6 +169,13 @@ class Synthesizer(torch.nn.Module):
                     f"``excitation_source`` reports that separately."
                 )
             self._assert_rate_supported(vocoder_spec, sr)
+            # This decoder renders the prior draw as formant-coloured bursts
+            # between the harmonics.  Measured 2026-09-11 on a sustained note
+            # (``pretrain-contentvec``, 4 seeds): 0.3 removes nearly all of the
+            # bursts that 0.66666 puts there, and costs 0.8 dB at 12-16 kHz
+            # with harmonic contrast unchanged.  Not 0: decoding the prior
+            # *mean* is an input the decoder never saw in training.
+            self.prior_noise_scale = 0.3
             self.dec = generators.RefineGAN2Generator(
                 sample_rate=int(sr),
                 upsample_rates=tuple(upsample_rates),
@@ -471,16 +480,21 @@ class Synthesizer(torch.nn.Module):
         nsff0: Optional[torch.Tensor] = None,
         sid: torch.Tensor = None,
         seed: int = 0,
+        noise_scale: Optional[float] = None,
     ):
+        """``noise_scale`` ``None`` means ``prior_noise_scale``."""
         if seed != 0:
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
+
+        if noise_scale is None:
+            noise_scale = self.prior_noise_scale
 
         g = self.emb_g(sid).unsqueeze(-1)
 
         m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)
         o = self.dec(z * x_mask, nsff0, g)
 

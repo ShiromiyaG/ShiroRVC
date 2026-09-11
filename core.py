@@ -108,6 +108,8 @@ def run_infer_script(
     index_power: float = 2.0,
     index_continuity: float = 0.5,
     silence_gate_db: float = -60.0,
+    *,
+    noise_scale: float = None,
 ):
     kwargs = {
         "audio_input_path": input_path,
@@ -140,6 +142,7 @@ def run_infer_script(
         "index_k": index_k,
         "index_power": index_power,
         "index_continuity": index_continuity,
+        "noise_scale": noise_scale,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(
@@ -189,6 +192,8 @@ def run_batch_infer_script(
     index_power: float = 2.0,
     index_continuity: float = 0.5,
     silence_gate_db: float = -60.0,
+    *,
+    noise_scale: float = None,
 ):
     kwargs = {
         "audio_input_paths": input_folder,
@@ -220,6 +225,7 @@ def run_batch_infer_script(
         "index_k": index_k,
         "index_power": index_power,
         "index_continuity": index_continuity,
+        "noise_scale": noise_scale,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(
@@ -259,6 +265,8 @@ def run_tts_script(
     index_power: float = 2.0,
     index_continuity: float = 0.5,
     silence_gate_db: float = -60.0,
+    *,
+    noise_scale: float = None,
 ):
 
     tts_script_path = os.path.join("rvc", "lib", "tools", "tts.py")
@@ -310,6 +318,7 @@ def run_tts_script(
         index_k=index_k,
         index_power=index_power,
         index_continuity=index_continuity,
+        noise_scale=noise_scale,
     )
 
     return f"Text {tts_text} synthesized successfully.", output_rvc_path.replace(
@@ -871,6 +880,12 @@ def inference_options(overrides: dict | None = None) -> list:
             default=0.5,
             show_default=True,
             help="Reward for neighbours that continue the frame the previous one matched, which stops the retrieval jumping between unrelated parts of the dataset. Needs an index built by this fork; ignored otherwise.",
+        ),
+        click.option(
+            "--noise_scale",
+            type=click.FloatRange(0, 1),
+            default=None,
+            help="Scale of the random draw from the model's prior. Lower is steadier and less breathy; unset uses the model's default (0.3 for RefineGAN2, 0.66666 otherwise).",
         ),
         click.option(
             "--volume_envelope",

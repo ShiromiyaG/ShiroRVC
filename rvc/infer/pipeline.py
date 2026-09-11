@@ -344,6 +344,7 @@ class Pipeline:
         seed,
         retrieval_config=None,
         do_normalize=False,
+        noise_scale=None,
     ):
         with torch.no_grad():
             pitch_guidance = pitch != None and pitchf != None
@@ -393,6 +394,7 @@ class Pipeline:
                     nsff0=pitchf.float(),
                     sid=sid,
                     seed=seed,
+                    noise_scale=noise_scale,
                 )[0][0, 0]
                 .detach()
                 .cpu()
@@ -467,9 +469,12 @@ class Pipeline:
         retrieval_config=None,
         do_normalize=False,
         silence_gate_db=-60.0,
+        noise_scale=None,
     ):
         """silence_gate_db: input level below which the output is faded out
         (None or -inf disables it); see AudioProcessor.gate_to_source.
+        noise_scale: prior draw handed to ``net_g.infer``; None uses the
+        model's own ``prior_noise_scale``.
         """
         if seed == 0:
             seed = random.randint(1, 2**32 - 1)
@@ -560,6 +565,7 @@ class Pipeline:
                         seed,
                         retrieval_config,
                         do_normalize,
+                        noise_scale=noise_scale,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
             else:
@@ -578,6 +584,7 @@ class Pipeline:
                         seed,
                         retrieval_config,
                         do_normalize,
+                        noise_scale=noise_scale,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
 
@@ -599,6 +606,7 @@ class Pipeline:
                     seed,
                     retrieval_config,
                     do_normalize,
+                    noise_scale=noise_scale,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         else:
@@ -617,6 +625,7 @@ class Pipeline:
                     seed,
                     retrieval_config,
                     do_normalize,
+                    noise_scale=noise_scale,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         audio_opt = np.concatenate(audio_opt)

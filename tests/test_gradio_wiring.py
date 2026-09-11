@@ -102,7 +102,13 @@ def test_the_silence_gate_is_last_everywhere():
         core.run_batch_infer_script,
         core.run_tts_script,
     ):
-        parameters = list(inspect.signature(entry).parameters)
+        # Keyword-only parameters cannot be reached by position, so they are
+        # free to follow it.
+        parameters = [
+            name
+            for name, parameter in inspect.signature(entry).parameters.items()
+            if parameter.kind is not inspect.Parameter.KEYWORD_ONLY
+        ]
         assert parameters[-1] == "silence_gate_db", entry.__name__
 
     for relative in TABS:

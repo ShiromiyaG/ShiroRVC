@@ -13,7 +13,7 @@ from distutils.util import strtobool
 from random import randint, Random
 import signal
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from time import time as ttime
 
 now_dir = os.getcwd()
@@ -210,6 +210,12 @@ validation_preview_figsize = (
     max(1.0, float(getattr(config.train, "validation_preview_width", 24.0))),
     max(1.0, float(getattr(config.train, "validation_preview_height", 5.8))),
 )
+# Prior draw for the preview render.  Absent means the model's own
+# ``prior_noise_scale``, which is what inference decodes with.
+preview_noise_scale = getattr(config.train, "preview_noise_scale", None)
+preview_noise_scale = (
+    None if preview_noise_scale is None else float(preview_noise_scale)
+)
 
 # Default: FP32 + TF32, no autocast/scaler. ``use_fp16`` enables autocast at
 # FP16 with GradScaler; the autocast-disable wrappers are narrowed to protect
@@ -357,10 +363,8 @@ def finish_stop(writer=None):
 def eval_infer(net_g, reference):
     net_g.eval()
     with torch.no_grad():
-        if hasattr(net_g, "module"):
-            o, *_ = net_g.module.infer(*reference)
-        else:
-            o, *_ = net_g.infer(*reference)
+        model = net_g.module if hasattr(net_g, "module") else net_g
+        o, *_ = model.infer(*reference, noise_scale=preview_noise_scale)
     net_g.train()
     return o
 
@@ -3682,8 +3686,21 @@ def training_loop(
                 finetune_preview_interval if finetune_phase else pretrain_preview_interval
             )
             if pretrain_preview and rank == 0 and phase_step % preview_interval == 0:
-                with averaged_weights((optimizer_choice_g, optim_g)):
-                    o = eval_infer(net_g, reference)
+                # The EMA when there is one: it is what the holdout scores and
+                # what the export ships.  The live weights of a GAN generator
+                # swing from step to step and read the latent's noise far more
+                # strongly -- measured 2026-09-11 on ``pretrain-contentvec`` at
+                # 218k, the seed-driven bursts between the harmonics came out
+                # 1.90 dB RMS on the live weights against 1.17 on the EMA at
+                # the same draw, so the preview showed a defect the delivered
+                # model mostly does not have.  Schedule-free runs carry no EMA
+                # and keep reading their averaged ``x`` iterate.
+                if ema is not None:
+                    with ema.applied(net_g):
+                        o = eval_infer(net_g, reference)
+                else:
+                    with averaged_weights((optimizer_choice_g, optim_g)):
+                        o = eval_infer(net_g, reference)
                 if reference_audio is not None:
                     eval_original_mel = wave_to_mel(
                         config,
@@ -3908,7 +3925,15 @@ def training_loop(
                 (optimizer_choice_g, optim_g), (optimizer_choice_d, optim_d)
             ):
                 with uninterruptible_save("checkpoint write"):
-                    save_checkpoint(net_g, optim_g, config.train.learning_rate_g, epoch, g_path, ema=ema)
+                    # The generator is written as if there were no EMA: the
+                    # average goes in ``model`` and no ``ema`` key is kept, so
+                    # the checkpoint is a plain one for anything that reads it
+                    # and is a pretrain as it stands, like
+                    # ``tools/clean_pretrain.py`` makes.  A resume therefore
+                    # continues from the average, and the shadow restarts from
+                    # it -- see the ``ema.load_state_dict`` fallback.
+                    with ema.applied(net_g) if ema is not None else nullcontext():
+                        save_checkpoint(net_g, optim_g, config.train.learning_rate_g, epoch, g_path)
                     save_checkpoint(
                         net_d,
                         optim_d,
