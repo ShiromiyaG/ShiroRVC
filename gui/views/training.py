@@ -168,7 +168,7 @@ class TrainingPage(Page):
         self.cut_preprocess = SearchableCombo(editable=False)
         self.cut_preprocess.refresh_button.hide()
         self.cut_preprocess.set_items(catalog.CUT_PREPROCESS)
-        self.cut_preprocess.set_text("Simple")
+        self.cut_preprocess.set_text("New Automatic")
 
         self.chunk_len = SliderSpin(0.5, 5.0, 0.1, decimals=1, value=3.0)
         self.overlap_len = SliderSpin(0.0, 0.4, 0.01, decimals=2, value=0.36)
@@ -256,7 +256,7 @@ class TrainingPage(Page):
 
         self.extract_threads = SliderSpin(1, max(1, os.cpu_count() or 8), 1, decimals=0,
                                           value=max(1, (os.cpu_count() or 8) // 2))
-        self.include_mutes = SliderSpin(0, 10, 1, decimals=0, value=2)
+        self.include_mutes = SliderSpin(0, 10, 1, decimals=0, value=5)
         advanced.add_row(
             Field(_("CPU threads"), self.extract_threads, ""),
             Field(_("Mute samples"), self.include_mutes, _("Silent references that teach the model to stay quiet.")),

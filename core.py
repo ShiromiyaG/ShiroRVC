@@ -380,7 +380,7 @@ def run_extract_script(
     sample_rate: int,
     vocoder_arch: str,
     embedder_model: str,
-    include_mutes: int = 2,
+    include_mutes: int = 5,
     remove_16k_slices: bool = False,
     feature_precision: str = "fp32",
 ):
@@ -1113,7 +1113,7 @@ PREPROCESS_OWN = [
     click.option(
         "--cut_preprocess",
         type=click.Choice(["Skip", "Simple", "Automatic", "New Automatic"]),
-        default='Simple',
+        default='New Automatic',
         show_default=True,
         help=(
             "How to cut the dataset into segments. 'Automatic' finds silence by "
@@ -1222,7 +1222,7 @@ EXTRACT_OWN = [
     click.option(
         "--include_mutes",
         type=click.IntRange(0, 10),
-        default=2,
+        default=5,
         show_default=True,
         help="Number of silent files to include.",
     ),

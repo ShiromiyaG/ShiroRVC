@@ -3,6 +3,7 @@ import shutil
 from random import shuffle
 from rvc.configs.config import Config
 from rvc.lib.terminal import info, success, warning
+from rvc.train.extract.noise_mutes import generated_mutes
 import json
 import librosa
 import soundfile as sf
@@ -152,7 +153,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str,
     apply_embedder_width(config_save_path, embedder_model)
 
 def generate_filelist(
-    model_path: str, sample_rate: int, include_mutes: int = 2, embedder_model: str = "contentvec", vocoder_arch: str = "hifi"
+    model_path: str, sample_rate: int, include_mutes: int = 5, embedder_model: str = "contentvec", vocoder_arch: str = "hifi"
 ):
     from rvc.configs.vocoders import normalize_vocoder
 
@@ -231,23 +232,30 @@ def generate_filelist(
         )
 
     if include_mutes > 0:
-        mute_audio_path = ensure_mute_audio(mute_base_path, sample_rate)
-        mute_feature_path = os.path.join(
-            mute_base_path, f"extracted", "mute.npy"
-        )
-        mute_f0_path = os.path.join(mute_base_path, "f0", "mute.wav.npy")
-        mute_f0nsf_path = os.path.join(mute_base_path, "f0_voiced", "mute.wav.npy")
-
-        mute_entry = "|".join(
-            (
-                relative_to_root(mute_audio_path),
-                relative_to_root(mute_feature_path),
-                relative_to_root(mute_f0_path),
-                relative_to_root(mute_f0nsf_path),
+        # The low-noise clips ``extract.py`` generated for this experiment, one
+        # entry each per speaker.  The shared digital-zero clip is only the
+        # fallback for when they are missing (a failed embedding pass).
+        mute_clips = generated_mutes(model_path)[:include_mutes]
+        if not mute_clips:
+            warning(
+                "No generated mute clips found; using the shared digital-silence "
+                "mute instead.",
+                tag="[EXTRACT]",
             )
-        )
-        for sid in sids * include_mutes:
-            options.append(f"{mute_entry}|{sid}")
+            mute_audio_path = ensure_mute_audio(mute_base_path, sample_rate)
+            mute_clips = [
+                (
+                    mute_audio_path,
+                    os.path.join(mute_base_path, "extracted", "mute.npy"),
+                    os.path.join(mute_base_path, "f0", "mute.wav.npy"),
+                    os.path.join(mute_base_path, "f0_voiced", "mute.wav.npy"),
+                )
+            ] * include_mutes
+
+        for clip in mute_clips:
+            mute_entry = "|".join(relative_to_root(path) for path in clip)
+            for sid in sids:
+                options.append(f"{mute_entry}|{sid}")
 
     file_path = os.path.join(model_path, "model_info.json")
     if os.path.exists(file_path):

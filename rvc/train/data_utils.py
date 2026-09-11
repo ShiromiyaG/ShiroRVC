@@ -8,6 +8,7 @@ from mel_processing import spectrogram_torch
 from utils import load_filepaths_and_text, load_wav_to_torch
 
 from rvc.lib.terminal import warning
+from rvc.train.extract.noise_mutes import is_mute_path
 
 debug_shapes = False
 
@@ -43,6 +44,10 @@ def holdout_split_indices(
     total = len(audiopaths_and_text)
     groups = {}
     for index, row in enumerate(audiopaths_and_text):
+        # Mute clips always train: scoring the holdout on silence would
+        # measure nothing, and holding them out would drop them from training.
+        if is_mute_path(row[0]):
+            continue
         groups.setdefault(source_group_key(row[0]), []).append(index)
 
     target = min(int(maximum), max(int(minimum), int(total * float(fraction))))

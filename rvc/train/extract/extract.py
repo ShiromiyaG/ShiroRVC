@@ -33,6 +33,7 @@ install_rich_print()
 
 from rvc.lib.utils import load_audio_16k, load_embedder_model, extract_features
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
+from rvc.train.extract.noise_mutes import prepare_noise_mutes
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE, load_high_register_settings
 from rvc.configs.config import Config
 
@@ -429,7 +430,7 @@ if __name__ == "__main__":
             "spin_v1 can no longer be used for training; choose contentvec or "
             "spin_v2. Existing spin_v1 models still run at inference."
         )
-    include_mutes = int(sys.argv[8]) if len(sys.argv) > 8 else 2
+    include_mutes = int(sys.argv[8]) if len(sys.argv) > 8 else 5
     remove_16k_slices = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
     feature_precision = sys.argv[10] if len(sys.argv) > 10 else "fp32"
     if feature_precision not in FEATURE_PRECISIONS:
@@ -476,8 +477,12 @@ if __name__ == "__main__":
 
     run_pitch_extraction(files, devices, f0_method, num_processes)
 
+    # The mute clips' pitch is written, not tracked (they are unvoiced by
+    # construction), so they join only the embedding pass.
+    _, mute_files = prepare_noise_mutes(exp_dir, sample_rate, embedder_model, include_mutes)
+
     run_embedding_extraction(
-        files,
+        files + mute_files,
         devices,
         embedder_model,
         num_processes,

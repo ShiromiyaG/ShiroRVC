@@ -492,7 +492,7 @@ def train_tab():
                     label=_("Audio cutting"),
                     info=_(AUDIO_FILE_SLICING_INFO),
                     choices=["Skip", "Simple", "Automatic", "New Automatic"],
-                    value="Simple",
+                    value="New Automatic",
                     interactive=True,
                     key='cut_preprocess'
                 )
@@ -600,7 +600,7 @@ def train_tab():
         include_mutes = gr.Slider(
             0,
             10,
-            2,
+            5,
             step=1,
             label=_("Silent ( 'mute' ) files for training."),
             info=_("Add silent examples so the model can reproduce silence."),
