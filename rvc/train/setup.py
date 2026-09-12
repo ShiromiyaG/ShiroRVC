@@ -379,31 +379,82 @@ def get_optimizers(
     return optim_g, optim_d
 
 
-def apply_frontend_freeze(net_g, rank, freeze_vae=False):
-    """
-    Freeze the frontend for fine-tuning, driven by the `freeze_vae` flag.
+#: What each staged-pretrain mode leaves trainable, by parameter-name prefix.
+#:
+#: The decoder does not read a mel spectrogram -- it reads ``z``, which comes
+#: out of the *posterior* ``enc_q(spec)``.  So the vocoder-only stage is not
+#: ``dec`` on its own: it is the spectral autoencoder ``enc_q -> dec``, with
+#: the prior side of the model held still.  Freezing ``enc_q`` alongside the
+#: frontend (which is what ``"frontend"`` does) is a fine-tune mode, not a
+#: from-scratch one: it hands the decoder a ``z`` from whatever encoder the
+#: checkpoint already had, and from a random init that is noise.
+#:
+#: A frozen module still passes gradient *through* itself, so freezing ``dec``
+#: in stage 2 leaves the spectral and adversarial terms training the frontend
+#: through the decoder rather than making them inert.
+FREEZE_MODES = {
+    # Nothing held.  End-to-end, the way a normal run trains.
+    "none": None,
+    # Fine-tune the vocoder onto an existing frontend: everything outside
+    # ``dec``/``emb_g`` is held.  This is the old ``freeze_vae`` flag.
+    "frontend": ("enc_p.", "enc_q.", "flow."),
+    # Stage 1 -- spectral autoencoder.  ``enc_q`` + ``dec`` + ``emb_g`` learn
+    # to reconstruct; the prior and the flow are held so the KL cannot drag
+    # the latent around while the decoder is being judged on reconstruction.
+    "vocoder": ("enc_p.", "flow."),
+    # Stage 2 -- the encoders.  The decoder is held at the weights stage 1
+    # validated, and ``enc_p``/``flow``/``enc_q`` learn to feed it.
+    "encoders": ("dec.",),
+}
 
-    Everything outside `dec.` and `emb_g.` is frozen, which means `enc_p`, the
-    posterior encoder and the flow.
+
+def apply_frontend_freeze(net_g, rank, freeze_vae=False, freeze_mode="none"):
+    """Hold part of the generator for a staged pretrain.
+
+    ``freeze_mode`` names the stage (see ``FREEZE_MODES``).  ``freeze_vae`` is
+    the older boolean spelling of ``freeze_mode="frontend"`` and still wins
+    when set, so a run configured the old way keeps its meaning.
+
+    Must run *before* ``get_optimizers``: ``build_decoder_param_groups`` skips
+    parameters whose ``requires_grad`` is already off, which is what keeps
+    frozen weights out of the optimizer's state entirely rather than merely
+    unupdated.
     """
-    if not freeze_vae:
+    if freeze_vae:
+        freeze_mode = "frontend"
+
+    if freeze_mode not in FREEZE_MODES:
+        raise ValueError(
+            f"Unknown freeze_mode {freeze_mode!r}; expected one of "
+            f"{sorted(FREEZE_MODES)}."
+        )
+
+    prefixes = FREEZE_MODES[freeze_mode]
+    if prefixes is None:
         if rank == 0:
-            info("Frontend: nothing frozen.", tag="[INIT]")
+            info("Freeze: nothing frozen.", tag="[INIT]")
         return
 
     model = net_g.module if hasattr(net_g, "module") else net_g
     frozen_params = 0
     for name, param in model.named_parameters():
-        if not name.startswith("dec.") and not name.startswith("emb_g.") and param.requires_grad:
+        if name.startswith(prefixes) and param.requires_grad:
             param.requires_grad = False
             frozen_params += param.numel()
 
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
-        info(f"Frontend frozen: everything but dec/emb_g ({frozen_params:,} params).", tag="[INIT]")
+        info(
+            f"Freeze '{freeze_mode}': held {', '.join(prefixes)} "
+            f"({frozen_params:,} params); {trainable:,} still training.",
+            tag="[INIT]",
+        )
 
 
-def apply_training_freezes(net_g, rank, freeze_vae=False):
-    apply_frontend_freeze(net_g, rank, freeze_vae=freeze_vae)
+def apply_training_freezes(net_g, rank, freeze_vae=False, freeze_mode="none"):
+    apply_frontend_freeze(
+        net_g, rank, freeze_vae=freeze_vae, freeze_mode=freeze_mode
+    )
 
 
 def apply_resume_lr_override(optim_g, optim_d=None, resume_lr=None, resume_lr_target="full"):

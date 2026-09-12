@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import get_type_hints
+from typing import Optional, Union, get_args, get_origin, get_type_hints
 
 #: Bumped when a field is renamed or its meaning changes, so a stale spec fails
 #: loudly instead of being read with the wrong semantics.
@@ -91,6 +91,41 @@ class TrainRunSpec:
     compile_vocoder: bool = False
     torch_compile_mode: str = "default"
 
+    # -- staged pretrain --------------------------------------------------
+    # Which half of the model this launch is allowed to move.  See
+    # ``rvc.train.setup.FREEZE_MODES``: ``"vocoder"`` trains the spectral
+    # autoencoder (``enc_q`` + ``dec``) with the prior held, ``"encoders"``
+    # trains the frontend against a held decoder, ``"none"`` is end-to-end.
+    # Per-launch rather than in ``config.json`` on purpose: the stage is the
+    # single thing that changes between the runs of a staged pretrain, and a
+    # resume must not silently inherit the previous stage's freeze.
+    freeze_mode: str = "none"
+    # Multiplier on ``config.train.c_kl`` for this launch.  Stage 1 runs it
+    # low so the KL only keeps the latent's scale sane while the decoder is
+    # judged on reconstruction; it is not 0, because an unconstrained
+    # posterior drifts in scale and leaves stage 2 chasing a moving target.
+    c_kl_scale: float = 1.0
+
+    # -- differential learning rate ---------------------------------------
+    # Multipliers on the base generator LR, per parameter group: ``dec_`` for
+    # everything under ``dec.``, ``vae_`` for the frontend and ``emb_g``.
+    # ``None`` means 1.0 and builds a single group, which is what every run
+    # before these existed used.  Stage 3 of a staged pretrain is what needs
+    # them: the decoder arrives already trained and has to adapt to the
+    # prior's latent without being pulled apart, so it runs at a fraction of
+    # the frontend's rate.
+    dec_lr_scale: Optional[float] = None
+    vae_lr_scale: Optional[float] = None
+
+    # Re-anchor the optimizer's LR after loading a checkpoint's state.
+    # Editing ``learning_rate_g``/``_d`` in config.json and resuming is a
+    # silent no-op -- the saved optimizer state carries the old rate -- so
+    # this is the only override that reaches a resumed run.  ``None`` leaves
+    # the checkpoint's LR alone.  ``resume_lr_target`` picks "g", "d" or
+    # "full".
+    resume_lr: Optional[float] = None
+    resume_lr_target: str = "full"
+
     # -- monitoring -------------------------------------------------------
     overtrain_detector: bool = False
     stop_on_overtrain: bool = False
@@ -133,6 +168,17 @@ class TrainRunSpec:
         coerced = {}
         for name, value in raw.items():
             target = known[name]
+            # ``Optional[float]`` is how a field says "unset" as distinct from
+            # a value: an LR scale of 0.0 means "freeze this group", so the
+            # absent case cannot be spelled with a sentinel number.  json
+            # round-trips it as ``null``.
+            if get_origin(target) is Union:
+                members = [arg for arg in get_args(target) if arg is not type(None)]
+                if value is None:
+                    coerced[name] = None
+                    continue
+                if len(members) == 1:
+                    target = members[0]
             try:
                 if target is bool:
                     coerced[name] = value if isinstance(value, bool) else bool(value)

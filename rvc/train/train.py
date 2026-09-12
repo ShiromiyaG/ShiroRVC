@@ -186,6 +186,8 @@ torch_compile_mode = spec.torch_compile_mode
 overtrain_detector = spec.overtrain_detector
 stop_on_overtrain = spec.stop_on_overtrain
 use_ema = spec.use_ema
+freeze_mode = spec.freeze_mode
+c_kl_scale = spec.c_kl_scale
 # No manual phase/step controls: a pretrained source selects fine-tuning,
 # its absence selects pretraining.
 training_phase = spec.training_phase
@@ -286,17 +288,32 @@ swap_start_step = 0  # Filled at resume: global_step when the swap was enabled.
 swap_completed = False
 
 # Freezes the whole frontend: everything outside `dec.` and `emb_g.`
-# ( enc_p + enc_q + flow )
+# ( enc_p + enc_q + flow ).  Legacy spelling of `freeze_mode = "frontend"`,
+# kept because it is edited here by hand; when True it wins over the spec's
+# `freeze_mode`.  For a staged pretrain use the spec field instead -- see
+# `rvc.train.setup.FREEZE_MODES` and `tools/pretrain_stage1_vocoder.py`.
 freeze_vae = False # If true, lets only vocoder ( dec ), spk embedding and discriminator learn
 
 # ----  Global LR scales  ----
 # Multipliers of the base LR ( 0.1 = 10%, 1.0 = 100% ).
+# These four are edited here by hand *or* carried on the run spec, whichever
+# is set: the spec wins when it names a value, so a launcher can set them
+# per-run ( see `tools/pretrain_stage3_endtoend.py` ) without this file being
+# edited, and an edit here still works when the spec leaves them unset.
 dec_lr_scale = None  # everything under `dec.` ( the decoder/vocoder )
 vae_lr_scale = None  # everything else ( frontend + emb_g ), see `freeze_vae` above
 
 # ----  Resume LR override  ----
 resume_lr = None  # e.g. 5e-5 ( None = Override disabled. )
 resume_lr_target = "full"  # Pick what you want it applied to: "g", "d" or "full" where full refers to both G/D
+
+if spec.dec_lr_scale is not None:
+    dec_lr_scale = spec.dec_lr_scale
+if spec.vae_lr_scale is not None:
+    vae_lr_scale = spec.vae_lr_scale
+if spec.resume_lr is not None:
+    resume_lr = spec.resume_lr
+    resume_lr_target = spec.resume_lr_target
 
 # True = Gamma is applied as-is each step.
 # False = Per-epoch budget, re-binned to per-step so the total decay per epoch equals "exp decay epoch" ( VITS-style ) ~ Default
@@ -441,7 +458,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
 
             # Apply decoder / frontend layer freezes for the selected phase.
-            apply_training_freezes(net_g, rank, freeze_vae=freeze_vae)
+            apply_training_freezes(net_g, rank, freeze_vae=freeze_vae, freeze_mode=freeze_mode)
 
             # Init the optimizers
             optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
@@ -583,7 +600,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
 
         # Apply decoder / vocoder layer freezes ( for fine-tuning )
-        apply_training_freezes(net_g, rank, freeze_vae=freeze_vae)
+        apply_training_freezes(net_g, rank, freeze_vae=freeze_vae, freeze_mode=freeze_mode)
 
         # Init the optimizers
         optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
@@ -1766,7 +1783,11 @@ def training_loop(
                     z_mask,
                     return_terms=True,
                 )
-                loss_kl = loss_kl * config.train.c_kl
+                # ``c_kl_scale`` is the launch's multiplier on the config's
+                # weight, so a staged pretrain can run stage 1 at a low KL
+                # without editing ``config.json`` -- which a later resume
+                # would then inherit silently.
+                loss_kl = loss_kl * config.train.c_kl * c_kl_scale
 
                 # KL diagnostic: per-dimension raw divergence.  Two things
                 # this deliberately does not do.  It does not re-form
