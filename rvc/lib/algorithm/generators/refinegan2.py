@@ -981,6 +981,11 @@ class RefineGAN2Generator(nn.Module):
         # the trunk downstream was not trained against, so it measures whether
         # the material propagates, not what training at that level converges
         # to.
+        #
+        # Ships at 0.003: at 0.01 this dither is most of what sits between the
+        # harmonics above 4 kHz (+4.7 dB at 8-10 kHz over 0.003 on a stage-1
+        # render), which the sweep above cannot see -- it measures only whether
+        # the band gets filled.
         self.source_noise_std = float(source_noise_std)
         # How many partials the excitation carries, and how steeply they fall.
         # 0 is what this shipped with and what every checkpoint before

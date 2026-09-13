@@ -30,10 +30,13 @@ MUTE_DIR = "mutes"
 #: Every filename starts with this; ``is_mute_path`` keys on it.
 MUTE_PREFIX = "mute"
 #: Bump whenever the clips change, so existing experiments regenerate them.
-VERSION = 1
+VERSION = 2
 
 DURATION_S = 3.0
 INPUT_RATE = 16000
+#: Samples in one clip's embedder input.  Fixed, so a work item carrying
+#: synthesised noise needs no ``sf.info`` to report its length.
+NOISE_SAMPLES = int(round(DURATION_S * INPUT_RATE))
 #: The pitch extractors' hop at 16 kHz: RMVPE frames are ``samples // 160 + 1``.
 F0_HOP = 160
 #: Noise-floor range, RMS in dBFS.  Below -60 the inference silence gate
@@ -64,6 +67,42 @@ def _coloured_noise(rng, samples, slope, rate):
     return noise - noise.mean()
 
 
+#: Marks a work item whose audio is synthesised instead of read off disk.
+NOISE_SOURCE = "mute_noise"
+
+
+def noise_source(index, level_db, slope):
+    """The source half of a work item for one mute clip.
+
+    A tuple rather than a callable because the embedding pass runs in a process
+    pool and every work item is pickled to get there; a closure would not
+    survive that.  It carries the whole spec, so the audio does not depend on
+    how many clips the run asked for.
+    """
+    return (NOISE_SOURCE, int(index), float(level_db), float(slope))
+
+
+def is_noise_source(source):
+    """Whether a work item's source is one of these descriptors."""
+    return (
+        isinstance(source, tuple) and len(source) == 4 and source[0] == NOISE_SOURCE
+    )
+
+
+def noise_audio(source):
+    """The embedder input for one mute clip, from its descriptor.
+
+    This is the only copy of that signal: it is deterministic in the clip
+    index, so it is made here rather than written to disk and read back.
+    """
+    _tag, index, level_db, slope = source
+    rng = np.random.default_rng(SEED + index)
+    noise = _coloured_noise(rng, NOISE_SAMPLES, slope, INPUT_RATE)
+    rms = float(np.sqrt(np.mean(np.square(noise)))) or 1.0
+    noise *= 10.0 ** (level_db / 20.0) / rms
+    return noise.astype(np.float32)
+
+
 def mute_specs(count):
     """``(name, level_db, slope)`` for each of ``count`` clips, deterministic."""
     low, high = LEVEL_DB_RANGE
@@ -88,9 +127,11 @@ def prepare_noise_mutes(exp_dir, sample_rate, embedder_model, count):
 
     Returns ``(clips, pending)``.  ``clips`` lists every clip as
     ``(target_wav, feature_npy, f0_npy, f0_voiced_npy)``.  ``pending`` holds
-    ``[input_wav_16k, f0_npy, f0_voiced_npy, feature_npy]`` for the clips whose
-    features still have to be extracted -- the same shape as
+    ``[noise_descriptor, f0_npy, f0_voiced_npy, feature_npy]`` for the clips
+    whose features still have to be extracted -- the same shape as
     ``extract.py``'s file entries, so they go through the same embedder pass.
+    The input side is a descriptor rather than a path because nothing writes
+    that noise to disk; see :func:`noise_source`.
 
     Pitch is written rather than extracted: a pitch tracker run on noise can
     report spurious voicing, and these clips are unvoiced by definition.  The
@@ -114,31 +155,23 @@ def prepare_noise_mutes(exp_dir, sample_rate, embedder_model, count):
 
     dirs = {
         key: os.path.join(root, key)
-        for key in ("sliced_audios", "sliced_audios_16k", "extracted", "f0", "f0_voiced")
+        for key in ("sliced_audios", "extracted", "f0", "f0_voiced")
     }
     for path in dirs.values():
         os.makedirs(path, exist_ok=True)
 
-    input_samples = int(round(DURATION_S * INPUT_RATE))
     target_samples = int(round(DURATION_S * int(sample_rate)))
-    f0_frames = input_samples // F0_HOP + 1
+    f0_frames = NOISE_SAMPLES // F0_HOP + 1
 
     clips, pending = [], []
     for index, (name, level_db, slope) in enumerate(mute_specs(count)):
         target = os.path.join(dirs["sliced_audios"], f"{name}.wav")
-        source = os.path.join(dirs["sliced_audios_16k"], f"{name}.wav")
         feature = os.path.join(dirs["extracted"], f"{name}.npy")
         f0 = os.path.join(dirs["f0"], f"{name}.wav.npy")
         f0_voiced = os.path.join(dirs["f0_voiced"], f"{name}.wav.npy")
 
         if not os.path.isfile(target):
             sf.write(target, np.zeros(target_samples, dtype=np.float32), int(sample_rate), subtype="PCM_16")
-        if not os.path.isfile(source):
-            rng = np.random.default_rng(SEED + index)
-            noise = _coloured_noise(rng, input_samples, slope, INPUT_RATE)
-            rms = float(np.sqrt(np.mean(np.square(noise)))) or 1.0
-            noise *= 10.0 ** (level_db / 20.0) / rms
-            sf.write(source, noise.astype(np.float32), INPUT_RATE, subtype="FLOAT")
         if not os.path.isfile(f0):
             np.save(f0, np.ones(f0_frames, dtype=np.int32), allow_pickle=False)
         if not os.path.isfile(f0_voiced):
@@ -146,7 +179,9 @@ def prepare_noise_mutes(exp_dir, sample_rate, embedder_model, count):
 
         clips.append((target, feature, f0, f0_voiced))
         if not os.path.isfile(feature):
-            pending.append([source, f0, f0_voiced, feature])
+            pending.append(
+                [noise_source(index, level_db, slope), f0, f0_voiced, feature]
+            )
 
     with open(meta_path, "w") as handle:
         json.dump(meta, handle, indent=4)

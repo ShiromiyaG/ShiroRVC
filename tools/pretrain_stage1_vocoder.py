@@ -82,11 +82,27 @@ and on in stage 3.  See ``COMMON_DEFAULTS`` in ``tools/_staged_pretrain.py``.
 WHAT TO LOOK AT
 ---------------
 ``loss_spectral`` is the objective here; ``loss_kl`` is a background term and
-should stay small and flat.  For the artefact question, do not judge from the
-loop's own previews: it trains on ``segment_size`` slices, so anything that
-depends on render length is invisible there.  Render a long continuous file and
-look at that -- ``tools/render_constant_f0.py`` and
-``tools/probe_mirror_fold.py`` are the ones for this.
+should stay small and flat.
+
+The loop's previews are rendered through the posterior in this stage --
+``enc_q(spec) -> dec``, unsliced -- so they show the reconstruction the stage
+is actually judged on.  They used to come from ``infer``, which reads the
+``enc_p`` and ``flow`` this stage *freezes*: from a scratch pretrain that is an
+untrained prior's draw, and the mottle it leaves between the harmonics is the
+prior's rather than the decoder's.  See ``eval_reconstruct`` in
+``rvc/train/train.py``.  Stages 2 and 3 train the prior and keep the ``infer``
+render, which is what conversion will run.
+
+They decode ``m_q``.  Set ``preview_posterior_noise_scale`` in ``config.json``
+to render the posterior *draw* instead: it is an independent sample per frame,
+and this decoder puts it in the picture as broadband flutter, so a preview at
+1.0 shows that on top of whatever the decoder is doing.
+
+What a preview still cannot settle: anything that depends on *render length*
+beyond the reference clip, and whether an inharmonic line is a fold.  Render a
+long continuous file and look at that -- ``tools/render_constant_f0.py``,
+``tools/probe_mirror_fold.py``, and ``tools/source_gain_ab.py`` when
+``refinegan2_source_gain`` is on.
 
 When it is done, go to ``tools/pretrain_stage2_encoders.py``.
 """

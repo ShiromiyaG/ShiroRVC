@@ -140,7 +140,7 @@ from losses import (
     HighFrequencyFloorNegative,
 )
 
-from mel_processing import build_ms_mel_loss
+from mel_processing import build_ms_mel_loss, spectrogram_torch
 
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
@@ -235,6 +235,12 @@ validation_preview_figsize = (
 preview_noise_scale = getattr(config.train, "preview_noise_scale", None)
 preview_noise_scale = (
     None if preview_noise_scale is None else float(preview_noise_scale)
+)
+# Posterior draw for the stage-1 reconstruction preview.  0 decodes ``m_q``,
+# which is what the holdout scorer already does (``holdout_noise_scale``);
+# raise it to see what the latent's own noise adds to the render.
+preview_posterior_noise_scale = float(
+    getattr(config.train, "preview_posterior_noise_scale", 0.0)
 )
 
 # Default: FP32 + TF32, no autocast/scaler. ``use_fp16`` enables autocast at
@@ -332,6 +338,105 @@ def eval_infer(net_g, reference):
         o, *_ = model.infer(*reference, noise_scale=preview_noise_scale)
     net_g.train()
     return o
+
+
+def eval_reconstruct(net_g, reference, reference_audio, config):
+    """Render the preview through the posterior -- the path the stage optimises.
+
+    ``eval_infer`` decodes ``flow(m_p + exp(logs_p) * randn * noise_scale)``,
+    so it reads ``enc_p`` and ``flow``.  Stage 1 (``freeze_mode="vocoder"``)
+    freezes exactly those two, and from a scratch pretrain they are still at
+    their initialisation: the preview then showed a decoder fed an untrained
+    prior's draw, while the loss the stage minimises goes through
+    ``enc_q(spec)``.  Two different inputs, so the image and ``loss_spectral``
+    described different things -- and the mottle the prior draw leaves between
+    the harmonics is the prior's, not the decoder's.  ``source_gain``
+    multiplies the excitation by an envelope projected from ``z``, which is
+    what turns a per-frame-white ``z`` into a sideband on every partial.
+
+    Rendered unsliced, unlike the training forward, which decodes one
+    ``segment_size`` slice: a defect that depends on render length is invisible
+    in 0.4 s.
+
+    Decoded from ``m_q``, like the holdout scorer, unless
+    ``preview_posterior_noise_scale`` says otherwise.  The draw is independent
+    per frame, so at 1.0 it lands in the image as broadband flutter -- the
+    decoder's own defects and the latent's noise, in one picture.
+
+    The reconstruction target is ``reference_audio``, so this needs one; the
+    custom-reference branch without ``ref_audio.wav`` has no target mel to
+    compare against either and keeps the ``infer`` render.
+    """
+    # ``phone``/``pitch`` are the prior's inputs and are deliberately unused:
+    # this render does not consult ``enc_p`` at all.
+    _phone, _phone_lengths, _pitch, pitchf, sid, seed = reference
+
+    net_g.eval()
+    with torch.no_grad():
+        model = net_g.module if hasattr(net_g, "module") else net_g
+        # Only bites when ``preview_posterior_noise_scale`` is non-zero: a
+        # preview that moves for two reasons cannot be compared against the
+        # previous epoch's.
+        if seed != 0:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+        # The spectrogram ``enc_q`` was trained on, built the way the
+        # dataloader builds it (``rvc/train/data_utils.py``): same window, same
+        # ``center=False``, so one frame is one hop here as well.
+        spec = spectrogram_torch(
+            reference_audio.squeeze(1),
+            config.data.filter_length,
+            config.data.hop_length,
+            config.data.win_length,
+            center=False,
+        )
+        # f0 and the spectrogram are cropped independently -- the custom
+        # reference trims to the shortest of its three files, and a short
+        # ``ref_audio.wav`` is only warned about -- so decode the prefix they
+        # share rather than trusting the two to agree.
+        frames = min(int(spec.shape[-1]), int(pitchf.shape[-1]))
+        spec = spec[..., :frames]
+        pitchf = pitchf[..., :frames]
+        spec_lengths = torch.LongTensor([frames]).to(spec.device)
+
+        g = model.emb_g(sid).unsqueeze(-1)
+        _z, m_q, logs_q, spec_mask = model.enc_q(spec, spec_lengths, g=g)
+        # The draw is independent per frame, and this decoder renders it as
+        # bursts between the harmonics -- the same thing ``prior_noise_scale``
+        # was lowered for on the prior side.
+        if preview_posterior_noise_scale:
+            z = m_q + (
+                torch.randn_like(m_q)
+                * torch.exp(logs_q)
+                * preview_posterior_noise_scale
+            )
+        else:
+            z = m_q
+        o = model.dec(z * spec_mask, pitchf, g=g)
+    net_g.train()
+    return o
+
+
+def eval_preview(net_g, reference, reference_audio, config):
+    """Render the preview by whichever path this stage's loss describes.
+
+    Stage 1 holds ``enc_p`` and ``flow``, so ``infer`` measures neither what it
+    trains nor what it scores -- see ``eval_reconstruct``.  Every other stage
+    trains the prior, and there the ``infer`` render is the honest one: it is
+    what conversion will actually run.
+    """
+    if freeze_mode == "vocoder" and reference_audio is not None:
+        if not getattr(eval_preview, "_announced", False):
+            info(
+                "freeze_mode='vocoder': previews render from the posterior "
+                "(enc_q -> dec), which is what this stage optimises. The "
+                "infer path reads the frozen, untrained prior.",
+                tag="[PREVIEW]",
+            )
+            eval_preview._announced = True
+        return eval_reconstruct(net_g, reference, reference_audio, config)
+    return eval_infer(net_g, reference)
 
 
 def setup_env_and_distr(rank, n_gpus, device, device_id, config):
@@ -1813,6 +1918,17 @@ def training_loop(
                         (diagnostic_kl > kl_active_threshold).float().mean()
                     )
                     last_kl_per_dim = diagnostic_kl
+                    # Masked mean sigma, prior beside posterior because neither
+                    # reads alone.  Both deques existed and were never filled,
+                    # so the tag stage 1 tells you to watch was never written.
+                    avg_rolling_cache["posterior_std_fast"].append(
+                        (torch.exp(logs_q.float()) * z_mask).sum()
+                        / (z_mask.sum().clamp(min=1) * logs_q.shape[1])
+                    )
+                    avg_rolling_cache["prior_std_fast"].append(
+                        (torch.exp(logs_p.float()) * x_mask).sum()
+                        / (x_mask.sum().clamp(min=1) * logs_p.shape[1])
+                    )
 
                 loss_core = loss_spectral + loss_kl
                 loss_gan = loss_adv + loss_fm
@@ -2274,10 +2390,10 @@ def training_loop(
                 # and keep reading their averaged ``x`` iterate.
                 if ema is not None:
                     with ema.applied(net_g):
-                        o = eval_infer(net_g, reference)
+                        o = eval_preview(net_g, reference, reference_audio, config)
                 else:
                     with averaged_weights((optimizer_choice_g, optim_g)):
-                        o = eval_infer(net_g, reference)
+                        o = eval_preview(net_g, reference, reference_audio, config)
                 if reference_audio is not None:
                     eval_original_mel = wave_to_mel(
                         config,
@@ -2418,9 +2534,9 @@ def training_loop(
             # weights its ``z`` state does not describe.
             if live_sd_g is None:
                 with averaged_weights((optimizer_choice_g, optim_g)):
-                    o = eval_infer(net_g, reference)
+                    o = eval_preview(net_g, reference, reference_audio, config)
             else:
-                o = eval_infer(net_g, reference)
+                o = eval_preview(net_g, reference, reference_audio, config)
             if reference_audio is not None:
                 eval_original_mel = wave_to_mel(
                     config,

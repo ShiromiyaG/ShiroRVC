@@ -109,8 +109,10 @@ SEED = 1234
 def _frame_energy_mask(audio_path, frames):
     """Per-frame keep mask for one recording, or ``None`` if it cannot be measured.
 
-    The 16 kHz slices are optional -- extraction can be told to delete them --
-    so every failure here is a reason to keep all frames, never to drop them.
+    The slices are at the project rate, so the hop is scaled off the file's own
+    rate: a feature frame is ``FEATURE_HOP_16K`` samples of 16 kHz audio,
+    whatever that comes to here.  Every failure is a reason to keep all frames,
+    never to drop them.
     """
     try:
         import soundfile as sf
@@ -120,13 +122,14 @@ def _frame_energy_mask(audio_path, frames):
         return None
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
-    if rate != 16000 or audio.size < FEATURE_HOP_16K:
+    hop = int(round(FEATURE_HOP_16K * rate / 16000))
+    if hop < 1 or audio.size < hop:
         return None
 
-    usable = min(frames, audio.size // FEATURE_HOP_16K)
+    usable = min(frames, audio.size // hop)
     if usable < 1:
         return None
-    blocks = audio[: usable * FEATURE_HOP_16K].reshape(usable, FEATURE_HOP_16K)
+    blocks = audio[: usable * hop].reshape(usable, hop)
     db = 10.0 * np.log10(np.square(blocks).mean(axis=1) + 1e-12)
 
     relative = db > (np.percentile(db, 95.0) + SILENCE_FLOOR_DB)
@@ -528,10 +531,10 @@ def main(exp_dir, index_algorithm, index_metric=index_meta.METRIC_L2, speaker_id
         # regenerating quietly handed back the previous index.
         info(f"Replacing the existing index at {index_filepath}.", tag="[INDEX]")
 
-    audio_dir = os.path.join(exp_dir, "sliced_audios_16k")
+    audio_dir = os.path.join(exp_dir, "sliced_audios")
     if not os.path.isdir(audio_dir):
         audio_dir = None
-        warning("No 16 kHz slices to measure; keeping silent frames.", tag="[INDEX]")
+        warning("No slices to measure; keeping silent frames.", tag="[INDEX]")
 
     features, utts, positions = _load_features(feature_dir, audio_dir, speaker_id)
     info(f"{features.shape[0]} frames of {features.shape[1]} dims.", tag="[INDEX]")

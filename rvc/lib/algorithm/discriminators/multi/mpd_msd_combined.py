@@ -89,7 +89,13 @@ PERIODS_BY_RATE = {
 #: The three multi-resolution spectrogram branches, shared by ``v3`` and
 #: ``v4``.  The 512-point branch's 50-sample hop is the one that must not be
 #: touched -- see the note above ``REFERENCE_SAMPLE_RATE``.
+#:
+#: The two spectral branches window the whole transform: UnivNet's shorter
+#: windows set the resolution from ``win_length``, too coarse at 32 kHz to
+#: separate a harmonic from the valley beside it.  The 512 keeps its 7.5 ms
+#: window -- that is what makes it the temporal branch.
 V3_RESOLUTIONS = [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]]
+V4_RESOLUTIONS = [[1024, 120, 1024], [2048, 240, 2048], [512, 50, 240]]
 
 DISCRIMINATOR_VERSIONS = {
     "v1": ([2, 3, 5, 7, 11, 17], [], (1, 1, 1)),
@@ -100,7 +106,7 @@ DISCRIMINATOR_VERSIONS = {
     # part of this D with any resolution above 10 kHz, which is the band being
     # chased.  A longer period folds at a lower rate, so it is the branch least
     # able to say anything up there -- the cheapest one to lose.
-    "v4": ([2, 3, 5, 7], V3_RESOLUTIONS, (1, 1, 1)),
+    "v4": ([2, 3, 5, 7], V4_RESOLUTIONS, (1, 1, 1)),
 }
 
 
@@ -759,9 +765,10 @@ class DiscriminatorR(torch.nn.Module):
     barely visible.  This branch takes the STFT magnitude at three resolutions
     instead, which is where such a defect is a single bright or missing line.
 
-    The window is deliberately rectangular (``torch.ones``): the branch is a
-    discriminator input, not an analysis, and the leakage a boxcar produces is
-    part of what it learns to read.
+    The two full-window branches use a Hann: a boxcar's -13 dB sidelobes fill
+    the inter-harmonic valleys in the real and the generated input alike, which
+    hides the one defect those branches are here to catch.  The fine-hop branch
+    reads modulation in time and keeps the boxcar.
     """
 
     def __init__(
@@ -802,13 +809,22 @@ class DiscriminatorR(torch.nn.Module):
             else norm_f(torch.nn.Conv2d(32, 1, (3, 3), padding=(1, 1)))
         )
 
-        # ``win_length`` is fixed at construction, so the boxcar is a constant
+        # ``win_length`` is fixed at construction, so the window is a constant
         # and was being rebuilt on every call -- three resolution branches,
         # both the real and the fake pass, and both the discriminator and the
         # generator update, i.e. twelve allocations of the same vector per
         # training step.  Non-persistent so no checkpoint gains a key.
+        #
+        # Hann only where the window spans the whole transform: on the short
+        # temporal branch it doubles a mainlobe already wider than f0 and takes
+        # its frequency contrast to 0.3 dB.  That branch's job is the hop.
+        n_fft, _hop, win_length = self.resolution
         self.register_buffer(
-            "window", torch.ones(int(self.resolution[2])), persistent=False
+            "window",
+            torch.hann_window(int(win_length))
+            if int(win_length) == int(n_fft)
+            else torch.ones(int(win_length)),
+            persistent=False,
         )
 
     def spectrogram(self, x):
@@ -829,9 +845,9 @@ class DiscriminatorR(torch.nn.Module):
     def forward(self, x, san_training: bool = False):
         fmap = []
         if self.fp32_input:
-            # The boxcar magnitude is linear and unnormalised -- a full-scale
-            # sine reads ``win_length / 2``, i.e. 120 to 600 here, against the
-            # [-1, 1] every period branch sees -- so under FP16 autocast this
+            # The magnitude is linear and unnormalised -- a full-scale sine
+            # reads 120 to 512 here, against the [-1, 1] every period branch
+            # sees -- so under FP16 autocast this
             # stage is where the activations and the weight gradient of the
             # first conv run out of range first, and at a raised learning rate
             # the branch diverges.  Only the STFT and ``convs[0]`` leave

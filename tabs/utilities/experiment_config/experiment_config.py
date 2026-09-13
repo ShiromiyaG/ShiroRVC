@@ -138,13 +138,27 @@ def describe_experiment(experiment: str | None):
         _("**model_info.json says:** `{}`").format(recorded or _("absent")),
     ]
 
-    if recorded and current_vocoder and normalize_vocoder(recorded) != current_vocoder:
-        lines.append(
-            _(
-                "The two disagree. Rebuilding writes both, which is how that "
-                "gets resolved."
+    if recorded:
+        try:
+            recorded_id = normalize_vocoder(recorded)
+        except ValueError:
+            # ``model_info.json`` can name a vocoder this build no longer ships.
+            # This panel exists to *report* that kind of drift, so it must not
+            # raise on it -- say so and let Rebuild write a value that resolves.
+            recorded_id = None
+            lines.append(
+                _(
+                    "`{}` is not a vocoder this build knows -- it was likely "
+                    "removed from the registry. Rebuilding writes a current one."
+                ).format(recorded)
             )
-        )
+        if recorded_id and current_vocoder and recorded_id != current_vocoder:
+            lines.append(
+                _(
+                    "The two disagree. Rebuilding writes both, which is how that "
+                    "gets resolved."
+                )
+            )
 
     existing_checkpoints = _checkpoints(experiment_dir)
     if existing_checkpoints:

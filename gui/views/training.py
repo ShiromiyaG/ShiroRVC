@@ -275,8 +275,6 @@ class TrainingPage(Page):
             )
         )
 
-        self.remove_16k = Toggle(_("Delete 16 kHz slices afterwards"), _("Frees disk once the features exist."))
-        advanced.add(self.remove_16k)
 
         self.extract_button = primary_button(_("Run extraction"))
         self.extract_button.clicked.connect(self._extract)
@@ -766,7 +764,6 @@ class TrainingPage(Page):
                 "vocoder_arch": self.vocoder.value(),
                 "embedder_model": self.extract_embedder.text(),
                 "include_mutes": int(self.include_mutes.value()),
-                "remove_16k_slices": self.remove_16k.isChecked(),
                 "feature_precision": self.feature_precision.text(),
             },
             busy_text=_("Extracting features…"),

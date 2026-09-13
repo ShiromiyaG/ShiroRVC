@@ -215,26 +215,19 @@ def test_the_retired_modes_still_run_but_are_not_offered():
         assert retired.strip('"') not in catalog.NORMALIZATION_MODES
 
 
-def test_the_two_copies_are_normalised_by_the_same_gain():
-    """The 16 kHz feature input and the ground truth must stay level-matched:
-    the gain is measured once, on the ground truth, and applied to both."""
+def test_the_per_slice_mode_reaches_the_loudness_target():
+    """What is left of the two-copies test: there is one copy now, and
+    extraction resamples it, so the only thing to check is that it lands on
+    the target."""
 
     preprocess = _preprocess()
-    _apply_post_norm = preprocess._apply_post_norm
-    _apply_post_norm_from_gain = preprocess._apply_post_norm_from_gain
 
-    gt_sr, k16_sr = 32000, 16000
+    gt_sr = 32000
     ground_truth = _sine(220.0, 2.0, gt_sr, 0.05)
-    sixteen = _sine(220.0, 2.0, k16_sr, 0.05)
-
-    gt_out, _ = _apply_post_norm(ground_truth, gt_sr, "post_loudness", -18.0)
-    k16_out = _apply_post_norm_from_gain(
-        sixteen, ground_truth, "post_loudness", -18.0, gt_sample_rate=gt_sr
+    gt_out, _ = preprocess._apply_post_norm(
+        ground_truth, gt_sr, "post_loudness", -18.0
     )
 
-    gt_gain = np.abs(gt_out).max() / np.abs(ground_truth).max()
-    k16_gain = np.abs(k16_out).max() / np.abs(sixteen).max()
-    assert gt_gain == pytest.approx(k16_gain, rel=1e-6)
     assert integrated_lufs(gt_out, gt_sr) == pytest.approx(-18.0, abs=0.05)
 
 
@@ -323,28 +316,23 @@ def _level_recordings(preprocess, tmp_path, files, sample_rate, target_lufs,
                       ceiling_db=-1.0):
     """Run the shipped ``pre_loudness`` path over ``files`` in ``tmp_path``.
 
-    The 16 kHz copies the worker also rewrites are made here rather than
-    faked, so the ceiling assertions cover both.  Returns
-    ``{source_key: (loudness, peak)}`` measured from the files on disk
+    Returns ``{source_key: (loudness, peak)}`` measured from the files on disk
     afterwards, plus the overshoots the worker reported.
     """
     import soundfile as sf
 
     gt_dir = tmp_path / "sliced_audios"
-    k16_dir = tmp_path / "sliced_audios_16k"
     gt_dir.mkdir(exist_ok=True)
-    k16_dir.mkdir(exist_ok=True)
     by_source = {}
     for name in files:
         audio, rate = sf.read(tmp_path / name)
         sf.write(gt_dir / name, audio.astype(np.float32), rate)
-        sf.write(k16_dir / name, audio[::2].astype(np.float32), rate // 2)
         by_source.setdefault(preprocess.source_key(name), []).append(name)
 
     overshoots = {}
     for key, names in sorted(by_source.items()):
         _written, overshoot, _short = preprocess._apply_source_gain_worker(
-            (key, sorted(names), str(gt_dir), str(k16_dir), ceiling_db, target_lufs)
+            (key, sorted(names), str(gt_dir), ceiling_db, target_lufs)
         )
         overshoots[key] = overshoot
 
@@ -352,8 +340,7 @@ def _level_recordings(preprocess, tmp_path, files, sample_rate, target_lufs,
     for key, names in by_source.items():
         powers, peak = [], 0.0
         for name in sorted(names):
-            for directory in (gt_dir, k16_dir):
-                peak = max(peak, float(np.abs(sf.read(directory / name)[0]).max()))
+            peak = max(peak, float(np.abs(sf.read(gt_dir / name)[0]).max()))
             audio, rate = sf.read(gt_dir / name)
             powers.append(block_powers(audio, rate))
         result[key] = (loudness_from_blocks(np.concatenate(powers)), peak)
@@ -524,9 +511,7 @@ def test_the_gain_is_solved_against_the_limited_result(tmp_path):
     preprocess = _preprocess()
     sample_rate = 32000
     gt_dir = tmp_path / "sliced_audios"
-    k16_dir = tmp_path / "sliced_audios_16k"
     gt_dir.mkdir()
-    k16_dir.mkdir()
 
     # A recording whose energy is mostly in transients: the limiter has to take
     # a lot out, which is exactly the case one round of gain gets wrong.
@@ -536,7 +521,6 @@ def test_the_gain_is_solved_against_the_limited_result(tmp_path):
     names = ["0_0_0.wav", "0_0_1.wav"]
     for name in names:
         sf.write(gt_dir / name, audio.astype(np.float32), sample_rate)
-        sf.write(k16_dir / name, audio[::2].astype(np.float32), 16000)
 
     # What one round of gain would have reached: the gain that puts the
     # *unlimited* recording on target, which is where the worker starts.
@@ -555,7 +539,7 @@ def test_the_gain_is_solved_against_the_limited_result(tmp_path):
     assert naive < -18.0 - 1.0, "the fixture is not exercising the solver"
 
     preprocess._apply_source_gain_worker(
-        ("0_0", names, str(gt_dir), str(k16_dir), -1.0, -18.0)
+        ("0_0", names, str(gt_dir), -1.0, -18.0)
     )
 
     powers = [
@@ -564,10 +548,9 @@ def test_the_gain_is_solved_against_the_limited_result(tmp_path):
     assert loudness_from_blocks(np.concatenate(powers)) == pytest.approx(
         -18.0, abs=preprocess.GAIN_SOLVE_TOLERANCE_DB + 0.01
     )
-    # The ceiling still holds, in both copies.
-    for directory in (gt_dir, k16_dir):
-        for name in names:
-            assert np.abs(sf.read(directory / name)[0]).max() <= 10 ** (-1 / 20) + 1e-6
+    # The ceiling still holds.
+    for name in names:
+        assert np.abs(sf.read(gt_dir / name)[0]).max() <= 10 ** (-1 / 20) + 1e-6
 
 
 def test_a_recording_that_saturates_below_the_target_says_so(tmp_path):
@@ -585,9 +568,7 @@ def test_a_recording_that_saturates_below_the_target_says_so(tmp_path):
     preprocess = _preprocess()
     sample_rate = 32000
     gt_dir = tmp_path / "sliced_audios"
-    k16_dir = tmp_path / "sliced_audios_16k"
     gt_dir.mkdir()
-    k16_dir.mkdir()
 
     # Short bursts separated by silence: the peaks carry essentially all of
     # the energy, so once the limiter has flattened them there is nothing left
@@ -603,10 +584,9 @@ def test_a_recording_that_saturates_below_the_target_says_so(tmp_path):
     names = ["0_0_0.wav"]
     for name in names:
         sf.write(gt_dir / name, audio.astype(np.float32), sample_rate)
-        sf.write(k16_dir / name, audio[::2].astype(np.float32), 16000)
 
     _written, _overshoot, shortfall = preprocess._apply_source_gain_worker(
-        ("0_0", names, str(gt_dir), str(k16_dir), -0.3, -3.0)
+        ("0_0", names, str(gt_dir), -0.3, -3.0)
     )
     assert shortfall is not None and shortfall > 0.1
 
@@ -615,8 +595,7 @@ def test_a_recording_that_saturates_below_the_target_says_so(tmp_path):
     assert loudness_from_blocks(np.concatenate(powers)) == pytest.approx(
         -3.0 - shortfall, abs=0.2
     )
-    for directory in (gt_dir, k16_dir):
-        assert np.abs(sf.read(directory / names[0])[0]).max() <= 10 ** (-0.3 / 20) + 1e-6
+    assert np.abs(sf.read(gt_dir / names[0])[0]).max() <= 10 ** (-0.3 / 20) + 1e-6
 
 
 def test_a_recording_scope_mode_is_the_default_everywhere():

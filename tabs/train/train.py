@@ -607,18 +607,6 @@ def train_tab():
             interactive=True,
             key='include_mutes'
         )
-        remove_16k_slices = gr.Checkbox(
-            label=_("Delete 16 kHz slices after extraction"),
-            info=(
-                _("The 16 kHz copies only feed pitch and embedder extraction; training "
-                "never reads them. Deleting frees roughly a third of what preprocessing "
-                "wrote. Re-extracting with another f0 method or embedder needs them "
-                "back, which means running preprocessing again.")
-            ),
-            value=False,
-            interactive=True,
-            key='remove_16k_slices'
-        )
         feature_precision = gr.Radio(
             label=_("Feature Precision"),
             info=(
@@ -654,7 +642,6 @@ def train_tab():
                 vocoder,
                 embedder_model,
                 include_mutes,
-                remove_16k_slices,
                 feature_precision,
             ],
             outputs=[extract_output_info],
@@ -1211,8 +1198,7 @@ def train_tab():
                 process_effects, noise_reduction, clean_strength,
 
                 # Feature extract
-                f0_method, embedder_model, include_mutes,
-                remove_16k_slices, feature_precision,
+                f0_method, embedder_model, include_mutes, feature_precision,
 
                 # Training
                 batch_size, epoch_save_frequency, total_epoch_count,

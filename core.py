@@ -381,7 +381,6 @@ def run_extract_script(
     vocoder_arch: str,
     embedder_model: str,
     include_mutes: int = 5,
-    remove_16k_slices: bool = False,
     feature_precision: str = "fp32",
 ):
     vocoder_arch = normalize_vocoder(vocoder_arch)
@@ -407,7 +406,6 @@ def run_extract_script(
                 vocoder_arch,
                 embedder_model,
                 include_mutes,
-                remove_16k_slices,
                 feature_precision,
             ],
         ),
@@ -1225,13 +1223,6 @@ EXTRACT_OWN = [
         default=5,
         show_default=True,
         help="Number of silent files to include.",
-    ),
-    click.option(
-        "--remove_16k_slices",
-        type=click.BOOL,
-        default=False,
-        show_default=True,
-        help="Delete the 16 kHz slices once extraction has consumed them.",
     ),
     click.option(
         "--feature_precision",

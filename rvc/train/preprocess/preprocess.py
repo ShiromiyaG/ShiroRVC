@@ -60,8 +60,6 @@ MIN_TAIL_SECONDS = 1.0
 MAX_AMPLITUDE = 0.9
 ALPHA = 0.75
 HIGH_PASS_CUTOFF = 48
-SAMPLE_RATE_16K = 16000
-RES_TYPE = "soxr_vhq"
 FLAC_COMPRESSION_LEVEL = 5 / 8 # FLAC level 5, libsndfile uses 0.0 - 1.0 range for compression level
 
 def secs_to_samples(secs, sr):
@@ -121,9 +119,7 @@ class PreProcess:
         self.exp_dir = exp_dir
 
         self.gt_wavs_dir = os.path.join(exp_dir, "sliced_audios")
-        self.wavs16k_dir = os.path.join(exp_dir, "sliced_audios_16k")
         os.makedirs(self.gt_wavs_dir, exist_ok=True)
-        os.makedirs(self.wavs16k_dir, exist_ok=True)
 
 
     def high_pass(self, audio: np.ndarray) -> np.ndarray:
@@ -167,48 +163,9 @@ class PreProcess:
         # and the extra precision is discarded on save anyway.
         return filtered.astype(np.float32, copy=False)
 
-    def resample_16k(self, audio: np.ndarray, loading_resampling: str) -> np.ndarray:
-        """The whole file at 16 kHz, resampled once.
-
-        Once per file rather than once per slice, which is what this used to
-        be.  On the ``ffmpeg`` path each slice cost a process spawn: 36 ms for
-        a 3 s slice against 0.4 ms for the same resample through soxr,
-        essentially all of it fork and exec.  At the ~7 slices a recording
-        averages here that was the single largest cost in the stage -- more
-        than the loader, the filter and the VAD together -- and it is why the
-        GPU sat idle: it was waiting on ffmpeg, not on the network.
-
-        Resampling first and cutting afterwards also removes the per-slice
-        edge transient the old order introduced, since the filter no longer
-        restarts at every slice boundary.  The 16 kHz offsets are computed
-        from the rate ratio (:meth:`_slice_16k`), so the two copies stay
-        sample-aligned to within the rounding of one 16 kHz sample.
-        """
-        if loading_resampling == "librosa":
-            return librosa.resample(
-                audio, orig_sr=self.sr, target_sr=SAMPLE_RATE_16K, res_type=RES_TYPE
-            )
-        return load_audio_ffmpeg(
-            audio, sample_rate=SAMPLE_RATE_16K, source_sr=self.sr,
-        )
-
-    def _slice_16k(self, audio_16k: np.ndarray, start: int, end: int) -> np.ndarray:
-        """``audio[start:end]`` mapped onto the 16 kHz copy.
-
-        Clamped to what the resampler actually produced: its output length is
-        the rate ratio give or take a sample, and the ratio is not an integer
-        at every project rate.
-        """
-        total = len(audio_16k)
-        ratio = SAMPLE_RATE_16K / self.sr
-        begin = min(total, max(0, int(round(start * ratio))))
-        finish = min(total, max(begin, int(round(end * ratio))))
-        return audio_16k[begin:finish]
-
     def process_audio_segment(
         self,
         audio: np.ndarray,
-        audio_16k: np.ndarray,
         start: int,
         end: int,
         sid: int,
@@ -218,19 +175,11 @@ class PreProcess:
     ):
         name = f"{sid}_{idx0}_{idx1}"
         save_audio(self.gt_wavs_dir, name, self.sr, dataset_format, audio[start:end])
-        save_audio(
-            self.wavs16k_dir,
-            name,
-            SAMPLE_RATE_16K,
-            dataset_format,
-            self._slice_16k(audio_16k, start, end),
-        )
 
 
     def simple_cut(
         self,
         audio: np.ndarray,
-        audio_16k: np.ndarray,
         sid: int,
         idx0: int,
         chunk_len: float,
@@ -274,7 +223,7 @@ class PreProcess:
                     start, end = 0, total
 
             self.process_audio_segment(
-                audio, audio_16k, start, end, sid, idx0, slice_idx, dataset_format
+                audio, start, end, sid, idx0, slice_idx, dataset_format
             )
             last_start = start
             slice_idx += 1
@@ -286,7 +235,6 @@ class PreProcess:
         self,
         spans,
         audio: np.ndarray,
-        audio_16k: np.ndarray,
         sid: int,
         idx0: int,
         dataset_format: str,
@@ -297,8 +245,7 @@ class PreProcess:
         how the voiced segments were found, and the slice geometry downstream
         has to stay identical either way.  Segments arrive as ``(start, end)``
         offsets into ``audio`` -- an iterable, so a cutter can stay a generator
-        -- rather than as arrays, because the same span has to be cut out of
-        the 16 kHz copy as well.
+        -- rather than as arrays.
         """
         idx1 = 0
         for segment_start, segment_end in spans:
@@ -309,12 +256,12 @@ class PreProcess:
                 if max(0, segment_end - start) > (PERCENTAGE + OVERLAP) * self.sr:
                     end = start + int(PERCENTAGE * self.sr)
                     self.process_audio_segment(
-                        audio, audio_16k, start, end, sid, idx0, idx1, dataset_format
+                        audio, start, end, sid, idx0, idx1, dataset_format
                     )
                     idx1 += 1
                 else:
                     self.process_audio_segment(
-                        audio, audio_16k, start, segment_end, sid, idx0, idx1,
+                        audio, start, segment_end, sid, idx0, idx1,
                         dataset_format,
                     )
                     idx1 += 1
@@ -350,26 +297,21 @@ class PreProcess:
                 import noisereduce as nr
                 audio = nr.reduce_noise(y=audio, sr=self.sr, prop_decrease=reduction_strength)
 
-            # Once per file, before any cutting: every slice is cut out of
-            # this copy instead of being resampled on its own.  See
-            # ``resample_16k``.
-            audio_16k = self.resample_16k(audio, loading_resampling)
-
             if cut_preprocess == "Skip":
                 self.process_audio_segment(
-                    audio, audio_16k, 0, len(audio), sid, idx0, 0, dataset_format
+                    audio, 0, len(audio), sid, idx0, 0, dataset_format
                 )
             elif cut_preprocess == "Simple":
-                self.simple_cut(audio, audio_16k, sid, idx0, chunk_len, overlap_len, dataset_format)
+                self.simple_cut(audio, sid, idx0, chunk_len, overlap_len, dataset_format)
             elif cut_preprocess == "Automatic":
                 self.chunk_segments(
-                    self.slicer.slice_spans(audio), audio, audio_16k, sid, idx0, dataset_format
+                    self.slicer.slice_spans(audio), audio, sid, idx0, dataset_format
                 )
             elif cut_preprocess == "New Automatic":
                 from rvc.train.preprocess import vad
 
                 self.chunk_segments(
-                    vad.segments(audio, self.sr), audio, audio_16k, sid, idx0, dataset_format,
+                    vad.segments(audio, self.sr), audio, sid, idx0, dataset_format,
                 )
         except Exception as e:
             logger.error(f"Error processing {path}: {e}")
@@ -410,29 +352,29 @@ def _process_audio_worker(args):
     )
 
 def _dry_run_check_file(args):
-    file_name, gt_wavs_dir, wavs16k_dir, target_rms, headroom, silence_thresh, eps, rms_norm_db = args
-    worst_in_file = None
-    for audio_dir in [gt_wavs_dir, wavs16k_dir]:
-        audio, _ = sf.read(os.path.join(audio_dir, file_name))
-        mask = np.abs(audio) > silence_thresh
-        if np.any(mask):
-            rms = np.sqrt(np.mean(audio[mask] ** 2) + eps)
-            gain = target_rms / rms
-        else:
-            gain = 1.0
+    file_name, gt_wavs_dir, target_rms, headroom, silence_thresh, eps, rms_norm_db = args
+    audio, _ = sf.read(os.path.join(gt_wavs_dir, file_name))
+    mask = np.abs(audio) > silence_thresh
+    if np.any(mask):
+        rms = np.sqrt(np.mean(audio[mask] ** 2) + eps)
+        gain = target_rms / rms
+    else:
+        gain = 1.0
 
-        peak = np.abs(audio * gain).max()
-        if peak > headroom:
-            gain_db = 20 * np.log10(gain)
-            peak_db = 20 * np.log10(peak)
-            crest_db = peak_db - rms_norm_db
-            safe_max_db = -0.5 - crest_db
-            if worst_in_file is None or safe_max_db < worst_in_file["safe_max_db"]:
-                worst_in_file = dict(gain_db=gain_db, peak_db=peak_db, crest_db=crest_db, safe_max_db=safe_max_db)
-    return worst_in_file
+    peak = np.abs(audio * gain).max()
+    if peak <= headroom:
+        return None
+    peak_db = 20 * np.log10(peak)
+    crest_db = peak_db - rms_norm_db
+    return dict(
+        gain_db=20 * np.log10(gain),
+        peak_db=peak_db,
+        crest_db=crest_db,
+        safe_max_db=-0.5 - crest_db,
+    )
 
 
-def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_processes):
+def _dry_run_post_rms(gt_wavs_dir, audio_files, rms_norm_db, num_processes):
     """Compute what post_rms would do without modifying files. Returns (is_safe, worst_safe_db, summary)."""
     target_rms = 10 ** (rms_norm_db / 20)
     headroom = 10 ** (-0.5 / 20)
@@ -440,7 +382,7 @@ def _dry_run_post_rms(gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_pr
     eps = 1e-9
 
     arg_list = [
-        (f, gt_wavs_dir, wavs16k_dir, target_rms, headroom, silence_thresh, eps, rms_norm_db)
+        (f, gt_wavs_dir, target_rms, headroom, silence_thresh, eps, rms_norm_db)
         for f in audio_files
     ]
 
@@ -572,12 +514,9 @@ def _apply_source_gain_worker(args):
     separate pass still bought was printing the summary before the writes
     rather than after, and it cost a full pass over 43 GB to do it.
 
-    The two copies get the same gain, which is what keeps the feature input and
-    the ground truth at one level, and then each is limited at its own rate.
-    Limiting the ground truth and resampling that to 16 kHz would be the purer
-    construction, but it would replace the 16 kHz file the slicer already wrote
-    with one that went through a second resample.  The two envelopes differ
-    only where the limiter acts at all.
+    The limiter runs once, on the ground truth.  The 16 kHz feature input is
+    resampled from these files at extraction time, so it inherits that envelope
+    instead of being limited a second time at its own rate.
 
     Returns ``(slices_written, overshoot_db, shortfall_db)``.  ``overshoot_db``
     is how far past the ceiling the recording would have gone at the target, or
@@ -590,7 +529,7 @@ def _apply_source_gain_worker(args):
     the same principle as everything else in this mode: a target the material
     cannot reach should be a message.
     """
-    key, file_names, gt_wavs_dir, wavs16k_dir, ceiling_db, target_lufs = args
+    key, file_names, gt_wavs_dir, ceiling_db, target_lufs = args
     try:
         gt_audio, gt_rate = [], None
         for file_name in file_names:
@@ -621,13 +560,6 @@ def _apply_source_gain_worker(args):
             stem, ext = file_name.split(".")[0], file_name.split(".")[1]
             limited = limit_peaks(audio * gain, gt_rate, ceiling_db=ceiling_db)
             save_audio(gt_wavs_dir, stem, gt_rate, ext, limited.astype(np.float32))
-            k16_audio, k16_rate = sf.read(os.path.join(wavs16k_dir, file_name))
-            k16_limited = limit_peaks(
-                k16_audio * gain, k16_rate, ceiling_db=ceiling_db
-            )
-            save_audio(
-                wavs16k_dir, stem, k16_rate, ext, k16_limited.astype(np.float32)
-            )
         return len(file_names), overshoot, shortfall
     except Exception as e:
         logger.error(f"Error normalizing recording {key} (pre_loudness): {e}")
@@ -651,10 +583,6 @@ def _apply_source_peak_rvc_worker(args):
     instead flattens the dynamics between phrases.  ``post_peak_rvc`` is that
     per-slice variant, kept for configs that already name it.
 
-    Both copies get the same scale factor, so the 16 kHz feature input and the
-    ground truth stay at one level -- the same contract as
-    ``_apply_source_gain_worker``.
-
     No limiter runs here, and unlike ``pre_loudness`` this mode has no ceiling:
     the blend puts the output peak at ``MAX_AMPLITUDE * ALPHA + (1 - ALPHA) *
     peak``, which is under ``MAX_AMPLITUDE`` only while the input peak is, and
@@ -671,7 +599,7 @@ def _apply_source_peak_rvc_worker(args):
 
     Returns the number of slices written.
     """
-    key, file_names, gt_wavs_dir, wavs16k_dir = args
+    key, file_names, gt_wavs_dir = args
     try:
         gt_audio, gt_rate = [], None
         for file_name in file_names:
@@ -691,12 +619,6 @@ def _apply_source_peak_rvc_worker(args):
             if scale:
                 audio = audio * scale + (1 - ALPHA) * audio
             save_audio(gt_wavs_dir, stem, gt_rate, ext, audio.astype(np.float32))
-            k16_audio, k16_rate = sf.read(os.path.join(wavs16k_dir, file_name))
-            if scale:
-                k16_audio = k16_audio * scale + (1 - ALPHA) * k16_audio
-            save_audio(
-                wavs16k_dir, stem, k16_rate, ext, k16_audio.astype(np.float32)
-            )
         return len(file_names)
     except Exception as e:
         logger.error(f"Error normalizing recording {key} (pre_peak_rvc): {e}")
@@ -753,49 +675,6 @@ def _dry_run_slice_loudness(gt_wavs_dir, audio_files, target_lufs, num_processes
             "avg_crest": float(np.mean(crests)),
         }
     return True, None, None
-
-
-def _apply_post_norm_from_gain(audio: np.ndarray, gt_audio: np.ndarray, mode: str, rms_norm_db: float, gt_sample_rate: int = 40000):
-    """Apply normalization using the gain computed from gt_audio, so gt and 16k stay loudness-consistent."""
-    if mode == "post_loudness":
-        # The gain is measured on ``gt_audio`` and applied to both copies, so
-        # the 16 kHz feature input and the ground truth stay at the same level.
-        # Its own rate is what the K-weighting has to be built at, hence
-        # ``gt_sample_rate`` rather than the 16 kHz one.
-        gain = loudness_gain(gt_audio, gt_sample_rate, rms_norm_db)
-        scaled, _ = apply_gain_with_ceiling(audio, gain)
-        return scaled.astype(np.float32)
-
-    elif mode == "post_rms":
-        eps = 1e-9
-        target_rms = 10 ** (rms_norm_db / 20)
-        headroom = 10 ** (-0.5 / 20)
-        silence_thresh = 10 ** (-40.0 / 20)
-        mask = np.abs(gt_audio) > silence_thresh
-        if np.any(mask):
-            gt_rms = np.sqrt(np.mean(gt_audio[mask] ** 2) + eps)
-            gain = target_rms / gt_rms
-        else:
-            gain = 1.0
-        audio2 = audio * gain
-        peak = np.abs(audio2).max()
-        if peak > headroom:
-            audio2 = audio2 / peak * headroom
-        return audio2.astype(np.float32)
-
-    elif mode == "post_peak_rvc":
-        a_max = np.abs(gt_audio).max()
-        if a_max <= 0:
-            return audio.astype(np.float32)
-        return ((audio / a_max * (MAX_AMPLITUDE * ALPHA)) + (1 - ALPHA) * audio).astype(np.float32)
-
-    elif mode == "post_peak":
-        peak = np.max(np.abs(gt_audio))
-        if peak > 0:
-            return (audio / peak * 0.95).astype(np.float32)
-        return audio.astype(np.float32)
-
-    return audio.astype(np.float32)
 
 
 def _apply_post_norm(audio: np.ndarray, sr: int, mode: str, rms_norm_db: float):
@@ -883,19 +762,13 @@ def _stage1_pool(workers, use_threads):
 
 
 def _process_and_save_worker(args):
-    file_name, gt_wavs_dir, wavs16k_dir, mode, rms_norm_db = args
+    file_name, gt_wavs_dir, mode, rms_norm_db = args
     try:
         stem, ext = file_name.split(".")[0], file_name.split(".")[1]
 
         gt_audio, gt_sr = sf.read(os.path.join(gt_wavs_dir, file_name))
         gt_result, gt_s = _apply_post_norm(gt_audio, gt_sr, mode, rms_norm_db)
         save_audio(gt_wavs_dir, stem, gt_sr, ext, gt_result)
-
-        k16_audio, k16_sr = sf.read(os.path.join(wavs16k_dir, file_name))
-        k16_result = _apply_post_norm_from_gain(
-            k16_audio, gt_audio, mode, rms_norm_db, gt_sample_rate=gt_sr
-        )
-        save_audio(wavs16k_dir, stem, k16_sr, ext, k16_result)
     except Exception as e:
         logger.error(f"Error normalizing {file_name} ({mode}): {e}")
         raise e
@@ -1010,6 +883,9 @@ def _duration_seconds(audio_path, loading_resampling):
 
 def cleanup_dirs(exp_dir):
     gt_wavs_dir = os.path.join(exp_dir, "sliced_audios")
+    # ``sliced_audios_16k`` is not written any more -- extraction resamples the
+    # slices as it reads them -- but it is still removed here so that
+    # re-preprocessing an older experiment clears the leftover copy.
     wavs16k_dir = os.path.join(exp_dir, "sliced_audios_16k")
     removed = []
     for directory in (gt_wavs_dir, wavs16k_dir):
@@ -1186,7 +1062,6 @@ def preprocess_training_set(
 
     if normalization_mode in POST_NORM_MODES:
         gt_wavs_dir = os.path.join(exp_dir, "sliced_audios")
-        wavs16k_dir = os.path.join(exp_dir, "sliced_audios_16k")
         audio_files = sorted(f for f in os.listdir(gt_wavs_dir) if f.endswith((".wav", ".flac")))
 
         logger.info("Stage 2: Normalization")
@@ -1199,7 +1074,7 @@ def preprocess_training_set(
             for f in audio_files:
                 by_source.setdefault(source_key(f), []).append(f)
             arg_list = [
-                (key, sorted(names), gt_wavs_dir, wavs16k_dir)
+                (key, sorted(names), gt_wavs_dir)
                 for key, names in sorted(by_source.items())
             ]
             logger.info(
@@ -1224,7 +1099,7 @@ def preprocess_training_set(
             for f in audio_files:
                 by_source.setdefault(source_key(f), []).append(f)
             arg_list = [
-                (key, sorted(names), gt_wavs_dir, wavs16k_dir, CEILING_DB, rms_norm_db)
+                (key, sorted(names), gt_wavs_dir, CEILING_DB, rms_norm_db)
                 for key, names in sorted(by_source.items())
             ]
             logger.info(
@@ -1282,7 +1157,7 @@ def preprocess_training_set(
         elif normalization_mode == "post_rms":
             logger.info("Performing a dry-run first to establish safety of chosen RMS dB...")
             is_safe, worst_safe, summary = _dry_run_post_rms(
-                gt_wavs_dir, wavs16k_dir, audio_files, rms_norm_db, num_processes
+                gt_wavs_dir, audio_files, rms_norm_db, num_processes
             )
             if not is_safe:
                 logger.warning(
@@ -1294,7 +1169,7 @@ def preprocess_training_set(
 
         if normalization_mode not in RECORDING_SCOPE_MODES:
             logger.info(f"Post Normalization: {POST_NORM_MODES[normalization_mode]}. Initiating...")
-            arg_list = [(f, gt_wavs_dir, wavs16k_dir, normalization_mode, rms_norm_db) for f in audio_files]
+            arg_list = [(f, gt_wavs_dir, normalization_mode, rms_norm_db) for f in audio_files]
 
             with worker_pool(pool_size(num_processes, len(audio_files))) as pool:
                 with progress_task(

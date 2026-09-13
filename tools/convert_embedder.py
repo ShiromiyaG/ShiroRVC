@@ -76,7 +76,7 @@ Usage:
         --output logs/pretrains/pretrain_contentvec_G.pth \\
         --source-embedder spin_v1 \\
         --target-embedder contentvec \\
-        --audio-dir logs/pretrain/sliced_audios_16k
+        --audio-dir logs/pretrain/sliced_audios
 """
 
 import argparse
@@ -179,7 +179,7 @@ def main():
     parser.add_argument(
         "--audio-dir",
         required=True,
-        help="16 kHz clips to fit on; the run's 'sliced_audios_16k' is the right input.",
+        help="Clips to fit on, resampled to 16 kHz as they are read; the run's 'sliced_audios' is the right input.",
     )
     parser.add_argument(
         "--max-files",

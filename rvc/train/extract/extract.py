@@ -1,7 +1,6 @@
 import os
 import sys
 import glob
-import shutil
 import time
 import torch
 from pathlib import Path
@@ -33,7 +32,12 @@ install_rich_print()
 
 from rvc.lib.utils import load_audio_16k, load_embedder_model, extract_features
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
-from rvc.train.extract.noise_mutes import prepare_noise_mutes
+from rvc.train.extract.noise_mutes import (
+    NOISE_SAMPLES,
+    is_noise_source,
+    noise_audio,
+    prepare_noise_mutes,
+)
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE, load_high_register_settings
 from rvc.configs.config import Config
 
@@ -165,10 +169,16 @@ def _grouped_by_length(files):
     """
     buckets = {}
     for file_info in files:
-        try:
-            frames = sf.info(file_info[0]).frames
-        except Exception:
-            frames = -1  # unreadable: give it its own bucket, fail it alone
+        source = file_info[0]
+        if is_noise_source(source):
+            # Synthesised, and every mute clip is the same length: no stat to
+            # do, and they all land in one bucket.
+            frames = NOISE_SAMPLES
+        else:
+            try:
+                frames = sf.info(source).frames
+            except Exception:
+                frames = -1  # unreadable: give it its own bucket, fail it alone
         buckets.setdefault(frames, []).append(file_info)
     return sorted(buckets.values(), key=len, reverse=True)
 
@@ -235,6 +245,15 @@ def run_pitch_extraction(files, devices, f0_method, threads):
 FEATURE_PRECISIONS = {"fp32": np.float32, "fp16": np.float16}
 
 
+def _clip_audio(source):
+    """A work item's 16 kHz audio: a file to read, or a mute's noise to make.
+
+    The mute clips' embedder input is deterministic in their spec, so it is
+    synthesised here instead of being written to disk and read back.
+    """
+    return noise_audio(source) if is_noise_source(source) else load_audio_16k(source)
+
+
 def process_file_embedding(
     files, embedder_model, device_num, device, n_threads,
     feature_precision="fp32",
@@ -248,7 +267,7 @@ def process_file_embedding(
     use_amp = str(device).startswith("cuda")
 
     def save(file_info, feats_out):
-        wav_file_path, _, _, out_file_path = file_info
+        source, _, _, out_file_path = file_info
         if np.isfinite(feats_out).all():
             np.save(
                 out_file_path,
@@ -256,13 +275,13 @@ def process_file_embedding(
                 allow_pickle=False,
             )
         else:
-            warning(f"{wav_file_path} produced NaN values; skipping.", tag="[EXTRACT]")
+            warning(f"{source} produced NaN values; skipping.", tag="[EXTRACT]")
 
     def worker(file_info):
-        wav_file_path, _, _, out_file_path = file_info
+        source, _, _, out_file_path = file_info
         if os.path.exists(out_file_path):
             return
-        feats = torch.from_numpy(load_audio_16k(wav_file_path)).to(device).float()
+        feats = torch.from_numpy(_clip_audio(source)).to(device).float()
         feats = feats.view(1, -1)
         with torch.autocast(
             device_type="cuda",
@@ -280,7 +299,7 @@ def process_file_embedding(
         neighbours a retry rather than their features.
         """
         try:
-            audio = np.stack([load_audio_16k(info[0]) for info in group])
+            audio = np.stack([_clip_audio(info[0]) for info in group])
             feats = torch.from_numpy(audio).to(device).float()
             with torch.autocast(
                 device_type="cuda",
@@ -353,61 +372,6 @@ def run_embedding_extraction(
     )
 
 
-def discard_16k_slices(wav_path):
-    """Delete the 16 kHz slices once the features derived from them exist.
-
-    They feed pitch and embedder extraction only, so are dead weight after
-    that; re-extracting with a different f0 method or embedder needs them
-    back, meaning preprocessing must run again.
-    """
-    if os.path.basename(os.path.normpath(wav_path)) != "sliced_audios_16k":
-        return
-    if not os.path.isdir(wav_path):
-        return
-
-    # The mute folders are a shared asset: `preparing_files` falls back to
-    # `logs/mute/sliced_audios_16k/mute.wav` when building the mute sample for
-    # a new sample rate, so never strip one of those.
-    experiment_name = os.path.basename(os.path.dirname(os.path.normpath(wav_path)))
-    if experiment_name.lower().startswith("mute"):
-        info(
-            f"Keeping 16 kHz slices: '{experiment_name}' is a shared mute asset.",
-            tag="[EXTRACT]",
-        )
-        return
-
-    # Only discard once the artifacts that replace them are actually on disk.
-    exp_dir = os.path.dirname(os.path.normpath(wav_path))
-    if not os.path.isfile(os.path.join(exp_dir, "filelist.txt")):
-        warning(
-            "Keeping 16 kHz slices: filelist.txt is missing, so extraction "
-            "looks incomplete.",
-            tag="[EXTRACT]",
-        )
-        return
-
-    freed = 0
-    count = 0
-    for root, _, names in os.walk(wav_path):
-        for name in names:
-            try:
-                freed += os.path.getsize(os.path.join(root, name))
-                count += 1
-            except OSError:
-                pass
-
-    try:
-        shutil.rmtree(wav_path)
-    except OSError as error:
-        warning(f"Could not remove the 16 kHz slices: {error}", tag="[EXTRACT]")
-        return
-
-    success(
-        f"Removed {count} 16 kHz slices, freeing {freed / (1024 ** 3):.2f} GB.",
-        tag="[EXTRACT]",
-    )
-
-
 if __name__ == "__main__":
     exp_dir = sys.argv[1]
     f0_method = sys.argv[2]
@@ -431,8 +395,7 @@ if __name__ == "__main__":
             "spin_v2. Existing spin_v1 models still run at inference."
         )
     include_mutes = int(sys.argv[8]) if len(sys.argv) > 8 else 5
-    remove_16k_slices = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
-    feature_precision = sys.argv[10] if len(sys.argv) > 10 else "fp32"
+    feature_precision = sys.argv[9] if len(sys.argv) > 9 else "fp32"
     if feature_precision not in FEATURE_PRECISIONS:
         warning(
             f"Unknown feature precision {feature_precision!r}; using fp32.",
@@ -440,7 +403,9 @@ if __name__ == "__main__":
         )
         feature_precision = "fp32"
 
-    wav_path = os.path.join(exp_dir, "sliced_audios_16k")
+    # The slices at the project rate.  ``load_audio_16k`` resamples each one as
+    # it is read, so no second copy of the dataset has to exist on disk.
+    wav_path = os.path.join(exp_dir, "sliced_audios")
     os.makedirs(os.path.join(exp_dir, "f0"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "f0_voiced"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "extracted"), exist_ok=True)
@@ -491,6 +456,3 @@ if __name__ == "__main__":
 
     generate_config(sample_rate, exp_dir, vocoder_arch, embedder_model)
     generate_filelist(exp_dir, sample_rate, include_mutes, embedder_model, vocoder_arch)
-
-    if remove_16k_slices:
-        discard_16k_slices(wav_path)

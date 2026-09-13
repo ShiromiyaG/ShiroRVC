@@ -147,9 +147,24 @@ def resolve_vocoder(directory: Path, requested: str | None) -> str:
         except (json.JSONDecodeError, OSError):
             previous = None
 
-    if requested and previous and normalize_vocoder(requested) != normalize_vocoder(
-        previous
-    ):
+    if previous:
+        try:
+            previous = normalize_vocoder(previous)
+        except ValueError as error:
+            # A vocoder this build no longer ships (one removed from the
+            # registry), or a hand-edited spec.  It cannot *conflict* with the
+            # request -- there is no decoder by that name for the folder to have
+            # trained -- so this is not the mismatch the guard below is for, just
+            # an answer that can no longer be read.  Drop it and let ``--vocoder``
+            # stand; with nothing requested, the "state one" error below fires.
+            print(
+                f"  warning   {spec_path} names vocoder {previous!r}, which this "
+                f"build does not know ({error}) -- ignoring it.",
+                file=sys.stderr,
+            )
+            previous = None
+
+    if requested and previous and normalize_vocoder(requested) != previous:
         raise StageError(
             f"--vocoder {requested!r} does not match the vocoder this folder "
             f"was last launched with ({previous!r}, from {spec_path}).\n"

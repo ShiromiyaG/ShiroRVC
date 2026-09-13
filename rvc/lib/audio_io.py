@@ -25,10 +25,37 @@ import numpy as np
 import soundfile as sf
 
 
+#: Feature-extraction rate, and the resampler used to reach it.  ``soxr_vhq``
+#: rather than librosa's default ``soxr_hq``, which is a step down.
+SAMPLE_RATE_16K = 16000
+RES_TYPE_16K = "soxr_vhq"
+
+
 def load_audio_16k(file):
-    # Callers already preprocess to 16k, so no resample happens here.
+    """One clip at 16 kHz, for the pitch and embedder extractors.
+
+    Resampled on demand rather than read from a second copy on disk: the
+    ``sliced_audios_16k`` preprocessing used to write held this same signal,
+    and deriving it here is what lets a re-extraction run against another f0
+    method or embedder without preprocessing the dataset again.
+    """
     try:
-        audio, sr = librosa.load(file, sr=16000)
+        audio, sr = sf.read(file, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = librosa.to_mono(audio.T)
+        if sr != SAMPLE_RATE_16K:
+            # Length from the rate ratio rather than from the resampler: it is
+            # what decides the frame counts the extractors derive.
+            target = int(round(len(audio) * SAMPLE_RATE_16K / sr))
+            audio = librosa.resample(
+                audio, orig_sr=sr, target_sr=SAMPLE_RATE_16K, res_type=RES_TYPE_16K
+            )
+            if len(audio) != target:
+                audio = (
+                    audio[:target]
+                    if len(audio) > target
+                    else np.pad(audio, (0, target - len(audio)))
+                )
     except Exception as error:
         raise RuntimeError(f"An error occurred loading the audio: {error}")
 
