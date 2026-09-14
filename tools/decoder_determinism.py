@@ -49,32 +49,28 @@ def apply_checkpoint_layout(model_cfg: dict, layout: dict | None) -> dict:
     """Make the config's decoder options say what the checkpoint was trained with.
 
     ``decoder_layout`` exists because none of these leave a trace in the state
-    dict: wrapping an activation adds no key, and redesigning its filter adds
-    none either.  A tool that builds from ``config.json`` alone therefore loads
-    ``decoder_layout`` exists because none of these leave a trace in the state
     dict: the stage ordering keeps every key and shape, and the upsamplers'
     interpolation kernels are non-persistent, so redesigning one adds no key.
     A tool that builds from ``config.json`` alone therefore loads happily into
-    the wrong signal path and measures a decoder that never existed.  Training
-    guards this with ``assert_decoder_layout_matches``; analysis has to as
-    well.
+    the wrong signal path and measures a decoder that never existed.
+
+    Only the options the decoder takes are copied; the upsample filter is not
+    configurable.  ``assert_decoder_layout_matches`` in
+    ``build`` checks all of them against the checkpoint.
     """
 
     if not layout:
         return model_cfg
     cfg = dict(model_cfg)
     cfg["upsample_rates"] = list(layout["upsample_rates"])
-    for key in ("source_gain", "source_bandwidth", "source_normalize"):
+    for key in ("source_gain", "source_harmonics", "source_tilt"):
         if key in layout:
             cfg[f"refinegan2_{key}"] = layout[key]
-    up = layout.get("upsample_filter")
-    if up:
-        cfg["refinegan2_filter_width"], cfg["refinegan2_rolloff"], \
-            cfg["refinegan2_filter_beta"] = (list(v) for v in up)
     return cfg
 
 
-def build(log_dir: Path, ckpt_path: Path, ema: bool):
+def build(log_dir: Path, ckpt_path: Path, ema: bool, keep_posterior: bool = False):
+    """``keep_posterior`` keeps ``enc_q``, for renders through the posterior."""
     config = json.loads((log_dir / "config.json").read_text(encoding="utf-8"))
     model_cfg = dict(config["model"])
     data = config["data"]
@@ -103,7 +99,8 @@ def build(log_dir: Path, ckpt_path: Path, ema: bool):
     from rvc.train.utils import assert_decoder_layout_matches
 
     assert_decoder_layout_matches(net_g, ckpt)
-    net_g.remove_training_modules()
+    if not keep_posterior:
+        net_g.remove_training_modules()
     net_g = net_g.float().eval()
     strip_parametrizations(net_g)
     return net_g, int(data["sample_rate"])

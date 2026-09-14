@@ -272,10 +272,9 @@ def test_the_decimation_filter_is_unchanged():
 
 
 def test_the_discriminator_version_is_overridable_from_the_config():
-    """v3 is the default because it is Applio's choice for RefineGAN and the
-    better discriminator -- its spectrogram branches are the only ones that see
-    a narrow, stationary frequency defect.  It is also 1.8 GiB more at batch 8,
-    which does not fit an 8 GB card, so the config has to be able to say v2.
+    """v4 is the registry default: v3's spectrogram branches, which are the only
+    ones that see a narrow, stationary frequency defect, minus v3's longest
+    period so it fits an 8 GB card.  The config can still say v2 or v3.
     """
 
     model = json.loads(CONFIG.read_text())["model"]
@@ -288,9 +287,9 @@ def test_the_discriminator_version_is_overridable_from_the_config():
         version = get_discriminator_id("refinegan2")
         return str(getattr(config_model, "d_version", None) or version)
 
-    assert resolve(types.SimpleNamespace()) == "v3"
+    assert resolve(types.SimpleNamespace()) == "v4"
     assert resolve(types.SimpleNamespace(d_version="v2")) == "v2"
-    assert resolve(types.SimpleNamespace(d_version=None)) == "v3"
+    assert resolve(types.SimpleNamespace(d_version=None)) == "v4"
 
 
 def test_the_upsampler_folds_its_gain_into_the_kernel():

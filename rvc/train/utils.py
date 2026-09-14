@@ -32,6 +32,7 @@ from rvc.train.messages import (
     TENSORBOARD_VALIDATION_PREVIEW_DIR,
     TENSORBOARD_VALIDATION_SOURCE_TAG,
 )
+from rvc.train.optimizers import restart_schedule_free_average
 
 
 MATPLOTLIB_FLAG = False
@@ -89,42 +90,70 @@ def replace_keys_in_dict(d, old_key_part, new_key_part):
     return updated_dict
 
 
-def remap_optimizer_state(optimizer, model, opt_state):
-    """Prune a saved optimizer state dict so it fits an optimizer whose parameter set changed
+def optimizer_param_names(optimizer, model):
+    """Parameter names in the order ``optimizer.state_dict()`` indexes them."""
+    names = {id(p): n for n, p in model.named_parameters()}
+    return [names.get(id(p)) for g in optimizer.param_groups for p in g["params"]]
+
+
+def remap_optimizer_state(optimizer, model, opt_state, saved_names=None):
+    """Fit a saved optimizer state dict to an optimizer whose parameter set changed
         ( e.g. layers were frozen between runs ).
 
-    The moments of params that still exist are kept and removed params' state is dropped.
+    Saved state is indexed by the saved optimizer's own parameter list, which
+    skips frozen params, so it is matched by ``saved_names`` rather than by
+    position in ``model.parameters()``.  Params without a match start fresh.
     Returns None if nothing can be salvaged.
     """
-    model_params = list(model.parameters())
-    old_index = {id(p): i for i, p in enumerate(model_params)}
-    new_params = [p for g in optimizer.param_groups for p in g["params"]]
-    new_index = {id(p): j for j, p in enumerate(new_params)}
-
-    state = {}
-    for old_i, group_state in opt_state.get("state", {}).items():
-        if isinstance(old_i, int) and old_i < len(model_params):
-            p = model_params[old_i]
-            if id(p) in new_index:
-                state[new_index[id(p)]] = group_state
-
     saved_groups = opt_state.get("param_groups", [])
     if not saved_groups:
         return None
 
+    if saved_names is None:
+        # Checkpoints from before the names were saved: a position only means
+        # something if the saved optimizer held every parameter.
+        model_names = [n for n, _ in model.named_parameters()]
+        saved_count = sum(len(g["params"]) for g in saved_groups)
+        saved_names = model_names if saved_count == len(model_names) else None
+
+    new_params = [p for g in optimizer.param_groups for p in g["params"]]
+    new_index = {n: j for j, n in enumerate(optimizer_param_names(optimizer, model))}
+
+    state = {}
+    if saved_names is not None:
+        for old_i, group_state in opt_state.get("state", {}).items():
+            if not isinstance(old_i, int) or old_i >= len(saved_names):
+                continue
+            j = new_index.get(saved_names[old_i])
+            if j is None:
+                continue
+            if all(
+                v.shape == new_params[j].shape
+                for v in group_state.values()
+                if torch.is_tensor(v) and v.dim() > 0
+            ):
+                state[j] = group_state
+
+    # Groups carry the saved hyperparameters, with the LR rebased onto each
+    # new group's ``lr_scale`` instead of inheriting the saved group's scale.
+    reference = saved_groups[0]
+    saved_scale = reference.get("lr_scale", 1.0) or 1.0
     param_groups = []
     for i, group in enumerate(optimizer.param_groups):
-        new_group = {}
-        for key, value in saved_groups[min(i, len(saved_groups) - 1)].items():
-            if key != "params":
-                new_group[key] = value
-        new_group["params"] = group["params"]
+        new_group = {
+            key: value
+            for key, value in saved_groups[min(i, len(saved_groups) - 1)].items()
+            if key != "params"
+        }
+        scale = group.get("lr_scale", 1.0)
+        new_group["lr"] = reference["lr"] / saved_scale * scale
+        if "initial_lr" in reference:
+            new_group["initial_lr"] = reference["initial_lr"] / saved_scale * scale
         if "lr_scale" in group:
-            new_group["lr_scale"] = group["lr_scale"]
+            new_group["lr_scale"] = scale
+        new_group["params"] = group["params"]
         param_groups.append(new_group)
 
-    if not state and not param_groups:
-        return None
     return {"state": state, "param_groups": param_groups}
 
 
@@ -144,6 +173,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
     assert_excitation_matches(model_state, checkpoint_dict)
     assert_decoder_layout_matches(model_state, checkpoint_dict)
     assert_periods_match(model_state, checkpoint_dict)
+    assert_msd_matches(model_state, checkpoint_dict)
     model_state.load_state_dict(checkpoint_dict["model"], strict=strict_load)
 
     if ema is not None:
@@ -163,19 +193,30 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
     if optimizer:
         opt_state = checkpoint_dict.get("optimizer")
         if opt_state:
+            saved_names = checkpoint_dict.get("optimizer_param_names")
+            # Same counts do not mean the same params: a stage switch can swap
+            # one frozen set for another of equal size and still load cleanly.
+            names_changed = saved_names is not None and list(saved_names) != (
+                optimizer_param_names(optimizer, model_state)
+            )
             try:
+                if names_changed:
+                    raise ValueError("optimizer parameter names changed")
                 optimizer.load_state_dict(opt_state)
                 info("Loaded optimizer state.", tag="[RESUME]")
             except ValueError:
                 warning(
                     "The optimizer's parameter set changed (layers were frozen, "
-                    "for instance); pruning the saved state to the surviving "
-                    "params, with the LR re-anchored to the saved value.",
+                    "for instance); matching the saved state to the surviving "
+                    "params by name, with the LR re-anchored to the saved value.",
                     tag="[RESUME]",
                 )
-                pruned = remap_optimizer_state(optimizer, model_state, opt_state)
+                pruned = remap_optimizer_state(
+                    optimizer, model_state, opt_state, saved_names
+                )
                 if pruned is not None:
                     optimizer.load_state_dict(pruned)
+                    restart_schedule_free_average(optimizer)
                     info(
                         "Loaded optimizer state (pruned to the surviving params).",
                         tag="[RESUME]",
@@ -218,18 +259,10 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True, em
 def excitation_source(model):
     """A short name for the decoder's excitation, or ``None`` if it has no say.
 
-    Only ``sine`` is built since 2026-09-08, when ``SineGenerator`` replaced
-    the band-limited impulse train, but the guard stays: every source this
-    fork tried owned different
-    state-dict keys (``bank`` a ``phase_offset`` sized by its harmonic count,
-    ``blit`` a ``gain``, ``comb`` none at all) and the generator resumes
-    *non-strictly*, so such a checkpoint loads into this synthesiser without
-    raising and leaves the new modules at their random init.  A sentence beats
-    training on from a silently wrong excitation.
-
-    Note this guard is coarser than it looks: it names the *kind* of source,
-    not its design.  A BLIT's bandwidth leaves no key either, and that one is
-    reported through ``decoder_layout`` instead.
+    Only ``sine`` is built, but the guard stays: every source this fork tried
+    owned different state-dict keys and the generator resumes *non-strictly*,
+    so such a checkpoint would load without raising and leave the new modules
+    at their random init.
     """
     decoder = getattr(model, "dec", None)
     source = getattr(decoder, "source_type", None)
@@ -245,10 +278,9 @@ def assert_excitation_matches(model, checkpoint_dict, origin="checkpoint"):
     if found != expected:
         raise ValueError(
             f"Excitation mismatch: this run builds '{expected}' but the "
-            f"{origin} was trained with '{found}'. The 'comb' and 'bank' "
-            f"sources were removed on 2026-09-03 and 'blit' was replaced by "
-            f"the sine on 2026-09-08, so such a checkpoint cannot be resumed "
-            f"-- start a fresh run."
+            f"{origin} was trained with '{found}'. That source was removed "
+            f"and only the sine is built, so such a checkpoint cannot be "
+            f"resumed -- start a fresh run."
         )
 
 
@@ -299,15 +331,6 @@ def decoder_layout(model):
         "upsample_rates": [int(rate) for rate in rates],
         "source_gain": bool(getattr(decoder, "has_source_gain", False)),
         "source_bands": int(getattr(decoder, "source_bands", 0)),
-        # How much of the band the excitation fills.  ``BlitGenerator`` owns
-        # one scalar parameter at every bandwidth, so this changes what the
-        # whole decoder was trained to receive while leaving the state dict
-        # byte-identical in shape.
-        "source_bandwidth": float(getattr(decoder, "source_bandwidth", 1.0)),
-        # Whether the excitation holds energy or peak constant across the
-        # range.  Worth 13-23 dB of source level depending on the note, and
-        # like the bandwidth it owns no state-dict key.
-        "source_normalize": bool(getattr(decoder, "source_normalize", False)),
         # The excitation's harmonic slope: partial ``j`` at ``j ** -tilt``.
         # The *count* sizes ``m_source.merge.0.weight`` and so a strict load
         # already refuses a mismatch, but the tilt is a non-persistent buffer
@@ -341,8 +364,6 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             ),
             "source_gain": False,
             "source_bands": 0,
-            "source_bandwidth": 1.0,
-            "source_normalize": False,
             "source_harmonics": 0,
             "source_tilt": 1.0,
             "upsample_filter": None,
@@ -352,13 +373,6 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
         "upsample_rates": [int(r) for r in found.get("upsample_rates", [])],
         "source_gain": bool(found.get("source_gain", False)),
         "source_bands": int(found.get("source_bands", 0)),
-        # Absent means the full-band BLIT: the bandwidth cap postdates the
-        # excitation, so a checkpoint that names no bandwidth was trained at
-        # 1.0.
-        "source_bandwidth": float(found.get("source_bandwidth", 1.0)),
-        # Absent means off: the normalisation postdates the excitation, so a
-        # checkpoint that names nothing was trained on the unit-peak kernel.
-        "source_normalize": bool(found.get("source_normalize", False)),
         # Absent means the one-partial sine at the tilt a single partial
         # cannot express: every run before 2026-09-09 is that, and reading
         # the tilt as "whatever this run builds" would let a harmonic-rich
@@ -421,6 +435,34 @@ def discriminator_periods(model):
     return None if periods is None else [int(p) for p in periods]
 
 
+def discriminator_has_msd(model):
+    """Whether a discriminator has the waveform (MSD) branch, or ``None`` if it is not one."""
+    target = getattr(model, "module", model)
+    use_msd = getattr(target, "use_msd", None)
+    return None if use_msd is None else bool(use_msd)
+
+
+def assert_msd_matches(model, checkpoint_dict, origin="checkpoint"):
+    """Refuse a discriminator checkpoint built with the other ``d_use_msd``.
+
+    The MSD is branch 0, so toggling it shifts every other branch's index and
+    the load fails on unrelated-looking keys.  An absent key means the MSD was
+    on: every checkpoint written before the key existed had it.
+    """
+    expected = discriminator_has_msd(model)
+    if expected is None:
+        return
+    found = checkpoint_dict.get("discriminator_msd")
+    found = True if found is None else bool(found)
+    if found != expected:
+        raise ValueError(
+            f"Discriminator MSD mismatch: this run builds d_use_msd={expected} "
+            f"but the {origin} was trained with d_use_msd={found}. Set "
+            f'"d_use_msd": {str(found).lower()} in the experiment\'s config.json '
+            f"to keep using it, or start the discriminator fresh."
+        )
+
+
 def assert_periods_match(model, checkpoint_dict, origin="checkpoint"):
     """Refuse to load a discriminator whose periods differ from this run's.
 
@@ -479,6 +521,9 @@ def save_checkpoint(
         "model": state_dict,
         "iteration": iteration,
         "optimizer": optimizer.state_dict(),
+        # What the optimizer state's integer indices refer to, so a resume
+        # with a different frozen set can match moments by name.
+        "optimizer_param_names": optimizer_param_names(optimizer, model_instance),
         "learning_rate": learning_rate,
     }
     architecture_id = getattr(model_instance, "architecture_id", None)
@@ -499,6 +544,9 @@ def save_checkpoint(
     periods = discriminator_periods(model_instance)
     if periods is not None:
         checkpoint_data["discriminator_periods"] = periods
+    has_msd = discriminator_has_msd(model_instance)
+    if has_msd is not None:
+        checkpoint_data["discriminator_msd"] = has_msd
     # Same additive contract once more: the stage ordering and the anti-aliased
     # activations are invisible in the weights, so a resume cannot tell that
     # either changed. Only generators have it.
@@ -1168,7 +1216,8 @@ def print_init_setup(
     config,
     optimizer_choice_g,
     optimizer_choice_d,
-    lr_scheduler,
+    lr_scheduler_g,
+    lr_scheduler_d,
     exp_decay_gamma,
     spectral_loss,
     lr_final_ratio=None,
@@ -1236,9 +1285,14 @@ def print_init_setup(
             return "cosine annealing"
         return f"{name}, gamma: {gamma}"
 
+    shown_g = scheduler_value(lr_scheduler_g, exp_decay_gamma)
+    shown_d = scheduler_value(lr_scheduler_d, exp_decay_gamma)
     rows.extend(
         [
-            ("LR scheduler (G/D)", scheduler_value(lr_scheduler, exp_decay_gamma)),
+            (
+                "LR scheduler (G/D)",
+                shown_g if shown_g == shown_d else f"G: {shown_g} | D: {shown_d}",
+            ),
         ]
     )
 

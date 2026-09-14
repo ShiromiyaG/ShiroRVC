@@ -4,6 +4,12 @@
         "seed": 1234,
         "learning_rate_g": 0.0001,
         "learning_rate_d": 0.0001,
+        "optimizer_g": "AdamW",
+        "optimizer_d": "AdamW",
+        "lr_scheduler_g": "exp decay step",
+        "lr_scheduler_d": "exp decay step",
+        "tf32": true,
+        "cudnn_benchmark": true,
         "betas": [
             0.8,
             0.99
@@ -36,6 +42,7 @@
         "overtrain_min_delta": 0.001,
         "overtrain_smoothing": 3,
         "overtrain_noise_window": 6,
+        "ema": true,
         "ema_decay": 0.999
     },
     "data": {
@@ -98,6 +105,7 @@
         "d_use_fast_mpd": false,
         "d_mrd_fp32_input": false,
         "d_use_san": true,
+        "d_use_msd": false,
         "use_spectral_norm": false,
         "gin_channels": 256,
         "spk_embed_dim": 109,
@@ -105,7 +113,7 @@
         "refinegan2_leaky_relu_slope": 0.2,
         "refinegan2_source_gain": true,
         "refinegan2_source_noise_std": 0.003,
-        "refinegan2_source_harmonics": 35,
+        "refinegan2_source_harmonics": 0,
         "refinegan2_source_tilt": 1.0,
         "architecture_id": "vits_gaussian_v1"
     }

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import re
 import struct
 import sys
@@ -137,6 +138,16 @@ def extract() -> dict[str, dict]:
             entry = messages.setdefault(msgid, {"plural": None, "locations": []})
             entry["plural"] = entry["plural"] or found["plural"]
             entry["locations"].extend(found["locations"])
+
+    # The vocoder descriptions are data, not code, and the UIs pass them to _().
+    registry_path = ROOT / "rvc" / "configs" / "vocoders.json"
+    relative = registry_path.relative_to(ROOT).as_posix()
+    for line_number, line in enumerate(registry_path.read_text(encoding="utf-8").splitlines(), 1):
+        match = re.match(r'^\s*"description":\s*(".*")\s*,?\s*$', line)
+        if match:
+            msgid = json.loads(match.group(1))
+            entry = messages.setdefault(msgid, {"plural": None, "locations": []})
+            entry["locations"].append((relative, line_number))
 
     LOCALE_DIR.mkdir(parents=True, exist_ok=True)
     POT_PATH.write_text(_render_pot(messages), encoding="utf-8")

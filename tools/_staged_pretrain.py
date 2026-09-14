@@ -24,8 +24,8 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from rvc.configs.vocoders import (  # noqa: E402
-    get_vocoder_ids,
     get_vocoder_sample_rates,
+    load_vocoder_registry,
     normalize_vocoder,
 )
 from rvc.train.run_spec import TrainRunSpec  # noqa: E402
@@ -178,7 +178,9 @@ def resolve_vocoder(directory: Path, requested: str | None) -> str:
         raise StageError(
             f"No vocoder given and {spec_path} does not name one, so there is "
             f"nothing to infer it from -- config.json does not record it. "
-            f"Pass --vocoder with one of {get_vocoder_ids()}."
+            # Every registry entry: ``enabled`` only hides a vocoder from the
+            # GUIs and core.py, and these scripts can still train it.
+            f"Pass --vocoder with one of {list(load_vocoder_registry())}."
         )
     return normalize_vocoder(chosen)
 
@@ -188,7 +190,7 @@ def resolve_vocoder(directory: Path, requested: str | None) -> str:
 #: has one answer in one place, and so a stage that wants something else has
 #: to say so explicitly (see ``STAGE_DEFAULTS`` in each launcher).
 #:
-#: The two that are on and would not be obvious:
+#: The one that is on and would not be obvious:
 #:
 #: ``fp16``   buys no throughput on its own -- the step is dispatch-bound, not
 #:            kernel-bound -- but takes 18-43% off peak VRAM, which is what
@@ -197,7 +199,8 @@ def resolve_vocoder(directory: Path, requested: str | None) -> str:
 #:            probe taken outside the ``GradScaler`` produces NaNs under FP16
 #:            (finite losses with a 100% skip rate is the tell).  No such probe
 #:            exists in this build.
-#: ``tf32``   free on Ampere and later, ignored on anything older.
+#:
+#: TF32, cuDNN benchmark, EMA and the learning rates come from config.json.
 #:
 #: And the two that are off:
 #:
@@ -209,14 +212,9 @@ def resolve_vocoder(directory: Path, requested: str | None) -> str:
 #:                      opaque build errors.  Opt-in.
 COMMON_DEFAULTS = {
     "batch_size": 8,
-    "save_every": 5,
+    "save_every": 1,
     "gpu": "0",
-    "optimizer": "AdamW",
-    "lr_scheduler": "exp decay step",
     "fp16": True,
-    "tf32": True,
-    "benchmark": True,
-    "ema": True,
     "checkpointing": False,
     "compile_vocoder": True,
 }
@@ -277,24 +275,7 @@ def add_common_arguments(
         help=f"Epochs between checkpoints (default {settings['save_every']}).",
     )
     parser.add_argument("--gpu", default=settings["gpu"])
-    parser.add_argument("--optimizer", default=settings["optimizer"])
-    parser.add_argument("--lr-scheduler", default=settings["lr_scheduler"])
-    parser.add_argument(
-        "--custom-lr-g",
-        type=float,
-        default=None,
-        help="Override the config's generator LR.",
-    )
-    parser.add_argument(
-        "--custom-lr-d",
-        type=float,
-        default=None,
-        help="Override the config's discriminator LR.",
-    )
     flag("fp16", "fp16", "Mixed precision: ~18-43% less peak VRAM, no speedup")
-    flag("tf32", "tf32", "TF32 matmuls; free on Ampere+, ignored before it")
-    flag("benchmark", "benchmark", "cuDNN autotuning")
-    flag("ema", "ema", "Weight EMA of the generator")
     flag(
         "checkpointing",
         "checkpointing",
@@ -348,23 +329,8 @@ def build_and_launch(
         cleanup=False,
         pretrain_g=pretrain_g,
         pretrain_d=pretrain_d,
-        optimizer_choice=str(args.optimizer),
-        lr_scheduler=str(args.lr_scheduler),
-        use_custom_lr=args.custom_lr_g is not None or args.custom_lr_d is not None,
-        custom_lr_g=float(
-            args.custom_lr_g
-            if args.custom_lr_g is not None
-            else config["train"]["learning_rate_g"]
-        ),
-        custom_lr_d=float(
-            args.custom_lr_d
-            if args.custom_lr_d is not None
-            else config["train"]["learning_rate_d"]
-        ),
         use_checkpointing=bool(args.checkpointing),
-        use_tf32=bool(args.tf32),
         use_fp16=bool(args.fp16),
-        use_benchmark=bool(args.benchmark),
         compile_vocoder=bool(args.compile_vocoder),
         # Off for stages 1 and 2, which are not optimising held-out
         # *conversion* -- stage 1 is judged on reconstruction, stage 2 on the
@@ -372,13 +338,13 @@ def build_and_launch(
         # the objective.  Stage 3 is the end-to-end run and turns it back on.
         overtrain_detector=bool(overtrain_detector),
         stop_on_overtrain=bool(stop_on_overtrain),
-        use_ema=bool(args.ema),
         freeze_mode=freeze_mode,
         c_kl_scale=float(c_kl_scale),
         dec_lr_scale=dec_lr_scale,
         vae_lr_scale=vae_lr_scale,
         resume_lr=resume_lr,
         resume_lr_target=resume_lr_target,
+        lr_horizon_per_stage=True,
     )
     spec_path = spec.save(directory / "run_spec.json")
 

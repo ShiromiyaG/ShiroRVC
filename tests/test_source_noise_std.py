@@ -34,8 +34,7 @@ def test_absent_means_what_every_earlier_run_was_trained_against():
 
 
 def test_it_reaches_the_source():
-    """It was a constructor default on ``BlitGenerator`` with nothing passing
-    it, which is the same as not having the knob."""
+    """The config value has to reach ``m_source``, or the knob does nothing."""
     assert _generator(source_noise_std=0.01).m_source.noise_std == pytest.approx(0.01)
 
 
@@ -57,8 +56,7 @@ def _floor_and_peak(excitation, f0_hz, harmonics=0, n_fft=1024):
     """Mean magnitude on the source's own partials, and between them.
 
     This used to take the 0.25 and 0.9 quantiles over the frequency axis, and
-    that stopped measuring anything the day the BLIT was replaced: the sine
-    puts ``harmonics + 1`` partials into 513 bins, so at the shipped
+    that measures nothing against the sine, which puts ``harmonics + 1`` partials into 513 bins, so at the shipped
     ``harmonics = 0`` a single bin in 513 cannot move a 0.9 quantile and
     "peak" was reading the noise floor.  Both assertions below then compared
     the floor against itself -- ``test_the_partials_are_actually_there``, the

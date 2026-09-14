@@ -79,18 +79,15 @@ def get_d_model(config, vocoder, use_checkpointing):
     )
 
     # The registry names the branch layout directly -- ``v2`` is Applio's (8
-    # periods), ``v3`` is what it picks for RefineGAN (5 periods + 3
-    # multi-resolution spectrogram branches) -- so this only has to check that
-    # the name exists.  Checked rather than passed through: it used to be
+    # periods), ``v4`` is RefineGAN2's (4 periods + 3 multi-resolution
+    # spectrogram branches) -- so this only has to check that the name exists.  Checked rather than passed through: it used to be
     # ``"v3" if id == "mpd_msd_v3" else "v2"``, which handed Applio's v2 to any
     # id it did not recognise, and a vocoder registered against the wrong name
     # would have trained against the wrong discriminator with nothing said.
     #
-    # ``d_version`` overrides it: v3 does not fit an 8 GB card at batch 8
-    # (6.42 GiB / 5912 ms/step against v2's 4.64 GiB / 498 ms/step), and the
-    # RefineGAN2 config names ``v4`` -- v3 minus its longest period branch.
-    # The registry stays at ``v3`` so a config predating that key builds what
-    # it always did.
+    # ``d_version`` overrides it.  A RefineGAN2 config without that key built
+    # ``v3`` before the registry moved to ``v4``, and its D checkpoint now fails
+    # ``assert_periods_match``: set ``"d_version": "v3"`` to resume it.
     if discriminator_id not in DISCRIMINATOR_VERSIONS:
         raise ValueError(
             f"Unknown discriminator {discriminator_id!r} for vocoder "
@@ -189,19 +186,28 @@ def enable_vocoder_compile(net_g, device, rank, enabled=False, mode="default"):
     return enabled
 
 
-def normalize_san_weights(net_d):
+def normalize_san_weights(net_d, optimizer=None):
     """Put every SAN direction back on the unit sphere after ``optim_d.step``.
 
     The projection is only unit-norm because it is *kept* there; an Adam step
     moves it off, and a direction that is not a direction is the one thing the
     method cannot tolerate.  A no-op when no branch carries a SAN head.
+
+    ``optimizer`` also projects a schedule-free ``z``: otherwise it drifts off
+    the sphere and every step pulls the live weight after it.
     """
 
     model = net_d.module if hasattr(net_d, "module") else net_d
     for module in model.modules():
         normalize = getattr(module, "normalize_weight", None)
-        if normalize is not None:
-            normalize()
+        if normalize is None:
+            continue
+        normalize()
+        z = optimizer.state.get(module.weight, {}).get("z") if optimizer is not None else None
+        if z is not None:
+            with torch.no_grad():
+                norm = z.flatten(1).norm(p=2, dim=1).clamp_min(1e-12)
+                z.div_(norm.view((-1,) + (1,) * (z.ndim - 1)))
 
 
 def enable_frontend_compile(net_g, config, device, rank):
@@ -350,16 +356,13 @@ def get_optimizers(
     config,
     optimizer_choice_g,
     optimizer_choice_d,
-    custom_lr_g,
-    custom_lr_d,
-    use_custom_lr,
     total_epoch_count,
     train_loader,
     dec_lr_scale=None,
     vae_lr_scale=None,
 ):
-    lr_g = custom_lr_g if use_custom_lr else config.train.learning_rate_g
-    lr_d = custom_lr_d if use_custom_lr else config.train.learning_rate_d
+    lr_g = config.train.learning_rate_g
+    lr_d = config.train.learning_rate_d
     num_batches = len(train_loader)
 
     g_param_groups = build_decoder_param_groups(

@@ -163,7 +163,7 @@ class Config:
         lines = [
             "Master weights and optimizer state: FP32 (always).",
             f"TF32 matmul/conv currently: {'on' if tf32 else 'off'}"
-            " - toggle it per run in the Training tab.",
+            " - set per model with 'tf32' in its config.json.",
         ]
         if use_fp16:
             lines.append(

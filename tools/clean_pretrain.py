@@ -78,6 +78,7 @@ KEEP_METADATA = (
 #: Named so the report can say what went and why, instead of "everything else".
 DROP_REASONS = {
     "optimizer": "optimizer moments (a finetune builds its own)",
+    "optimizer_param_names": "index of the optimizer moments above",
     "iteration": "epoch counter of the finished run",
     "learning_rate": "last LR of the finished run",
     "extra": "AMP/grad-scaler controller state",

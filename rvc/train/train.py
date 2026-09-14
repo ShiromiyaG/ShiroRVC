@@ -110,6 +110,7 @@ from utils import (
     summarize,
     assert_decoder_layout_matches,
     assert_excitation_matches,
+    assert_msd_matches,
     assert_periods_match,
     load_checkpoint,
     save_checkpoint,
@@ -168,34 +169,20 @@ warmup_duration = spec.warmup_duration
 cleanup = spec.cleanup
 vocoder = normalize_vocoder(spec.vocoder)
 architecture = "RVC"
-# G and D always share one optimizer choice; kept as two names because the
-# rest of the file distinguishes them.
-optimizer_choice_g = optimizer_choice_d = spec.optimizer_choice
 use_checkpointing = spec.use_checkpointing
-use_tf32 = spec.use_tf32
 use_fp16 = spec.use_fp16
-use_benchmark = spec.use_benchmark
-lr_scheduler = spec.lr_scheduler
-
-use_custom_lr = spec.use_custom_lr
-custom_lr_g, custom_lr_d = (spec.custom_lr_g, spec.custom_lr_d) if use_custom_lr else (None, None)
-assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR values."
 
 compile_vocoder = spec.compile_vocoder
 torch_compile_mode = spec.torch_compile_mode
 overtrain_detector = spec.overtrain_detector
 stop_on_overtrain = spec.stop_on_overtrain
-use_ema = spec.use_ema
 freeze_mode = spec.freeze_mode
 c_kl_scale = spec.c_kl_scale
+lr_horizon_per_stage = spec.lr_horizon_per_stage
 # No manual phase/step controls: a pretrained source selects fine-tuning,
 # its absence selects pretraining.
 training_phase = spec.training_phase
 max_steps = 0
-
-cuda.matmul.allow_tf32 = use_tf32
-cudnn.allow_tf32 = use_tf32
-cudnn.benchmark = use_benchmark
 
 current_dir = os.getcwd()
 experiment_dir = os.path.join(current_dir, "logs", model_name)
@@ -207,6 +194,23 @@ config = load_config_from_json(config_save_path)
 config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
 
 exp_decay_gamma = float(getattr(config.train, "lr_decay", 0.999875))
+# The fallbacks cover experiments whose config.json predates these keys.
+optimizer_choice_g = str(getattr(config.train, "optimizer_g", "AdamW"))
+optimizer_choice_d = str(getattr(config.train, "optimizer_d", "AdamW"))
+lr_scheduler_g = str(getattr(config.train, "lr_scheduler_g", "exp decay epoch"))
+lr_scheduler_d = str(getattr(config.train, "lr_scheduler_d", "exp decay epoch"))
+# Schedule-free replaces the decay schedule, so that side runs without one.
+if is_schedule_free(optimizer_choice_g):
+    lr_scheduler_g = "none"
+if is_schedule_free(optimizer_choice_d):
+    lr_scheduler_d = "none"
+use_tf32 = bool(getattr(config.train, "tf32", True))
+use_benchmark = bool(getattr(config.train, "cudnn_benchmark", True))
+use_ema = bool(getattr(config.train, "ema", True))
+
+cuda.matmul.allow_tf32 = use_tf32
+cudnn.allow_tf32 = use_tf32
+cudnn.benchmark = use_benchmark
 # Belongs to the vocoder, not the run: a single-scale mel cannot resolve a
 # harmonic comb far above ~2 kHz, so RefineGAN wants the multi-scale mel while
 # HiFi-GAN uses the plain mel it was designed around.
@@ -257,6 +261,9 @@ from_scratch = False
 finetune_phase = training_phase == "finetune"
 phase_start_step = 0
 phase_step = 0
+# Where the current stage of a staged pretrain began, for its LR horizon.
+stage_start_step = 0
+stage_start_epoch = 0
 phase_limit_reached = False
 overtrain_flagged = False
 overtrain_exported = False
@@ -264,7 +271,6 @@ reset_optimizer_for_run = finetune_phase
 # True when this run continues from a G_/D_ checkpoint in the experiment folder
 # rather than starting from the pretrains (or from scratch).
 resumed_run = False
-use_lr_scheduler = lr_scheduler != "none"
 # Steps the GradScaler discarded for non-finite gradients. A steady run of
 # skips looks like a stalled loss otherwise. Cumulative across resumes.
 amp_skipped_steps = 0
@@ -521,10 +527,14 @@ def _checkpoint_extra(grad_scaler):
     if grad_scaler is not None:
         extra["grad_scaler"] = grad_scaler.state_dict()
         extra["amp_skipped_steps"] = int(amp_skipped_steps)
+    if lr_horizon_per_stage:
+        extra["stage_freeze_mode"] = freeze_mode
+        extra["stage_start_step"] = int(stage_start_step)
+        extra["stage_start_epoch"] = int(stage_start_epoch)
     return extra or None
 
 
-def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, device, device_id, n_gpus, rank, reset_pretrained_embeddings=False):
+def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice_g, optimizer_choice_d, total_epoch_count, train_loader, device, device_id, n_gpus, rank, reset_pretrained_embeddings=False):
     # Init the models
     net_g = get_g_model(config, sample_rate, vocoder, use_checkpointing)
     net_d = get_d_model(config, vocoder, use_checkpointing)
@@ -533,7 +543,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
     # a fresh run, on a pretrained start, and on every checkpoint written before
     # the key existed -- all three of which mean "start the controller cold".
     resumed_extra_d = {}
-    global reset_optimizer_for_run, resumed_run
+    global reset_optimizer_for_run, resumed_run, stage_start_step, stage_start_epoch
     try:
         info("Starting the training ...", tag="[INIT]")
 
@@ -566,7 +576,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             apply_training_freezes(net_g, rank, freeze_vae=freeze_vae, freeze_mode=freeze_mode)
 
             # Init the optimizers
-            optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
+            optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
 
             # Resuming loads the generator non-strictly for the VITS-latent
             # vocoders, so nothing downstream would complain if the checkpoint
@@ -594,6 +604,22 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             )
             resumed_extra_d = extra_d or {}
 
+            # The checkpoint's own freeze_mode means an interrupted stage, which
+            # keeps its LR horizon; any other is a new stage, which starts one.
+            if lr_horizon_per_stage:
+                if resumed_extra_d.get("stage_freeze_mode") == freeze_mode:
+                    stage_start_step = int(resumed_extra_d.get("stage_start_step", 0))
+                    stage_start_epoch = int(resumed_extra_d.get("stage_start_epoch", 0))
+                else:
+                    stage_start_step = int(os.path.basename(g_checkpoint_path).split("_")[-1].split(".")[0])
+                    stage_start_epoch = epoch_str
+                    # The new horizon starts from the checkpoint's LR rather
+                    # than jumping back to its old base; resume_lr below can
+                    # still re-anchor it.
+                    for optim in (optim_g, optim_d):
+                        for param_group in optim.param_groups:
+                            param_group["initial_lr"] = param_group["lr"]
+
             # resume_lr re-anchors G and/or D to the given base LR.
             apply_resume_lr_override(
                 optim_g, optim_d, resume_lr=resume_lr, resume_lr_target=resume_lr_target
@@ -618,6 +644,8 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             if finetune_phase
             else 0
         )
+        stage_start_step = global_step
+        stage_start_epoch = 0
 
         # Loading the pretrained Generator model
         if pretrainG not in ["", "None"]:
@@ -699,6 +727,11 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                 checkpoint,
                 origin="pretrained discriminator",
             )
+            assert_msd_matches(
+                net_d.module if hasattr(net_d, "module") else net_d,
+                checkpoint,
+                origin="pretrained discriminator",
+            )
             net_d.load_state_dict(state_dict, strict=True)
 
         # Load the models and optionally wrap with DDP
@@ -708,7 +741,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         apply_training_freezes(net_g, rank, freeze_vae=freeze_vae, freeze_mode=freeze_mode)
 
         # Init the optimizers
-        optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
+        optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice_g, optimizer_choice_d, total_epoch_count, train_loader, dec_lr_scale=dec_lr_scale, vae_lr_scale=vae_lr_scale)
 
     # Built after both branches so the shadow starts from the weights the run
     # is actually beginning with (resumed, pretrained, or fresh).
@@ -980,7 +1013,8 @@ def run(
         config,
         optimizer_choice_g,
         optimizer_choice_d,
-        lr_scheduler,
+        lr_scheduler_g,
+        lr_scheduler_d,
         exp_decay_gamma,
         spectral_loss,
         lr_final_ratio,
@@ -1164,9 +1198,6 @@ def run(
         sample_rate,
         optimizer_choice_g,
         optimizer_choice_d,
-        custom_lr_g,
-        custom_lr_d,
-        use_custom_lr, 
         total_epoch_count,
         train_loader,
         device,
@@ -1271,8 +1302,8 @@ def run(
     scheduler_g, scheduler_d = prepare_schedulers(
         optim_g,
         optim_d,
-        use_lr_scheduler,
-        lr_scheduler,
+        lr_scheduler_g,
+        lr_scheduler_d,
         exp_decay_gamma,
         total_epoch_count,
         epoch_str,
@@ -1285,6 +1316,8 @@ def run(
         optimizer_choice_d=optimizer_choice_d,
         lr_final_ratio=lr_final_ratio,
         exp_decay_step_raw=exp_decay_step_raw,
+        horizon_start_epoch=stage_start_epoch,
+        horizon_start_step=max(0, stage_start_step - phase_start_step),
     )
 
     # Reference sample for live-infer
@@ -1404,9 +1437,11 @@ def run(
             ema=ema,
             grad_scaler=grad_scaler,
         )
-        if use_lr_scheduler and (not warmup_active() or warmup_completed):
-            if lr_scheduler in ["exp decay epoch", "cosine annealing", "cosine annealing epoch"]:
+        if not warmup_active() or warmup_completed:
+            per_epoch = ["exp decay epoch", "cosine annealing", "cosine annealing epoch"]
+            if scheduler_g is not None and lr_scheduler_g in per_epoch:
                 scheduler_g.step()
+            if scheduler_d is not None and lr_scheduler_d in per_epoch:
                 scheduler_d.step()
 
 
@@ -1483,7 +1518,7 @@ def training_loop(
     grad_scaler=None,
 ):
     """Trains and evaluates the model for one epoch."""
-    global global_step, warmup_completed, use_lr_scheduler, lr_scheduler, use_warmup, swap_completed
+    global global_step, warmup_completed, use_warmup, swap_completed
     global phase_step, phase_limit_reached, overtrain_flagged, overtrain_exported
     global amp_skipped_steps
 
@@ -1717,7 +1752,7 @@ def training_loop(
             else:
                 optim_d.step()
             if san_active:
-                normalize_san_weights(net_d)
+                normalize_san_weights(net_d, optim_d)
 
             # Per-head separation, which the aggregate loss cannot show: nine
             # heads are summed into ``loss_disc``, and a head that has stopped
@@ -2192,12 +2227,14 @@ def training_loop(
                             )
 
 
-            # Per step exp lr decay for both optimizers.
-            if use_lr_scheduler and (not warmup_active() or warmup_completed) and lr_scheduler == "exp decay step":
+            # Per step exp lr decay, for whichever optimizer uses it.
+            if not warmup_active() or warmup_completed:
                 # FP32/BF16 only: no scaler can retract a step, so the
                 # schedulers always advance.
-                scheduler_g.step()
-                scheduler_d.step()
+                if scheduler_g is not None and lr_scheduler_g == "exp decay step":
+                    scheduler_g.step()
+                if scheduler_d is not None and lr_scheduler_d == "exp decay step":
+                    scheduler_d.step()
 
 
             if not from_scratch:

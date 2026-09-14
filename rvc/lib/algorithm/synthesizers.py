@@ -144,38 +144,7 @@ class Synthesizer(torch.nn.Module):
             # ``sample_rate`` and the trunk is built from ``upsample_rates``,
             # whose product is the hop.  So the registry decides which rates
             # ship, rather than a constant here.
-            # Both described the full-band BLIT this decoder no longer has:
-            # one capped the fraction of Nyquist it filled, the other held its
-            # energy rather than its peak constant across the range.  The sine
-            # fills a single bin, so neither has anything to act on.  Named
-            # here rather than dropped silently -- a config key that quietly
-            # stops doing anything is the same class of bug as one that changes
-            # the signal path invisibly, which is what these two were.
-            retired = [
-                key
-                for key in (
-                    "refinegan2_source_bandwidth",
-                    "refinegan2_source_normalize",
-                )
-                if key in decoder_config
-            ]
-            if retired:
-                raise ValueError(
-                    f"{', '.join(retired)} configure the BLIT excitation, which "
-                    f"was replaced by the sine on 2026-09-08. Remove the "
-                    f"key(s): this decoder's source fills one bin, so there is "
-                    f"no band to cap and no energy to normalise. A checkpoint "
-                    f"trained with the BLIT will not load here either -- "
-                    f"``excitation_source`` reports that separately."
-                )
             self._assert_rate_supported(vocoder_spec, sr)
-            # This decoder renders the prior draw as formant-coloured bursts
-            # between the harmonics.  Measured 2026-09-11 on a sustained note
-            # (``pretrain-contentvec``, 4 seeds): 0.3 removes nearly all of the
-            # bursts that 0.66666 puts there, and costs 0.8 dB at 12-16 kHz
-            # with harmonic contrast unchanged.  Not 0: decoding the prior
-            # *mean* is an input the decoder never saw in training.
-            self.prior_noise_scale = 0.3
             self.dec = generators.RefineGAN2Generator(
                 sample_rate=int(sr),
                 upsample_rates=tuple(upsample_rates),
@@ -311,7 +280,7 @@ class Synthesizer(torch.nn.Module):
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "refinegan2"}:
+        if self.vocoder not in {"hifi", "hifi++", "refinegan2"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode

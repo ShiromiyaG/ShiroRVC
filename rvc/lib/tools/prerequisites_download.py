@@ -23,6 +23,33 @@ pretraineds_hifigan_list = [
     )
 ]
 
+#: Folder URL holding ``f0G32k.pth`` and ``f0D32k.pth`` for each vocoder, keyed
+#: as in ``rvc/configs/vocoders.json``.  Empty means none is published yet, and
+#: the vocoder is skipped.
+VOCODER_PRETRAINED_URLS = {
+    "refinegan2": "",
+    "hifi++": "",
+}
+
+vocoder_pretraineds = {
+    "refinegan2": ("pretrained_refinegan2/", ["f0G32k.pth", "f0D32k.pth"]),
+    "hifi++": ("pretrained_hifi++/", ["f0G32k.pth", "f0D32k.pth"]),
+}
+
+
+def vocoder_pretraineds_list(vocoder=None, sample_rate=None):
+    """Download entries for the vocoder pretrains, optionally for one vocoder and rate."""
+    entries = []
+    for vocoder_id, (remote_folder, files) in vocoder_pretraineds.items():
+        url = VOCODER_PRETRAINED_URLS.get(vocoder_id, "").rstrip("/")
+        if not url or (vocoder is not None and vocoder_id != vocoder):
+            continue
+        if sample_rate is not None:
+            files = [f for f in files if f.endswith(f"{str(sample_rate)[:2]}k.pth")]
+        if files:
+            entries.append((remote_folder, files, url))
+    return entries
+
 models_list = [
     # Both live under ``predictors/`` in the resource repo, so both go through
     # the default path.  ``fcpe_ddsp.pt`` used to carry an override pointing at
@@ -46,6 +73,9 @@ executables_list = [
 
 folder_mapping_list = {
     "pretrained_v2/": "rvc/models/pretraineds/hifi-gan/",
+    # Must match ``pretrained_dir`` in vocoders.json: pretrained_selector reads there.
+    "pretrained_refinegan2/": "rvc/models/pretraineds/refinegan2/",
+    "pretrained_hifi++/": "rvc/models/pretraineds/hifi-gan++/",
     "embedders/contentvec/": "rvc/models/embedders/contentvec/",
     "embedders/spin_v1": "rvc/models/embedders/spin_v1/",
     "embedders/spin_v2": "rvc/models/embedders/spin_v2/",
@@ -199,13 +229,30 @@ def calculate_total_size(
     return total_size
 
 
+def download_vocoder_pretraineds(vocoder, sample_rate):
+    """Fetch one vocoder's missing G/D at ``sample_rate``."""
+    entries = vocoder_pretraineds_list(vocoder, sample_rate)
+    total_size = get_file_size_if_missing(entries)
+    if total_size > 0:
+        with progress_task(
+            total_size,
+            f"Downloading {vocoder} pretrained models",
+            download=True,
+            leave=True,
+        ) as (progress, task_id):
+            download_mapping_files(entries, progress_handle(progress, task_id))
+
+
 def prequisites_download_pipeline(
     pretraineds_hifigan,
     models,
     exe,
 ):
+    pretraineds = (
+        pretraineds_hifigan_list + vocoder_pretraineds_list() if pretraineds_hifigan else []
+    )
     total_size = calculate_total_size(
-        pretraineds_hifigan_list if pretraineds_hifigan else [],
+        pretraineds,
         models,
         exe,
     )
@@ -227,6 +274,6 @@ def prequisites_download_pipeline(
                 else:
                     info("No executables needed.", tag="[DOWNLOAD]")
             if pretraineds_hifigan:
-                download_mapping_files(pretraineds_hifigan_list, global_bar)
+                download_mapping_files(pretraineds, global_bar)
     else:
         pass

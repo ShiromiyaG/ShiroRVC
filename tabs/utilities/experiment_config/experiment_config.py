@@ -24,9 +24,12 @@ import gradio as gr
 
 from rvc.configs.vocoders import (
     get_architecture_id,
+    get_default_vocoder,
     get_vocoder_choices,
     get_vocoder_sample_rates,
     get_vocoder_spec,
+    is_vocoder_enabled,
+    load_vocoder_registry,
     normalize_vocoder,
 )
 from rvc.lib.i18n import _
@@ -91,7 +94,9 @@ def _vocoder_from_architecture(architecture_id: str | None) -> str | None:
     """
     if not architecture_id:
         return None
-    for _label, vocoder_id in get_vocoder_choices():
+    # Every vocoder, disabled ones included: an existing config still has to be
+    # identified.
+    for vocoder_id in load_vocoder_registry():
         if get_architecture_id(vocoder_id) == architecture_id:
             return vocoder_id
     return None
@@ -303,7 +308,7 @@ def experiment_config_tab():
             label=_("Vocoder / Architecture"),
             info=_("The architecture the rebuilt config will be written for."),
             choices=get_vocoder_choices(),
-            value="refinegan2",
+            value="refinegan2" if is_vocoder_enabled("refinegan2") else get_default_vocoder(),
             interactive=True,
         )
     refresh_button = gr.Button(_("Refresh"))

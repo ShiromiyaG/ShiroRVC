@@ -34,9 +34,13 @@ install_rich_print()
 current_script_directory = os.path.dirname(os.path.realpath(__file__))
 logs_path = os.path.join(current_script_directory, "logs")
 
-from rvc.lib.tools.prerequisites_download import prequisites_download_pipeline
+from rvc.lib.tools.prerequisites_download import (
+    download_vocoder_pretraineds,
+    prequisites_download_pipeline,
+)
 from rvc.configs.vocoders import (
     get_all_vocoder_sample_rates,
+    get_default_vocoder,
     get_vocoder_cli_choices,
     get_vocoder_sample_rates,
     normalize_vocoder,
@@ -458,20 +462,12 @@ def run_train_script(
     g_pretrained_path: str = None,
     d_pretrained_path: str = None,
     vocoder: str = "hifi",
-    optimizer_choice: str = "AdamW",
     use_checkpointing: bool = False,
-    use_tf32: bool = False,
     use_fp16: bool = False,
-    use_benchmark: bool = True,
-    lr_scheduler: str = "exp decay step",
-    use_custom_lr: bool = False,
-    custom_lr_g: float = 1e-4,
-    custom_lr_d: float = 1e-4,
     compile_vocoder: bool = False,
     torch_compile_mode: str = "default",
     overtrain_detector: bool = False,
     stop_on_overtrain: bool = False,
-    use_ema: bool = True,
 ):
     global training_process
 
@@ -484,6 +480,9 @@ def run_train_script(
         from rvc.lib.tools.pretrained_selector import pretrained_selector
 
         if custom_pretrained == False:
+            # A link added after the app's startup download would otherwise be
+            # missed, and a missing file silently means training from scratch.
+            download_vocoder_pretraineds(vocoder, int(sample_rate))
             pg, pd = pretrained_selector(str(vocoder), int(sample_rate))
         else:
             pg = g_pretrained_path if g_pretrained_path is not None else ""
@@ -506,24 +505,14 @@ def run_train_script(
         cleanup=bool(cleanup),
         pretrain_g=str(pg),
         pretrain_d=str(pd),
-        optimizer_choice=str(optimizer_choice),
-        lr_scheduler=str(lr_scheduler),
         use_warmup=bool(use_warmup),
         warmup_duration=int(warmup_duration),
-        use_custom_lr=bool(use_custom_lr),
-        # The UIs send the slider value even with the override off, but a CLI
-        # caller can pass nothing at all.
-        custom_lr_g=float(custom_lr_g if custom_lr_g is not None else 1e-4),
-        custom_lr_d=float(custom_lr_d if custom_lr_d is not None else 1e-4),
         use_checkpointing=bool(use_checkpointing),
-        use_tf32=bool(use_tf32),
         use_fp16=bool(use_fp16),
-        use_benchmark=bool(use_benchmark),
         compile_vocoder=bool(compile_vocoder),
         torch_compile_mode=str(torch_compile_mode),
         overtrain_detector=bool(overtrain_detector),
         stop_on_overtrain=bool(stop_on_overtrain),
-        use_ema=bool(use_ema),
     )
     # Written into the run's own log directory, so it survives the process and
     # answers "what was this trained with?" long after the fact.
@@ -1203,7 +1192,7 @@ EXTRACT_OWN = [
     click.option(
         "--vocoder_arch",
         type=click.Choice(get_vocoder_cli_choices()),
-        default='hifi',
+        default=get_default_vocoder(),
         show_default=True,
         help="Choose the vocoder architecture",
     ),
@@ -1244,16 +1233,9 @@ TRAIN_OWN = [
     click.option(
         "--vocoder",
         type=click.Choice(get_vocoder_cli_choices()),
-        default='hifi',
+        default=get_default_vocoder(),
         show_default=True,
         help="Vocoder name",
-    ),
-    click.option(
-        "--optimizer_choice",
-        type=click.Choice(["AdamW", "Sched-Free AdamW", "Muon", "Lion"]),
-        default='AdamW',
-        show_default=True,
-        help="Optimizer for the generator and discriminator. Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; kept as a literal so --help does not import torch.",
     ),
     click.option(
         "--use_checkpointing",
@@ -1277,20 +1259,6 @@ TRAIN_OWN = [
         help="Torch compile mode used for the vocoder decoder.",
     ),
     click.option(
-        "--custom_lr_g",
-        type=float,
-        default=0.0001,
-        show_default=True,
-        help="Custom learning rate for generator.",
-    ),
-    click.option(
-        "--custom_lr_d",
-        type=float,
-        default=0.0001,
-        show_default=True,
-        help="Custom learning rate for discriminator.",
-    ),
-    click.option(
         "--overtrain_detector",
         type=click.BOOL,
         default=False,
@@ -1303,13 +1271,6 @@ TRAIN_OWN = [
         default=False,
         show_default=True,
         help="Ends the run once held-out quality has stopped improving. Off by default: the pre-overtrain weights are exported either way, this only decides whether training keeps going.",
-    ),
-    click.option(
-        "--use_ema",
-        type=click.BOOL,
-        default=True,
-        show_default=True,
-        help="Keeps an exponential moving average of the generator weights and exports that instead of a single step. Usually better than any one step of a GAN vocoder, and it makes the overtrain curve far less noisy. Costs one extra copy of the generator in VRAM.",
     ),
     click.option(
         "--epoch_save_frequency",
@@ -1399,13 +1360,6 @@ TRAIN_OWN = [
         help="Duration of warmup phase (in epochs).",
     ),
     click.option(
-        "--use_tf32",
-        type=click.BOOL,
-        default=False,
-        show_default=True,
-        help="Lets you choose between FP32 and TF32 precision used in training.",
-    ),
-    click.option(
         "--use_fp16",
         type=click.BOOL,
         default=False,
@@ -1413,29 +1367,8 @@ TRAIN_OWN = [
         help=(
             "Run the forward pass under FP16 autocast with a GradScaler. Master "
             "weights stay FP32; distribution math and the NSF source stay FP32. "
-            "Off means plain FP32 (with TF32 tensor cores if --use_tf32)."
+            "Off means plain FP32 (with TF32 if the model config enables it)."
         ),
-    ),
-    click.option(
-        "--use_benchmark",
-        type=click.BOOL,
-        default=True,
-        show_default=True,
-        help="Enable cuDNN benchmark mode for potential speedup.",
-    ),
-    click.option(
-        "--lr_scheduler",
-        type=click.Choice(["exp decay step", "exp decay epoch", "cosine annealing", "none"]),
-        default='exp decay epoch',
-        show_default=True,
-        help="Pick the shared LR scheduler for generator and discriminator.",
-    ),
-    click.option(
-        "--use_custom_lr",
-        type=click.BOOL,
-        default=False,
-        show_default=True,
-        help="Enables customization of learning rate for Generator and Discriminator.",
     ),
     click.option(
         "--cleanup",
@@ -1535,7 +1468,7 @@ PREREQUISITES_OWN = [
         type=click.BOOL,
         default=True,
         show_default=True,
-        help="Download pretrained models for RVC v2.",
+        help="Download pretrained models.",
     ),
     click.option(
         "--models",

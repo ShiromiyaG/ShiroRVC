@@ -44,15 +44,42 @@ def get_vocoder_spec(vocoder):
     return load_vocoder_registry()[normalize_vocoder(vocoder)]
 
 
+def is_vocoder_enabled(vocoder):
+    """``enabled: false`` hides a vocoder from the GUIs and ``core.py``'s choices.
+
+    It still resolves everywhere else, so models and checkpoints already
+    trained with it keep loading, and the staged pretrain scripts can train it.
+    """
+    return bool(get_vocoder_spec(vocoder).get("enabled", True))
+
+
+def get_vocoder_description(vocoder):
+    """The registry's ``description``, or ``""`` when it has none."""
+    return str(get_vocoder_spec(vocoder).get("description", ""))
+
+
+def get_default_vocoder():
+    """``hifi`` when enabled, else the first enabled vocoder."""
+    enabled = get_vocoder_ids()
+    if not enabled:
+        raise ValueError(f"Every vocoder in {_REGISTRY_PATH} is disabled.")
+    return "hifi" if "hifi" in enabled else enabled[0]
+
+
 def get_vocoder_choices():
     return [
         (spec["label"], vocoder_id)
         for vocoder_id, spec in load_vocoder_registry().items()
+        if spec.get("enabled", True)
     ]
 
 
 def get_vocoder_ids():
-    return list(load_vocoder_registry())
+    return [
+        vocoder_id
+        for vocoder_id, spec in load_vocoder_registry().items()
+        if spec.get("enabled", True)
+    ]
 
 
 def get_all_vocoder_sample_rates():
@@ -70,7 +97,7 @@ def get_vocoder_cli_choices():
     choices.extend(
         spec["label"]
         for spec in load_vocoder_registry().values()
-        if spec["label"] not in choices
+        if spec.get("enabled", True) and spec["label"] not in choices
     )
     return choices
 

@@ -14,6 +14,7 @@ import os
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QLabel,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -156,6 +157,11 @@ class TrainingPage(Page):
         row.addWidget(Field(_("Vocoder"), self.vocoder, ""), 1)
         row.addWidget(Field(_("Sample rate"), self.sample_rate, ""), 1)
         card.body.addLayout(row)
+
+        self.vocoder_description = QLabel()
+        self.vocoder_description.setObjectName("FieldHint")
+        self.vocoder_description.setWordWrap(True)
+        card.body.addWidget(self.vocoder_description)
 
         return card
 
@@ -313,19 +319,6 @@ class TrainingPage(Page):
         )
         card.add(advanced)
 
-        # -- optimiser ------------------------------------------------------
-        # Advanced rather than on the main card: AdamW is right for almost
-        # every run, and the choice sat beside the GPU picker as though it were
-        # an equally routine decision.
-        advanced.add_group("Optimizer")
-        self.optimizer = SearchableCombo(editable=False)
-        self.optimizer.refresh_button.hide()
-        self.optimizer.set_items(catalog.OPTIMIZERS)
-        advanced.add(Field(
-            _("Optimizer"), self.optimizer,
-            _("AdamW unless you have a reason. The others change the schedule too."),
-        ))
-
         # -- pretrained -----------------------------------------------------
         advanced.add_group("Pretrained")
         self.custom_pretrained = Toggle(_("Use my own pretrained files"), "")
@@ -349,12 +342,6 @@ class TrainingPage(Page):
 
         # -- which weights you end up with -----------------------------------
         advanced.add_group("Model selection")
-        self.use_ema = Toggle(
-            _("Average the weights (EMA)"),
-            _("A GAN generator oscillates against its discriminator; the average is usually "
-            "better than any single step. Costs one extra copy of it in VRAM."),
-            checked=True,
-        )
         self.overtrain_detector = Toggle(
             _("Detect overtraining"),
             _("Holds whole source recordings out of training and scores them as it goes. "
@@ -365,7 +352,6 @@ class TrainingPage(Page):
             _("The pre-overtrain model is exported either way; this only ends the run."),
         )
         advanced.add(
-            self.use_ema,
             self.overtrain_detector,
             self.stop_on_overtrain,
         )
@@ -378,32 +364,12 @@ class TrainingPage(Page):
         advanced.add_group("Schedule")
         self.use_warmup = Toggle(_("Warm up the learning rate"), "")
         self.warmup_duration = SliderSpin(1, 100, 1, decimals=0, value=5)
-        self.lr_scheduler = SearchableCombo(editable=False)
-        self.lr_scheduler.refresh_button.hide()
-        self.lr_scheduler.set_items(catalog.LR_SCHEDULERS)
-        self.lr_scheduler.set_text("exp decay epoch")
 
         advanced.add(self.use_warmup, Field(_("Warmup epochs"), self.warmup_duration, ""))
-        advanced.add(Field(_("LR scheduler"), self.lr_scheduler, ""))
-
-        self.use_custom_lr = Toggle(_("Override the learning rates"), "")
-        self.custom_lr_g = SliderSpin(0.00001, 0.001, 0.00001, decimals=5, value=0.0001)
-        self.custom_lr_d = SliderSpin(0.00001, 0.001, 0.00001, decimals=5, value=0.0001)
-        advanced.add(self.use_custom_lr)
-        advanced.add_row(
-            Field(_("Generator LR"), self.custom_lr_g, ""),
-            Field(_("Discriminator LR"), self.custom_lr_d, ""),
-        )
 
         # -- performance ----------------------------------------------------
         advanced.add_group("Performance")
         self.checkpointing = Toggle(_("Gradient checkpointing"), _("Trades speed for a much smaller VRAM footprint."))
-        # Left off and disabled until the backend reports what the card is;
-        # ``_apply_tf32_support`` turns it on when the hardware has the units.
-        # Ticking it by default on a card without them would send a flag that
-        # does nothing and read as though it were doing something.
-        self.tf32 = Toggle(_("TF32 matmuls"), _("Faster on Ampere and newer, marginally less precise."))
-        self.tf32.setEnabled(False)
         # FP16 autocast with a GradScaler, on top of FP32 master weights.  Same
         # 11-bit mantissa as TF32, narrower exponent range -- which is what the
         # scaler is for.  Disabled until a device reports capability 7.0 or
@@ -413,7 +379,6 @@ class TrainingPage(Page):
             _("Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."),
         )
         self.fp16.setEnabled(False)
-        self.benchmark = Toggle(_("cuDNN benchmark"), _("Faster once shapes settle."), checked=True)
         self.compile_vocoder = Toggle(
             _("torch.compile the vocoder"), _("Slow first epoch, faster afterwards.")
         )
@@ -431,7 +396,7 @@ class TrainingPage(Page):
         self.compile_vocoder.toggled.connect(self.torch_compile_mode_field.setVisible)
 
         advanced.add(
-            self.checkpointing, self.tf32, self.fp16, self.benchmark,
+            self.checkpointing, self.fp16,
             self.compile_vocoder, self.torch_compile_mode_field,
         )
 
@@ -452,7 +417,6 @@ class TrainingPage(Page):
         for toggle, dependants in (
             (self.custom_pretrained, [self.pretrained_g, self.pretrained_d]),
             (self.use_warmup, [self.warmup_duration]),
-            (self.use_custom_lr, [self.custom_lr_g, self.custom_lr_d]),
         ):
             toggle.toggled.connect(
                 lambda checked, widgets=dependants: [w.setEnabled(checked) for w in widgets]
@@ -599,6 +563,9 @@ class TrainingPage(Page):
         vocoder = self.vocoder.value()
         rates = catalog.sample_rates_for(vocoder)
         self.sample_rate.set_items([str(rate) for rate in rates])
+        description = catalog.description_for(vocoder)
+        self.vocoder_description.setText(_(description) if description else "")
+        self.vocoder_description.setVisible(bool(description))
 
     def _on_model_changed(self, name: str) -> None:
         # The speaker list belongs to the model, so it follows it whichever way
@@ -797,16 +764,8 @@ class TrainingPage(Page):
             "g_pretrained_path": self.pretrained_g.path() or None,
             "d_pretrained_path": self.pretrained_d.path() or None,
             "vocoder": self.vocoder.value(),
-            "optimizer_choice": self.optimizer.text(),
             "use_checkpointing": self.checkpointing.isChecked(),
-            "use_tf32": self.tf32.isChecked(),
             "use_fp16": self.fp16.isChecked(),
-            "use_benchmark": self.benchmark.isChecked(),
-            "lr_scheduler": self.lr_scheduler.text(),
-            "use_custom_lr": self.use_custom_lr.isChecked(),
-            "custom_lr_g": self.custom_lr_g.value(),
-            "custom_lr_d": self.custom_lr_d.value(),
-            "use_ema": self.use_ema.isChecked(),
             "overtrain_detector": self.overtrain_detector.isChecked(),
             "stop_on_overtrain": self.stop_on_overtrain.isChecked(),
             "compile_vocoder": self.compile_vocoder.isChecked(),
@@ -977,7 +936,6 @@ class TrainingPage(Page):
 
     def populate_gpus(self, devices: list[dict]) -> None:
         """Fill the device pickers once the backend has queried torch."""
-        self._apply_tf32_support(devices)
         self._apply_fp16_support(devices)
         if not devices:
             return
@@ -991,33 +949,6 @@ class TrainingPage(Page):
                     f"{device['name']} · {device['total_vram'] / 2**30:.0f} GB",
                     Qt.ToolTipRole,
                 )
-
-    def _apply_tf32_support(self, devices: list[dict]) -> None:
-        """Enable TF32 when the hardware has the tensor cores for it.
-
-        Matches the Gradio tab, which both ticks and enables the box from
-        ``microarchitecture_capability_checker`` -- compute capability 8.0 and
-        up, meaning Ampere onwards.  The capability comes back from
-        ``cmd_gpu_info`` as "major.minor".
-        """
-        supported = False
-        for device in devices:
-            try:
-                major = int(str(device.get("capability", "0")).split(".")[0])
-            except (TypeError, ValueError):
-                continue
-            if major >= 8:
-                supported = True
-                break
-
-        self.tf32.setEnabled(supported)
-        self.tf32.setChecked(supported)
-        self.tf32.setToolTip(
-            _("Faster on Ampere and newer, marginally less precise.")
-            if supported
-            else _("This GPU has no TF32 units, so the setting would do nothing.")
-        )
-
 
     def refresh_suggestions(self) -> None:
         """Offer what is already on disk from the path fields themselves."""

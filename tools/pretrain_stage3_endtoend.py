@@ -42,9 +42,9 @@ THE LEARNING RATE IS RE-ANCHORED BY DEFAULT
 Editing ``learning_rate_g``/``learning_rate_d`` in ``config.json`` and resuming
 does nothing: the checkpoint's optimizer state carries the old rate, and it is
 what gets loaded.  ``resume_lr`` is the only override that reaches a resumed
-run, so this stage sets it for you, to the config's ``learning_rate_g`` -- a
-checkpoint arriving here has decayed through two stages and would otherwise
-start the longest run of the three with almost no rate left.
+run, so this stage sets it for you, to the config's ``learning_rate_g``, as
+stage 2 does.  With ``lr_final_ratio`` the decay horizon is this stage's
+epochs, not the cumulative count.
 
 ``--resume-lr`` names a different base; ``--keep-checkpoint-lr`` turns the
 re-anchor off.  Each parameter group keeps its own ``lr_scale``, so the base

@@ -118,6 +118,7 @@ _train_dir = os.path.join(now_dir, "rvc", "train")
 if _train_dir not in sys.path:
     sys.path.insert(0, _train_dir)
 
+from rvc.configs.vocoders import get_vocoder_spec  # noqa: E402
 from rvc.lib.algorithm import generators  # noqa: E402
 from rvc.train.ema import WeightEMA  # noqa: E402
 from rvc.train.losses import (  # noqa: E402
@@ -158,7 +159,9 @@ def build_decoder(config, vocoder: str, checkpointing: bool):
     """
 
     num_mels = int(config.data.n_mel_channels)
-    if vocoder == "refinegan2":
+    # By generator, not vocoder id: HiFi-GAN and HiFi-GAN++ share a decoder.
+    generator_id = get_vocoder_spec(vocoder)["generator"]
+    if generator_id == "refinegan2":
         return generators.RefineGAN2Generator(
             sample_rate=int(config.data.sample_rate),
             upsample_rates=tuple(config.model.upsample_rates),
@@ -185,7 +188,7 @@ def build_decoder(config, vocoder: str, checkpointing: bool):
                 getattr(config.model, "refinegan2_source_tilt", 1.0)
             ),
         )
-    if vocoder == "hifigan_nsf":
+    if generator_id == "hifi_nsf":
         return generators.HiFiGANNSFGenerator(
             initial_channel=num_mels,
             resblock_kernel_sizes=config.model.resblock_kernel_sizes,

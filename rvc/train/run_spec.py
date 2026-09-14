@@ -36,7 +36,7 @@ from typing import Optional, Union, get_args, get_origin, get_type_hints
 
 #: Bumped when a field is renamed or its meaning changes, so a stale spec fails
 #: loudly instead of being read with the wrong semantics.
-SPEC_VERSION = 1
+SPEC_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -75,19 +75,14 @@ class TrainRunSpec:
     pretrain_d: str = ""
 
     # -- optimisation -----------------------------------------------------
-    optimizer_choice: str = "AdamW"
-    lr_scheduler: str = "exp decay step"
+    # Optimizer and LR scheduler live in config.json, per G and D.
     use_warmup: bool = False
     warmup_duration: int = 5
-    use_custom_lr: bool = False
-    custom_lr_g: float = 1e-4
-    custom_lr_d: float = 1e-4
 
     # -- performance ------------------------------------------------------
+    # TF32, cuDNN benchmark and EMA live in config.json.
     use_checkpointing: bool = False
-    use_tf32: bool = False
     use_fp16: bool = False
-    use_benchmark: bool = True
     compile_vocoder: bool = False
     torch_compile_mode: str = "default"
 
@@ -125,11 +120,13 @@ class TrainRunSpec:
     # "full".
     resume_lr: Optional[float] = None
     resume_lr_target: str = "full"
+    # With ``lr_final_ratio``, restart the LR horizon whenever ``freeze_mode``
+    # changes from the checkpoint's, instead of spanning the cumulative epochs.
+    lr_horizon_per_stage: bool = False
 
     # -- monitoring -------------------------------------------------------
     overtrain_detector: bool = False
     stop_on_overtrain: bool = False
-    use_ema: bool = True
 
     @property
     def training_phase(self) -> str:

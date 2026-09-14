@@ -206,7 +206,7 @@ msgid "Auto picks by dataset size."
 msgstr "Automático escolhe pelo tamanho do dataset."
 
 msgid "Autocast needs a CUDA GPU, so the setting would do nothing."
-msgstr ""
+msgstr "O autocast precisa de uma GPU CUDA; sem ela, a opção não faria nada."
 
 msgid "Autotune"
 msgstr "Autotune"
@@ -417,7 +417,7 @@ msgid "Copy"
 msgstr "Copiar"
 
 msgid "Correction mode"
-msgstr ""
+msgstr "Modo de correção"
 
 msgid "Could not read that preset file: {}"
 msgstr "Não foi possível ler esse arquivo de predefinição: {}"
@@ -484,12 +484,6 @@ msgstr "O padrão é 1e-4 / 0,0001"
 
 msgid "Default: 1.0."
 msgstr "Padrão: 1,0."
-
-msgid "Delete 16 kHz slices after extraction"
-msgstr "Apagar os trechos de 16 kHz após a extração"
-
-msgid "Delete 16 kHz slices afterwards"
-msgstr "Apagar os trechos de 16 kHz depois"
 
 msgid "Denoise the output. Recommended for speech, not for singing."
 msgstr "Remove ruído da saída. Recomendado para fala, não para canto."
@@ -579,7 +573,7 @@ msgid "Empty saves to logs using the first model name."
 msgstr "Vazio salva em logs usando o nome do primeiro modelo."
 
 msgid "Enable RMVPE high-register correction"
-msgstr ""
+msgstr "Ativar correção de registro agudo do RMVPE"
 
 msgid "Enable cuDNN benchmark mode."
 msgstr "Ativa o modo benchmark do cuDNN."
@@ -690,7 +684,7 @@ msgid "F0 Curve"
 msgstr "Curva de F0"
 
 msgid "F0 ceiling (Hz)"
-msgstr ""
+msgstr "Teto de F0 (Hz)"
 
 msgid "F0 curve file"
 msgstr "Arquivo da curva de F0"
@@ -759,7 +753,7 @@ msgid "Fit to window"
 msgstr "Ajustar à janela"
 
 msgid "Fixes the octave errors rmvpe.pt makes above ~1040 Hz (flutes, high strings, whistle register) with a second pass on octave-down-resampled audio. Off by default; when disabled RMVPE behaves exactly as before."
-msgstr ""
+msgstr "Corrige os erros de oitava que o rmvpe.pt comete acima de ~1040 Hz (flautas, cordas agudas, registro de apito) com uma segunda passagem sobre o áudio reamostrado uma oitava abaixo. Desativado por padrão; quando desativado, o RMVPE se comporta exatamente como antes."
 
 msgid "Fold the chart away and give the width to the steps."
 msgstr "Recolhe o gráfico e cede a largura para as etapas."
@@ -815,9 +809,6 @@ msgstr "Frames somados por correspondência. Menos preserva a articulação idio
 msgid "Frames averaged per match. Fewer keeps what is idiosyncratic about the training voice; more averages toward its mean."
 msgstr "Frames somados por correspondência. Menos preserva o que há de idiossincrático na voz de treinamento; mais aproxima da sua média."
 
-msgid "Frees disk once the features exist."
-msgstr "Libera disco assim que as características existirem."
-
 msgid "Fresh Training"
 msgstr "Treinamento do zero"
 
@@ -825,7 +816,7 @@ msgid "Fusion"
 msgstr "Fundir"
 
 msgid "GPU"
-msgstr ""
+msgstr "GPU"
 
 msgid "GPU ID"
 msgstr "ID da GPU"
@@ -903,7 +894,7 @@ msgid "Higher values snap pitch to the chromatic grid."
 msgstr "Valores mais altos prendem o pitch à grade cromática."
 
 msgid "Highest pitch written in true_pitch mode. Models trained on stock RMVPE labels cannot synthesize above ~1250 Hz; raise it only for models trained with the correction enabled."
-msgstr ""
+msgstr "Pitch mais alto gravado no modo true_pitch. Modelos treinados com rótulos do RMVPE padrão não conseguem sintetizar acima de ~1250 Hz; aumente só para modelos treinados com a correção ativada."
 
 msgid "Hold a few whole source recordings out of training and score them as it goes. Training loss keeps falling while a model overtrains, so this is the only signal that can see it. Exports the last good weights. Turns itself off on datasets too small to spare any."
 msgstr "Reserva algumas gravações inteiras fora do treinamento e as avalia ao longo dele. A perda de treinamento continua caindo enquanto um modelo entra em overtraining, então este é o único sinal capaz de enxergar isso. Exporta os últimos pesos bons. Desliga-se sozinho em datasets pequenos demais para dispensar gravações."
@@ -1413,7 +1404,7 @@ msgid "RMS Volume Envelope"
 msgstr "Envelope de volume RMS"
 
 msgid "RMVPE high-register correction"
-msgstr ""
+msgstr "Correção de registro agudo do RMVPE"
 
 msgid "RMVPE is the recommended default. CREPE is an alternative for clean audio."
 msgstr "RMVPE é o padrão recomendado. CREPE é uma alternativa para áudio limpo."
@@ -1453,6 +1444,9 @@ msgstr "Reduz o uso de VRAM em troca de velocidade."
 
 msgid "Reduce detected noise in speech."
 msgstr "Reduz o ruído detectado na fala."
+
+msgid "RefineGAN decoder driven by a multi-harmonic excitation source, trained against multi-resolution spectrogram, UnivHD and SAN discriminators. Needs its own pretrain. 32 kHz only."
+msgstr "Decoder RefineGAN guiado por uma fonte de excitação multi-harmônica, treinado contra discriminadores de espectrograma multi-resolução, UnivHD e SAN. Precisa de pré-treinado próprio. Só 32 kHz."
 
 msgid "Refresh"
 msgstr "Atualizar"
@@ -1875,11 +1869,11 @@ msgstr "Texto a sintetizar"
 msgid "Text to speech"
 msgstr "Texto para fala"
 
-msgid "The 16 kHz copies only feed pitch and embedder extraction; training never reads them. Deleting frees roughly a third of what preprocessing wrote. Re-extracting with another f0 method or embedder needs them back, which means running preprocessing again."
-msgstr "As cópias de 16 kHz alimentam apenas a extração de pitch e do embedder; o treinamento nunca as lê. Apagá-las libera cerca de um terço do que o pré-processamento gravou. Extrair de novo com outro método de f0 ou outro embedder exige tê-las de volta, o que significa rodar o pré-processamento novamente."
-
 msgid "The Edge TTS voice used before conversion."
 msgstr "A voz do Edge TTS usada antes da conversão."
+
+msgid "The HiFi-GAN generator trained against RefineGAN v2's discriminator: multi-resolution spectrogram branches, UnivHD and SAN. Needs its own pretrain. 32 kHz only."
+msgstr "O gerador do HiFi-GAN treinado contra o discriminador do RefineGAN v2: ramos de espectrograma multi-resolução, UnivHD e SAN. Precisa de pré-treinado próprio. Só 32 kHz."
 
 msgid "The architecture the rebuilt config will be written for."
 msgstr "A arquitetura para a qual o config regerado será escrito."
@@ -1950,6 +1944,9 @@ msgstr "O vocoder selecionado exige guia de F0."
 msgid "The shipped config is missing: {}"
 msgstr "O config que acompanha o projeto está faltando: {}"
 
+msgid "The stock RVC v2 NSF-HiFi-GAN with Applio's 8-period discriminator. Loads the public RVC v2 pretrains. 32, 40 and 48 kHz."
+msgstr "O NSF-HiFi-GAN padrão do RVC v2, com o discriminador de 8 períodos do Applio. Carrega os pré-treinados públicos do RVC v2. 32, 40 e 48 kHz."
+
 msgid "The two disagree. Rebuilding writes both, which is how that gets resolved."
 msgstr "Os dois discordam. Regerar escreve os dois, que é como isso se resolve."
 
@@ -1957,7 +1954,7 @@ msgid "There is no converted file to save yet."
 msgstr "Ainda não há arquivo convertido para salvar."
 
 msgid "This GPU has no FP16 tensor cores: autocast still halves activation memory, but it may not make the steps any faster."
-msgstr ""
+msgstr "Esta GPU não tem tensor cores para FP16: o autocast ainda reduz pela metade a memória das ativações, mas pode não deixar os passos mais rápidos."
 
 msgid "This GPU has no TF32 units, so the setting would do nothing."
 msgstr "Esta GPU não tem unidades TF32, então a opção não faria nada."
@@ -2163,6 +2160,9 @@ msgstr "`{}` não tem config.json para regerar."
 msgid "`{}` has no readable config.json."
 msgstr "`{}` não tem um config.json legível."
 
+msgid "`{}` is not a vocoder this build knows -- it was likely removed from the registry. Rebuilding writes a current one."
+msgstr "`{}` não é um vocoder que esta versão conhece -- provavelmente foi removido do registro. Reconstruir grava um atual."
+
 msgid "absent"
 msgstr "ausente"
 
@@ -2182,7 +2182,7 @@ msgid "fp32 doubles the feature cache on disk but keeps the retrieval index free
 msgstr "fp32 dobra o cache de características em disco, mas mantém o index de recuperação livre de um piso de quantização; fp16 o reduz à metade. Ambos podem ser lidos sem extrair novamente."
 
 msgid "https://…"
-msgstr ""
+msgstr "https://…"
 
 msgid "l2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally."
 msgstr "l2 é o que o RVC original constrói. O cosseno compara apenas a direção, então uma tomada baixa e uma alta do mesmo som combinam igualmente."
@@ -2215,7 +2215,7 @@ msgid "torch.compile the vocoder"
 msgstr "compilar o vocoder com torch.compile"
 
 msgid "true_pitch writes the real pitch, capped at the F0 ceiling. fold only repairs wrong-octave frames using half-pitch drives; use it with models trained on uncorrected labels to keep their timbre."
-msgstr ""
+msgstr "true_pitch grava o pitch real, limitado ao teto de F0. fold só corrige os frames na oitava errada usando excitações a meio pitch; use-o com modelos treinados com rótulos sem correção para manter o timbre deles."
 
 msgid "unrecognised -- this config predates the current registry"
 msgstr "não reconhecida -- este config é anterior ao registro atual"

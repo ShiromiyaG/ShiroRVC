@@ -6,8 +6,7 @@ every partial above f0 was manufactured by the trunk out of feature maps on the
 frame grid, and that is what stopped working: under ``[5, 4, 4, 4]`` the trunk
 was linear only to 3960 Hz, so the render had no harmonics above ~6 kHz.  Since
 2026-09-09 the source carries ``source_harmonics`` partials on a
-``j ** -source_tilt`` slope, which is the part that separates it from the flat
-BLIT that was removed for arriving 18 dB too bright.  The count is still 0 by
+``j ** -source_tilt`` slope.  The count is still 0 by
 default, because that is what every checkpoint before then was trained on.
 
 ``comb`` (fish-diffusion's band-limited impulse train) and ``bank`` (a
@@ -191,9 +190,7 @@ def test_one_partial_stays_bit_identical():
 
 
 def test_the_partials_arrive_on_the_intended_slope():
-    """The whole difference from the BLIT.  A flat source measured +18 dB
-    against the reference at 4.4-5 kHz because ``source_gain`` is one scalar
-    per frame and cannot impose a tilt; this one carries its own."""
+    """Partial ``j`` arrives at ``j ** -tilt`` relative to the fundamental."""
 
     f0 = 220.0
     for tilt in (0.0, 1.0):

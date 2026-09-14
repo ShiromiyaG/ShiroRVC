@@ -36,6 +36,13 @@ stage 1 ran 40 epochs and you want 30 more here, pass ``--total-epochs 70``.
 Passing 30 would make the run finish immediately.  The script checks the
 checkpoint's epoch and refuses a target below it.
 
+THE LEARNING RATE STARTS OVER
+-----------------------------
+``enc_p`` and ``flow`` start training here, so the LR is re-anchored to the
+config's ``learning_rate_g`` (``--resume-lr`` for another base,
+``--keep-checkpoint-lr`` to continue stage 1's).  With ``lr_final_ratio`` the
+decay horizon is this stage's epochs, not the cumulative count.
+
 WHAT COMES OUT -- AND WHAT IT IS NOT
 ------------------------------------
 Stage 2 does not leave a usable pretrain behind.  Two separate reasons.
@@ -135,6 +142,20 @@ def main() -> int:
         help="Multiplier on the config's c_kl (default 1.0, the full weight).",
     )
     parser.add_argument(
+        "--resume-lr",
+        type=float,
+        default=None,
+        help=(
+            "Base LR to re-anchor to after loading stage 1's optimizer state. "
+            "Defaults to the config's learning_rate_g."
+        ),
+    )
+    parser.add_argument(
+        "--keep-checkpoint-lr",
+        action="store_true",
+        help="Do not re-anchor: continue on the LR stage 1 ended with.",
+    )
+    parser.add_argument(
         "--allow-no-checkpoint",
         action="store_true",
         help=(
@@ -185,11 +206,22 @@ def main() -> int:
                 f"{epoch} + however many epochs stage 2 should last."
             )
 
+    if args.keep_checkpoint_lr:
+        resume_lr = None
+        print("  lr        keeping the checkpoint's optimizer LR")
+    else:
+        resume_lr = (
+            args.resume_lr
+            if args.resume_lr is not None
+            else float(config["train"]["learning_rate_g"])
+        )
+
     return build_and_launch(
         args,
         directory,
         freeze_mode="encoders",
         c_kl_scale=args.c_kl_scale,
+        resume_lr=resume_lr,
     )
 
 

@@ -10,7 +10,6 @@ import math
 import torch
 
 from rvc.lib.terminal import warning
-from rvc.train.optimizers import is_schedule_free
 
 
 def planned_step_count(total_epoch_count: int, train_loader, max_steps: int = 0) -> int:
@@ -58,14 +57,22 @@ def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int
 
 def prepare_schedulers(
     optim_g, optim_d,
-    use_lr_scheduler, lr_scheduler, exp_decay_gamma,
+    lr_scheduler_g, lr_scheduler_d, exp_decay_gamma,
     total_epoch_count, epoch_str, global_step, train_loader,
     fresh_start=False,
     optimizer_choice_g="AdamW",
     optimizer_choice_d="AdamW",
     lr_final_ratio=None,
     exp_decay_step_raw=False,
+    horizon_start_epoch=0,
+    horizon_start_step=0,
 ):
+    """Build the G and D schedulers; ``"none"`` gives ``None`` for that side.
+
+    ``horizon_start_*`` move the start of the ``lr_final_ratio`` horizon
+    from the beginning of training to the beginning of a stage, in the same
+    units as ``epoch_str - 1`` and ``global_step``.
+    """
     def _horizon_decay(final_ratio, total_units):
         """Exponential decay reaching ``final_ratio`` at the end of the run,
         so the same config gives the same endpoint at any run length. Progress
@@ -98,8 +105,6 @@ def prepare_schedulers(
 
         return scale
 
-    scheduler_g, scheduler_d = None, None
-
     num_batches_per_epoch = len(train_loader)
 
     scheduler_resume_epoch = -1 if fresh_start else epoch_str - 1
@@ -112,71 +117,54 @@ def prepare_schedulers(
         if 'initial_lr' not in param_group:
             param_group['initial_lr'] = param_group['lr']
 
-    if use_lr_scheduler and (
-        is_schedule_free(optimizer_choice_g) or is_schedule_free(optimizer_choice_d)
-    ):
-        # Not an error -- the optimizer survives it, because its averaging
-        # weights key off ``lr_max`` rather than the current lr -- but a decay
-        # schedule is the thing schedule-free exists to remove, so a run using
-        # both is almost certainly a leftover setting.
-        warning(
-            f"'{lr_scheduler}' is set together with a schedule-free optimizer, "
-            "which is designed to run without one. The schedule will still be "
-            "applied; set the scheduler to 'none' if that was not intended.",
-            tag="[INIT]",
-        )
+    horizon_shapes = {
+        "exp decay epoch": _horizon_decay,
+        "exp decay step": _horizon_decay,
+        "cosine annealing epoch": _horizon_cosine,
+    }
 
-    if use_lr_scheduler:
+    def build(optim, lr_scheduler):
+        if lr_scheduler == "none":
+            return None
         scheduler_name = (
             "cosine annealing epoch"
             if lr_scheduler == "cosine annealing"
             else lr_scheduler
         )
 
-        horizon_shapes = {
-            "exp decay epoch": _horizon_decay,
-            "exp decay step": _horizon_decay,
-            "cosine annealing epoch": _horizon_cosine,
-        }
         if lr_final_ratio is not None and scheduler_name in horizon_shapes:
             # Only one variant is stepped per optimizer step; the others are
             # stepped per epoch, so the ratio has to land at the end of the run
             # in whichever unit this scheduler counts.
             per_epoch = scheduler_name != "exp decay step"
-            total_units = total_epoch_count * (1 if per_epoch else num_batches_per_epoch)
+            span_epochs = max(1, total_epoch_count - horizon_start_epoch)
+            total_units = span_epochs * (1 if per_epoch else num_batches_per_epoch)
             shape = horizon_shapes[scheduler_name](lr_final_ratio, total_units)
             resume_at = scheduler_resume_epoch if per_epoch else scheduler_resume_step
-            scheduler_g = torch.optim.lr_scheduler.LambdaLR(
-                optim_g, shape, last_epoch=resume_at
+            if resume_at >= 0:
+                start = horizon_start_epoch if per_epoch else horizon_start_step
+                resume_at = max(-1, resume_at - start)
+            return torch.optim.lr_scheduler.LambdaLR(
+                optim, shape, last_epoch=resume_at
             )
-            scheduler_d = torch.optim.lr_scheduler.LambdaLR(
-                optim_d, shape, last_epoch=resume_at
+        if scheduler_name == "exp decay epoch":
+            return torch.optim.lr_scheduler.ExponentialLR(
+                optim, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
             )
-        elif scheduler_name == "exp decay epoch":
-            scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-                optim_g, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
-            )
-            scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-                optim_d, gamma=exp_decay_gamma, last_epoch=scheduler_resume_epoch
-            )
-        elif scheduler_name == "exp decay step":
+        if scheduler_name == "exp decay step":
             scheduler_gamma = (
                 exp_decay_gamma
                 if exp_decay_step_raw
                 else exp_decay_gamma ** (1.0 / num_batches_per_epoch)
             )
-            scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-                optim_g, gamma=scheduler_gamma, last_epoch=scheduler_resume_step
+            return torch.optim.lr_scheduler.ExponentialLR(
+                optim, gamma=scheduler_gamma, last_epoch=scheduler_resume_step
             )
-            scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-                optim_d, gamma=scheduler_gamma, last_epoch=scheduler_resume_step
+        if scheduler_name == "cosine annealing epoch":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optim, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch
             )
-        elif scheduler_name == "cosine annealing epoch":
-            scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optim_g, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch
-            )
-            scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optim_d, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch
-            )
+        warning(f"Unknown LR scheduler {lr_scheduler!r}; running without one.", tag="[INIT]")
+        return None
 
-    return scheduler_g, scheduler_d
+    return build(optim_g, lr_scheduler_g), build(optim_d, lr_scheduler_d)

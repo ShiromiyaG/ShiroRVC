@@ -8,6 +8,7 @@ import traceback
 
 from rvc.configs.vocoders import (
     get_architecture_id,
+    get_default_vocoder,
     get_vocoder_choices,
     get_vocoder_sample_rates,
     get_vocoder_spec,
@@ -148,11 +149,13 @@ def extract_small_model_tab():
                 scale=1
             )
 
+        default_vocoder = get_default_vocoder()
+        default_rates = get_vocoder_sample_rates(default_vocoder)
         with gr.Row():
             sr_input = gr.Dropdown(
                 label=_("Sample Rate of the model (sr)"),
-                choices=get_vocoder_sample_rates("hifi"),
-                value=48000, 
+                choices=default_rates,
+                value=48000 if 48000 in default_rates else default_rates[0],
                 type="value",
                 interactive=True,
                 scale=1
@@ -160,7 +163,7 @@ def extract_small_model_tab():
             vocoder_input = gr.Dropdown(
                 label=_("Vocoder"),
                 choices=get_vocoder_choices(),
-                value="hifi",
+                value=default_vocoder,
                 type="value",
                 interactive=True,
                 scale=1,

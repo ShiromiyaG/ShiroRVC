@@ -1,6 +1,6 @@
 """Does the prior's roughness reach the waveform through ``source_gain``?
 
-``source_gain`` multiplies the excitation by an envelope projected from ``z``.
+``source_gain`` multiplies the excitation by envelopes projected from ``z``.
 At inference ``z_p = m_p + exp(logs_p) * randn * noise_scale`` draws an
 *independent* ``randn`` per frame, so that envelope jumps every 10 ms -- a
 multiplication, not a pointwise nonlinearity, which is why no anti-aliasing
@@ -21,18 +21,28 @@ Two numbers per case, because they move for different reasons:
                has bought quiet with flatness; one that lowers only the first
                is a free win.
 
+``--posterior`` measures stage 1's path instead, where the prior is still at
+its init: ``logs/reference`` audio -> ``enc_q`` -> ``m_q`` -> ``dec``, against
+the reference itself.  Per case it reports how much the gain envelope jumps
+from frame to frame, how much the render's level error does (the vertical
+columns in a preview's Difference panel), and the mel L1, all over voiced
+frames and 250 Hz - 4 kHz.
+
 Usage::
 
     python tools/source_gain_ab.py
+    python tools/source_gain_ab.py --log-dir logs/my-model --posterior
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
 
+import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -44,6 +54,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from decoder_determinism import build  # noqa: E402
 from render_constant_f0 import coarse, pick_feature  # noqa: E402
+from rvc.lib.audio_io import load_audio  # noqa: E402
+from rvc.train.mel_processing import mel_spectrogram_torch, spectrogram_torch  # noqa: E402
 
 PERIOD = 1600
 BLOCKS = 32
@@ -67,25 +79,28 @@ def lowpass_frames(gain: torch.Tensor, frame_rate: float, cutoff: float):
     return F.conv1d(padded, kernel)
 
 
-def patched_source_gain(dec, mode: str, frame_rate: float, cutoff: float):
-    """A drop-in ``_apply_source_gain`` for one A/B case."""
+def frame_gain_logits(dec, mel, g, mode: str, frame_rate: float, cutoff: float):
+    """The pre-softplus gains at the frame rate, as one A/B case shapes them."""
+    gain = dec.source_gain(mel)
+    if g is not None and hasattr(dec, "source_gain_cond"):
+        gain = gain + dec.source_gain_cond(g)
+    if mode == "mean":
+        gain = gain.mean(dim=-1, keepdim=True).expand_as(gain)
+    elif mode == "lowpass":
+        gain = lowpass_frames(gain, frame_rate, cutoff)
+    return gain
 
-    def apply(har_source, mel):
+
+def patched_source_gain(dec, mode: str, frame_rate: float, cutoff: float):
+    """A drop-in ``_source_gain`` for one A/B case."""
+
+    def apply(mel, g=None):
         if mode == "off":
-            return har_source
-        gain = F.softplus(dec.source_gain(mel))
-        if mode == "mean":
-            gain = gain.mean(dim=-1, keepdim=True).expand_as(gain)
-        elif mode == "lowpass":
-            gain = lowpass_frames(gain, frame_rate, cutoff)
+            return None
+        gain = frame_gain_logits(dec, mel, g, mode, frame_rate, cutoff)
         for ups in dec.source_gain_ups:
             gain = ups(gain)
-        length = har_source.shape[-1]
-        if gain.shape[-1] > length:
-            gain = gain[..., :length]
-        elif gain.shape[-1] < length:
-            gain = F.pad(gain, (0, length - gain.shape[-1]), mode="replicate")
-        return har_source * gain
+        return F.softplus(gain).transpose(1, 2)
 
     return apply
 
@@ -106,6 +121,112 @@ def skirt_db(x, sr: int, f0: float, start: int):
     )
 
 
+def gain_envelope_db(dec, z, g, mode: str, frame_rate: float, cutoff: float):
+    """The per-frame source gain each case applies, in dB, averaged over channels."""
+    if mode == "off":
+        return np.zeros(z.shape[-1])
+    with torch.no_grad():
+        gain = F.softplus(frame_gain_logits(dec, z, g, mode, frame_rate, cutoff))
+    return (20 * torch.log10(gain[0].double().clamp_min(1e-8))).mean(dim=0).numpy()
+
+
+def log_mel_db(wave: torch.Tensor, data: dict):
+    """The training loss's log-mel, in dB, as (bins, frames)."""
+    mel = mel_spectrogram_torch(
+        wave.view(1, -1).float(),
+        data["filter_length"],
+        data["n_mel_channels"],
+        data["sample_rate"],
+        data["hop_length"],
+        data["win_length"],
+        data["mel_fmin"],
+        data["mel_fmax"],
+    )
+    return mel[0].double().numpy() * (20 / math.log(10))
+
+
+def run_posterior(args, net_g, sr: int, log_dir: Path, ckpt_path: Path) -> None:
+    data = json.loads((log_dir / "config.json").read_text(encoding="utf-8"))["data"]
+    dec = net_g.dec
+    hop = data["hop_length"]
+    frame_rate = sr / dec.upp
+
+    ref_dir = Path(args.ref_dir)
+    wave = torch.from_numpy(load_audio(str(ref_dir / "ref_audio.wav"), sr)).float()
+    f0 = torch.from_numpy(np.load(ref_dir / "ref_f0f.npy")).float().flatten()
+    spec = spectrogram_torch(
+        wave.view(1, -1), data["filter_length"], hop, data["win_length"], center=False
+    )
+    frames = min(spec.shape[-1], f0.shape[0], wave.shape[0] // hop)
+    spec, f0 = spec[..., :frames], f0[:frames]
+    target = wave[: frames * hop]
+
+    with torch.no_grad():
+        g = net_g.emb_g(torch.tensor([args.sid])).unsqueeze(-1)
+        _z, m_q, logs_q, mask = net_g.enc_q(spec, torch.tensor([frames]), g=g)
+        z = m_q
+        if args.posterior_noise:
+            torch.manual_seed(1234)
+            z = m_q + torch.randn_like(m_q) * torch.exp(logs_q) * args.posterior_noise
+        z = z * mask
+
+    fmax = data["mel_fmax"] or sr / 2
+    centers = librosa.mel_frequencies(
+        n_mels=data["n_mel_channels"] + 2, fmin=data["mel_fmin"], fmax=fmax
+    )[1:-1]
+    band = (centers >= 250.0) & (centers <= 4000.0)
+    voiced = f0.numpy() > 0
+    pairs = voiced[1:] & voiced[:-1]
+    original_db = log_mel_db(target, data)
+
+    print(
+        f"checkpoint: {ckpt_path.name}   sr={sr}   frames={frames}   "
+        f"voiced={int(voiced.sum())}   z={'m_q' if not args.posterior_noise else f'draw x{args.posterior_noise:g}'}"
+    )
+    print("path: reference -> enc_q -> dec (stage 1's), metrics over 250 Hz - 4 kHz\n")
+    print(f"{'case':24s} {'gain jump':>10s} {'column jump':>12s} {'mel L1':>9s}")
+
+    save_dir = Path(args.save_dir) if args.save_dir else None
+    if save_dir:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        sf.write(save_dir / "original.wav", target.numpy(), sr)
+
+    original = dec._source_gain
+    cases = [
+        ("source_gain on", "on"),
+        ("source_gain OFF", "off"),
+        ("gain -> its mean", "mean"),
+        (f"gain LP {args.cutoff:g}Hz", "lowpass"),
+    ]
+    for label, mode in cases:
+        dec._source_gain = (
+            original
+            if mode == "on"
+            else patched_source_gain(dec, mode, frame_rate, args.cutoff)
+        )
+        with torch.no_grad():
+            out = dec(z, f0.view(1, -1), g)[0, 0][: target.shape[0]]
+        render_db = log_mel_db(out, data)
+        n = min(render_db.shape[1], original_db.shape[1], frames)
+        diff = render_db[band, :n] - original_db[band, :n]
+        # Mean error per frame across the band: a vertical column in the
+        # Difference panel is a jump in this from one frame to the next.
+        column = diff.mean(axis=0)
+        mask_n = pairs[: n - 1]
+        column_jump = float(np.sqrt((np.diff(column)[mask_n] ** 2).mean()))
+        gain_db = gain_envelope_db(dec, z, g, mode, frame_rate, args.cutoff)[:n]
+        gain_jump = float(np.sqrt((np.diff(gain_db)[mask_n] ** 2).mean()))
+        mel_l1 = float(np.abs(diff[:, voiced[:n]]).mean())
+        print(
+            f"{label:24s} {gain_jump:7.2f} dB {column_jump:9.2f} dB {mel_l1:6.2f} dB"
+        )
+        if save_dir:
+            name = label.replace(" ", "").replace("->", "to") + ".wav"
+            sf.write(save_dir / name, out.double().numpy(), sr)
+
+    dec._source_gain = original
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log-dir", default="logs/pretrain")
@@ -115,6 +236,19 @@ def main() -> None:
     ap.add_argument("--freeze-frame", type=int, default=60)
     ap.add_argument("--cutoff", type=float, default=20.0, help="gain lowpass, Hz")
     ap.add_argument("--save-dir", default=None)
+    ap.add_argument(
+        "--posterior",
+        action="store_true",
+        help="render through enc_q from --ref-dir instead of the prior (stage 1)",
+    )
+    ap.add_argument("--ref-dir", default="logs/reference")
+    ap.add_argument("--sid", type=int, default=0)
+    ap.add_argument(
+        "--posterior-noise",
+        type=float,
+        default=0.0,
+        help="with --posterior, decode m_q + exp(logs_q) * randn * this instead of m_q",
+    )
     args = ap.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -123,9 +257,14 @@ def main() -> None:
         if args.checkpoint
         else max(log_dir.glob("G_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
     )
-    net_g, sr = build(log_dir, ckpt_path, False)
+    net_g, sr = build(log_dir, ckpt_path, False, keep_posterior=args.posterior)
     dec = net_g.dec
+    if not getattr(dec, "has_source_gain", False):
+        raise SystemExit(f"{ckpt_path.name} has no source_gain to compare.")
     dec.m_source.noise_std = 0.0  # the dither is measured elsewhere, not here
+    if args.posterior:
+        run_posterior(args, net_g, sr, log_dir, ckpt_path)
+        return
     frame_rate = sr / dec.upp
 
     feature_path, sid = pick_feature(log_dir, None)
@@ -144,7 +283,7 @@ def main() -> None:
         g = net_g.emb_g(sid_t).unsqueeze(-1)
         m_p, logs_p, x_mask = net_g.enc_p(phone=phone_t, pitch=pitch, lengths=lengths)
 
-    original = dec._apply_source_gain
+    original = dec._source_gain
 
     def render(noise_scale: float, seed: int):
         with torch.no_grad():
@@ -182,7 +321,7 @@ def main() -> None:
         save_dir.mkdir(parents=True, exist_ok=True)
 
     for label, mode, noise_scale in cases:
-        dec._apply_source_gain = (
+        dec._source_gain = (
             original
             if mode == "on"
             else patched_source_gain(dec, mode, frame_rate, args.cutoff)
@@ -203,7 +342,7 @@ def main() -> None:
             name = label.replace(" ", "").replace("->", "to") + ".wav"
             sf.write(save_dir / name, a, sr)
 
-    dec._apply_source_gain = original
+    dec._source_gain = original
 
 
 if __name__ == "__main__":

@@ -26,10 +26,11 @@ from rvc.configs.config import (
     get_number_of_gpus,
     get_use_fp16,
     max_vram_gpu,
-    microarchitecture_capability_checker,
 )
 from rvc.configs.vocoders import (
+    get_default_vocoder,
     get_vocoder_choices,
+    get_vocoder_description,
     get_vocoder_sample_rates,
     get_vocoder_spec,
     normalize_vocoder,
@@ -262,19 +263,11 @@ def start_train_from_ui(
     g_pretrained_path,
     d_pretrained_path,
     vocoder,
-    optimizer_choice,
     use_checkpointing,
-    use_tf32,
-    use_benchmark,
-    lr_scheduler,
-    use_custom_lr,
-    custom_lr_g,
-    custom_lr_d,
     compile_vocoder,
     torch_compile_mode,
     overtrain_detector,
     stop_on_overtrain,
-    use_ema,
 ):
     """Launch a run from this tab's controls.
 
@@ -305,27 +298,27 @@ def start_train_from_ui(
         g_pretrained_path=g_pretrained_path,
         d_pretrained_path=d_pretrained_path,
         vocoder=vocoder,
-        optimizer_choice=optimizer_choice,
         use_checkpointing=use_checkpointing,
-        use_tf32=use_tf32,
         use_fp16=get_use_fp16(),
-        use_benchmark=use_benchmark,
-        lr_scheduler=lr_scheduler,
-        use_custom_lr=use_custom_lr,
-        custom_lr_g=custom_lr_g,
-        custom_lr_d=custom_lr_d,
         compile_vocoder=compile_vocoder,
         torch_compile_mode=torch_compile_mode,
         overtrain_detector=overtrain_detector,
         stop_on_overtrain=stop_on_overtrain,
-        use_ema=use_ema,
     )
 
 
+initial_vocoder = get_default_vocoder()
 initial_sample_rate_choices = [
-    str(rate) for rate in get_vocoder_sample_rates("hifi")
+    str(rate) for rate in get_vocoder_sample_rates(initial_vocoder)
 ]
-initial_sample_rate = "48000"
+initial_sample_rate = (
+    "48000" if "48000" in initial_sample_rate_choices else initial_sample_rate_choices[0]
+)
+
+
+def vocoder_description_text(vocoder_id):
+    description = get_vocoder_description(vocoder_id)
+    return _(description)
 
 
 def update_vocoder_settings(vocoder_id, current_sample_rate):
@@ -344,15 +337,6 @@ def update_vocoder_settings(vocoder_id, current_sample_rate):
         "value": selected_sample_rate,
         "__type__": "update",
     }
-
-initial_optimizer = "AdamW"
-# Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES.
-initial_optimizer_choices = [
-    ("AdamW", "AdamW"),
-    ("Sched-Free AdamW", "Sched-Free AdamW"),
-    ("Muon", "Muon"),
-    ("Lion", "Lion"),
-]
 
 def train_tab():
     with gr.Accordion(_("Training Presets"), open=False):
@@ -395,10 +379,13 @@ def train_tab():
                     label=_("Vocoder"),
                     info=_(VOCODER_INFO_RVC),
                     choices=get_vocoder_choices(),
-                    value="hifi",
+                    value=initial_vocoder,
                     interactive=True,
                     visible=True,
                     key='vocoder'
+                )
+                vocoder_description = gr.Markdown(
+                    value=vocoder_description_text(initial_vocoder)
                 )
         with gr.Accordion(
             _("CPU / GPU settings for ' f0 ' and ' features ' extraction."),
@@ -735,26 +722,6 @@ def train_tab():
             gr.Markdown(f"#### {_('Optimisation')}")
             with gr.Row():
                 with gr.Column(min_width=0):
-                    optimizer_choice = gr.Radio(
-                        label=_("Optimizer (G/D)"),
-                        info=_(OPTIMIZER_INFO),
-                        choices=initial_optimizer_choices,
-                        value=initial_optimizer,
-                        interactive=True,
-                        visible=True,
-                        key='optimizer_choice'
-                    )
-                with gr.Column(min_width=0):
-                    lr_scheduler = gr.Radio(
-                        label=_("LR scheduler (G/D)"),
-                        info=_(LR_SCHEDULER_INFO),
-                        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
-                        value="exp decay epoch",
-                        interactive=True,
-                        key='lr_scheduler'
-                    )
-            with gr.Row():
-                with gr.Column(min_width=0):
                     use_warmup = gr.Checkbox(
                         label=_("Warmup phase for training"),
                         info=_("Use linear learning-rate warmup."),
@@ -774,30 +741,6 @@ def train_tab():
                                 interactive=True,
                                 key='warmup_duration'
                             )
-                with gr.Column(min_width=0):
-                    use_custom_lr = gr.Checkbox(
-                        label=_("Custom lr for gen and disc"),
-                        info=_("Set separate generator and discriminator learning rates."),
-                        value=False,
-                        interactive=True,
-                        key='use_custom_lr'
-                    )
-                    with gr.Column(visible=False) as custom_lr_settings:
-                        with gr.Accordion(_("Custom lr settings")):
-                            custom_lr_g = gr.Textbox(
-                                label=_("Learning rate for Generator"),
-                                placeholder=_("Default is 1e-4 / 0.0001"),
-                                info=_("Generator learning rate. Both rates are required."),
-                                interactive=True,
-                                key='custom_lr_g'
-                            )
-                            custom_lr_d = gr.Textbox(
-                                label=_("Learning rate for Discriminator"),
-                                placeholder=_("Default is 1e-4 / 0.0001"),
-                                info=_("Discriminator learning rate. Both rates are required."),
-                                interactive=True,
-                                key='custom_lr_d'
-                            )
 
             gr.Markdown(f"#### {_('Checkpoints and quality')}")
             with gr.Row():
@@ -815,14 +758,6 @@ def train_tab():
                         value=True,
                         interactive=True,
                         key='save_weight_models'
-                    )
-                with gr.Column(min_width=0):
-                    use_ema = gr.Checkbox(
-                        label=_(USE_EMA_LABEL),
-                        info=_(USE_EMA_INFO),
-                        value=True,
-                        interactive=True,
-                        key='use_ema'
                     )
                 with gr.Column(min_width=0):
                     overtrain_detector = gr.Checkbox(
@@ -864,21 +799,6 @@ def train_tab():
                         value=auto_enable_checkpointing,
                         interactive=True,
                         key='use_checkpointing'
-                    )
-                    use_benchmark = gr.Checkbox(
-                        label=_("Use 'cuDNN benchmark' mode"),
-                        info=_("Enable cuDNN benchmark mode."),
-                        value=True,
-                        interactive=True,
-                        key='use_benchmark'
-                    )
-                with gr.Column(min_width=0):
-                    use_tf32 = gr.Checkbox(
-                        label=_("use 'TF32' precision"),
-                        info=_("Use TF32 on supported GPUs for faster training."),
-                        value=microarchitecture_capability_checker(),
-                        interactive=microarchitecture_capability_checker(),
-                        key='use_tf32'
                     )
                 with gr.Column(min_width=0):
                     compile_vocoder = gr.Checkbox(
@@ -1029,19 +949,11 @@ def train_tab():
                     g_pretrained_path,
                     d_pretrained_path,
                     vocoder,
-                    optimizer_choice,
                     use_checkpointing,
-                    use_tf32,
-                    use_benchmark,
-                    lr_scheduler,
-                    use_custom_lr,
-                    custom_lr_g,
-                    custom_lr_d,
                     compile_vocoder,
                     torch_compile_mode,
                     overtrain_detector,
                     stop_on_overtrain,
-                    use_ema,
                 ],
                 outputs=[train_output_info],
                 show_progress="hidden",
@@ -1204,14 +1116,11 @@ def train_tab():
                 batch_size, epoch_save_frequency, total_epoch_count,
                 save_only_latest_net_models, save_weight_models, pretrained,
                 cleanup, use_checkpointing, compile_vocoder, torch_compile_mode,
-                use_tf32, use_benchmark,
-                optimizer_choice, lr_scheduler,
                 custom_pretrained, g_pretrained_path,
                 d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
-                warmup_duration, use_custom_lr, custom_lr_g,
-                custom_lr_d,
+                warmup_duration,
                 index_algorithm, index_metric, index_single_speaker,
-                overtrain_detector, stop_on_overtrain, use_ema
+                overtrain_detector, stop_on_overtrain
             ])
 
             def save_training_preset(inputs):
@@ -1305,6 +1214,12 @@ def train_tab():
                 inputs=[vocoder, sampling_rate],
                 outputs=[sampling_rate],
             )
+            vocoder.change(
+                fn=vocoder_description_text,
+                inputs=[vocoder],
+                outputs=[vocoder_description],
+                show_progress="hidden",
+            )
             refresh.click(
                 fn=refresh_models_and_datasets,
                 inputs=[],
@@ -1345,12 +1260,6 @@ def train_tab():
                 fn=toggle_compile_mode,
                 inputs=[compile_vocoder],
                 outputs=[torch_compile_mode],
-                show_progress="hidden",
-            )
-            use_custom_lr.change(
-                fn=toggle_visible,
-                inputs=[use_custom_lr],
-                outputs=[custom_lr_settings],
                 show_progress="hidden",
             )
             multiple_gpu.change(

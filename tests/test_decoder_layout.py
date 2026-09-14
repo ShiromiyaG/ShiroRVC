@@ -17,7 +17,6 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +28,6 @@ torch = pytest.importorskip("torch", reason="needs torch", exc_type=ImportError)
 import torch.nn.functional as F  # noqa: E402
 
 from rvc.lib.algorithm.generators.refinegan2 import (  # noqa: E402
-    BlitGenerator,
     ParallelResBlock,
     ResBlock,
     RefineGAN2Generator,
@@ -124,13 +122,6 @@ def test_the_layout_round_trips_through_a_checkpoint():
         "upsample_rates": [5, 4, 4, 4],
         "source_gain": False,
         "source_bands": 0,
-        # Both are pinned since the sine replaced the BLIT on 2026-09-08.  A
-        # source that fills one bin has no band to cap and no energy to hold
-        # constant, so the layout reports what a sine run implies rather than
-        # whatever a config asked for -- and the two no longer disagree
-        # between a config and a checkpoint, because neither can vary.
-        "source_bandwidth": 1.0,
-        "source_normalize": False,
         # The excitation's harmonic slope.  The count is a state-dict shape,
         # but the tilt is a non-persistent buffer that scales every partial,
         # so it travels here for the same reason ``upsample_filter`` does.
@@ -155,7 +146,6 @@ def test_the_layout_round_trips_through_a_checkpoint():
     "checkpoint_layout",
     [
         {"upsample_rates": [3, 3, 7, 7]},
-        {"upsample_rates": [5, 4, 4, 4], "source_normalize": False},
         {"upsample_rates": [5, 4, 4, 4], "source_gain": True},
         # A checkpoint from before the anti-aliased activations were removed.
         # Nothing in the current layout can see the difference, and its weights
@@ -167,7 +157,7 @@ def test_a_mismatch_is_refused_and_names_the_keys(checkpoint_layout):
     model = torch.nn.Module()
     model.dec = _generator((5, 4, 4, 4))
     model.sr = 32000
-    layout = {"source_normalize": True, **checkpoint_layout}
+    layout = dict(checkpoint_layout)
     with pytest.raises(ValueError, match="Decoder layout mismatch") as excinfo:
         assert_decoder_layout_matches(model, {"decoder_layout": layout})
     message = str(excinfo.value)
@@ -288,16 +278,13 @@ def test_the_shipped_config_leaves_the_source_at_one_partial(sample_rate):
     the trunk its harmonics for free is the case ``source_gain``'s comment
     already reasons about: the trunk stops consulting ``z``, and the KL falls
     because the decoder needs less rather than because the prior caught up.
-    The BLIT was that source, and 32 tilted partials are much closer to it
-    than one sine is.  Raising this costs a pretrain, so it wants a
-    measurement first.
+    Raising this costs a pretrain, so it wants a measurement first.
     """
 
     model = json.loads(CONFIGS[sample_rate].read_text())["model"]
     assert model["refinegan2_source_harmonics"] == 0
     # The tilt only bites at harmonics > 0, but it travels in the config so a
-    # run that raises the count does not silently get a flat source -- which is
-    # the BLIT, and what it was removed for.
+    # run that raises the count does not silently get a flat source.
     assert model["refinegan2_source_tilt"] > 0.0
 
 
@@ -649,270 +636,3 @@ def decoder_layout_of(decoder):
     holder.dec = decoder
     holder.sr = 32000
     return decoder_layout(holder)
-
-
-def _blit(f0_hz, bandwidth=1.0, length=32768, rate=32000, **kwargs):
-    source = BlitGenerator(rate, bandwidth=bandwidth, noise_std=0.0, **kwargs)
-    f0 = torch.full((1, 1, length), float(f0_hz))
-    with torch.no_grad():
-        return source(f0).squeeze()
-
-
-def test_the_excitation_carries_the_same_energy_at_every_pitch():
-    """The Dirichlet kernel is normalised to a unit *peak*, so each of its M
-    harmonics carries ``1/M`` and its RMS is ``1/sqrt(M)``.  M is chosen per
-    sample from f0, so without a correction the excitation's level is a
-    function of the note: measured -46.1 dB per partial at f0=80 against -26.5
-    at f0=800, a 20 dB tilt across a singer's range.
-
-    ``source_gain`` is the only thing placed to undo that, and it is 193
-    parameters that would come out coupled to pitch for the privilege.  The
-    ``sqrt(M/2)`` in ``BlitGenerator.forward`` makes it unnecessary.
-
-    ``wave_amp`` reads as the amplitude of the equivalent sine, which is what
-    it meant under the source this replaced.
-
-    The tolerance is 5% (0.42 dB) rather than anything tighter because the
-    kernel's mean square is exactly ``1/M`` only over a whole number of
-    periods, and 32768 samples is 819.2 of them at f0=800.  That residual is a
-    window artefact and does not grow with the range; the 20 dB it replaces
-    did, which is what the assertion is really about.
-    """
-
-    reference = 0.1 / 2 ** 0.5
-    for bandwidth in (1.0, 0.5):
-        for f0 in (80.0, 200.0, 800.0):
-            rms = _blit(f0, bandwidth).pow(2).mean().sqrt().item()
-            assert rms == pytest.approx(reference, rel=0.05), (f0, bandwidth)
-
-
-def test_voiced_frames_are_not_quieter_than_unvoiced_ones():
-    """The other half of the same bug, and the one that would have been heard.
-
-    The unvoiced noise is specified as an RMS and the pulse was a peak, so the
-    two were never on the same scale: at f0=200 and ``wave_amp=0.1`` the pulse
-    ran at 0.0079 RMS against the noise floor's 0.0333, putting unvoiced frames
-    12 dB *louder* than voiced ones.
-    """
-
-    source = BlitGenerator(32000, bandwidth=0.5)
-    voiced = torch.full((1, 1, 32768), 200.0)
-    with torch.no_grad():
-        loud = source(voiced).pow(2).mean().sqrt().item()
-        quiet = source(torch.zeros_like(voiced)).pow(2).mean().sqrt().item()
-    assert loud > 1.5 * quiet
-
-
-def test_the_bandwidth_caps_occupancy_and_holds_it_across_the_range():
-    """Why the cap is a frequency and not a harmonic count.
-
-    Intermodulation at every downstream nonlinearity is set by how much of the
-    band the signal occupies, so a cap in Hz makes that constant -- and the
-    sites predictable -- while a fixed harmonic count would make it track f0
-    (4% of Nyquist at 80 Hz against 40% at 800).
-
-    The ceiling sits one partial *below* the cap: without that margin, every f0
-    that divides the cap puts the top partial exactly on it, and at
-    ``bandwidth=1`` that is Nyquist, where the conjugate image coincides and
-    doubles it.  So the expected top is ``bandwidth * nyquist - f0`` and not
-    ``bandwidth * nyquist``.  That margin is the only f0 dependence left, and it
-    is a single harmonic rather than the whole scaling a fixed count would give.
-    """
-
-    rate = 32000
-    nyquist = rate / 2
-    freqs = torch.fft.rfftfreq(32768, 1 / rate)
-    for bandwidth in (0.25, 0.5, 1.0):
-        for f0 in (80.0, 200.0, 800.0):
-            spectrum = torch.fft.rfft(
-                _blit(f0, bandwidth) * torch.hann_window(32768)
-            ).abs()
-            top = freqs[spectrum > spectrum.max() * 1e-3].max().item()
-            expected = bandwidth * nyquist - f0
-            assert top == pytest.approx(expected, abs=f0 + 0.02 * nyquist), (
-                f0,
-                bandwidth,
-            )
-
-
-def test_the_top_partial_never_lands_on_nyquist():
-    """``floor(nyquist / f0) * f0 == nyquist`` for every f0 that divides it.
-
-    At 32 kHz that is 100, 200, 320, 400, 500, 640 and 800 Hz -- ordinary
-    singing pitches -- and there the partial's own conjugate image coincides
-    with it and sums, so it comes out 6 dB above every other harmonic at the
-    exact frequency every nonlinearity downstream folds about.  The one-partial
-    margin is what keeps it off.
-    """
-
-    rate = 32000
-    nyquist = rate / 2
-    freqs = torch.fft.rfftfreq(32768, 1 / rate)
-    for f0 in (100.0, 200.0, 320.0, 400.0, 500.0, 640.0, 800.0):
-        spectrum = torch.fft.rfft(_blit(f0, 1.0) * torch.hann_window(32768)).abs()
-        partials = torch.tensor(
-            [
-                spectrum[int(round(k * f0 / (rate / 32768)))]
-                for k in range(1, int(nyquist // f0) + 1)
-            ]
-        )
-        top, rest = partials[-1], partials[:-1].median()
-        assert top < rest, (f0, (20 * torch.log10(top / rest)).item())
-
-
-def test_the_harmonic_count_is_continuous_in_f0():
-    """A per-sample ``floor`` steps the count whenever f0 crosses ``limit / N``.
-
-    ``Dirichlet(M, phi) != Dirichlet(M - 2, phi)`` anywhere but the peak of the
-    pulse, so each step is a discontinuity in the waveform -- and since the
-    steps happen at f0-determined instants, the lines they leave walk with the
-    pitch and read as a fold.  The tell is energy between 20 Hz and f0/2, a band
-    a band-limited impulse train cannot occupy at all.
-
-    Weighting the top conjugate pair by the fraction makes the count continuous;
-    the residue drops by more than 50 dB.
-    """
-
-    rate = 32000
-    length = 32768
-    t = torch.arange(length, dtype=torch.float64) / rate
-    f0 = 200.0 * 2 ** (50.0 / 1200.0 * torch.sin(2 * torch.pi * 5.0 * t))
-
-    source = BlitGenerator(rate, noise_std=0.0, learn_gain=False)
-    source.eval()
-    with torch.no_grad():
-        wave = source(f0.float()[None, None, :])[0, 0]
-    wave = wave - wave.mean()
-
-    spectrum = torch.fft.rfft(wave.double() * torch.hann_window(length)).abs() ** 2
-    freqs = torch.fft.rfftfreq(length, 1 / rate)
-    audible = freqs >= 20.0
-    sub = audible & (freqs <= 200.0 / 2)
-    ratio = 10 * torch.log10(spectrum[sub].sum() / spectrum[audible].sum())
-    # The integer count measures about -74 dB here.
-    assert ratio < -110.0, ratio.item()
-
-
-def test_a_narrower_source_leaves_more_level_on_each_partial_it_keeps():
-    """The compensation the energy normalisation buys back.
-
-    Constant energy over fewer harmonics is more energy per harmonic, so
-    lowering the bandwidth does not simply remove content: what it keeps
-    arrives louder relative to whatever the trunk adds on top.
-    """
-
-    def partial_db(bandwidth):
-        spectrum = torch.fft.rfft(
-            _blit(200.0, bandwidth) * torch.hann_window(32768)
-        ).abs()
-        return 20 * np.log10(spectrum[int(round(200.0 * 32768 / 32000))].item())
-
-    assert partial_db(0.5) > partial_db(1.0) + 2.0
-
-
-@pytest.mark.parametrize("sample_rate", sorted(CONFIGS))
-def test_the_shipped_bandwidth_stays_above_the_floor(sample_rate):
-    """The shipped configs do not set a bandwidth, which means the full-band
-    BLIT: lowering it is a trade -- less intermodulation at the sites nothing
-    else covers, against handing the band above the ceiling back to the
-    activation products that used to make it -- and the trade has not been
-    measured on this decoder.
-
-    What this pins is the floor.  The ceiling decides where the invented band
-    starts, and below about 0.4 it lands at 4 kHz, which is where the folded
-    lines used to sit: a value there would reintroduce the artefact it was
-    reached for.
-    """
-
-    model = json.loads(CONFIGS[sample_rate].read_text())["model"]
-    assert 0.4 <= model.get("refinegan2_source_bandwidth", 1.0) <= 1.0
-
-
-def test_the_retired_blit_keys_are_refused_rather_than_ignored():
-    """``source_bandwidth`` and ``source_normalize`` went with the BLIT on
-    2026-09-08.  Both described a source that fills a band; the sine fills one
-    bin, so neither has anything to act on.
-
-    They used to be carried by ``decoder_layout`` precisely because they were
-    invisible in the weights -- a full-band checkpoint loaded into a
-    band-limited decoder without raising.  Accepting them now and quietly
-    doing nothing would be the same failure wearing the opposite mask, so
-    ``Synthesizer`` names them instead.
-    """
-
-    from rvc.lib.algorithm.synthesizers import Synthesizer
-
-    model = json.loads(CONFIGS[32000].read_text())["model"]
-    data = json.loads(CONFIGS[32000].read_text())["data"]
-
-    def build(extra):
-        cfg = dict(model, **extra)
-        return Synthesizer(
-            data["filter_length"] // 2 + 1, 32, cfg["inter_channels"],
-            cfg["hidden_channels"], cfg["filter_channels"], cfg["n_heads"],
-            cfg["n_layers"], cfg["kernel_size"], cfg["p_dropout"],
-            cfg["resblock"], cfg["resblock_kernel_sizes"],
-            cfg["resblock_dilation_sizes"], cfg["upsample_rates"],
-            cfg["upsample_initial_channel"], cfg["upsample_kernel_sizes"],
-            cfg["spk_embed_dim"], cfg["gin_channels"], data["sample_rate"],
-            use_f0=True, text_enc_hidden_dim=768, vocoder="refinegan2",
-            vocoder_config=cfg,
-        )
-
-    # The shipped config names neither, and builds the sine.
-    assert build({}).dec.source_type == "sine"
-
-    for key, value in (
-        ("refinegan2_source_bandwidth", 0.5),
-        ("refinegan2_source_normalize", True),
-    ):
-        with pytest.raises(ValueError, match=key):
-            build({key: value})
-
-
-def test_turning_the_normalisation_off_restores_the_old_excitation_exactly():
-    """The flag has to be the whole pre-2026-09-04 behaviour, not half of it.
-
-    Off is the unit-peak Dirichlet kernel: peak ``wave_amp`` at every pitch and
-    RMS ``wave_amp / sqrt(M)``.  The two tilts that follow are different
-    quantities and both are real -- 20 dB per *partial* across f0=80..800
-    (amplitude ``1/M``) and 9.9 dB in *RMS* (``1/sqrt(M)``).  This asserts the
-    RMS one, because that is the one the trunk's calibration sees.
-    """
-
-    for f0 in (80.0, 800.0):
-        raw = _blit(f0, bandwidth=1.0, normalize=False)
-        assert raw.abs().max().item() == pytest.approx(0.1, rel=0.01)
-
-    # The tilt is the thing, and it is a property of f0 alone.
-    quiet = _blit(80.0, bandwidth=1.0, normalize=False).pow(2).mean().sqrt()
-    loud = _blit(800.0, bandwidth=1.0, normalize=False).pow(2).mean().sqrt()
-    assert 20 * np.log10(loud / quiet) > 8.0
-    # ...and it is gone with the flag on, which is what the flag is for.
-    quiet = _blit(80.0, bandwidth=1.0).pow(2).mean().sqrt()
-    loud = _blit(800.0, bandwidth=1.0).pow(2).mean().sqrt()
-    assert abs(20 * np.log10(loud / quiet)) < 0.5
-
-
-def test_a_blit_checkpoint_does_not_load_into_the_sine():
-    """The source swap is invisible to a shape check but not to the guard.
-
-    ``SineGenerator`` owns ``merge.0.weight`` and ``BlitGenerator`` owns
-    ``gain``, so the two state dicts differ -- but the generator resumes
-    non-strictly, which is exactly the path that would leave a new module at
-    its random init.  ``excitation_source`` is what names it.
-    """
-
-    from rvc.train.utils import assert_excitation_matches, excitation_source
-
-    model = torch.nn.Module()
-    model.dec = _generator((5, 4, 4, 4))
-    model.sr = 32000
-    assert excitation_source(model) == "sine"
-
-    with pytest.raises(ValueError, match="blit"):
-        assert_excitation_matches(model, {"excitation_source": "blit"})
-
-    # Absent means ``sine``: every checkpoint predating the key is one, and
-    # that is what this decoder builds again.
-    assert_excitation_matches(model, {})

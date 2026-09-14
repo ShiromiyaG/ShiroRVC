@@ -25,9 +25,6 @@ EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2"]
 #: to run, and the embedder is read off the checkpoint at inference.
 TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2"]
 EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
-#: Mirrors rvc.train.optimizers.OPTIMIZER_CHOICES; first entry is the default.
-OPTIMIZERS = ["AdamW", "Sched-Free AdamW", "Muon", "Lion"]
-LR_SCHEDULERS = ["exp decay step", "exp decay epoch", "cosine annealing", "none"]
 INDEX_ALGORITHMS = ["Auto", "Faiss", "KMeans"]
 #: How the index ranks neighbours.  "l2" is the default and is what upstream RVC
 #: writes; "cosine" compares direction only, which suits embeddings whose
@@ -322,9 +319,18 @@ def list_dataset_folders() -> list[str]:
 
 
 def vocoders() -> list[tuple[str, str]]:
-    """``(label, id)`` pairs from the backend's vocoder registry."""
+    """``(label, id)`` pairs from the backend's vocoder registry, minus disabled ones."""
     registry = _vocoder_registry()
-    return [(spec.get("label", key), key) for key, spec in registry.items()]
+    return [
+        (spec.get("label", key), key)
+        for key, spec in registry.items()
+        if spec.get("enabled", True)
+    ]
+
+
+def description_for(vocoder: str) -> str:
+    """The registry's ``description`` for a vocoder, or ``""``."""
+    return str(_vocoder_registry().get(vocoder, {}).get("description", ""))
 
 
 def sample_rates_for(vocoder: str) -> list[int]:

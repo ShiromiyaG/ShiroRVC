@@ -23,13 +23,9 @@ PITCH_EXTRACTION_INFO = N_("RMVPE is the recommended default. CREPE is an altern
 BATCH_SIZE_INFO = N_("Larger batches need more VRAM. Reduce the value if training runs out of memory.")
 
 
-LR_SCHEDULER_INFO = N_("Exponential decay is the default. Cosine annealing and none are alternatives.")
-
 KL_ANNEALING_INFO = N_("Cyclic KL-loss annealing. Experimental.")
 
 KL_ANNEALING_CYCLE_INFO = N_("Length of each KL annealing cycle, in epochs.")
-
-OPTIMIZER_INFO = N_("AdamW is the default. Sched-Free AdamW needs no LR scheduler and averages its own weights. Muon orthogonalises the update for matrix-shaped layers. Lion halves the optimizer memory and uses a smaller learning rate automatically.")
 
 VOCODER_COMPILE_LABEL = N_("Compile vocoder decoder")
 
@@ -55,15 +51,6 @@ STOP_ON_OVERTRAIN_LABEL = N_("Stop when overtrained")
 STOP_ON_OVERTRAIN_INFO = N_(
     "End the run once held-out quality stops improving. The pre-overtrain model is "
     "exported either way; this only decides whether training keeps going."
-)
-
-USE_EMA_LABEL = N_("Weight averaging (EMA)")
-
-USE_EMA_INFO = N_(
-    "Export a moving average of the generator instead of one step of it. A GAN "
-    "generator oscillates against its discriminator, so the average is usually better "
-    "than any single step, and it makes the overtrain curve much cleaner. Costs one "
-    "extra copy of the generator in VRAM."
 )
 
 INDEX_SINGLE_SPEAKER_INFO = N_(

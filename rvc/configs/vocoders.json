@@ -1,6 +1,8 @@
 {
     "hifi": {
         "label": "HiFi-GAN",
+        "enabled": true,
+        "description": "The stock RVC v2 NSF-HiFi-GAN with Applio's 8-period discriminator. Loads the public RVC v2 pretrains. 32, 40 and 48 kHz.",
         "architecture": "hifi",
         "config_dir": "hifi",
         "sample_rates": [
@@ -13,8 +15,28 @@
         "discriminator": "v2",
         "architecture_id": "hifi_gan_nsf_v1"
     },
+    "hifi++": {
+        "label": "HiFi-GAN++",
+        "enabled": false,
+        "description": "The HiFi-GAN generator trained against RefineGAN v2's discriminator: multi-resolution spectrogram branches, UnivHD and SAN. Needs its own pretrain. 32 kHz only.",
+        "architecture": "hifi++",
+        "config_dir": "hifi++",
+        "sample_rates": [
+            32000
+        ],
+        "pretrained_dir": "hifi-gan++",
+        "generator": "hifi_nsf",
+        "discriminator": "v4",
+        "architecture_id": "hifi_gan_nsf_pp_v1",
+        "aliases": [
+            "hifi-gan++",
+            "hifigan++"
+        ]
+    },
     "refinegan2": {
         "label": "RefineGAN v2",
+        "enabled": true,
+        "description": "RefineGAN decoder driven by a multi-harmonic excitation source, trained against multi-resolution spectrogram, UnivHD and SAN discriminators. Needs its own pretrain. 32 kHz only.",
         "architecture": "refinegan2",
         "config_dir": "refinegan2",
         "sample_rates": [
@@ -22,7 +44,7 @@
         ],
         "pretrained_dir": "refinegan2",
         "generator": "refinegan2",
-        "discriminator": "v3",
+        "discriminator": "v4",
         "architecture_id": "vits_gaussian_v1",
         "aliases": [
             "refinegan",

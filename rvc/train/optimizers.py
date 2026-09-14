@@ -62,6 +62,24 @@ def averaged_weights(*pairs):
             optimizer.train()
 
 
+def restart_schedule_free_average(optimizer):
+    """Restart a schedule-free average from the weights currently loaded.
+
+    For a state loaded onto a different parameter set (a new pretrain stage):
+    the carried ``weight_sum`` would give the new stage's steps almost no weight
+    in the average.  Expects the weights to be the saved ``x`` iterate, which is
+    how checkpoints are written.  A no-op for other optimizers.
+    """
+    for group in optimizer.param_groups:
+        if "weight_sum" not in group:
+            return
+        group["weight_sum"] = 0.0
+        group["lr_max"] = -1.0
+        group["train_mode"] = False
+        for param in group["params"]:
+            optimizer.state[param].pop("z", None)
+
+
 def _embedding_parameters(model):
     """Parameters that live in an ``nn.Embedding``, by identity.
 
@@ -127,11 +145,13 @@ def _make_optimizer(
         # warmup over ``group['lr']``.  That is compatible: the averaging weight
         # is ``lr_max ** weight_lr_power`` and ``lr_max`` is a running maximum,
         # so an external ramp down-weights the warmup steps exactly as the
-        # built-in one would.
+        # built-in one would.  beta1 is not a momentum here but the
+        # interpolation between the average and the fast iterate, so it takes
+        # the method's own default instead of ``BASE_BETAS``.
         optimizer = AdamWScheduleFree(
             params,
             lr=lr,
-            betas=lazy_betas(BASE_BETAS),
+            betas=lazy_betas((0.9, BASE_BETAS[1])),
             eps=1e-9,
             weight_decay=BASE_WEIGHT_DECAY,
             warmup_steps=0,
