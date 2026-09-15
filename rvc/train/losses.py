@@ -38,7 +38,7 @@ def feature_loss(fmap_r, fmap_g, normalize=False, branch_weights=None):
     for index, (dr, dg) in enumerate(zip(fmap_r, fmap_g)):
         weight = _branch_weight(branch_weights, index)
         for rl, gl in zip(dr, dg):
-            terms.append(weight * torch.mean(torch.abs(rl - gl)))
+            terms.append(weight * torch.mean(torch.abs(rl.float() - gl.float())))
             weights.append(weight)
     if not terms:
         return torch.zeros((), device=fmap_r[0][0].device)
@@ -514,6 +514,8 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask, return_terms: bool = False):
     -- a square and an ``exp`` over ``(batch, channels, frames)`` -- every
     step, for a number that is only read once per logging interval.
     """
+    # FP32 whatever autocast produced: the terms nearly cancel.
+    z_p, logs_q, m_p, logs_p = (t.float() for t in (z_p, logs_q, m_p, logs_p))
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     loss = (kl * z_mask).sum() / z_mask.sum()
 
@@ -677,7 +679,7 @@ class MultiScaleSTFTLoss(nn.Module):
         self.spectral_convergence = bool(spectral_convergence)
 
     def _stft(self, x: torch.Tensor, fft_size: int, hop_size: int, win_size: int) -> torch.Tensor:
-        x = x.squeeze(1)
+        x = x.float().squeeze(1)
         x = F.pad(x, (win_size // 2, win_size // 2), mode='reflect')
 
         window = torch.hann_window(win_size, device=x.device, dtype=x.dtype)

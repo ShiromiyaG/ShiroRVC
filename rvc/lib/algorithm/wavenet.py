@@ -83,9 +83,15 @@ class WaveNet(torch.nn.Module):
             res_skip_layer = torch.nn.utils.parametrizations.weight_norm(res_skip_layer, name="weight")
             self.res_skip_layers.append(res_skip_layer)
 
+        # Set by ``apply_precision_policy`` under BF16: the residual and skip
+        # sums stay FP32 so small per-layer updates are not rounded away.
+        self.fp32_residuals = False
+
     def forward(
         self, x: torch.Tensor, x_mask: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
+        if self.fp32_residuals:
+            x = x.float()
         output = torch.zeros_like(x)
 
         if g is not None:

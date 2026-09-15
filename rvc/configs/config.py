@@ -8,19 +8,17 @@ from rvc.lib.terminal import info
 
 arch_config_paths = get_vocoder_config_paths()
 
-# Training defaults to FP32 master weights with TF32 tensor cores: no autocast,
-# no scaler, toggled per run from the training tab.
-#
-# FP16 is the one autocast mode offered, enabled from Settings -> Precision and
-# carried into the run spec by the launcher.  It has the same 11-bit mantissa as
-# TF32 (gradient cosine 0.99 against a true-FP32 reference) but a narrow
-# exponent range, which is what the GradScaler is there for.  BF16 is not
-# offered: an 8-bit mantissa measured a gradient cosine of only 0.77-0.82 on
-# this model, whose oscillatory NSF source and L1-on-log-mel loss produce
-# heavily cancelling sums.
+# Training defaults to FP32 master weights with TF32 tensor cores and no
+# autocast.  Settings -> Precision picks FP16 (autocast + GradScaler) or BF16
+# (autocast, no scaler) and the launcher carries it into the run spec.  BF16
+# has FP32's range but a shorter mantissa, so the trainer keeps the losses, the
+# excitation, the residual streams and the output layer in FP32 under it (see
+# ``rvc.train.setup.apply_precision_policy``).
 
-#: Where the persisted FP16 preference lives.  Read defensively -- a missing or
-#: hand-broken config must not stop the app from starting.
+TRAINING_PRECISIONS = ("fp32", "fp16", "bf16")
+
+#: Where the persisted precision preference lives.  Read defensively -- a
+#: missing or hand-broken config must not stop the app from starting.
 _APP_CONFIG_PATH = os.path.join("assets", "config.json")
 
 
@@ -80,22 +78,35 @@ def _read_app_config() -> dict:
         return {}
 
 
-def get_use_fp16() -> bool:
-    """The persisted "train under FP16 autocast" preference.
+def bf16_is_supported() -> bool:
+    """Whether this machine has native BF16 kernels (Ampere or newer)."""
 
-    Absent means *undecided*, not "off": the machine is asked instead, so a
-    fresh install on capable hardware starts in FP16 without anyone finding the
-    settings tab.  The answer is deliberately *not* written back -- the file
-    then records only what a person chose, a read-only install works by
-    construction, and moving a config between machines re-asks rather than
-    carrying one machine's answer to another.  ``set_use_fp16`` is what makes
-    the value explicit, and from then on it wins.
+    if not torch.cuda.is_available():
+        return False
+    if getattr(torch.version, "hip", None):
+        return torch.cuda.is_bf16_supported()
+    try:
+        return torch.cuda.get_device_capability() >= (8, 0)
+    except (AssertionError, RuntimeError):
+        return False
+
+
+def get_training_precision() -> str:
+    """The persisted training precision: ``"fp32"``, ``"fp16"`` or ``"bf16"``.
+
+    Absent means *undecided*: the machine is asked instead (FP16 where it pays,
+    else FP32), and the answer is not written back, so the file records only
+    what a person chose.  A config from before ``precision`` existed is read
+    through its ``use_fp16`` key.
     """
 
     stored = _read_app_config()
+    precision = str(stored.get("precision", "")).lower()
+    if precision in TRAINING_PRECISIONS:
+        return precision
     if "use_fp16" in stored:
-        return bool(stored["use_fp16"])
-    return fp16_is_supported()
+        return "fp16" if stored["use_fp16"] else "fp32"
+    return "fp16" if fp16_is_supported() else "fp32"
 
 def singleton(cls):
     instances = {}
@@ -148,38 +159,43 @@ class Config:
 
 
     def get_precision(self):
-        return "fp16 (autocast)" if get_use_fp16() else "fp32"
+        precision = get_training_precision()
+        return precision if precision == "fp32" else f"{precision} (autocast)"
 
-    def check_precision(self, use_fp16=None):
+    def check_precision(self, precision=None):
         """Report the precision the next run would start with.
 
-        ``use_fp16`` comes from the settings checkbox so the report matches what
+        ``precision`` comes from the settings radio so the report matches what
         is on screen even before the change handler has written it; falling back
         to the persisted value keeps the method callable with no arguments.
         """
-        if use_fp16 is None:
-            use_fp16 = get_use_fp16()
+        precision = str(precision or get_training_precision()).lower()
         tf32 = torch.backends.cuda.matmul.allow_tf32
         lines = [
             "Master weights and optimizer state: FP32 (always).",
             f"TF32 matmul/conv currently: {'on' if tf32 else 'off'}"
             " - set per model with 'tf32' in its config.json.",
         ]
-        if use_fp16:
+        if precision == "fp16":
             lines.append(
                 "FP16 autocast: ON, with a GradScaler. Distribution math and the"
                 " NSF source stay in FP32."
             )
-            if not torch.cuda.is_available():
+        elif precision == "bf16":
+            lines.append(
+                "BF16 autocast: ON, no GradScaler. Losses, the excitation, the"
+                " RefineGAN2/WaveNet residual streams and the output layer stay"
+                " in FP32."
+            )
+            if torch.cuda.is_available() and not bf16_is_supported():
                 lines.append(
-                    "No CUDA device visible, so the setting will do nothing here."
+                    "This GPU has no native BF16 (compute capability 8.0+), so it"
+                    " would be emulated and slow."
                 )
         else:
-            lines.append("FP16 autocast: off - no autocast, no GradScaler.")
-        lines.append(
-            "BF16 is not offered: it lost too much mantissa here (gradient cosine"
-            " 0.77-0.82 vs FP32; TF32 is 0.9997 and FP16 is 0.99)."
-        )
+            lines.append("Autocast: off - no autocast, no GradScaler.")
+        if precision != "fp32" and not torch.cuda.is_available():
+            lines.append("No CUDA device visible, so the setting will do nothing here.")
         return "\n".join(lines)
 
     def device_config(self):

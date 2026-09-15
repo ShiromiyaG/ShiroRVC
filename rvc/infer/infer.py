@@ -153,7 +153,8 @@ class VoiceConverter:
         -inf disables the gate.
 
         noise_scale: scale of the prior draw the model decodes. None uses the
-        model's own default (0.3 for RefineGAN2, 0.66666 otherwise).
+        model's own default (0.3 for RefineGAN2, 0.66666 otherwise or when the
+        checkpoint carries ``prior_noise_subspace``).
         """
         if not model_path:
             print_error("No model provided. Aborting conversion.", tag="[INFER]")
@@ -469,6 +470,7 @@ class VoiceConverter:
             self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
 
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
+            self.net_g.set_prior_noise_subspace(self.active_cpt.get("prior_noise_subspace"))
             # ``remove_training_modules`` drops the posterior on either
             # frontend and keeps the flow where inference needs it.
             self.net_g.remove_training_modules()

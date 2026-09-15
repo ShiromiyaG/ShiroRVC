@@ -20,6 +20,10 @@ Two numbers per case, because they move for different reasons:
                This is what ``noise_scale`` is *for*.  A case that lowers both
                has bought quiet with flatness; one that lowers only the first
                is a free win.
+``ih floor``   median inter-harmonic over harmonic power, per one-period frame.
+``burst``      the loudest 5% of those frames over their median (all bands,
+               and above 4 kHz): steady variation reads near 1 dB, bursts
+               read higher at the same ``diversity``.
 
 ``--posterior`` measures stage 1's path instead, where the prior is still at
 its init: ``logs/reference`` audio -> ``enc_q`` -> ``m_q`` -> ``dec``, against
@@ -74,9 +78,21 @@ def lowpass_frames(gain: torch.Tensor, frame_rate: float, cutoff: float):
     kernel = torch.sinc(2 * cutoff / frame_rate * n) * torch.hamming_window(
         taps, periodic=False, dtype=gain.dtype
     )
-    kernel = (kernel / kernel.sum()).view(1, 1, -1)
+    channels = gain.shape[1]
+    kernel = (kernel / kernel.sum()).view(1, 1, -1).expand(channels, 1, -1)
     padded = F.pad(gain, (taps // 2, taps // 2), mode="replicate")
-    return F.conv1d(padded, kernel)
+    return F.conv1d(padded, kernel, groups=channels)
+
+
+def smooth_noise(noise: torch.Tensor, width: int) -> torch.Tensor:
+    """White noise correlated over ``width`` frames, still unit variance per frame."""
+    if width <= 1:
+        return noise
+    kernel = torch.hann_window(width + 2, periodic=False, dtype=noise.dtype)[1:-1]
+    kernel = (kernel / kernel.square().sum().sqrt()).view(1, 1, -1)
+    channels = noise.shape[1]
+    padded = F.pad(noise, (width // 2, (width - 1) // 2), mode="reflect")
+    return F.conv1d(padded, kernel.expand(channels, 1, -1), groups=channels)
 
 
 def frame_gain_logits(dec, mel, g, mode: str, frame_rate: float, cutoff: float):
@@ -91,12 +107,20 @@ def frame_gain_logits(dec, mel, g, mode: str, frame_rate: float, cutoff: float):
     return gain
 
 
-def patched_source_gain(dec, mode: str, frame_rate: float, cutoff: float):
-    """A drop-in ``_source_gain`` for one A/B case."""
+def patched_source_gain(
+    dec, mode: str, frame_rate: float, cutoff: float, fixed_mel=None
+):
+    """A drop-in ``_source_gain`` for one A/B case.
+
+    ``fixed_mel`` makes the gain read that ``z`` instead of the one the trunk
+    decodes.
+    """
 
     def apply(mel, g=None):
         if mode == "off":
             return None
+        if fixed_mel is not None:
+            mel = fixed_mel
         gain = frame_gain_logits(dec, mel, g, mode, frame_rate, cutoff)
         for ups in dec.source_gain_ups:
             gain = ups(gain)
@@ -119,6 +143,39 @@ def skirt_db(x, sr: int, f0: float, start: int):
         10 * math.log10(spectrum[~comb].sum() / spectrum[comb].sum()),
         float(np.sqrt((seg**2).mean())),
     )
+
+
+def burst_metrics(x, sr: int, f0: float, start: int):
+    """Inter-harmonic floor and burstiness over one-period frames.
+
+    Each frame is exactly one period under a rectangular window, so a periodic
+    render puts all its power on harmonic bins and every frame is identical.
+    Returns, in dB: the median inter-harmonic over harmonic power per frame,
+    and the loudest 5% of frames' inter-harmonic power over its median, over
+    0.3-15 kHz and over 4-15 kHz.
+    """
+    hop = PERIOD // 4
+    seg = np.asarray(x[start:])
+    count = (seg.size - PERIOD) // hop + 1
+    frames = np.stack([seg[i * hop : i * hop + PERIOD] for i in range(count)])
+    power = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+    freqs = np.fft.rfftfreq(PERIOD, 1.0 / sr)
+    step = PERIOD * f0 / sr
+    assert abs(step - round(step)) < 1e-9, "f0 is not on an exact bin"
+    harmonic = np.zeros(freqs.size, dtype=bool)
+    harmonic[:: int(round(step))] = True
+    band = (freqs >= 300.0) & (freqs <= 15000.0)
+
+    def burst(mask):
+        energy = power[:, mask & ~harmonic].sum(axis=1)
+        top = np.sort(energy)[-max(1, energy.size // 20) :].mean()
+        return energy, 10 * math.log10(top / np.median(energy))
+
+    inter, burst_full = burst(band)
+    comb = power[:, band & harmonic].sum(axis=1)
+    floor = 10 * math.log10(np.median(inter) / np.median(comb))
+    _, burst_high = burst(band & (freqs >= 4000.0))
+    return floor, burst_full, burst_high
 
 
 def gain_envelope_db(dec, z, g, mode: str, frame_rate: float, cutoff: float):
@@ -282,28 +339,41 @@ def main() -> None:
     with torch.no_grad():
         g = net_g.emb_g(sid_t).unsqueeze(-1)
         m_p, logs_p, x_mask = net_g.enc_p(phone=phone_t, pitch=pitch, lengths=lengths)
+        z_prior_mean = net_g.flow(m_p * x_mask, x_mask, g=g, reverse=True) * x_mask
 
     original = dec._source_gain
 
-    def render(noise_scale: float, seed: int):
+    def render(noise_scale: float, seed: int, smooth: int = 1):
         with torch.no_grad():
             z_p = m_p
             if noise_scale:
                 torch.manual_seed(seed)
-                z_p = m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale
+                noise = smooth_noise(torch.randn_like(m_p), smooth)
+                z_p = m_p + torch.exp(logs_p) * noise * noise_scale
             z = net_g.flow(z_p * x_mask, x_mask, g=g, reverse=True) * x_mask
             return dec(z, pitchf, g)[0, 0].double().numpy()
 
     start = 2 * sr  # past the padding transient at the encoder and the decoder
     cases = [
         ("source_gain on   ns=0.667", "on", 0.66666),
+        ("source_gain on   ns=0.5  ", "on", 0.5),
         ("source_gain on   ns=0.4  ", "on", 0.4),
+        ("source_gain on   ns=0.3  ", "on", 0.3),
         ("source_gain on   ns=0.2  ", "on", 0.2),
         ("source_gain on   ns=0    ", "on", 0.0),
         ("source_gain OFF  ns=0.667", "off", 0.66666),
         ("gain -> its mean ns=0.667", "mean", 0.66666),
         (f"gain LP {args.cutoff:g}Hz   ns=0.667", "lowpass", 0.66666),
         (f"gain LP {args.cutoff:g}Hz   ns=0.4  ", "lowpass", 0.4),
+        # Trunk decodes the draw; the gain reads the prior mean through the flow.
+        ("gain = prior mean ns=0.667", "prior_mean", 0.66666),
+        ("gain = prior mean ns=0.5 ", "prior_mean", 0.5),
+        ("gain = prior mean ns=0.4 ", "prior_mean", 0.4),
+        # The prior draw correlated over N frames instead of white per frame.
+        ("eps smooth 3fr   ns=0.667", "smooth3", 0.66666),
+        ("eps smooth 5fr   ns=0.667", "smooth5", 0.66666),
+        ("eps smooth 10fr  ns=0.667", "smooth10", 0.66666),
+        ("eps smooth 20fr  ns=0.667", "smooth20", 0.66666),
     ]
 
     print(
@@ -314,22 +384,34 @@ def main() -> None:
         f"window: {BLOCKS} x {PERIOD} = {BLOCKS * PERIOD} samples "
         f"({BLOCKS * PERIOD / sr:.2f} s), coherent\n"
     )
-    print(f"{'case':28s} {'skirt':>9s} {'rms':>8s} {'diversity':>11s}")
+    print(
+        f"{'case':28s} {'skirt':>9s} {'rms':>8s} {'diversity':>11s} "
+        f"{'ih floor':>10s} {'burst':>8s} {'burst>4k':>9s}"
+    )
 
     save_dir = Path(args.save_dir) if args.save_dir else None
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
 
     for label, mode, noise_scale in cases:
+        smooth = int(mode[len("smooth"):]) if mode.startswith("smooth") else 1
         dec._source_gain = (
             original
-            if mode == "on"
-            else patched_source_gain(dec, mode, frame_rate, args.cutoff)
+            if mode == "on" or smooth > 1
+            else patched_source_gain(
+                dec,
+                mode,
+                frame_rate,
+                args.cutoff,
+                fixed_mel=z_prior_mean if mode == "prior_mean" else None,
+            )
         )
-        a = render(noise_scale, 1234)
+        a = render(noise_scale, 1234, smooth)
         skirt, rms = skirt_db(a, sr, args.f0, start)
+        # The last second holds the decoder's end-of-signal padding transient.
+        floor, burst, burst_high = burst_metrics(a[:-sr], sr, args.f0, start)
         if noise_scale:
-            b = render(noise_scale, 4321)
+            b = render(noise_scale, 4321, smooth)
             d = a - b
             diversity = 20 * math.log10(
                 math.sqrt((d**2).mean()) / math.sqrt((a**2).mean())
@@ -337,7 +419,10 @@ def main() -> None:
             diversity_text = f"{diversity:7.1f} dB"
         else:
             diversity_text = "--"
-        print(f"{label:28s} {skirt:6.1f} dB {rms:8.4f} {diversity_text:>11s}")
+        print(
+            f"{label:28s} {skirt:6.1f} dB {rms:8.4f} {diversity_text:>11s} "
+            f"{floor:7.1f} dB {burst:5.1f} dB {burst_high:6.1f} dB"
+        )
         if save_dir:
             name = label.replace(" ", "").replace("->", "to") + ".wav"
             sf.write(save_dir / name, a, sr)

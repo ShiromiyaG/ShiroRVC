@@ -145,6 +145,7 @@ class Synthesizer(torch.nn.Module):
             # whose product is the hop.  So the registry decides which rates
             # ship, rather than a constant here.
             self._assert_rate_supported(vocoder_spec, sr)
+            # self.prior_noise_scale = 0.3
             self.dec = generators.RefineGAN2Generator(
                 sample_rate=int(sr),
                 upsample_rates=tuple(upsample_rates),
@@ -233,6 +234,9 @@ class Synthesizer(torch.nn.Module):
         # [Speaker Embedding] maps identity to global conditioning (g)
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
 
+        # Set from a checkpoint by ``set_prior_noise_subspace``.
+        self.register_buffer("prior_noise_subspace", None, persistent=False)
+
     @staticmethod
     def _assert_rate_supported(vocoder_spec, sr):
         """Refuse a rate the registry does not list for this vocoder.
@@ -277,6 +281,19 @@ class Synthesizer(torch.nn.Module):
         here would leave the decoder with nothing to decode.
         """
         self.enc_q = None
+
+    def set_prior_noise_subspace(self, basis: Optional[torch.Tensor]) -> None:
+        """Keep the prior draw out of ``basis``, [inter_channels, k], in ``infer``.
+
+        These are the latent directions the decoder renders as bursts between
+        the harmonics; ``tools/estimate_prior_subspace.py`` stores them in the
+        checkpoint. Without the bursts the draw can use the usual 0.66666.
+        """
+        if basis is None:
+            self.prior_noise_subspace = None
+            return
+        self.prior_noise_subspace = basis.detach().float()
+        self.prior_noise_scale = 0.66666
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
@@ -465,6 +482,15 @@ class Synthesizer(torch.nn.Module):
 
         z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)
+        basis = self.prior_noise_subspace
+        if basis is not None and noise_scale != 0:
+            # The draw's effect is taken in z, after the flow, because that is
+            # where the decoder's sensitive directions were measured.
+            z_mean = self.flow(m_p * x_mask, x_mask, g=g, reverse=True)
+            delta = z - z_mean
+            basis = basis.to(device=delta.device, dtype=delta.dtype)
+            along = torch.einsum("ck,bkt->bct", basis, torch.einsum("ck,bct->bkt", basis, delta))
+            z = z_mean + delta - along
         o = self.dec(z * x_mask, nsff0, g)
 
         return o, x_mask, (z, z_p, m_p, logs_p)

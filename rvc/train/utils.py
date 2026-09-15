@@ -512,7 +512,14 @@ def assert_periods_match(model, checkpoint_dict, origin="checkpoint"):
 
 
 def save_checkpoint(
-    model, optimizer, learning_rate, iteration, checkpoint_path, ema=None, extra=None
+    model,
+    optimizer,
+    learning_rate,
+    iteration,
+    checkpoint_path,
+    ema=None,
+    extra=None,
+    prior_noise_subspace=None,
 ):
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
     model_instance = model.module if hasattr(model, "module") else model
@@ -561,6 +568,8 @@ def save_checkpoint(
     # unpickles them, so the loader stays hardened.
     if extra:
         checkpoint_data["extra"] = dict(extra)
+    if prior_noise_subspace is not None:
+        checkpoint_data["prior_noise_subspace"] = prior_noise_subspace
 
     torch.save(checkpoint_data, checkpoint_path)
     info(f"Saved '{os.path.basename(checkpoint_path)}'.", tag="[SAVE]")

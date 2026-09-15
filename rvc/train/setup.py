@@ -161,6 +161,19 @@ def setup_models_for_training(net_g, net_d, device, device_id, n_gpus):
     return net_g, net_d
 
 
+def apply_precision_policy(net_g, amp_dtype):
+    """Under BF16 autocast, keep the generator's precision-critical paths in FP32.
+
+    Sets ``fp32_residuals`` on every module that declares it.  Must run before
+    the compile: Dynamo guards on the attribute.
+    """
+    enabled = amp_dtype == torch.bfloat16
+    model = net_g.module if hasattr(net_g, "module") else net_g
+    for module in model.modules():
+        if hasattr(module, "fp32_residuals"):
+            module.fp32_residuals = enabled
+
+
 def enable_vocoder_compile(net_g, device, rank, enabled=False, mode="default"):
     """Compile the decoder, driven by the run spec's ``compile_vocoder``.
 

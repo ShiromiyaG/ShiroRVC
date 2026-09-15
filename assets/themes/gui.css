@@ -262,11 +262,21 @@ footer {
 
 /* Field labels: a touch more presence, descriptions a touch quieter. */
 .gradio-container .block > label > span,
-.gradio-container span[data-testid="block-info"] {
+.gradio-container span[data-testid="block-info"],
+.gradio-container .rvc-vocoder-description {
     letter-spacing: -.005em;
 }
-.gradio-container span[data-testid="block-info"] {
+.gradio-container span[data-testid="block-info"],
+.gradio-container .rvc-vocoder-description {
     opacity: .72;
+}
+/* A Markdown block dressed as the field description above it. */
+.gradio-container .rvc-vocoder-description,
+.gradio-container .rvc-vocoder-description * {
+    font-size: var(--block-info-text-size) !important;
+    font-weight: var(--block-info-text-weight) !important;
+    color: var(--block-info-text-color) !important;
+    line-height: var(--line-sm) !important;
 }
 
 /* ------------------------------------------------------------ accordions -- */

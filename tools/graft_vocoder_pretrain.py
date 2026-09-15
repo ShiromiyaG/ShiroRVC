@@ -68,6 +68,7 @@ if _train_dir not in sys.path:
 from rvc.train.setup import get_d_model, get_g_model  # noqa: E402
 from rvc.train.utils import (  # noqa: E402
     decoder_layout,
+    discriminator_has_msd,
     discriminator_periods,
     excitation_source,
     load_config_from_json,
@@ -240,6 +241,9 @@ def main() -> int:
         periods = discriminator_periods(net_d)
         if periods is not None:
             payload_d["discriminator_periods"] = periods
+        has_msd = discriminator_has_msd(net_d)
+        if has_msd is not None:
+            payload_d["discriminator_msd"] = has_msd
         out_d = Path(args.out_d)
         out_d.parent.mkdir(parents=True, exist_ok=True)
         torch.save(payload_d, out_d)

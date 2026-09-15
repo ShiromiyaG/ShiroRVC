@@ -46,6 +46,7 @@ def extract_model(
     version="v2",
     weights_step=None,
     weights_source=None,
+    prior_noise_subspace=None,
 ):
     try:
         architecture = "RVC"
@@ -145,6 +146,10 @@ def extract_model(
         opt["architecture_id"] = vocoder_config.get(
             "architecture_id", get_architecture_id(vocoder_id)
         )
+        # Read by ``Synthesizer.set_prior_noise_subspace``; see
+        # ``rvc/train/prior_subspace.py``.
+        if prior_noise_subspace is not None:
+            opt["prior_noise_subspace"] = prior_noise_subspace
 
         # Since fork uses new API for weight norm ( parametrizations )
         # and mainline RVC ( Original ), W-okada and such rely on old API, we're performing keys conversion.

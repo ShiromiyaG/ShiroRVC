@@ -76,6 +76,7 @@ from rvc.train.schedules import (
 )
 from rvc.train.setup import (
     apply_resume_lr_override,
+    apply_precision_policy,
     apply_training_freezes,
     assert_resumable_architecture,
     checkpoint_step_from_path,
@@ -144,6 +145,7 @@ from losses import (
 from mel_processing import build_ms_mel_loss, spectrogram_torch
 
 from rvc.train.process.extract_model import extract_model
+from rvc.train.prior_subspace import estimate_prior_subspace, pick_clips
 from rvc.lib.algorithm import commons
 from rvc.configs.vocoders import normalize_vocoder
 from rvc.train.run_spec import TrainRunSpec
@@ -170,7 +172,7 @@ cleanup = spec.cleanup
 vocoder = normalize_vocoder(spec.vocoder)
 architecture = "RVC"
 use_checkpointing = spec.use_checkpointing
-use_fp16 = spec.use_fp16
+precision = spec.precision
 
 compile_vocoder = spec.compile_vocoder
 torch_compile_mode = spec.torch_compile_mode
@@ -247,12 +249,16 @@ preview_posterior_noise_scale = float(
     getattr(config.train, "preview_posterior_noise_scale", 0.0)
 )
 
-# Default: FP32 + TF32, no autocast/scaler. ``use_fp16`` enables autocast at
-# FP16 with GradScaler; the autocast-disable wrappers are narrowed to protect
-# only distribution math and the NSF source, so the compiled decoder graph
-# stays in one dtype end-to-end.
-use_amp = bool(use_fp16)
-amp_dtype = torch.float16 if use_amp else None
+# Default: FP32 + TF32, no autocast/scaler. ``fp16`` autocasts with a
+# GradScaler.  ``bf16`` needs no scaler, but its mantissa is shorter, so
+# ``apply_precision_policy`` keeps the paths where rounding accumulates in FP32.
+AMP_DTYPES = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+if precision not in AMP_DTYPES:
+    raise ValueError(
+        f"Unknown precision {precision!r}; expected one of {sorted(AMP_DTYPES)}."
+    )
+amp_dtype = AMP_DTYPES[precision]
+use_amp = amp_dtype is not None
 
 # Globals ( Do not alter these )
 global_step = 0
@@ -338,12 +344,65 @@ logging.getLogger("torch").setLevel(logging.ERROR)
 
 
 def eval_infer(net_g, reference):
+    model = net_g.module if hasattr(net_g, "module") else net_g
+    # Render the way a checkpoint exported with these weights does.  A failed
+    # estimate keeps the previous basis.
+    if vocoder == "refinegan2":
+        basis = prior_subspace_for(model)
+        if basis is not None:
+            model.set_prior_noise_subspace(basis)
     net_g.eval()
     with torch.no_grad():
-        model = net_g.module if hasattr(net_g, "module") else net_g
         o, *_ = model.infer(*reference, noise_scale=preview_noise_scale)
     net_g.train()
     return o
+
+
+# Clips the burst-direction estimate reads, picked once per process.
+_prior_subspace_clips = None
+
+
+def prior_subspace_for(model_g):
+    """``prior_noise_subspace`` for the weights ``model_g`` holds now, or None.
+
+    RefineGAN2 only; see ``rvc/train/prior_subspace.py``.  A failure costs the
+    checkpoint its key, never the save.
+    """
+    global _prior_subspace_clips
+    if vocoder != "refinegan2":
+        return None
+    try:
+        if _prior_subspace_clips is None:
+            _prior_subspace_clips = pick_clips(config.data.training_files)
+        if not _prior_subspace_clips:
+            return None
+        basis, captured = estimate_prior_subspace(
+            model_g,
+            _prior_subspace_clips,
+            int(config.data.sample_rate),
+            int(config.data.hop_length),
+            max_frames=400,
+        )
+        return basis
+    except Exception as error:
+        warning(
+            f"Could not estimate prior_noise_subspace; saving without it: {error}",
+            tag="[SAVE]",
+        )
+        return None
+
+
+def prior_subspace_for_state(model_g, state_dict):
+    """``prior_subspace_for`` on ``state_dict``, restoring ``model_g``'s weights after."""
+    if vocoder != "refinegan2":
+        return None
+    # On the CPU, like ``WeightEMA.applied``: no third copy of G on the device.
+    live = {key: value.detach().to("cpu", copy=True) for key, value in model_g.state_dict().items()}
+    try:
+        model_g.load_state_dict(state_dict, strict=False)
+        return prior_subspace_for(model_g)
+    finally:
+        model_g.load_state_dict(live)
 
 
 def eval_reconstruct(net_g, reference, reference_audio, config):
@@ -1210,6 +1269,7 @@ def run(
     # Before the compile: the fence is a plain attribute read inside
     # ``forward``, so Dynamo guards on it and a policy set afterwards would
     # only take effect on a recompile.
+    apply_precision_policy(net_g, amp_dtype)
 
     enable_vocoder_compile(
         net_g, device, rank, enabled=compile_vocoder, mode=torch_compile_mode
@@ -1224,7 +1284,8 @@ def run(
     # this is a guard, not a per-step rescaler.
     grad_scaler = (
         torch.amp.GradScaler("cuda", init_scale=2.0 ** 10, growth_interval=2000)
-        if use_amp
+        # BF16 has FP32's exponent range, so there is nothing to scale.
+        if amp_dtype == torch.float16
         else None
     )
     # The scaler carries real state: the current scale and how far it is into the
@@ -2625,6 +2686,7 @@ def training_loop(
 
     # Save checkpoint
     model_add = []
+    subspace_g = None
     done = phase_limit_reached or (overtrain_flagged and stop_on_overtrain)
 
     if rank == 0:
@@ -2654,6 +2716,12 @@ def training_loop(
             with averaged_weights(
                 (optimizer_choice_g, optim_g), (optimizer_choice_d, optim_d)
             ):
+                # Outside the protected region because it takes seconds; on
+                # the same weights the generator is saved with.
+                with ema.applied(net_g) if ema is not None else nullcontext():
+                    subspace_g = prior_subspace_for(
+                        net_g.module if hasattr(net_g, "module") else net_g
+                    )
                 with uninterruptible_save("checkpoint write"):
                     # The generator is written as if there were no EMA: the
                     # average goes in ``model`` and no ``ema`` key is kept, so
@@ -2663,7 +2731,14 @@ def training_loop(
                     # continues from the average, and the shadow restarts from
                     # it -- see the ``ema.load_state_dict`` fallback.
                     with ema.applied(net_g) if ema is not None else nullcontext():
-                        save_checkpoint(net_g, optim_g, config.train.learning_rate_g, epoch, g_path)
+                        save_checkpoint(
+                            net_g,
+                            optim_g,
+                            config.train.learning_rate_g,
+                            epoch,
+                            g_path,
+                            prior_noise_subspace=subspace_g,
+                        )
                     save_checkpoint(
                         net_d,
                         optim_d,
@@ -2736,6 +2811,11 @@ def training_loop(
                 success(
                     f"{os.path.basename(m)} <- {ckpt_label}", tag="[EXPORT]"
                 )
+                if use_holdout or subspace_g is None:
+                    subspace = prior_subspace_for_state(model_g, ckpt)
+                else:
+                    # EMA or live weights at this step: what G_*.pth was saved with.
+                    subspace = subspace_g
                 with uninterruptible_save("weight model export"):
                     extract_model(
                         ckpt=ckpt,
@@ -2749,6 +2829,7 @@ def training_loop(
                         architecture=architecture,
                         weights_step=ckpt_step,
                         weights_source=ckpt_label,
+                        prior_noise_subspace=subspace,
                     )
 
         if stop_was_requested():

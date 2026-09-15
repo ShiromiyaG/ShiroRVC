@@ -74,6 +74,7 @@ KEEP_METADATA = (
     "excitation_source",
     "decoder_layout",
     "discriminator_periods",
+    "discriminator_msd",
 )
 #: Named so the report can say what went and why, instead of "everything else".
 DROP_REASONS = {

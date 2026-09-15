@@ -24,7 +24,7 @@ from core import (
 from rvc.configs.config import (
     get_gpu_info,
     get_number_of_gpus,
-    get_use_fp16,
+    get_training_precision,
     max_vram_gpu,
 )
 from rvc.configs.vocoders import (
@@ -277,7 +277,7 @@ def start_train_from_ui(
     shifts every later flag.  Naming the parameters here and calling with
     keywords confines the positional coupling to this one function.
 
-    ``use_fp16`` is not among the controls: it is a machine-level setting under
+    ``precision`` is not among the controls: it is a machine-level setting under
     Settings -> Precision, read at launch so it still lands in the run spec.
     """
     return run_train_script(
@@ -299,7 +299,7 @@ def start_train_from_ui(
         d_pretrained_path=d_pretrained_path,
         vocoder=vocoder,
         use_checkpointing=use_checkpointing,
-        use_fp16=get_use_fp16(),
+        precision=get_training_precision(),
         compile_vocoder=compile_vocoder,
         torch_compile_mode=torch_compile_mode,
         overtrain_detector=overtrain_detector,
@@ -385,7 +385,8 @@ def train_tab():
                     key='vocoder'
                 )
                 vocoder_description = gr.Markdown(
-                    value=vocoder_description_text(initial_vocoder)
+                    value=vocoder_description_text(initial_vocoder),
+                    elem_classes=["rvc-vocoder-description"],
                 )
         with gr.Accordion(
             _("CPU / GPU settings for ' f0 ' and ' features ' extraction."),

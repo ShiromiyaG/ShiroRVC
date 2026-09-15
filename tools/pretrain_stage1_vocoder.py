@@ -71,7 +71,7 @@ the wrong decoder loaded non-strictly against a trained discriminator.
 DEFAULTS
 --------
 FP16, TF32, cuDNN benchmarking and the weight EMA are on by default in all
-three stages -- ``--no-fp16`` and friends turn any of them off.  FP16 buys no
+three stages -- ``--precision fp32`` and the ``--no-*`` flags turn them off.  FP16 buys no
 throughput here (the step is dispatch-bound, not kernel-bound) but takes
 18-43% off peak VRAM, which is what makes batch 8 fit an 8 GB card.  Gradient
 checkpointing and ``torch.compile`` on the decoder stay off: both cost speed on

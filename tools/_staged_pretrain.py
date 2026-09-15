@@ -192,7 +192,7 @@ def resolve_vocoder(directory: Path, requested: str | None) -> str:
 #:
 #: The one that is on and would not be obvious:
 #:
-#: ``fp16``   buys no throughput on its own -- the step is dispatch-bound, not
+#: ``precision="fp16"`` buys no throughput on its own -- the step is dispatch-bound, not
 #:            kernel-bound -- but takes 18-43% off peak VRAM, which is what
 #:            makes batch 8 fit an 8 GB card.  It was unsafe while the
 #:            discriminator carried an R1 penalty, because an ``autograd.grad``
@@ -214,7 +214,7 @@ COMMON_DEFAULTS = {
     "batch_size": 8,
     "save_every": 1,
     "gpu": "0",
-    "fp16": True,
+    "precision": "fp16",
     "checkpointing": False,
     "compile_vocoder": True,
 }
@@ -275,7 +275,13 @@ def add_common_arguments(
         help=f"Epochs between checkpoints (default {settings['save_every']}).",
     )
     parser.add_argument("--gpu", default=settings["gpu"])
-    flag("fp16", "fp16", "Mixed precision: ~18-43% less peak VRAM, no speedup")
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "fp16", "bf16"),
+        default=settings["precision"],
+        help="Autocast dtype; fp16 takes ~18-43%% off peak VRAM, bf16 needs no "
+        f"GradScaler (default: {settings['precision']} for this stage).",
+    )
     flag(
         "checkpointing",
         "checkpointing",
@@ -330,7 +336,7 @@ def build_and_launch(
         pretrain_g=pretrain_g,
         pretrain_d=pretrain_d,
         use_checkpointing=bool(args.checkpointing),
-        use_fp16=bool(args.fp16),
+        precision=str(args.precision),
         compile_vocoder=bool(args.compile_vocoder),
         # Off for stages 1 and 2, which are not optimising held-out
         # *conversion* -- stage 1 is judged on reconstruction, stage 2 on the

@@ -370,15 +370,16 @@ class TrainingPage(Page):
         # -- performance ----------------------------------------------------
         advanced.add_group("Performance")
         self.checkpointing = Toggle(_("Gradient checkpointing"), _("Trades speed for a much smaller VRAM footprint."))
-        # FP16 autocast with a GradScaler, on top of FP32 master weights.  Same
-        # 11-bit mantissa as TF32, narrower exponent range -- which is what the
-        # scaler is for.  Disabled until a device reports capability 7.0 or
-        # better, and ticked when one does; see ``_apply_fp16_support``.
-        self.fp16 = Toggle(
-            _("FP16 autocast"),
-            _("Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."),
+        # Autocast dtype over FP32 master weights.  Disabled until a CUDA device
+        # is reported; see ``_apply_precision_support`` for the default.
+        self.precision = SearchableCombo(editable=False)
+        self.precision.refresh_button.hide()
+        self.precision.set_pairs([("FP32", "fp32"), ("FP16", "fp16"), ("BF16", "bf16")])
+        self.precision.setEnabled(False)
+        self.precision_field = Field(
+            _("Precision"), self.precision,
+            _("FP16 uses a GradScaler; BF16 needs none and keeps precision-sensitive paths in FP32."),
         )
-        self.fp16.setEnabled(False)
         self.compile_vocoder = Toggle(
             _("torch.compile the vocoder"), _("Slow first epoch, faster afterwards.")
         )
@@ -396,7 +397,7 @@ class TrainingPage(Page):
         self.compile_vocoder.toggled.connect(self.torch_compile_mode_field.setVisible)
 
         advanced.add(
-            self.checkpointing, self.fp16,
+            self.checkpointing, self.precision_field,
             self.compile_vocoder, self.torch_compile_mode_field,
         )
 
@@ -765,7 +766,7 @@ class TrainingPage(Page):
             "d_pretrained_path": self.pretrained_d.path() or None,
             "vocoder": self.vocoder.value(),
             "use_checkpointing": self.checkpointing.isChecked(),
-            "use_fp16": self.fp16.isChecked(),
+            "precision": self.precision.value(),
             "overtrain_detector": self.overtrain_detector.isChecked(),
             "stop_on_overtrain": self.stop_on_overtrain.isChecked(),
             "compile_vocoder": self.compile_vocoder.isChecked(),
@@ -897,15 +898,12 @@ class TrainingPage(Page):
     def apply_theme(self, tokens: dict[str, str]) -> None:
         super().apply_theme(tokens)
 
-    def _apply_fp16_support(self, devices: list[dict]) -> None:
-        """Tick FP16 when the hardware has half-precision tensor cores.
+    def _apply_precision_support(self, devices: list[dict]) -> None:
+        """Pick the default precision from the best device's capability.
 
-        Three states, not two: no CUDA device disables it outright; below
-        capability 7.0 (pre-Volta) the box stays available but unticked,
-        since the memory saving still holds without the speed and an
-        unmeasured trade should not be someone's default; at 7.0 or better
-        it is ticked. Measured at batch 8: RefineGAN 5.12 -> 3.78 GiB,
-        ChouwaGAN 4.27 -> 2.61 GiB, both slightly faster too.
+        No CUDA device disables the picker at FP32; below 7.0 (no FP16 tensor
+        cores) it stays available at FP32; at 7.0 or better it defaults to FP16.
+        BF16 is never the default, and below 8.0 it has no native kernels.
         """
 
         best = -1
@@ -919,8 +917,9 @@ class TrainingPage(Page):
         has_cuda = best >= 0
         has_tensor_cores = best >= 7
 
-        self.fp16.setEnabled(has_cuda)
-        self.fp16.setChecked(has_tensor_cores)
+        combo = self.precision.combo
+        self.precision.setEnabled(has_cuda)
+        combo.setCurrentIndex(combo.findData("fp16" if has_tensor_cores else "fp32"))
         if not has_cuda:
             tooltip = _("Autocast needs a CUDA GPU, so the setting would do nothing.")
         elif not has_tensor_cores:
@@ -928,15 +927,21 @@ class TrainingPage(Page):
                 "This GPU has no FP16 tensor cores: autocast still halves activation "
                 "memory, but it may not make the steps any faster."
             )
+        elif best < 8:
+            tooltip = _(
+                "FP16: less VRAM and faster steps, with a GradScaler. "
+                "BF16 has no native kernels on this GPU."
+            )
         else:
             tooltip = _(
-                "Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."
+                "FP16: less VRAM and faster steps, with a GradScaler. "
+                "BF16: no scaler; precision-sensitive paths stay in FP32."
             )
-        self.fp16.setToolTip(tooltip)
+        self.precision.setToolTip(tooltip)
 
     def populate_gpus(self, devices: list[dict]) -> None:
         """Fill the device pickers once the backend has queried torch."""
-        self._apply_fp16_support(devices)
+        self._apply_precision_support(devices)
         if not devices:
             return
         labels = [f"{device['index']}" for device in devices]

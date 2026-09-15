@@ -36,7 +36,7 @@ from typing import Optional, Union, get_args, get_origin, get_type_hints
 
 #: Bumped when a field is renamed or its meaning changes, so a stale spec fails
 #: loudly instead of being read with the wrong semantics.
-SPEC_VERSION = 3
+SPEC_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,8 @@ class TrainRunSpec:
     # -- performance ------------------------------------------------------
     # TF32, cuDNN benchmark and EMA live in config.json.
     use_checkpointing: bool = False
-    use_fp16: bool = False
+    # Autocast dtype over FP32 master weights: "fp32", "fp16" or "bf16".
+    precision: str = "fp32"
     compile_vocoder: bool = False
     torch_compile_mode: str = "default"
 

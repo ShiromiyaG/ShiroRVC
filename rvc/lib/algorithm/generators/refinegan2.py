@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Sequence
 
 import numpy as np
@@ -137,7 +138,13 @@ class ResBlock(nn.Module):
         )
         self.convs2.apply(init_weights)
 
+        # Set by ``apply_precision_policy`` under BF16: an FP32 stream keeps an
+        # update smaller than BF16's rounding step from being lost in the sum.
+        self.fp32_residuals = False
+
     def forward(self, x: torch.Tensor):
+        if self.fp32_residuals:
+            x = x.float()
         for c1, c2 in zip(self.convs1, self.convs2):
             xt = F.leaky_relu(x, self.leaky_relu_slope)
             xt = c1(xt)
@@ -864,6 +871,22 @@ class RefineGAN2Generator(nn.Module):
 
         self.out_tanh = nn.Tanh()
 
+        # Set by ``apply_precision_policy`` under BF16: the excitation, the
+        # upsampling filters and the output layer then run in FP32.
+        self.fp32_residuals = False
+
+    def _fp32_region(self, x: torch.Tensor):
+        if not self.fp32_residuals:
+            return nullcontext()
+        return torch.autocast(x.device.type, enabled=False)
+
+    def _fp32(self, x: torch.Tensor) -> torch.Tensor:
+        return x.float() if self.fp32_residuals else x
+
+    def _upsample(self, ups: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        with self._fp32_region(x):
+            return ups(self._fp32(x))
+
     # The other half of the compile story.  ``torchaudio.functional.resample``
     # builds its sinc kernel from Python ints on every call, and Inductor
     # compiles that construction to a *CPU* kernel, which on Windows needs
@@ -944,9 +967,14 @@ class RefineGAN2Generator(nn.Module):
         f0 = self._expand_f0(f0, f0_size * self.upp)
         # ``SineGenerator`` works in (batch, time, dim) -- ``dim`` is the
         # harmonic axis, 1 here -- while the trunk is channel-first throughout.
-        gain = self._source_gain(mel, g)
-        har_source = self.m_source(f0.transpose(1, 2), gain).transpose(1, 2)
-        x = self.pre_conv(har_source)
+        # The sine is the one signal whose low-order bits carry phase, so it is
+        # kept out of BF16 until the first conv has turned it into features.
+        with self._fp32_region(mel):
+            gain = self._source_gain(
+                self._fp32(mel), None if g is None else self._fp32(g)
+            )
+            har_source = self.m_source(f0.transpose(1, 2), gain).transpose(1, 2)
+            x = self.pre_conv(har_source)
         downs = []
         for index, (block, (old_size, new_size)) in enumerate(
             zip(self.downsample_blocks, self.df0)
@@ -1011,19 +1039,20 @@ class RefineGAN2Generator(nn.Module):
             # Those are the generic case anti-aliasing exists for; these four
             # were the ones that could simply be moved.
             if self.training and self.checkpointing:
-                x = checkpoint(ups, x, use_reentrant=False)
+                x = checkpoint(self._upsample, ups, x, use_reentrant=False)
                 x = F.leaky_relu(x, self.leaky_relu_slope)
                 x = torch.cat([x, down], dim=1)
                 x = checkpoint(res, x, use_reentrant=False)
             else:
-                x = ups(x)
+                x = self._upsample(ups, x)
                 x = F.leaky_relu(x, self.leaky_relu_slope)
                 x = torch.cat([x, down], dim=1)
                 x = res(x)
 
-        x = F.leaky_relu(x, self.leaky_relu_slope)
-        x = self.conv_post(x)
-        x = self.out_tanh(x)
+        with self._fp32_region(x):
+            x = F.leaky_relu(self._fp32(x), self.leaky_relu_slope)
+            x = self.conv_post(x)
+            x = self.out_tanh(x)
 
         return x
 

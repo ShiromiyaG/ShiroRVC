@@ -463,7 +463,7 @@ def run_train_script(
     d_pretrained_path: str = None,
     vocoder: str = "hifi",
     use_checkpointing: bool = False,
-    use_fp16: bool = False,
+    precision: str = "fp32",
     compile_vocoder: bool = False,
     torch_compile_mode: str = "default",
     overtrain_detector: bool = False,
@@ -508,7 +508,7 @@ def run_train_script(
         use_warmup=bool(use_warmup),
         warmup_duration=int(warmup_duration),
         use_checkpointing=bool(use_checkpointing),
-        use_fp16=bool(use_fp16),
+        precision=str(precision).lower(),
         compile_vocoder=bool(compile_vocoder),
         torch_compile_mode=str(torch_compile_mode),
         overtrain_detector=bool(overtrain_detector),
@@ -1360,14 +1360,15 @@ TRAIN_OWN = [
         help="Duration of warmup phase (in epochs).",
     ),
     click.option(
-        "--use_fp16",
-        type=click.BOOL,
-        default=False,
+        "--precision",
+        type=click.Choice(["fp32", "fp16", "bf16"], case_sensitive=False),
+        default="fp32",
         show_default=True,
         help=(
-            "Run the forward pass under FP16 autocast with a GradScaler. Master "
-            "weights stay FP32; distribution math and the NSF source stay FP32. "
-            "Off means plain FP32 (with TF32 if the model config enables it)."
+            "Autocast dtype over FP32 master weights. fp16 adds a GradScaler; "
+            "bf16 needs none and keeps losses, residual streams, the excitation "
+            "and the output layer in FP32. fp32 is no autocast (with TF32 if the "
+            "model config enables it)."
         ),
     ),
     click.option(
