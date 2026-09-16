@@ -118,10 +118,35 @@ def latest_checkpoints(directory):
     return step, os.path.join(directory, f"G_{step}.pth"), os.path.join(directory, f"D_{step}.pth")
 
 
+def wav_samples(path):
+    """Sample count from the RIFF header, falling back to soundfile for anything else."""
+    with open(path, "rb") as f:
+        head = f.read(4096)
+        file_size = os.fstat(f.fileno()).st_size
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        pos, align = 12, 0
+        while pos + 8 <= len(head):
+            chunk, size = head[pos : pos + 4], int.from_bytes(head[pos + 4 : pos + 8], "little")
+            if chunk == b"fmt ":
+                align = int.from_bytes(head[pos + 20 : pos + 22], "little")
+            elif chunk == b"data" and align:
+                if size in (0, 0xFFFFFFFF):
+                    break
+                # A truncated file claims more data than it holds; soundfile clamps the same way.
+                return min(size, file_size - pos - 8) // align
+            pos += 8 + size + (size & 1)
+    return sf.info(path).frames
+
+
+def _frames_chunk(chunk, hop):
+    return [wav_samples(path) // hop for path in chunk]
+
+
 def build_frames_cache(paths):
     """Writes every filelist clip's frame count to ``frames_cache`` once, before the chips spawn."""
     import json
-    from concurrent.futures import ThreadPoolExecutor
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
 
     stat = os.stat(paths["filelist"])
     with open(paths["config"]) as f:
@@ -139,11 +164,14 @@ def build_frames_cache(paths):
     print(f"[TPU] Reading the length of {len(audio)} clips (cached for later runs)...", flush=True)
     frames = {}
     started = time.time()
-    with ThreadPoolExecutor(max_workers=32) as pool:
-        counts = pool.map(lambda path: sf.info(path).frames // hop, audio)
-        for done, (path, count) in enumerate(zip(audio, counts), 1):
-            frames[path] = count
-            if done % 10000 == 0 or done == len(audio):
+    chunks = [audio[i : i + 2000] for i in range(0, len(audio), 2000)]
+    # Processes, not threads: the per-file Python work holds the GIL. Fork is safe, XLA is not up yet.
+    workers = min(64, os.cpu_count() or 8)
+    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("fork")) as pool:
+        for chunk, counts in zip(chunks, pool.map(_frames_chunk, chunks, [hop] * len(chunks))):
+            frames.update(zip(chunk, counts))
+            done = len(frames)
+            if done % 20000 < len(chunk) or done == len(audio):
                 rate = done / max(time.time() - started, 1e-6)
                 print(f"[TPU]   {done}/{len(audio)} ({rate:.0f} clips/s)", flush=True)
     tmp = paths["frames_cache"] + ".tmp"
