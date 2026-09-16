@@ -100,24 +100,43 @@ def _ms_mel_spectrogram(self, wav, n_mels, window_length):
         return torch.matmul(self.mel_banks[mel_key], magnitude)
 
 
+def _upsample_plan(self):
+    """``(left, right, first_phase, count)`` per run of phases sharing a ``start``."""
+    plan = self.__dict__.get("_xla_upsample_plan")
+    if plan is None:
+        plan = []
+        for phase, start in enumerate(self.starts):
+            left = self.pad + self.extra_left - start
+            right = self.taps - 1 - left
+            if left < 0 or right < 0:
+                raise ValueError(f"AntiAliasedUpsample1d x{self.factor}: phase {phase} needs a crop.")
+            if plan and plan[-1][:2] == (left, right):
+                plan[-1] = (left, right, plan[-1][2], plan[-1][3] + 1)
+            else:
+                plan.append((left, right, phase, 1))
+        self.__dict__["_xla_upsample_plan"] = plan
+    return plan
+
+
 def _upsample_forward(self, x):
-    """``AntiAliasedUpsample1d.forward`` with the phases interleaved by reshape."""
+    """``AntiAliasedUpsample1d.forward`` with each phase's offset moved into its input pad.
+
+    Cropping the conv output at ``start`` is what the TPU compiler folds into a
+    negative window pad and rejects (``fusion_emitter.cc``); padding the input
+    ``start`` samples less gives the same samples with no crop.
+    """
     if self.factor == 1:
         return x
     batch, channels, length = x.shape[0], x.shape[1], x.shape[-1]
-    weight = self._polyphase(x)
-    padded = F.pad(
-        x,
-        (self.pad + self.extra_left, self.pad + 1 + self.extra_right),
-        mode="replicate",
-    )
-    phases = F.conv1d(padded, weight, groups=channels)
-    phases = phases.view(batch, channels, self.factor, -1)
-    parts = [
-        phases[:, :, phase, start : start + length]
-        for phase, start in enumerate(self.starts)
-    ]
-    return torch.stack(parts, dim=-1).reshape(batch, channels, length * self.factor)
+    weight = self._polyphase(x).view(channels, self.factor, 1, self.taps)
+    parts = []
+    for left, right, first, count in _upsample_plan(self):
+        padded = F.pad(x, (left, right), mode="replicate")
+        kernel = weight.narrow(1, first, count).reshape(channels * count, 1, self.taps)
+        out = F.conv1d(padded, kernel, groups=channels)
+        parts.append(out.view(batch, channels, count, length))
+    phases = torch.cat(parts, dim=2) if len(parts) > 1 else parts[0]
+    return phases.transpose(2, 3).reshape(batch, channels, length * self.factor)
 
 
 def _f02sine(self, f0):
