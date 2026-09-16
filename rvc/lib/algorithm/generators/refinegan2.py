@@ -1,17 +1,26 @@
+import math
 from contextlib import nullcontext
 from typing import Sequence
 
 import numpy as np
 import torch
 import rvc.lib.torchaudio_guard  # noqa: F401 -- must precede torchaudio
-import torchaudio
+from torchaudio.functional.functional import (
+    _apply_sinc_resample_kernel,
+    _get_sinc_resample_kernel,
+)
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 from torch.utils.checkpoint import checkpoint
 
-from rvc.lib.algorithm.commons import expand_f0, init_weights, get_padding
+from rvc.lib.algorithm.commons import (
+    cache_scope,
+    expand_f0,
+    get_padding,
+    init_weights,
+)
 from rvc.lib.algorithm.resampling import (
     AntiAliasedUpsample1d,
     filter_schedule,
@@ -325,6 +334,7 @@ class SineGenerator(nn.Module):
         # leaves no key is a ``decoder_layout`` field, like the upsamplers'
         # interpolation design -- see ``rvc/train/utils.py``.
         orders = torch.arange(1, self.dim + 1, dtype=torch.float32)
+        self.register_buffer("harmonic_order", orders, persistent=False)
         self.register_buffer(
             "harmonic_gain",
             orders ** (-self.harmonic_tilt),
@@ -394,28 +404,33 @@ class SineGenerator(nn.Module):
         """
 
         nyquist = self.sampling_rate / 2.0
-        return ((nyquist - f0_buf) / (nyquist * self.NYQUIST_TAPER)).clamp(0.0, 1.0)
+        return (
+            (nyquist - f0_buf).div_(nyquist * self.NYQUIST_TAPER).clamp_(0.0, 1.0)
+        )
 
-    def _f02sine(self, f0_values):
-        """f0_values: (batchsize, length, dim), dim = fundamental + overtones."""
+    def _f02sine(self, f0):
+        """f0: (batchsize, length, 1).  Returns (batchsize, length, dim) sines."""
         # rad_values is F0 in rad mod 1 (the integer cycle count doesn't affect phase)
-        rad_values = (f0_values / self.sampling_rate) % 1
+        rad_values = (f0 / self.sampling_rate) % 1
 
         # random initial phase per harmonic, none for the fundamental
-        rand_ini = torch.rand(
-            f0_values.shape[0], f0_values.shape[2], device=f0_values.device
-        )
+        rand_ini = torch.rand(f0.shape[0], self.dim, device=f0.device)
         rand_ini[:, 0] = 0
-        rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
 
         tmp_over_one = torch.cumsum(rad_values, 1) % 1
         tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
         cumsum_shift = torch.zeros_like(rad_values)
         cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
+        phase = torch.cumsum(rad_values + cumsum_shift, dim=1)
 
-        sines = torch.sin(torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * np.pi)
+        # Partial j's phase is j times the fundamental's (mod 1), so the two
+        # cumsums run on one channel instead of ``dim``.
+        phase = phase * self.harmonic_order
+        # In place from here: at ``dim`` partials every temporary is a full
+        # (batch, length, dim) tensor.  Same op order as out of place.
+        phase.add_(rand_ini.unsqueeze(1))
 
-        return sines
+        return phase.mul_(2).mul_(np.pi).sin_()
 
     # Inductor cannot compile this body.  ``_f02sine`` is a cumsum over the
     # sample axis, and Inductor lowers it to a ``SplitScan`` whose codegen
@@ -430,43 +445,46 @@ class SineGenerator(nn.Module):
     def forward(self, f0, gain=None):
         """f0: (batch, length, 1).  gain: (batch, length, gain_channels) or None."""
         with torch.no_grad():
-            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
-            # fundamental component
-            f0_buf[:, :, 0] = f0[:, :, 0]
-            for idx in np.arange(self.harmonic_num):
-                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+            f0_buf = f0 * self.harmonic_order
 
-            sine_waves = self._f02sine(f0_buf) * self.sine_amp
+            sine_waves = self._f02sine(f0).mul_(self.sine_amp)
             # Both are identity at ``harmonic_num = 0``: ``harmonic_gain`` is
             # ``[1.0]`` and no fundamental sits within 10% of Nyquist.  So a
             # single-partial run computes what it always did, bit for bit.
-            sine_waves = sine_waves * self.harmonic_gain
-            sine_waves = sine_waves * self._nyquist_fade(f0_buf)
+            sine_waves.mul_(self.harmonic_gain)
+            sine_waves.mul_(self._nyquist_fade(f0_buf))
 
             uv = self._f02uv(f0)
 
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-            # ``merge`` sums ``dim`` independent draws, so without this the
-            # dither the decoder actually receives would grow as sqrt(dim) --
-            # ``noise_std`` would silently mean 0.057 at 32 partials instead of
-            # the 0.01 the sweep in ``RefineGAN2Generator`` chose, which is past
-            # where that sweep measured the low bands starting to suffer.  With
-            # it, the merged level is ``noise_std`` at every harmonic count (at
-            # initialisation, where ``merge`` is ones), so the sweep keeps
-            # meaning what it measured and the two knobs stay independent.
-            noise = noise_amp * torch.randn_like(sine_waves) / self.dim**0.5
+            noise = noise_amp * torch.randn_like(uv)
 
-            sine_waves = sine_waves * uv
+            sine_waves.mul_(uv)
 
         # merge with grad
-        if gain is None:
-            return self.merge(sine_waves + noise)
-        # No Tanh under a gain: a learned gain can push the sum into saturation,
-        # and saturating a harmonic sum at the output rate folds.  The gain used
-        # to multiply after the Tanh, so the output is no less bounded than it was.
-        sine_waves = sine_waves * gain[..., self.gain_band]
-        noise = noise * gain[..., -1:]
-        return self.merge[0](sine_waves + noise)
+        if gain is not None:
+            # No Tanh under a gain: a learned gain can push the sum into
+            # saturation, and saturating a harmonic sum at the output rate
+            # folds.  The gain used to multiply after the Tanh, so the output
+            # is no less bounded than it was.
+            # ``index_select`` rather than ``gain[..., band]``: advanced
+            # indexing backpropagates through a sort-based ``index_put_`` over
+            # every (sample, partial), ``index_select`` through ``index_add_``.
+            sine_waves = sine_waves * torch.index_select(gain, -1, self.gain_band)
+            noise = noise * gain[..., -1:]
+
+        if self.dim == 1:
+            merged = self.merge[0](sine_waves + noise)
+        else:
+            # ``merge`` over ``dim`` iid draws of std ``s / sqrt(dim)`` is one
+            # draw of std ``s * ||w|| / sqrt(dim)``, so a single channel stands
+            # in for all of them and the merged level stays ``noise_std`` at
+            # init (``w`` is ones) whatever the harmonic count.
+            weight = self.merge[0].weight
+            noise_scale = weight.norm() / self.dim**0.5
+            merged = self.merge[0](sine_waves) + noise * noise_scale
+
+        return merged if gain is not None else self.merge[1](merged)
 
 
 class RefineGAN2Generator(nn.Module):
@@ -896,16 +914,31 @@ class RefineGAN2Generator(nn.Module):
     # 385/953 taps against the 73/169 a ``FixedLowPass1d`` of the same shape as
     # the upsamplers would build, and its stopband is 135-156 dB against 68-78,
     # so swapping it would be a numerical change smuggled in under a build fix.
+    #
+    # The kernel is what ``torchaudio.functional.resample`` builds, cached per
+    # reduced ratio: it rebuilt it on every call, with a host-to-device copy
+    # each time, and it only depends on ``orig / gcd``, ``new / gcd``.
     @torch.compiler.disable
     def _decimate(self, x: torch.Tensor, orig_freq: int, new_freq: int):
-        return torchaudio.functional.resample(
-            x.contiguous(),
-            orig_freq=orig_freq,
-            new_freq=new_freq,
-            lowpass_filter_width=64,
-            rolloff=0.9475937167399596,
-            resampling_method="sinc_interp_kaiser",
-            beta=14.769656459379492,
+        gcd = math.gcd(orig_freq, new_freq)
+        key = (orig_freq // gcd, new_freq // gcd, x.dtype, x.device)
+        cache = self.__dict__.setdefault("_decimate_kernels", {})
+        if key not in cache:
+            with cache_scope():
+                cache[key] = _get_sinc_resample_kernel(
+                    orig_freq,
+                    new_freq,
+                    gcd,
+                    lowpass_filter_width=64,
+                    rolloff=0.9475937167399596,
+                    resampling_method="sinc_interp_kaiser",
+                    beta=14.769656459379492,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+        kernel, width = cache[key]
+        return _apply_sinc_resample_kernel(
+            x.contiguous(), orig_freq, new_freq, gcd, kernel, width
         )
 
     @staticmethod

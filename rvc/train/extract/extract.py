@@ -155,7 +155,7 @@ BATCH_SIZE = 16
 
 
 def _grouped_by_length(files):
-    """``files`` bucketed by exact sample count, longest bucket first.
+    """``files`` bucketed by exact 16 kHz sample count, longest bucket first.
 
     Exact, not approximate: a batch has to be one tensor, and padding clips to
     a common length would change the model's own padding and every frame that
@@ -176,7 +176,12 @@ def _grouped_by_length(files):
             frames = NOISE_SAMPLES
         else:
             try:
-                frames = sf.info(source).frames
+                clip = sf.info(source)
+                # The length after resampling, the same way ``load_audio_16k``
+                # derives it: bucketing on the source frame count would put a
+                # clip at the project rate in the same batch as a mute whose
+                # count is already at 16 kHz.
+                frames = int(round(clip.frames * 16000 / clip.samplerate))
             except Exception:
                 frames = -1  # unreadable: give it its own bucket, fail it alone
         buckets.setdefault(frames, []).append(file_info)

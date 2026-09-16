@@ -266,7 +266,8 @@ def test_the_decimation_filter_is_unchanged():
     import inspect
 
     source = inspect.getsource(R.RefineGAN2Generator._decimate)
-    assert "torchaudio.functional.resample" in source
+    assert "_get_sinc_resample_kernel" in source
+    assert "_apply_sinc_resample_kernel" in source
     assert "lowpass_filter_width=64" in source
     assert "beta=14.769656459379492" in source
 

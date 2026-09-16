@@ -166,11 +166,12 @@ def generate_filelist(
     f0nsf_dir = os.path.join(model_path, "f0_voiced")
 
     def _stem(name: str) -> str:
-        # f0 files are "<clip>.wav.npy", features "<clip>.npy", audio "<clip>.wav".
-        for suffix in (".npy", ".wav"):
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-        return name
+        # f0 files are "<clip>.<ext>.npy", features "<clip>.npy", audio
+        # "<clip>.<ext>" -- and the audio extension follows the preprocessing
+        # format, so it is not always ".wav".
+        if name.endswith(".npy"):
+            name = name[: -len(".npy")]
+        return os.path.splitext(name)[0]
 
     def _by_stem(directory: str) -> dict:
         return {_stem(name): name for name in os.listdir(directory)}
