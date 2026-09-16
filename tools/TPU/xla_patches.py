@@ -218,6 +218,27 @@ def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels: int):
     return t_act * s_act
 
 
+def _apply_sinc_resample_kernel(waveform, orig_freq, new_freq, gcd, kernel, width):
+    """torchaudio's, with the right pad trimmed so the strided conv needs no crop.
+
+    The TPU compiler folds that crop into the conv as a negative pad and aborts
+    (``fusion_emitter.cc: window.pad_low[output_dim] == 0``).  The windows the
+    shorter pad drops only covered padding zeros, so the output is identical.
+    """
+    orig_freq = int(orig_freq) // gcd
+    new_freq = int(new_freq) // gcd
+    shape = waveform.size()
+    waveform = waveform.reshape(-1, shape[-1])
+    length = int(waveform.shape[-1])
+    waveform = F.pad(waveform, (width, width + orig_freq - 1))
+    resampled = F.conv1d(waveform[:, None], kernel, stride=orig_freq)
+    resampled = resampled.transpose(1, 2).reshape(waveform.shape[0], -1)
+    target_length = math.ceil(new_freq * length / orig_freq)
+    if resampled.shape[-1] != target_length:
+        resampled = resampled[..., :target_length]
+    return resampled.view(shape[:-1] + resampled.shape[-1:])
+
+
 def _rmvpe_mel_forward(self, audio, keyshift=0, speed=1, center=True):
     """``RMVPE.MelSpectrogram.forward`` for the unshifted extraction path."""
     if keyshift != 0 or speed != 1:
@@ -265,4 +286,5 @@ def apply() -> None:
     resampling.AntiAliasedUpsample1d.forward = _upsample_forward
     refinegan2.SineGenerator._f02sine = _f02sine
     refinegan2.expand_f0 = expand_f0
+    refinegan2._apply_sinc_resample_kernel = _apply_sinc_resample_kernel
     wavenet.fused_add_tanh_sigmoid_multiply = fused_add_tanh_sigmoid_multiply
