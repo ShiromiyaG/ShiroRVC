@@ -423,6 +423,8 @@ def _mp_fn(index, args):
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=4,
+        # Forking a process whose TPU runtime is already up aborts in runtime_metric_aggregator.
+        multiprocessing_context="spawn",
     )
     steps_per_epoch = len(sampler) // args.batch_size
     device_loader = pl.MpDeviceLoader(loader, device)
