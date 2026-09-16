@@ -100,6 +100,30 @@ def _ms_mel_spectrogram(self, wav, n_mels, window_length):
         return torch.matmul(self.mel_banks[mel_key], magnitude)
 
 
+_ORIGINAL_POLYPHASE = None
+_ORIGINAL_SINC_KERNEL = None
+
+
+def _polyphase(self, x):
+    """``AntiAliasedUpsample1d._polyphase`` built on the CPU and uploaded.
+
+    Built on the device, its construction ops land in step 1's graph only, and
+    step 2 then compiles the whole step a second time.
+    """
+    key = (int(x.shape[1]), x.dtype, x.device)
+    if self.__dict__.get("_xla_poly_key") != key:
+        probe = torch.empty(1, key[0], 0, dtype=x.dtype)
+        self.__dict__["_xla_poly"] = _ORIGINAL_POLYPHASE(self, probe).to(x.device)
+        self.__dict__["_xla_poly_key"] = key
+    return self.__dict__["_xla_poly"]
+
+
+def _get_sinc_resample_kernel(*args, device=None, dtype=None, **kwargs):
+    """torchaudio's kernel built on the CPU and uploaded, for the same reason as ``_polyphase``."""
+    kernel, width = _ORIGINAL_SINC_KERNEL(*args, device=torch.device("cpu"), dtype=dtype, **kwargs)
+    return kernel.to(device), width
+
+
 def _upsample_plan(self):
     """``(left, right, first_phase, count)`` per run of phases sharing a ``start``."""
     plan = self.__dict__.get("_xla_upsample_plan")
@@ -281,6 +305,7 @@ def apply_extract() -> None:
 
 
 def apply() -> None:
+    global _ORIGINAL_POLYPHASE, _ORIGINAL_SINC_KERNEL
     from rvc.lib.algorithm import resampling, wavenet
     from rvc.lib.algorithm.discriminators.multi import mpd_msd_combined
     from rvc.lib.algorithm.discriminators.single import univhd
@@ -303,6 +328,11 @@ def apply() -> None:
             module.spectrogram_torch = _make_spectrogram_torch(module.spectrogram_torch)
     hifigan_nsf.SineGenerator.forward = _nsf_sine_forward
     resampling.AntiAliasedUpsample1d.forward = _upsample_forward
+    if _ORIGINAL_POLYPHASE is None:
+        _ORIGINAL_POLYPHASE = resampling.AntiAliasedUpsample1d._polyphase
+        _ORIGINAL_SINC_KERNEL = refinegan2._get_sinc_resample_kernel
+    resampling.AntiAliasedUpsample1d._polyphase = _polyphase
+    refinegan2._get_sinc_resample_kernel = _get_sinc_resample_kernel
     refinegan2.SineGenerator._f02sine = _f02sine
     refinegan2.expand_f0 = expand_f0
     refinegan2._apply_sinc_resample_kernel = _apply_sinc_resample_kernel

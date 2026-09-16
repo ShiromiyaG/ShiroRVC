@@ -1,4 +1,4 @@
-"""Vocoder training on TPU (torch_xla), one process per TPU chip (or one for all, with ``--spmd``).
+"""Vocoder training on TPU (torch_xla): one process for every chip (SPMD), or one per chip with ``--no-spmd``.
 
 Covers every vocoder in ``rvc/configs/vocoders.json`` -- RefineGAN v2, HiFi-GAN
 and HiFi-GAN++ -- including those the registry disables for the UI.  Runs the
@@ -68,16 +68,24 @@ def parse_args(argv=None):
     parser.add_argument("--log-every", type=int, default=50, help="Steps between log lines.")
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--metrics", action="store_true", help="Print the XLA metrics report after the first epoch (to spot recompiles).")
-    parser.add_argument("--single-process", action="store_true", help="One chip only, for debugging.")
+    parser.add_argument("--single-process", action="store_true", help="One chip only, for debugging (implies --no-spmd).")
     parser.add_argument(
         "--spmd",
-        action="store_true",
-        help="One process driving every chip (SPMD): one compile instead of one per chip, far less host RAM.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="One process driving every chip (SPMD): one compile instead of one per chip, far less host RAM. "
+        "--no-spmd runs one process per chip.",
+    )
+    parser.add_argument(
+        "--compile-cache",
+        default=None,
+        help="Persistent XLA compile cache, so a rerun of the same graph skips compiling. "
+        "Default logs/<model>/xla_cache; pass an empty string to disable.",
     )
     parser.add_argument(
         "--split-step",
         action="store_true",
-        help="Compile the D and G updates as two graphs: less host RAM while compiling, a little slower per step.",
+        help="Compile each step as four smaller graphs: much faster compile and less host RAM, a little slower per step.",
     )
     parser.add_argument(
         "--debug-sync",
@@ -363,6 +371,38 @@ def optimizer_to(optimizer, device):
                 state[key] = value.float() if key == "step" else value
 
 
+def init_adamw_state(optimizer):
+    """Creates the state ``AdamW`` would create lazily, so step 1 traces the same graph as step 2."""
+    from torch.optim.optimizer import _get_scalar_dtype
+
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            state = optimizer.state[p]
+            if state:
+                continue
+            state["step"] = torch.zeros((), dtype=_get_scalar_dtype(), device=p.device)
+            state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            if group["amsgrad"]:
+                state["max_exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+
+@torch.no_grad()
+def ema_update(ema, model, device):
+    """``WeightEMA.update`` with the weight uploaded as data.
+
+    XLA bakes 0 and 1 into the graph and uploads other scalars, so the first
+    update's weight of 1 would make step 1 a different graph from the rest.
+    """
+    ema.updates += 1
+    weight = torch.tensor(1.0 - ema.current_decay(), device=device)
+    torch._foreach_lerp_(ema._shadow_float, ema._live_float, [weight] * len(ema._shadow_float))
+    if ema._other_keys:
+        state = model.state_dict()
+        for key in ema._other_keys:
+            ema.shadow[key].copy_(state[key])
+
+
 def grad_norm(parameters):
     norms = [p.grad.detach().float().norm() for p in parameters if p.grad is not None]
     if not norms:
@@ -402,6 +442,11 @@ def _mp_fn(index, args):
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
     import torch_xla.runtime as xr
+
+    if args.compile_cache:
+        # torch_xla wants one cache directory per process when there are several.
+        path = args.compile_cache if args.spmd else os.path.join(args.compile_cache, f"process{index}")
+        xr.initialize_cache(path)
 
     import xla_patches
 
@@ -600,6 +645,9 @@ def _mp_fn(index, args):
     if not args.no_ema and bool(getattr(config.train, "ema", True)):
         ema = WeightEMA(net_g, decay=float(getattr(config.train, "ema_decay", WeightEMA.DEFAULT_DECAY)))
 
+    for optimizer in (optim_g, optim_d):
+        init_adamw_state(optimizer)
+
     total_steps = max(1, args.epochs * steps_per_epoch)
     lr_final_ratio = getattr(config.train, "lr_final_ratio", None)
     gamma = float(getattr(config.train, "lr_decay", 0.999875)) ** (1.0 / steps_per_epoch)
@@ -681,6 +729,10 @@ def _mp_fn(index, args):
         if not args.spmd:
             xm.reduce_gradients(optim_d)
         norm_d = grad_norm(net_d.parameters())
+        # --split-step cuts the step into four graphs: forward + D backward, D update,
+        # G loss + backward, G update + EMA.  Each compiles far faster than the whole.
+        if args.split_step:
+            sync()
         optim_d.step()
         if san_active:
             normalize_san_weights(net_d, optim_d)
@@ -711,10 +763,12 @@ def _mp_fn(index, args):
         if not args.spmd:
             xm.reduce_gradients(optim_g)
         norm_g = grad_norm(net_g.parameters())
-        optim_g.step()
         net_d.requires_grad_(True)
+        if args.split_step:
+            sync()
+        optim_g.step()
         if ema is not None:
-            ema.update(net_g)
+            ema_update(ema, net_g, device)
         return {
             "loss_disc": loss_disc,
             "loss_gen": loss_gen,
@@ -726,9 +780,16 @@ def _mp_fn(index, args):
             "grad_norm_g": norm_g,
         }
 
-    # Updated every step with the same ops, so logging adds no second graph.
+    # Updated every step with the same ops (the weight is uploaded, not baked in),
+    # so logging adds no second graph.
     smoothing = 1.0 / max(1, int(getattr(config.train, "rolling_loss_steps", 50)))
-    running = None
+    running = {
+        key: torch.zeros((), device=device)
+        for key in ("loss_disc", "loss_gen", "loss_mel", "loss_kl", "loss_fm", "loss_adv", "grad_norm_d", "grad_norm_g")
+    }
+    # Everything created so far (optimizer state, EMA shadow, the running losses)
+    # runs here, in its own small graph, instead of only in step 1's.
+    sync()
     writer = None
     if master:
         import types
@@ -816,11 +877,9 @@ def _mp_fn(index, args):
             if global_step == first_step:
                 xm.add_step_closure(stage, args=("First step compiled; training.",))
             with torch.no_grad():
-                if running is None:
-                    running = {key: value.detach().float().clone() for key, value in values.items()}
-                else:
-                    for key, value in values.items():
-                        running[key].lerp_(value.detach().float(), smoothing)
+                weight = torch.tensor(1.0 if global_step == first_step else smoothing, device=device)
+                for key, value in values.items():
+                    running[key].lerp_(value.detach().float(), weight)
             if global_step % args.log_every == 0:
                 xm.add_step_closure(log_closure, args=(global_step, epoch, dict(running), started))
         if master and args.metrics and epoch == epoch_start:
@@ -846,8 +905,12 @@ def main(argv=None):
             sys.exit(f"{paths[key]} is missing: run preprocess + extract first.")
     build_frames_cache(paths)
 
-    if args.spmd and args.single_process:
-        sys.exit("--spmd already runs one process; drop --single-process.")
+    if args.single_process:
+        args.spmd = False
+    if args.compile_cache is None:
+        args.compile_cache = os.path.join(paths["dir"], "xla_cache")
+    if args.compile_cache:
+        os.makedirs(args.compile_cache, exist_ok=True)
     if args.spmd:
         import torch_xla.runtime as xr
 
