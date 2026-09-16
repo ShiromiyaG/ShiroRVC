@@ -669,6 +669,12 @@ def main(argv=None):
         if not os.path.isfile(paths[key]):
             sys.exit(f"{paths[key]} is missing: run preprocess + extract first.")
 
+    if not args.single_process:
+        # Kaggle presets a one-process topology (TPU_PROCESS_ADDRESSES=local); torch_xla only
+        # setdefault()s these, so each spawned chip would keep it and fail to find its peers.
+        for key in ("TPU_PROCESS_ADDRESSES", "TPU_PROCESS_BOUNDS", "TPU_VISIBLE_CHIPS", "TPU_PROCESS_PORT"):
+            os.environ.pop(key, None)
+
     import torch_xla
 
     if hasattr(torch_xla, "launch"):
