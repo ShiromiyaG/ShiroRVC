@@ -423,8 +423,6 @@ def _mp_fn(index, args):
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=4,
-        # Forking a process whose TPU runtime is already up aborts in runtime_metric_aggregator.
-        multiprocessing_context="spawn",
     )
     steps_per_epoch = len(sampler) // args.batch_size
     device_loader = pl.MpDeviceLoader(loader, device)
@@ -632,6 +630,11 @@ def _mp_fn(index, args):
     running = None
     writer = None
     if master:
+        import types
+
+        # tensorboard imports a full tensorflow when present, whose own TPU runtime aborts
+        # this process (runtime_metric_aggregator); the notf marker makes it use its stub.
+        sys.modules.setdefault("tensorboard.compat.notf", types.ModuleType("tensorboard.compat.notf"))
         from torch.utils.tensorboard import SummaryWriter
 
         writer = SummaryWriter(log_dir=os.path.join(paths["dir"], "eval"))
