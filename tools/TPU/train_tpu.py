@@ -325,6 +325,11 @@ def checkpoint_payload(model, state, optimizer, learning_rate, epoch):
 
 
 def _mp_fn(index, args):
+    import faulthandler
+
+    # The TPU runtime aborts with a native-only trace; this adds the Python stack of every thread.
+    faulthandler.enable(all_threads=True)
+
     import torch_xla
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
