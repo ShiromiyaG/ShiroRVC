@@ -137,9 +137,15 @@ def build_frames_cache(paths):
     # Same path resolution as the dataset, so the keys match its audiopaths.
     audio = sorted({row[0] for row in load_filepaths_and_text(paths["filelist"])})
     print(f"[TPU] Reading the length of {len(audio)} clips (cached for later runs)...", flush=True)
+    frames = {}
+    started = time.time()
     with ThreadPoolExecutor(max_workers=32) as pool:
-        counts = pool.map(lambda path: sf.info(path).frames // hop, audio, chunksize=64)
-        frames = dict(zip(audio, counts))
+        counts = pool.map(lambda path: sf.info(path).frames // hop, audio)
+        for done, (path, count) in enumerate(zip(audio, counts), 1):
+            frames[path] = count
+            if done % 10000 == 0 or done == len(audio):
+                rate = done / max(time.time() - started, 1e-6)
+                print(f"[TPU]   {done}/{len(audio)} ({rate:.0f} clips/s)", flush=True)
     tmp = paths["frames_cache"] + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"stamp": stamp, "frames": frames}, f)
