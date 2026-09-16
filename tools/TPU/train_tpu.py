@@ -905,6 +905,12 @@ def _mp_fn(index, args):
 
 
 def main(argv=None):
+    import faulthandler
+    import signal
+
+    # `kill -USR1 <pid>` prints every thread's Python stack and keeps running,
+    # for when a compile seems stuck and py-spy is not allowed to attach.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     args = parse_args(argv)
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     os.chdir(REPO_ROOT)
