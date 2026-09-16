@@ -119,7 +119,7 @@ def latest_checkpoints(directory):
 
 
 def wav_samples(path):
-    """Sample count from the RIFF header, falling back to soundfile for anything else."""
+    """(sample count, file size); the count comes from the RIFF header, else from soundfile."""
     with open(path, "rb") as f:
         head = f.read(4096)
         file_size = os.fstat(f.fileno()).st_size
@@ -133,17 +133,17 @@ def wav_samples(path):
                 if size in (0, 0xFFFFFFFF):
                     break
                 # A truncated file claims more data than it holds; soundfile clamps the same way.
-                return min(size, file_size - pos - 8) // align
+                return min(size, file_size - pos - 8) // align, file_size
             pos += 8 + size + (size & 1)
-    return sf.info(path).frames
+    return sf.info(path).frames, file_size
 
 
 def _frames_chunk(chunk, hop):
-    return [wav_samples(path) // hop for path in chunk]
+    return [(samples // hop, size) for samples, size in map(wav_samples, chunk)]
 
 
 def build_frames_cache(paths):
-    """Writes every filelist clip's frame count to ``frames_cache`` once, before the chips spawn."""
+    """Writes every filelist clip's (frames, file size) to ``frames_cache`` once, before the chips spawn."""
     import json
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
@@ -151,7 +151,7 @@ def build_frames_cache(paths):
     stat = os.stat(paths["filelist"])
     with open(paths["config"]) as f:
         hop = int(json.load(f)["data"]["hop_length"])
-    stamp = [stat.st_size, stat.st_mtime_ns, hop]
+    stamp = [stat.st_size, stat.st_mtime_ns, hop, 2]
     if os.path.isfile(paths["frames_cache"]):
         with open(paths["frames_cache"]) as f:
             cached = json.load(f)
@@ -180,12 +180,24 @@ def build_frames_cache(paths):
     os.replace(tmp, paths["frames_cache"])
 
 
-def clip_frames(dataset, indices, cache_path):
+def load_frames_cache(cache_path):
     import json
 
     with open(cache_path) as f:
-        frames = json.load(f)["frames"]
-    return {index: frames[dataset.audiopaths_and_text[index][0]] for index in indices}
+        return json.load(f)["frames"]
+
+
+def cached_dataset(dataset_cls, cache):
+    """``dataset_cls`` with ``_filter`` reading file sizes from ``cache`` instead of stat()ing every clip."""
+
+    class CachedDataset(dataset_cls):
+        def _filter(self):
+            self.audiopaths_and_text = [
+                row for row in self.audiopaths_and_text if self.min_text_len <= len(row[1]) <= self.max_text_len
+            ]
+            self.lengths = [cache[row[0]][1] // (3 * self.hop_length) for row in self.audiopaths_and_text]
+
+    return CachedDataset
 
 
 def auto_max_frames(frames):
@@ -406,10 +418,11 @@ def _mp_fn(index, args):
     random.seed(int(config.train.seed) + rank)
 
     # Data
-    dataset = TextAudioLoaderMultiNSFsid(config.data, n_mel_bins=config.model.inter_channels)
+    cache = load_frames_cache(paths["frames_cache"])
+    dataset = cached_dataset(TextAudioLoaderMultiNSFsid, cache)(config.data, n_mel_bins=config.model.inter_channels)
     # The CUDA sampler's bucket bounds, so both trainers see the same clips.
     bucketed = [i for i, length in enumerate(dataset.lengths) if 50 < length <= 900]
-    lengths = clip_frames(dataset, bucketed, paths["frames_cache"])
+    lengths = {i: cache[dataset.audiopaths_and_text[i][0]][0] for i in bucketed}
     # The random slice needs a whole segment inside the clip; the margin
     # covers features a frame or two shorter than the audio.
     usable = [i for i in bucketed if lengths[i] >= segment_size // hop + 2]
