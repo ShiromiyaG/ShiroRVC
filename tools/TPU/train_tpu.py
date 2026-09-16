@@ -373,6 +373,13 @@ def _mp_fn(index, args):
     sync = getattr(torch_xla, "sync", xm.mark_step)
     rank, world = xr.global_ordinal(), xr.world_size()
     master = rank == 0
+    launched = time.time()
+
+    def stage(message):
+        if master:
+            info(f"{message} ({time.time() - launched:.0f}s)", tag="[TPU]")
+
+    stage(f"Runtime up on {world} chip(s); loading the dataset...")
 
     paths = experiment_paths(args.model_name)
     config = load_config_from_json(paths["config"])
@@ -426,6 +433,7 @@ def _mp_fn(index, args):
     )
     steps_per_epoch = len(sampler) // args.batch_size
     device_loader = pl.MpDeviceLoader(loader, device)
+    stage(f"Dataset ready: {len(usable)} of {len(dataset)} clips usable; building the models...")
 
     # Models
     speakers = verify_spk_dim(
@@ -469,6 +477,7 @@ def _mp_fn(index, args):
         if master and not (args.pretrain_g and args.pretrain_d):
             info("No pretrain pair given: the missing side starts from scratch.", tag="[TPU]")
 
+    stage("Models built; moving them to the TPU and syncing the chips...")
     net_g.to(device)
     net_d.to(device)
     if world > 1 and resume is None:
@@ -697,6 +706,7 @@ def _mp_fn(index, args):
 
     started = [time.time()]
     epoch = epoch_start - 1
+    first_step = global_step + 1
     for epoch in range(epoch_start, args.epochs + 1):
         sampler.set_epoch(epoch)
         net_g.train()
@@ -707,7 +717,11 @@ def _mp_fn(index, args):
                 for group in optimizer.param_groups:
                     group["lr"] = group["initial_lr"] * factor
             global_step += 1
+            if global_step == first_step:
+                stage("Compiling the first step (5-20 min, no output meanwhile)...")
             values = train_step(batch)
+            if global_step == first_step:
+                xm.add_step_closure(stage, args=("First step compiled; training.",))
             with torch.no_grad():
                 if running is None:
                     running = {key: value.detach().float().clone() for key, value in values.items()}
