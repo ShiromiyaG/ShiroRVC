@@ -69,6 +69,11 @@ def parse_args(argv=None):
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--metrics", action="store_true", help="Print the XLA metrics report after the first epoch (to spot recompiles).")
     parser.add_argument("--single-process", action="store_true", help="One chip only, for debugging.")
+    parser.add_argument(
+        "--debug-sync",
+        action="store_true",
+        help="Compile around every module and print its name, to find an op the TPU compiler rejects.",
+    )
     return parser.parse_args(argv)
 
 
@@ -202,6 +207,25 @@ def cached_dataset(dataset_cls, hparams, n_mel_bins, cache):
     ]
     dataset.lengths = [cache[row[0]][1] // (3 * dataset.hop_length) for row in dataset.audiopaths_and_text]
     return dataset
+
+
+def add_sync_hooks(nets, sync):
+    """Syncs before and after every leaf module, so a compile failure names the op range."""
+
+    def hook(label):
+        def cut(*_):
+            print(f"[TPU] sync {label}", flush=True)
+            sync()
+
+        return cut
+
+    for net in nets:
+        for name, module in net.named_modules():
+            if list(module.children()) or "parametrizations" in name:
+                continue
+            label = f"{name} ({type(module).__name__})"
+            module.register_forward_pre_hook(hook(f"before {label}"))
+            module.register_forward_hook(hook(f"after {label}"))
 
 
 def auto_max_frames(frames):
@@ -496,6 +520,8 @@ def _mp_fn(index, args):
 
     stage("Models built; moving them to the TPU and syncing the chips...")
     net_g.to(device)
+    if args.debug_sync:
+        add_sync_hooks((net_g, net_d), sync)
     net_d.to(device)
     if world > 1 and resume is None:
         xm.broadcast_master_param(net_g)
