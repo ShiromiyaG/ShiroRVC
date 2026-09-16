@@ -187,17 +187,21 @@ def load_frames_cache(cache_path):
         return json.load(f)["frames"]
 
 
-def cached_dataset(dataset_cls, cache):
-    """``dataset_cls`` with ``_filter`` reading file sizes from ``cache`` instead of stat()ing every clip."""
-
-    class CachedDataset(dataset_cls):
-        def _filter(self):
-            self.audiopaths_and_text = [
-                row for row in self.audiopaths_and_text if self.min_text_len <= len(row[1]) <= self.max_text_len
-            ]
-            self.lengths = [cache[row[0]][1] // (3 * self.hop_length) for row in self.audiopaths_and_text]
-
-    return CachedDataset
+def cached_dataset(dataset_cls, hparams, n_mel_bins, cache):
+    """``dataset_cls`` with its ``_filter`` done from ``cache``'s file sizes instead of stat()ing every clip."""
+    # Skipped on the class for the constructor only: the instance must stay a plain
+    # dataset_cls, since the loader workers are spawned and unpickle it.
+    original = dataset_cls._filter
+    dataset_cls._filter = lambda self: None
+    try:
+        dataset = dataset_cls(hparams, n_mel_bins=n_mel_bins)
+    finally:
+        dataset_cls._filter = original
+    dataset.audiopaths_and_text = [
+        row for row in dataset.audiopaths_and_text if dataset.min_text_len <= len(row[1]) <= dataset.max_text_len
+    ]
+    dataset.lengths = [cache[row[0]][1] // (3 * dataset.hop_length) for row in dataset.audiopaths_and_text]
+    return dataset
 
 
 def auto_max_frames(frames):
@@ -419,7 +423,7 @@ def _mp_fn(index, args):
 
     # Data
     cache = load_frames_cache(paths["frames_cache"])
-    dataset = cached_dataset(TextAudioLoaderMultiNSFsid, cache)(config.data, n_mel_bins=config.model.inter_channels)
+    dataset = cached_dataset(TextAudioLoaderMultiNSFsid, config.data, config.model.inter_channels, cache)
     # The CUDA sampler's bucket bounds, so both trainers see the same clips.
     bucketed = [i for i, length in enumerate(dataset.lengths) if 50 < length <= 900]
     lengths = {i: cache[dataset.audiopaths_and_text[i][0]][0] for i in bucketed}
