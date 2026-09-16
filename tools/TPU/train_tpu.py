@@ -1,4 +1,4 @@
-"""Vocoder training on TPU (torch_xla), one process per TPU chip.
+"""Vocoder training on TPU (torch_xla), one process per TPU chip (or one for all, with ``--spmd``).
 
 Covers every vocoder in ``rvc/configs/vocoders.json`` -- RefineGAN v2, HiFi-GAN
 and HiFi-GAN++ -- including those the registry disables for the UI.  Runs the
@@ -69,6 +69,11 @@ def parse_args(argv=None):
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--metrics", action="store_true", help="Print the XLA metrics report after the first epoch (to spot recompiles).")
     parser.add_argument("--single-process", action="store_true", help="One chip only, for debugging.")
+    parser.add_argument(
+        "--spmd",
+        action="store_true",
+        help="One process driving every chip (SPMD): one compile instead of one per chip, far less host RAM.",
+    )
     parser.add_argument(
         "--split-step",
         action="store_true",
@@ -271,6 +276,29 @@ class FixedCollate:
         return phone, lengths, pitch, pitchf, spec, lengths.clone(), wave, sid
 
 
+class BatchSharding:
+    """``input_sharding`` for ``MpDeviceLoader``: every batch tensor split over the chips along dim 0.
+
+    One ``ShardingSpec`` only applies to tensors of its own rank, and a batch mixes ranks 1-3.
+    """
+
+    minibatch = False
+
+    def __init__(self, chips):
+        import numpy as np
+        import torch_xla.distributed.spmd as xs
+
+        self._xs = xs
+        self._mesh = xs.Mesh(np.arange(chips), (chips,), ("data",))
+        self._specs = {}
+
+    def xla_spec(self, t):
+        rank = t.dim()
+        if rank not in self._specs:
+            self._specs[rank] = self._xs.ShardingSpec(self._mesh, (0,) + (None,) * (rank - 1))
+        return self._specs[rank].xla_spec(t)
+
+
 class ShardedShuffleSampler(torch.utils.data.Sampler):
     """Per-epoch shuffle, split across chips, trimmed to whole global batches."""
 
@@ -416,7 +444,12 @@ def _mp_fn(index, args):
 
     device = torch_xla.device() if hasattr(torch_xla, "device") else xm.xla_device()
     sync = getattr(torch_xla, "sync", xm.mark_step)
-    rank, world = xr.global_ordinal(), xr.world_size()
+    if args.spmd:
+        # One process holds every chip; the batch is sharded, the weights replicated.
+        rank, world, chips = 0, 1, xr.global_runtime_device_count()
+    else:
+        rank, world = xr.global_ordinal(), xr.world_size()
+        chips = world
     master = rank == 0
     launched = time.time()
 
@@ -424,7 +457,7 @@ def _mp_fn(index, args):
         if master:
             info(f"{message} ({time.time() - launched:.0f}s)", tag="[TPU]")
 
-    stage(f"Runtime up on {world} chip(s); loading the dataset...")
+    stage(f"Runtime up on {chips} chip(s){' (SPMD)' if args.spmd else ''}; loading the dataset...")
 
     paths = experiment_paths(args.model_name)
     config = load_config_from_json(paths["config"])
@@ -464,22 +497,28 @@ def _mp_fn(index, args):
     frames = args.max_frames or auto_max_frames([lengths[i] for i in usable])
     if frames * hop < segment_size:
         raise ValueError(f"--max-frames must be at least {segment_size // hop}.")
-    sampler = ShardedShuffleSampler(usable, args.batch_size, world, rank, int(config.train.seed))
+    # Under SPMD this process loads the whole global batch.
+    loader_batch = args.batch_size * (chips if args.spmd else 1)
+    sampler = ShardedShuffleSampler(usable, loader_batch, world, rank, int(config.train.seed))
     # Spawned workers each import torch and hold a copy of the dataset, and there
     # are this many per chip: 12 of them filled the Kaggle host's 330 GB.
     workers = max(1, args.num_workers)
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=loader_batch,
         sampler=sampler,
         collate_fn=FixedCollate(frames, hop),
-        num_workers=workers,
+        num_workers=workers * (chips if args.spmd else 1),
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=4,
+        # Never fork a process whose TPU runtime is up (SPMD's default would).
+        multiprocessing_context="spawn",
     )
-    steps_per_epoch = len(sampler) // args.batch_size
-    device_loader = pl.MpDeviceLoader(loader, device)
+    steps_per_epoch = len(sampler) // loader_batch
+    device_loader = pl.MpDeviceLoader(
+        loader, device, input_sharding=BatchSharding(chips) if args.spmd else None
+    )
     stage(f"Dataset ready: {len(usable)} of {len(dataset)} clips usable; building the models...")
 
     # Models
@@ -533,7 +572,7 @@ def _mp_fn(index, args):
         xm.broadcast_master_param(net_g)
         xm.broadcast_master_param(net_d)
 
-    global_batch = args.batch_size * world
+    global_batch = args.batch_size * chips
     batch_ratio = global_batch / max(1, args.reference_batch)
     lr_multiplier = args.lr_scale * {
         "sqrt": math.sqrt(batch_ratio),
@@ -639,7 +678,8 @@ def _mp_fn(index, args):
             )
         optim_d.zero_grad(set_to_none=True)
         loss_disc.backward()
-        xm.reduce_gradients(optim_d)
+        if not args.spmd:
+            xm.reduce_gradients(optim_d)
         norm_d = grad_norm(net_d.parameters())
         optim_d.step()
         if san_active:
@@ -668,7 +708,8 @@ def _mp_fn(index, args):
             loss_gen = loss_mel + loss_kl + loss_adv + loss_fm
         optim_g.zero_grad(set_to_none=True)
         loss_gen.backward()
-        xm.reduce_gradients(optim_g)
+        if not args.spmd:
+            xm.reduce_gradients(optim_g)
         norm_g = grad_norm(net_g.parameters())
         optim_g.step()
         net_d.requires_grad_(True)
@@ -700,7 +741,7 @@ def _mp_fn(index, args):
         writer = SummaryWriter(log_dir=os.path.join(paths["dir"], "eval"))
         info(
             f"{vocoder} at {sample_rate} Hz ({spectral_loss_name}), "
-            f"{world} chip(s), batch {args.batch_size} per chip ({global_batch} global), "
+            f"{chips} chip(s), batch {args.batch_size} per chip ({global_batch} global), "
             f"{frames} frames per item, {steps_per_epoch} steps/epoch, {workers} loader workers "
             f"per chip, precision {args.precision}.",
             tag="[TPU]",
@@ -753,7 +794,8 @@ def _mp_fn(index, args):
                     architecture="RVC",
                     weights_source="EMA weights" if ema is not None else "live weights",
                 )
-        xm.rendezvous("tpu_checkpoint_saved")
+        if world > 1:
+            xm.rendezvous("tpu_checkpoint_saved")
 
     started = [time.time()]
     epoch = epoch_start - 1
@@ -803,6 +845,16 @@ def main(argv=None):
         if not os.path.isfile(paths[key]):
             sys.exit(f"{paths[key]} is missing: run preprocess + extract first.")
     build_frames_cache(paths)
+
+    if args.spmd and args.single_process:
+        sys.exit("--spmd already runs one process; drop --single-process.")
+    if args.spmd:
+        import torch_xla.runtime as xr
+
+        # Before any XLA tensor exists; Kaggle's one-process topology is what SPMD wants.
+        xr.use_spmd()
+        _mp_fn(0, args)
+        return
 
     if not args.single_process:
         # Kaggle presets a one-process topology: torch_xla only setdefault()s TPU_PROCESS_ADDRESSES,
