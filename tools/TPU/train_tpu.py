@@ -325,11 +325,6 @@ def checkpoint_payload(model, state, optimizer, learning_rate, epoch):
 
 
 def _mp_fn(index, args):
-    import faulthandler
-
-    # The TPU runtime aborts with a native-only trace; this adds the Python stack of every thread.
-    faulthandler.enable(all_threads=True)
-
     import torch_xla
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
@@ -745,9 +740,10 @@ def main(argv=None):
     build_frames_cache(paths)
 
     if not args.single_process:
-        # Kaggle presets a one-process topology (TPU_PROCESS_ADDRESSES=local); torch_xla only
-        # setdefault()s these, so each spawned chip would keep it and fail to find its peers.
-        for key in ("TPU_PROCESS_ADDRESSES", "TPU_PROCESS_BOUNDS", "TPU_VISIBLE_CHIPS", "TPU_PROCESS_PORT"):
+        # Kaggle presets a one-process topology: torch_xla only setdefault()s TPU_PROCESS_ADDRESSES,
+        # so each chip would keep "local", and the per-chip metrics ports make every process
+        # register the runtime metric reporter twice (runtime_metric_aggregator abort).
+        for key in ("TPU_PROCESS_ADDRESSES", "TPU_RUNTIME_METRICS_PORTS"):
             os.environ.pop(key, None)
 
     import torch_xla
