@@ -708,6 +708,14 @@ def _mp_fn(index, args):
     def autocast():
         return torch.autocast("xla", dtype=torch.bfloat16, enabled=amp_dtype is not None)
 
+    def split(graph):
+        """A ``--split-step`` boundary; on the first step it also says which graph compiles next."""
+        if not args.split_step:
+            return
+        sync()
+        if global_step == first_step:
+            stage(f"Graph {graph}/4 compiled; compiling graph {graph + 1}/4...")
+
     def train_step(batch):
         phone, phone_lengths, pitch, pitchf, spec, spec_lengths, y, sid = batch
         with autocast():
@@ -731,14 +739,12 @@ def _mp_fn(index, args):
         norm_d = grad_norm(net_d.parameters())
         # --split-step cuts the step into four graphs: forward + D backward, D update,
         # G loss + backward, G update + EMA.  Each compiles far faster than the whole.
-        if args.split_step:
-            sync()
+        split(1)
         optim_d.step()
         if san_active:
             normalize_san_weights(net_d, optim_d)
         optim_d.zero_grad(set_to_none=True)
-        if args.split_step:
-            sync()
+        split(2)
 
         # D is only read here; freezing it skips its weight gradients.
         net_d.requires_grad_(False)
@@ -764,8 +770,7 @@ def _mp_fn(index, args):
             xm.reduce_gradients(optim_g)
         norm_g = grad_norm(net_g.parameters())
         net_d.requires_grad_(True)
-        if args.split_step:
-            sync()
+        split(3)
         optim_g.step()
         if ema is not None:
             ema_update(ema, net_g, device)
@@ -872,7 +877,11 @@ def _mp_fn(index, args):
                     group["lr"] = group["initial_lr"] * factor
             global_step += 1
             if global_step == first_step:
-                stage("Compiling the first step (5-20 min, no output meanwhile)...")
+                stage(
+                    "Compiling graph 1/4 (forward + D backward)..."
+                    if args.split_step
+                    else "Compiling the first step (5-20 min, no output meanwhile)..."
+                )
             values = train_step(batch)
             if global_step == first_step:
                 xm.add_step_closure(stage, args=("First step compiled; training.",))
