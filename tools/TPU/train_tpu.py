@@ -64,11 +64,16 @@ def parse_args(argv=None):
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--max-frames", type=int, default=0, help="Fixed frame window per item; 0 sizes it from the dataset.")
     parser.add_argument("--lr-scale", type=float, default=1.0, help="Extra multiplier on top of --lr-scaling.")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers per chip; 0 splits the host's CPUs across chips.")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers per chip (at least 1).")
     parser.add_argument("--log-every", type=int, default=50, help="Steps between log lines.")
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--metrics", action="store_true", help="Print the XLA metrics report after the first epoch (to spot recompiles).")
     parser.add_argument("--single-process", action="store_true", help="One chip only, for debugging.")
+    parser.add_argument(
+        "--split-step",
+        action="store_true",
+        help="Compile the D and G updates as two graphs: less host RAM while compiling, a little slower per step.",
+    )
     parser.add_argument(
         "--debug-sync",
         action="store_true",
@@ -460,8 +465,9 @@ def _mp_fn(index, args):
     if frames * hop < segment_size:
         raise ValueError(f"--max-frames must be at least {segment_size // hop}.")
     sampler = ShardedShuffleSampler(usable, args.batch_size, world, rank, int(config.train.seed))
-    # One process per chip shares the host, so the CPUs are split between them.
-    workers = args.num_workers or max(2, min(12, (os.cpu_count() or 8) // world - 1))
+    # Spawned workers each import torch and hold a copy of the dataset, and there
+    # are this many per chip: 12 of them filled the Kaggle host's 330 GB.
+    workers = max(1, args.num_workers)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -639,6 +645,8 @@ def _mp_fn(index, args):
         if san_active:
             normalize_san_weights(net_d, optim_d)
         optim_d.zero_grad(set_to_none=True)
+        if args.split_step:
+            sync()
 
         # D is only read here; freezing it skips its weight gradients.
         net_d.requires_grad_(False)
