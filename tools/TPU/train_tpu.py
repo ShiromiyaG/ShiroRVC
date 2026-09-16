@@ -79,6 +79,7 @@ def experiment_paths(model_name):
         "config": os.path.join(directory, "config.json"),
         "filelist": os.path.join(directory, "filelist.txt"),
         "model_info": os.path.join(directory, "model_info.json"),
+        "frames_cache": os.path.join(directory, "clip_frames.json"),
     }
 
 
@@ -117,11 +118,40 @@ def latest_checkpoints(directory):
     return step, os.path.join(directory, f"G_{step}.pth"), os.path.join(directory, f"D_{step}.pth")
 
 
-def clip_frames(dataset, indices, hop_length):
-    return {
-        index: sf.info(dataset.audiopaths_and_text[index][0]).frames // hop_length
-        for index in indices
-    }
+def build_frames_cache(paths):
+    """Writes every filelist clip's frame count to ``frames_cache`` once, before the chips spawn."""
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    stat = os.stat(paths["filelist"])
+    with open(paths["config"]) as f:
+        hop = int(json.load(f)["data"]["hop_length"])
+    stamp = [stat.st_size, stat.st_mtime_ns, hop]
+    if os.path.isfile(paths["frames_cache"]):
+        with open(paths["frames_cache"]) as f:
+            cached = json.load(f)
+        if cached.get("stamp") == stamp:
+            return
+    from rvc.train.utils import load_filepaths_and_text
+
+    # Same path resolution as the dataset, so the keys match its audiopaths.
+    audio = sorted({row[0] for row in load_filepaths_and_text(paths["filelist"])})
+    print(f"[TPU] Reading the length of {len(audio)} clips (cached for later runs)...", flush=True)
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        counts = pool.map(lambda path: sf.info(path).frames // hop, audio, chunksize=64)
+        frames = dict(zip(audio, counts))
+    tmp = paths["frames_cache"] + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"stamp": stamp, "frames": frames}, f)
+    os.replace(tmp, paths["frames_cache"])
+
+
+def clip_frames(dataset, indices, cache_path):
+    import json
+
+    with open(cache_path) as f:
+        frames = json.load(f)["frames"]
+    return {index: frames[dataset.audiopaths_and_text[index][0]] for index in indices}
 
 
 def auto_max_frames(frames):
@@ -338,7 +368,7 @@ def _mp_fn(index, args):
     dataset = TextAudioLoaderMultiNSFsid(config.data, n_mel_bins=config.model.inter_channels)
     # The CUDA sampler's bucket bounds, so both trainers see the same clips.
     bucketed = [i for i, length in enumerate(dataset.lengths) if 50 < length <= 900]
-    lengths = clip_frames(dataset, bucketed, hop)
+    lengths = clip_frames(dataset, bucketed, paths["frames_cache"])
     # The random slice needs a whole segment inside the clip; the margin
     # covers features a frame or two shorter than the audio.
     usable = [i for i in bucketed if lengths[i] >= segment_size // hop + 2]
@@ -668,6 +698,7 @@ def main(argv=None):
     for key in ("config", "filelist"):
         if not os.path.isfile(paths[key]):
             sys.exit(f"{paths[key]} is missing: run preprocess + extract first.")
+    build_frames_cache(paths)
 
     if not args.single_process:
         # Kaggle presets a one-process topology (TPU_PROCESS_ADDRESSES=local); torch_xla only
