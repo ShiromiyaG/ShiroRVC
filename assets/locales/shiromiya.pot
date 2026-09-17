@@ -4,7 +4,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ShiroRVC\n"
-"POT-Creation-Date: 2026-09-13 10:24+0000\n"
+"POT-Creation-Date: 2026-09-17 10:47+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -74,8 +74,8 @@ msgstr ""
 msgid "0 picks a fresh seed each run."
 msgstr ""
 
-#: tabs/train/train.py:436
-#: tabs/train/train.py:933
+#: tabs/train/train.py:411
+#: tabs/train/train.py:841
 msgid "0 to ∞ separated by -"
 msgstr ""
 
@@ -83,7 +83,7 @@ msgstr ""
 msgid "1 keeps the output's own dynamics; 0 copies the input's."
 msgstr ""
 
-#: gui/views/training.py:140
+#: gui/views/training.py:147
 msgid "1 · Model"
 msgstr ""
 
@@ -95,7 +95,7 @@ msgstr ""
 msgid "12 = one octave up, -12 = one octave down."
 msgstr ""
 
-#: gui/views/training.py:169
+#: gui/views/training.py:176
 msgid "2 · Preprocess"
 msgstr ""
 
@@ -103,20 +103,16 @@ msgstr ""
 msgid "3 balances size and speed."
 msgstr ""
 
-#: gui/views/training.py:237
+#: gui/views/training.py:244
 msgid "3 · Extract features"
 msgstr ""
 
-#: gui/views/training.py:291
+#: gui/views/training.py:298
 msgid "4 · Train"
 msgstr ""
 
-#: gui/views/training.py:471
+#: gui/views/training.py:437
 msgid "5 · Index"
-msgstr ""
-
-#: gui/views/training.py:360
-msgid "A GAN generator oscillates against its discriminator; the average is usually better than any single step. Costs one extra copy of it in VRAM."
 msgstr ""
 
 #: tabs/utilities/experiment_config/experiment_config.py:302
@@ -132,15 +128,7 @@ msgstr ""
 msgid "Actual size"
 msgstr ""
 
-#: tabs/train/descs.py:32
-msgid "AdamW is the default. Sched-Free AdamW needs no LR scheduler and averages its own weights. Muon orthogonalises the update for matrix-shaped layers. Lion halves the optimizer memory and uses a smaller learning rate automatically."
-msgstr ""
-
-#: gui/views/training.py:332
-msgid "AdamW unless you have a reason. The others change the schedule too."
-msgstr ""
-
-#: tabs/train/train.py:619
+#: tabs/train/train.py:594
 msgid "Add silent examples so the model can reproduce silence."
 msgstr ""
 
@@ -157,26 +145,30 @@ msgstr ""
 msgid "Advanced Settings for inference"
 msgstr ""
 
-#: tabs/train/train.py:459
+#: tabs/train/train.py:434
 msgid "Advanced Settings for the preprocessing step"
 msgstr ""
 
-#: tabs/train/train.py:695
+#: tabs/train/train.py:670
 msgid "Advanced Settings for training"
 msgstr ""
 
 #: gui/views/inference.py:237
-#: gui/views/training.py:190
-#: gui/views/training.py:259
-#: gui/views/training.py:317
+#: gui/views/training.py:197
+#: gui/views/training.py:266
+#: gui/views/training.py:324
 msgid "Advanced settings"
 msgstr ""
 
-#: gui/views/training.py:479
+#: gui/views/training.py:445
 msgid "Algorithm"
 msgstr ""
 
-#: gui/views/training.py:352
+#: gui/views/inference.py:429
+msgid "All files"
+msgstr ""
+
+#: gui/views/training.py:346
 msgid "Also export inference weights each save"
 msgstr ""
 
@@ -200,8 +192,8 @@ msgstr ""
 msgid "Applied on the next start. Takes effect immediately when launched with --language, which overrides this setting."
 msgstr ""
 
-#: tabs/settings/sections/precision.py:51
-msgid "Applies to runs started after this is saved. Needs a CUDA GPU."
+#: tabs/settings/sections/precision.py:62
+msgid "Applies to runs started after this is saved. FP16 and BF16 need a CUDA GPU."
 msgstr ""
 
 #: tabs/tts/tts.py:178
@@ -216,7 +208,7 @@ msgstr ""
 msgid "Apply autotune."
 msgstr ""
 
-#: tabs/train/train.py:547
+#: tabs/train/train.py:522
 msgid "Apply spectral-gating noise reduction."
 msgstr ""
 
@@ -232,7 +224,7 @@ msgstr ""
 msgid "Audio Analyzer"
 msgstr ""
 
-#: tabs/train/train.py:170
+#: tabs/train/train.py:169
 msgid "Audio added. Run preprocessing when ready."
 msgstr ""
 
@@ -244,7 +236,7 @@ msgstr ""
 msgid "Audio cleanup"
 msgstr ""
 
-#: tabs/train/train.py:505
+#: tabs/train/train.py:480
 msgid "Audio cutting"
 msgstr ""
 
@@ -260,11 +252,11 @@ msgstr ""
 msgid "Audio to convert."
 msgstr ""
 
-#: gui/views/training.py:479
+#: gui/views/training.py:445
 msgid "Auto picks by dataset size."
 msgstr ""
 
-#: gui/views/training.py:975
+#: gui/views/training.py:933
 msgid "Autocast needs a CUDA GPU, so the setting would do nothing."
 msgstr ""
 
@@ -285,10 +277,6 @@ msgstr ""
 
 #: tabs/inference/inference.py:525
 msgid "Autotuning"
-msgstr ""
-
-#: gui/views/training.py:359
-msgid "Average the weights (EMA)"
 msgstr ""
 
 #: gui/app.py:127
@@ -315,11 +303,11 @@ msgstr ""
 msgid "Batch"
 msgstr ""
 
-#: tabs/train/train.py:670
+#: tabs/train/train.py:645
 msgid "Batch Size"
 msgstr ""
 
-#: gui/views/training.py:300
+#: gui/views/training.py:307
 msgid "Batch size"
 msgstr ""
 
@@ -361,11 +349,11 @@ msgstr ""
 msgid "Browse presets for formanting"
 msgstr ""
 
-#: gui/views/training.py:926
+#: gui/views/training.py:886
 msgid "Building index…"
 msgstr ""
 
-#: gui/views/training.py:471
+#: gui/views/training.py:437
 msgid "Builds the retrieval index used at inference time."
 msgstr ""
 
@@ -377,20 +365,20 @@ msgstr ""
 msgid "Bundle voice"
 msgstr ""
 
-#: tabs/train/train.py:417
+#: tabs/train/train.py:392
 msgid "CPU / GPU settings for ' f0 ' and ' features ' extraction."
 msgstr ""
 
-#: tabs/train/train.py:427
+#: tabs/train/train.py:402
 msgid "CPU Threads"
 msgstr ""
 
-#: gui/views/training.py:225
-#: gui/views/training.py:267
+#: gui/views/training.py:232
+#: gui/views/training.py:274
 msgid "CPU threads"
 msgstr ""
 
-#: tabs/train/train.py:428
+#: tabs/train/train.py:403
 msgid "CPU threads used during extraction."
 msgstr ""
 
@@ -398,11 +386,11 @@ msgstr ""
 msgid "CUDA is not available to the backend; everything will run on CPU."
 msgstr ""
 
-#: tabs/settings/sections/precision.py:70
+#: tabs/settings/sections/precision.py:84
 msgid "Check precision"
 msgstr ""
 
-#: tabs/train/train.py:1185
+#: tabs/train/train.py:1085
 msgid "Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped."
 msgstr ""
 
@@ -414,11 +402,11 @@ msgstr ""
 msgid "Checkpoint read."
 msgstr ""
 
-#: tabs/train/train.py:875
+#: tabs/train/train.py:798
 msgid "Checkpointing"
 msgstr ""
 
-#: tabs/train/train.py:815
+#: tabs/train/train.py:746
 msgid "Checkpoints and quality"
 msgstr ""
 
@@ -426,7 +414,7 @@ msgstr ""
 msgid "Choose a vocoder; its available sample rates are selected automatically."
 msgstr ""
 
-#: tabs/train/descs.py:40
+#: tabs/train/descs.py:36
 msgid "Choose the compile strategy. More aggressive modes may take longer to build and use more workspace."
 msgstr ""
 
@@ -434,19 +422,19 @@ msgstr ""
 msgid "Choose the loudness normalization method."
 msgstr ""
 
-#: tabs/train/train.py:922
+#: tabs/train/train.py:830
 msgid "Choose which GPUs to train on, and enable multi-GPU training."
 msgstr ""
 
-#: gui/views/training.py:185
+#: gui/views/training.py:192
 msgid "Chunk length (s)"
 msgstr ""
 
-#: tabs/train/train.py:518
+#: tabs/train/train.py:493
 msgid "Chunk length (sec)"
 msgstr ""
 
-#: tabs/train/train.py:519
+#: tabs/train/train.py:494
 msgid "Chunk length for Simple cutting."
 msgstr ""
 
@@ -481,28 +469,28 @@ msgstr ""
 msgid "Clear Outputs"
 msgstr ""
 
-#: tabs/train/train.py:718
+#: tabs/train/train.py:693
 msgid "Clear previous weights and logs before training."
 msgstr ""
 
-#: gui/views/training.py:344
+#: gui/views/training.py:338
 msgid "Click the field to pick one already in the custom pretraineds folder."
 msgstr ""
 
-#: gui/views/training.py:256
-#: gui/views/training.py:307
+#: gui/views/training.py:263
+#: gui/views/training.py:314
 msgid "Comma-separated for multi-GPU."
 msgstr ""
 
-#: gui/views/training.py:431
+#: gui/views/training.py:398
 msgid "Compile mode"
 msgstr ""
 
-#: tabs/train/descs.py:36
+#: tabs/train/descs.py:32
 msgid "Compile the fixed-shape training decoder for higher throughput. The first batch takes longer while the graph is built."
 msgstr ""
 
-#: tabs/train/descs.py:34
+#: tabs/train/descs.py:30
 msgid "Compile vocoder decoder"
 msgstr ""
 
@@ -533,7 +521,7 @@ msgstr ""
 msgid "Convert audio to a trained voice"
 msgstr ""
 
-#: gui/views/inference.py:515
+#: gui/views/inference.py:526
 msgid "Convert folder"
 msgstr ""
 
@@ -541,11 +529,11 @@ msgstr ""
 msgid "Converted speech"
 msgstr ""
 
-#: gui/views/inference.py:564
+#: gui/views/inference.py:575
 msgid "Converting folder…"
 msgstr ""
 
-#: gui/views/inference.py:474
+#: gui/views/inference.py:485
 msgid "Converting…"
 msgstr ""
 
@@ -569,11 +557,11 @@ msgstr ""
 msgid "Could not read {name}."
 msgstr ""
 
-#: gui/views/inference.py:435
+#: gui/views/inference.py:446
 msgid "Could not save the copy: {error}"
 msgstr ""
 
-#: gui/widgets/console.py:192
+#: gui/widgets/console.py:195
 msgid "Could not save the log: {error}"
 msgstr ""
 
@@ -581,39 +569,31 @@ msgstr ""
 msgid "Create model bundle"
 msgstr ""
 
-#: gui/views/training.py:156
+#: gui/views/training.py:163
 msgid "Creates logs/<name>/. Reuse a name to continue a run."
 msgstr ""
 
-#: tabs/train/train.py:709
+#: tabs/train/train.py:684
 msgid "Custom Pretrained"
 msgstr ""
 
-#: tabs/train/train.py:740
+#: tabs/train/train.py:715
 msgid "Custom Pretrained D"
 msgstr ""
 
-#: tabs/train/train.py:732
+#: tabs/train/train.py:707
 msgid "Custom Pretrained G"
-msgstr ""
-
-#: tabs/train/train.py:792
-msgid "Custom lr for gen and disc"
-msgstr ""
-
-#: tabs/train/train.py:799
-msgid "Custom lr settings"
 msgstr ""
 
 #: gui/views/inference.py:182
 msgid "Cut into segments before converting. Helps on long files."
 msgstr ""
 
-#: tabs/train/descs.py:28
+#: tabs/train/descs.py:26
 msgid "Cyclic KL-loss annealing. Experimental."
 msgstr ""
 
-#: tabs/train/train.py:537
+#: tabs/train/train.py:512
 msgid "DC / high-pass filtering"
 msgstr ""
 
@@ -621,25 +601,20 @@ msgstr ""
 msgid "Dark theme"
 msgstr ""
 
-#: tabs/train/train.py:464
+#: tabs/train/train.py:439
 msgid "Dataset Format"
 msgstr ""
 
-#: tabs/train/train.py:450
+#: tabs/train/train.py:425
 msgid "Dataset Path"
 msgstr ""
 
-#: gui/views/training.py:172
+#: gui/views/training.py:179
 msgid "Dataset folder"
 msgstr ""
 
-#: gui/views/training.py:224
+#: gui/views/training.py:231
 msgid "Dataset format"
-msgstr ""
-
-#: tabs/train/train.py:802
-#: tabs/train/train.py:809
-msgid "Default is 1e-4 / 0.0001"
 msgstr ""
 
 #: tabs/inference/inference.py:859
@@ -655,12 +630,12 @@ msgstr ""
 msgid "Details appear here."
 msgstr ""
 
-#: gui/views/training.py:365
+#: gui/views/training.py:353
 msgid "Detect overtraining"
 msgstr ""
 
-#: tabs/train/train.py:443
-#: tabs/train/train.py:943
+#: tabs/train/train.py:418
+#: tabs/train/train.py:851
 msgid "Detected GPU information."
 msgstr ""
 
@@ -669,23 +644,15 @@ msgstr ""
 msgid "Diagnostics"
 msgstr ""
 
-#: gui/views/training.py:353
+#: gui/views/training.py:347
 msgid "Discard previous training state"
 msgstr ""
 
-#: gui/views/training.py:346
+#: gui/views/training.py:340
 msgid "Discriminator (D)"
 msgstr ""
 
-#: gui/views/training.py:401
-msgid "Discriminator LR"
-msgstr ""
-
-#: tabs/train/train.py:810
-msgid "Discriminator learning rate. Both rates are required."
-msgstr ""
-
-#: tabs/train/train.py:741
+#: tabs/train/train.py:716
 msgid "Discriminator pretrained file."
 msgstr ""
 
@@ -744,7 +711,7 @@ msgstr ""
 msgid "Drop an audio file here or browse…"
 msgstr ""
 
-#: tabs/train/train.py:785
+#: tabs/train/train.py:740
 msgid "Duration of the warmup phase"
 msgstr ""
 
@@ -754,13 +721,13 @@ msgid "Edited F0 curve"
 msgstr ""
 
 #: gui/views/inference.py:233
-#: gui/views/training.py:250
+#: gui/views/training.py:257
 msgid "Embedder"
 msgstr ""
 
 #: tabs/inference/inference.py:749
 #: tabs/inference/inference.py:1004
-#: tabs/train/train.py:606
+#: tabs/train/train.py:581
 #: tabs/tts/tts.py:299
 msgid "Embedder Model"
 msgstr ""
@@ -777,15 +744,11 @@ msgstr ""
 msgid "Enable RMVPE high-register correction"
 msgstr ""
 
-#: tabs/train/train.py:883
-msgid "Enable cuDNN benchmark mode."
-msgstr ""
-
-#: tabs/train/descs.py:55
+#: tabs/train/descs.py:51
 msgid "End the run once held-out quality stops improving. The pre-overtrain model is exported either way; this only decides whether training keeps going."
 msgstr ""
 
-#: tabs/train/train.py:153
+#: tabs/train/train.py:152
 msgid "Enter a valid dataset name."
 msgstr ""
 
@@ -833,15 +796,15 @@ msgstr ""
 msgid "Epoch"
 msgstr ""
 
-#: tabs/train/train.py:238
+#: tabs/train/train.py:237
 msgid "Error uploading to Google Drive"
 msgstr ""
 
-#: gui/views/training.py:172
+#: gui/views/training.py:179
 msgid "Every audio file below this folder is used."
 msgstr ""
 
-#: gui/views/inference.py:494
+#: gui/views/inference.py:505
 msgid "Every audio file in the input folder is converted."
 msgstr ""
 
@@ -861,10 +824,6 @@ msgstr ""
 msgid "Experiment Config"
 msgstr ""
 
-#: tabs/train/descs.py:26
-msgid "Exponential decay is the default. Cosine annealing and none are alternatives."
-msgstr ""
-
 #: tabs/tts/tts.py:317
 msgid "Export Audio"
 msgstr ""
@@ -875,7 +834,7 @@ msgstr ""
 msgid "Export Format"
 msgstr ""
 
-#: tabs/train/train.py:1130
+#: tabs/train/train.py:1030
 msgid "Export Model"
 msgstr ""
 
@@ -883,19 +842,15 @@ msgstr ""
 msgid "Export Preset"
 msgstr ""
 
-#: tabs/train/descs.py:62
-msgid "Export a moving average of the generator instead of one step of it. A GAN generator oscillates against its discriminator, so the average is usually better than any single step, and it makes the overtrain curve much cleaner. Costs one extra copy of the generator in VRAM."
-msgstr ""
-
 #: gui/views/inference.py:243
 msgid "Export format"
 msgstr ""
 
-#: tabs/train/train.py:1153
+#: tabs/train/train.py:1053
 msgid "Exported Index File"
 msgstr ""
 
-#: tabs/train/train.py:1138
+#: tabs/train/train.py:1038
 msgid "Exported Pth file"
 msgstr ""
 
@@ -903,7 +858,7 @@ msgstr ""
 msgid "Extract F0 Curve"
 msgstr ""
 
-#: tabs/train/train.py:646
+#: tabs/train/train.py:621
 msgid "Extract Features"
 msgstr ""
 
@@ -911,15 +866,15 @@ msgstr ""
 msgid "Extract Small Model"
 msgstr ""
 
-#: gui/views/training.py:778
+#: gui/views/training.py:745
 msgid "Extracting features…"
 msgstr ""
 
-#: tabs/train/train.py:594
+#: tabs/train/train.py:569
 msgid "Extraction"
 msgstr ""
 
-#: tabs/train/train.py:641
+#: tabs/train/train.py:616
 msgid "Extraction status."
 msgstr ""
 
@@ -940,20 +895,16 @@ msgstr ""
 msgid "F0-guided model"
 msgstr ""
 
-#: gui/views/training.py:418
-msgid "FP16 autocast"
+#: gui/views/training.py:388
+msgid "FP16 uses a GradScaler; BF16 needs none and keeps precision-sensitive paths in FP32."
 msgstr ""
 
-#: tabs/settings/sections/precision.py:50
-msgid "FP16 training (autocast + GradScaler)"
+#: gui/views/training.py:940
+msgid "FP16: less VRAM and faster steps, with a GradScaler. BF16 has no native kernels on this GPU."
 msgstr ""
 
-#: tabs/settings/sections/precision.py:41
-msgid "FP16 training disabled. Runs start from now on in FP32 with TF32 tensor cores."
-msgstr ""
-
-#: tabs/settings/sections/precision.py:39
-msgid "FP16 training enabled. Runs started from now on use autocast with a GradScaler."
+#: gui/views/training.py:945
+msgid "FP16: less VRAM and faster steps, with a GradScaler. BF16: no scaler; precision-sensitive paths stay in FP32."
 msgstr ""
 
 #: tabs/inference/inference.py:709
@@ -970,15 +921,6 @@ msgstr ""
 msgid "Faiss index. Picked automatically when there is only one next to the model."
 msgstr ""
 
-#: gui/views/training.py:411
-#: gui/views/training.py:1025
-msgid "Faster on Ampere and newer, marginally less precise."
-msgstr ""
-
-#: gui/views/training.py:422
-msgid "Faster once shapes settle."
-msgstr ""
-
 #: gui/views/inference.py:272
 msgid "Favours matches that continue the previous frame's, instead of jumping between unrelated parts of the dataset. Needs an index built by this fork."
 msgstr ""
@@ -989,11 +931,11 @@ msgstr ""
 msgid "Favours matches that continue the previous frame's, so the retrieval stops jumping between unrelated parts of the dataset. Needs an index built by this fork."
 msgstr ""
 
-#: tabs/train/train.py:624
+#: tabs/train/train.py:599
 msgid "Feature Precision"
 msgstr ""
 
-#: gui/views/training.py:276
+#: gui/views/training.py:283
 msgid "Feature precision"
 msgstr ""
 
@@ -1001,7 +943,7 @@ msgstr ""
 msgid "File to Speech"
 msgstr ""
 
-#: tabs/train/train.py:235
+#: tabs/train/train.py:234
 msgid "File uploaded successfully."
 msgstr ""
 
@@ -1039,7 +981,7 @@ msgstr ""
 msgid "Folder containing input audio."
 msgstr ""
 
-#: tabs/train/train.py:451
+#: tabs/train/train.py:426
 msgid "Folder containing the training audio."
 msgstr ""
 
@@ -1047,15 +989,15 @@ msgstr ""
 msgid "Folder for converted audio."
 msgstr ""
 
-#: gui/views/inference.py:495
+#: gui/views/inference.py:506
 msgid "Folder with audio to convert"
 msgstr ""
 
-#: gui/views/training.py:171
+#: gui/views/training.py:178
 msgid "Folder with your training audio"
 msgstr ""
 
-#: gui/views/inference.py:494
+#: gui/views/inference.py:505
 msgid "Folders"
 msgstr ""
 
@@ -1106,7 +1048,7 @@ msgstr ""
 msgid "Frames averaged per match. Fewer keeps what is idiosyncratic about the training voice; more averages toward its mean."
 msgstr ""
 
-#: tabs/train/train.py:717
+#: tabs/train/train.py:692
 msgid "Fresh Training"
 msgstr ""
 
@@ -1114,45 +1056,46 @@ msgstr ""
 msgid "Fusion"
 msgstr ""
 
-#: gui/views/training.py:256
-#: gui/views/training.py:307
+#: gui/views/training.py:263
+#: gui/views/training.py:314
 msgid "GPU"
 msgstr ""
 
-#: tabs/train/train.py:434
+#: tabs/train/train.py:409
 msgid "GPU ID"
 msgstr ""
 
-#: tabs/train/train.py:929
+#: tabs/train/train.py:837
 msgid "GPU ID override / Multi-gpu-training configuration"
 msgstr ""
 
-#: tabs/train/train.py:435
+#: tabs/train/train.py:410
 msgid "GPU IDs for extraction, separated by '-'."
 msgstr ""
 
-#: tabs/train/train.py:932
+#: tabs/train/train.py:840
 msgid "GPU IDs for training, separated by '-'."
 msgstr ""
 
-#: tabs/train/train.py:442
-#: tabs/train/train.py:942
+#: tabs/train/train.py:417
+#: tabs/train/train.py:850
 msgid "GPU Information"
 msgstr ""
 
-#: tabs/train/train.py:931
+#: tabs/train/train.py:839
 msgid "GPU Number"
 msgstr ""
 
-#: tabs/train/train.py:918
+#: tabs/train/train.py:826
 msgid "GPU Settings"
 msgstr ""
 
-#: gui/widgets/status.py:67
+#: gui/widgets/status.py:169
+#: gui/widgets/status.py:214
 msgid "GPU not detected"
 msgstr ""
 
-#: gui/widgets/status.py:91
+#: gui/widgets/status.py:226
 msgid "GPU query failed"
 msgstr ""
 
@@ -1164,11 +1107,11 @@ msgstr ""
 msgid "G_*.pth / D_*.pth from the old architecture are moved into a subfolder instead of being deleted."
 msgstr ""
 
-#: tabs/train/train.py:1122
+#: tabs/train/train.py:1022
 msgid "Generate Index"
 msgstr ""
 
-#: gui/views/training.py:504
+#: gui/views/training.py:470
 msgid "Generate index"
 msgstr ""
 
@@ -1180,27 +1123,19 @@ msgstr ""
 msgid "Generated"
 msgstr ""
 
-#: gui/views/training.py:343
+#: gui/views/training.py:337
 msgid "Generator (G)"
 msgstr ""
 
-#: gui/views/training.py:400
-msgid "Generator LR"
-msgstr ""
-
-#: tabs/train/train.py:803
-msgid "Generator learning rate. Both rates are required."
-msgstr ""
-
-#: tabs/train/train.py:733
+#: tabs/train/train.py:708
 msgid "Generator pretrained file."
 msgstr ""
 
-#: gui/views/training.py:406
+#: gui/views/training.py:379
 msgid "Gradient checkpointing"
 msgstr ""
 
-#: tabs/train/train.py:914
+#: tabs/train/train.py:822
 msgid "Hardware"
 msgstr ""
 
@@ -1214,7 +1149,7 @@ msgstr ""
 
 #: tabs/inference/inference.py:551
 #: tabs/inference/inference.py:833
-#: tabs/train/train.py:557
+#: tabs/train/train.py:532
 msgid "Higher values apply stronger cleanup."
 msgstr ""
 
@@ -1227,11 +1162,11 @@ msgstr ""
 msgid "Highest pitch written in true_pitch mode. Models trained on stock RMVPE labels cannot synthesize above ~1250 Hz; raise it only for models trained with the correction enabled."
 msgstr ""
 
-#: tabs/train/descs.py:46
+#: tabs/train/descs.py:42
 msgid "Hold a few whole source recordings out of training and score them as it goes. Training loss keeps falling while a model overtrains, so this is the only signal that can see it. Exports the last good weights. Turns itself off on datasets too small to spare any."
 msgstr ""
 
-#: gui/views/training.py:366
+#: gui/views/training.py:354
 msgid "Holds whole source recordings out of training and scores them as it goes. Training loss cannot see overtraining. Exports the last good weights."
 msgstr ""
 
@@ -1239,7 +1174,7 @@ msgstr ""
 msgid "How much of the index to blend in. Higher is closer to the training voice."
 msgstr ""
 
-#: tabs/train/train.py:969
+#: tabs/train/train.py:877
 msgid "How neighbours are ranked. L2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally well."
 msgstr ""
 
@@ -1253,7 +1188,7 @@ msgstr ""
 msgid "How strongly closer neighbours outweigh further ones. 0 averages them equally; high values use the nearest alone."
 msgstr ""
 
-#: tabs/train/train.py:626
+#: tabs/train/train.py:601
 msgid "How the extracted embeddings are stored. These are both the training input and what the retrieval index is built from, and fp16 puts a quantisation floor under every index vector while inference queries with fp32 ones. fp32 doubles the feature cache on disk (a 2 h dataset goes from roughly 550 MB to 1.1 GB); fp16 halves it. Either can be read back without re-extracting."
 msgstr ""
 
@@ -1266,11 +1201,11 @@ msgid "Increase or decrease TTS speed."
 msgstr ""
 
 #: gui/views/inference.py:79
-#: tabs/train/train.py:951
+#: tabs/train/train.py:859
 msgid "Index"
 msgstr ""
 
-#: tabs/train/train.py:958
+#: tabs/train/train.py:866
 msgid "Index Algorithm"
 msgstr ""
 
@@ -1281,7 +1216,7 @@ msgid "Index Continuity"
 msgstr ""
 
 #: tabs/inference/inference.py:372
-#: tabs/train/train.py:1159
+#: tabs/train/train.py:1059
 #: tabs/tts/tts.py:69
 msgid "Index File"
 msgstr ""
@@ -1298,11 +1233,11 @@ msgstr ""
 msgid "Index Sharpness"
 msgstr ""
 
-#: tabs/train/train.py:967
+#: tabs/train/train.py:875
 msgid "Index Similarity"
 msgstr ""
 
-#: tabs/train/train.py:1160
+#: tabs/train/train.py:1060
 msgid "Index file to export."
 msgstr ""
 
@@ -1312,12 +1247,12 @@ msgstr ""
 msgid "Index influence. Lower values can reduce artifacts."
 msgstr ""
 
-#: tabs/train/train.py:959
+#: tabs/train/train.py:867
 msgid "Index method for large datasets."
 msgstr ""
 
-#: gui/views/training.py:488
-#: tabs/train/train.py:981
+#: gui/views/training.py:454
+#: tabs/train/train.py:889
 msgid "Index one speaker only"
 msgstr ""
 
@@ -1347,7 +1282,7 @@ msgstr ""
 msgid "Input file"
 msgstr ""
 
-#: gui/views/inference.py:499
+#: gui/views/inference.py:510
 msgid "Input folder"
 msgstr ""
 
@@ -1393,15 +1328,15 @@ msgstr ""
 msgid "Introduce the model pth path"
 msgstr ""
 
-#: tabs/train/train.py:158
+#: tabs/train/train.py:157
 msgid "Invalid audio file."
 msgstr ""
 
-#: tabs/train/train.py:141
+#: tabs/train/train.py:140
 msgid "Invalid pretrained file."
 msgstr ""
 
-#: tabs/train/train.py:1239
+#: tabs/train/train.py:1136
 msgid "Invalid training preset name: {name}"
 msgstr ""
 
@@ -1409,24 +1344,16 @@ msgstr ""
 msgid "Keep a backup of the current config"
 msgstr ""
 
-#: gui/views/training.py:351
+#: gui/views/training.py:345
 msgid "Keep only the latest G/D"
 msgstr ""
 
-#: tabs/train/train.py:820
+#: tabs/train/train.py:751
 msgid "Keep only the latest generator and discriminator checkpoints."
 msgstr ""
 
 #: tabs/utilities/experiment_config/experiment_config.py:238
 msgid "Kept the previous config at `{}`."
-msgstr ""
-
-#: gui/views/training.py:393
-msgid "LR scheduler"
-msgstr ""
-
-#: tabs/train/train.py:762
-msgid "LR scheduler (G/D)"
 msgstr ""
 
 #: gui/app.py:602
@@ -1449,21 +1376,8 @@ msgstr ""
 msgid "Latest"
 msgstr ""
 
-#: tabs/train/train.py:808
-msgid "Learning rate for Discriminator"
-msgstr ""
-
-#: tabs/train/train.py:801
-msgid "Learning rate for Generator"
-msgstr ""
-
-#: tabs/train/descs.py:30
+#: tabs/train/descs.py:28
 msgid "Length of each KL annealing cycle, in epochs."
-msgstr ""
-
-#: gui/views/training.py:419
-#: gui/views/training.py:982
-msgid "Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."
 msgstr ""
 
 #: gui/app.py:122
@@ -1479,12 +1393,12 @@ msgstr ""
 msgid "Live metrics"
 msgstr ""
 
-#: tabs/train/train.py:381
+#: tabs/train/train.py:355
 msgid "Load from preset"
 msgstr ""
 
 #: gui/widgets/metrics.py:206
-#: gui/widgets/status.py:161
+#: gui/widgets/status.py:298
 msgid "Log"
 msgstr ""
 
@@ -1492,7 +1406,7 @@ msgstr ""
 msgid "Log scale. Worth turning on for losses: the first 2% of a run covers most of the range, and flattens everything after it."
 msgstr ""
 
-#: tabs/train/train.py:482
+#: tabs/train/train.py:457
 msgid "Loudness Normalization"
 msgstr ""
 
@@ -1534,7 +1448,7 @@ msgstr ""
 msgid "Model Link"
 msgstr ""
 
-#: tabs/train/train.py:387
+#: tabs/train/train.py:361
 #: tabs/voice_blender/voice_blender.py:24
 msgid "Model Name"
 msgstr ""
@@ -1543,7 +1457,7 @@ msgstr ""
 msgid "Model Processing"
 msgstr ""
 
-#: tabs/train/train.py:383
+#: tabs/train/train.py:357
 msgid "Model Settings"
 msgstr ""
 
@@ -1564,7 +1478,7 @@ msgstr ""
 msgid "Model information."
 msgstr ""
 
-#: gui/views/training.py:156
+#: gui/views/training.py:163
 msgid "Model name"
 msgstr ""
 
@@ -1574,7 +1488,7 @@ msgstr ""
 
 #: tabs/inference/inference.py:750
 #: tabs/inference/inference.py:1005
-#: tabs/train/train.py:607
+#: tabs/train/train.py:582
 msgid "Model used for speaker features."
 msgstr ""
 
@@ -1590,20 +1504,20 @@ msgstr ""
 msgid "Moved {} checkpoint(s) into `{}/`."
 msgstr ""
 
-#: gui/views/training.py:249
+#: gui/views/training.py:256
 msgid "Must match what you will use at inference time."
 msgstr ""
 
-#: gui/views/training.py:268
+#: gui/views/training.py:275
 msgid "Mute samples"
 msgstr ""
 
-#: tabs/train/train.py:388
+#: tabs/train/train.py:362
 #: tabs/voice_blender/voice_blender.py:25
 msgid "Name of the new model."
 msgstr ""
 
-#: gui/views/training.py:140
+#: gui/views/training.py:147
 msgid "Names the run and decides the architecture."
 msgstr ""
 
@@ -1631,50 +1545,42 @@ msgstr ""
 msgid "No training logs found under logs/. They appear once a run starts writing TensorBoard events."
 msgstr ""
 
-#: tabs/train/train.py:546
+#: tabs/train/train.py:521
 msgid "Noise Reduction"
 msgstr ""
 
-#: tabs/train/train.py:556
+#: tabs/train/train.py:531
 msgid "Noise Reduction Strength"
 msgstr ""
 
 #: gui/views/inference.py:186
-#: gui/views/training.py:213
+#: gui/views/training.py:220
 msgid "Noise reduction"
 msgstr ""
 
-#: gui/views/training.py:216
+#: gui/views/training.py:223
 msgid "Noise reduction strength"
 msgstr ""
 
-#: gui/views/training.py:206
+#: gui/views/training.py:213
 msgid "Normalisation"
 msgstr ""
 
-#: gui/views/training.py:311
+#: gui/views/training.py:318
 msgid "Off means training from scratch, which needs far more data."
 msgstr ""
 
-#: gui/views/training.py:489
-#: tabs/train/descs.py:69
+#: gui/views/training.py:455
+#: tabs/train/descs.py:56
 msgid "On a multispeaker model, keeps one voice's articulation out of another's. Saved as <model>_spk<id>.index, beside the full one."
 msgstr ""
 
-#: gui/views/training.py:213
+#: gui/views/training.py:220
 msgid "Only worth it on genuinely noisy source material."
 msgstr ""
 
-#: tabs/train/train.py:748
+#: tabs/train/train.py:723
 msgid "Optimisation"
-msgstr ""
-
-#: gui/views/training.py:331
-msgid "Optimizer"
-msgstr ""
-
-#: tabs/train/train.py:752
-msgid "Optimizer (G/D)"
 msgstr ""
 
 #: gui/views/inference.py:208
@@ -1719,10 +1625,10 @@ msgstr ""
 #: tabs/inference/inference.py:1021
 #: tabs/settings/sections/language.py:68
 #: tabs/settings/sections/model_author.py:43
-#: tabs/settings/sections/precision.py:57
-#: tabs/train/train.py:564
-#: tabs/train/train.py:640
-#: tabs/train/train.py:1005
+#: tabs/settings/sections/precision.py:71
+#: tabs/train/train.py:539
+#: tabs/train/train.py:615
+#: tabs/train/train.py:913
 #: tabs/tts/tts.py:314
 #: tabs/utilities/analyzer/analyzer.py:16
 #: tabs/utilities/model_information.py:15
@@ -1749,7 +1655,7 @@ msgstr ""
 msgid "Output audio format."
 msgstr ""
 
-#: gui/views/inference.py:500
+#: gui/views/inference.py:511
 msgid "Output folder"
 msgstr ""
 
@@ -1769,27 +1675,23 @@ msgstr ""
 msgid "Output path"
 msgstr ""
 
-#: gui/views/training.py:186
+#: gui/views/training.py:193
 msgid "Overlap (s)"
 msgstr ""
 
-#: tabs/train/train.py:530
+#: tabs/train/train.py:505
 msgid "Overlap between Simple chunks, in seconds."
 msgstr ""
 
-#: tabs/train/train.py:529
+#: tabs/train/train.py:504
 msgid "Overlap length"
 msgstr ""
 
-#: gui/views/training.py:395
-msgid "Override the learning rates"
-msgstr ""
-
-#: tabs/train/descs.py:44
+#: tabs/train/descs.py:40
 msgid "Overtrain detector"
 msgstr ""
 
-#: tabs/train/train.py:1145
+#: tabs/train/train.py:1045
 msgid "PTH file to export."
 msgstr ""
 
@@ -1808,7 +1710,7 @@ msgstr ""
 msgid "Percent faster or slower than default."
 msgstr ""
 
-#: tabs/train/train.py:871
+#: tabs/train/train.py:794
 msgid "Performance"
 msgstr ""
 
@@ -1816,7 +1718,7 @@ msgstr ""
 msgid "Pick a preset above, or tick metrics below."
 msgstr ""
 
-#: tabs/train/train.py:1098
+#: tabs/train/train.py:998
 msgid "Pick a speaker, or turn off 'Index one speaker only'."
 msgstr ""
 
@@ -1839,7 +1741,7 @@ msgid "Pitch / f0 estimation algorithm used in extraction."
 msgstr ""
 
 #: gui/views/inference.py:231
-#: gui/views/training.py:249
+#: gui/views/training.py:256
 msgid "Pitch algorithm"
 msgstr ""
 
@@ -1849,13 +1751,13 @@ msgstr ""
 msgid "Pitch algorithm. RMVPE is the recommended default."
 msgstr ""
 
-#: gui/views/training.py:237
+#: gui/views/training.py:244
 msgid "Pitch curves and content embeddings."
 msgstr ""
 
 #: tabs/inference/inference.py:737
 #: tabs/inference/inference.py:992
-#: tabs/train/train.py:597
+#: tabs/train/train.py:572
 #: tabs/tts/tts.py:287
 #: tabs/utilities/f0_extractor/f0_extractor.py:45
 msgid "Pitch extraction algorithm"
@@ -1869,7 +1771,11 @@ msgstr ""
 msgid "Pitch shift in semitones. 12 = one octave up."
 msgstr ""
 
-#: gui/views/training.py:54
+#: gui/views/training.py:387
+msgid "Precision"
+msgstr ""
+
+#: gui/views/training.py:61
 msgid "Prepare a dataset and train a voice, one step at a time."
 msgstr ""
 
@@ -1877,19 +1783,19 @@ msgstr ""
 msgid "Prepare data and train a model"
 msgstr ""
 
-#: tabs/train/train.py:572
+#: tabs/train/train.py:547
 msgid "Preprocess Dataset"
 msgstr ""
 
-#: tabs/train/train.py:448
+#: tabs/train/train.py:423
 msgid "Preprocessing"
 msgstr ""
 
-#: gui/views/training.py:758
+#: gui/views/training.py:724
 msgid "Preprocessing dataset…"
 msgstr ""
 
-#: tabs/train/train.py:565
+#: tabs/train/train.py:540
 msgid "Preprocessing status."
 msgstr ""
 
@@ -1897,12 +1803,12 @@ msgstr ""
 msgid "Prerequisites"
 msgstr ""
 
-#: tabs/train/train.py:1193
+#: tabs/train/train.py:1093
 msgid "Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing."
 msgstr ""
 
 #: tabs/inference/inference.py:619
-#: tabs/train/train.py:375
+#: tabs/train/train.py:349
 msgid "Preset Name"
 msgstr ""
 
@@ -1910,7 +1816,7 @@ msgstr ""
 msgid "Preset Settings"
 msgstr ""
 
-#: tabs/train/train.py:1251
+#: tabs/train/train.py:1148
 msgid "Preset does not exist: {name}"
 msgstr ""
 
@@ -1920,11 +1826,11 @@ msgid "Presets from assets/formant_shift."
 msgstr ""
 
 #: tabs/download/download.py:220
-#: tabs/train/train.py:701
+#: tabs/train/train.py:676
 msgid "Pretrained"
 msgstr ""
 
-#: tabs/train/train.py:724
+#: tabs/train/train.py:699
 msgid "Pretrained Custom Settings"
 msgstr ""
 
@@ -1956,7 +1862,7 @@ msgstr ""
 msgid "Protect voiceless consonants. Higher values reduce index influence."
 msgstr ""
 
-#: tabs/train/train.py:1144
+#: tabs/train/train.py:1044
 msgid "Pth file"
 msgstr ""
 
@@ -1976,7 +1882,7 @@ msgstr ""
 msgid "RMVPE is the recommended default. CREPE is an alternative for clean audio."
 msgstr ""
 
-#: gui/views/training.py:300
+#: gui/views/training.py:307
 msgid "Raise until VRAM is nearly full, then stop."
 msgstr ""
 
@@ -1988,11 +1894,11 @@ msgstr ""
 msgid "Raw"
 msgstr ""
 
-#: gui/views/training.py:496
+#: gui/views/training.py:462
 msgid "Read from the extracted features."
 msgstr ""
 
-#: tabs/train/train.py:996
+#: tabs/train/train.py:904
 msgid "Read from the extracted features. Refresh after extracting."
 msgstr ""
 
@@ -2018,7 +1924,7 @@ msgstr ""
 msgid "Rebuild config"
 msgstr ""
 
-#: tabs/train/train.py:876
+#: tabs/train/train.py:799
 msgid "Reduce VRAM use at the cost of speed."
 msgstr ""
 
@@ -2031,19 +1937,19 @@ msgstr ""
 msgid "RefineGAN decoder driven by a multi-harmonic excitation source, trained against multi-resolution spectrogram, UnivHD and SAN discriminators. Needs its own pretrain. 32 kHz only."
 msgstr ""
 
-#: tabs/train/train.py:457
-#: tabs/train/train.py:1168
+#: tabs/train/train.py:432
+#: tabs/train/train.py:1068
 #: tabs/tts/tts.py:78
 #: tabs/utilities/experiment_config/experiment_config.py:314
 msgid "Refresh"
 msgstr ""
 
-#: tabs/train/train.py:730
+#: tabs/train/train.py:705
 msgid "Refresh Custom Pretraineds"
 msgstr ""
 
 #: tabs/inference/inference.py:602
-#: tabs/train/train.py:370
+#: tabs/train/train.py:344
 msgid "Refresh Presets"
 msgstr ""
 
@@ -2051,19 +1957,19 @@ msgstr ""
 msgid "Refresh models, indexes and audios"
 msgstr ""
 
-#: tabs/train/train.py:148
+#: tabs/train/train.py:147
 msgid "Refresh the list to use the uploaded pretrained file."
 msgstr ""
 
-#: tabs/train/train.py:538
+#: tabs/train/train.py:513
 msgid "Remove DC offset and low-frequency noise."
 msgstr ""
 
-#: gui/views/training.py:209
+#: gui/views/training.py:216
 msgid "Resampler"
 msgstr ""
 
-#: tabs/train/train.py:473
+#: tabs/train/train.py:448
 msgid "Resampling & Loading Handler"
 msgstr ""
 
@@ -2077,7 +1983,7 @@ msgstr ""
 msgid "Restart ShiroRVC"
 msgstr ""
 
-#: gui/widgets/status.py:167
+#: gui/widgets/status.py:304
 msgid "Restart backend"
 msgstr ""
 
@@ -2093,7 +1999,7 @@ msgstr ""
 msgid "Restarting the backend."
 msgstr ""
 
-#: gui/views/training.py:353
+#: gui/views/training.py:347
 msgid "Restarts the run instead of resuming it."
 msgstr ""
 
@@ -2105,48 +2011,60 @@ msgstr ""
 msgid "Run"
 msgstr ""
 
-#: gui/views/training.py:285
+#: gui/views/training.py:292
 msgid "Run extraction"
 msgstr ""
 
-#: gui/views/training.py:228
+#: gui/views/training.py:235
 msgid "Run preprocessing"
+msgstr ""
+
+#: tabs/settings/sections/precision.py:41
+msgid "Runs started from now on train in FP32 with TF32 tensor cores."
+msgstr ""
+
+#: tabs/settings/sections/precision.py:43
+msgid "Runs started from now on use BF16 autocast without a GradScaler; precision-sensitive paths stay in FP32."
+msgstr ""
+
+#: tabs/settings/sections/precision.py:42
+msgid "Runs started from now on use FP16 autocast with a GradScaler."
 msgstr ""
 
 #: tabs/utilities/model_processing/model_processing.py:156
 msgid "Sample Rate of the model (sr)"
 msgstr ""
 
-#: gui/views/training.py:158
+#: gui/views/training.py:165
 msgid "Sample rate"
 msgstr ""
 
 #: tabs/download/download.py:227
-#: tabs/train/train.py:397
+#: tabs/train/train.py:371
 msgid "Sampling Rate"
 msgstr ""
 
-#: tabs/train/train.py:819
+#: tabs/train/train.py:750
 msgid "Save Only Latest G/D"
 msgstr ""
 
-#: tabs/train/train.py:681
+#: tabs/train/train.py:656
 msgid "Save a checkpoint every N epochs."
 msgstr ""
 
-#: gui/views/inference.py:416
-msgid "Save a copy to"
+#: gui/views/inference.py:431
+msgid "Save a copy as"
 msgstr ""
 
 #: gui/widgets/audio.py:268
 msgid "Save a copy…"
 msgstr ""
 
-#: gui/views/training.py:301
+#: gui/views/training.py:308
 msgid "Save every N epochs"
 msgstr ""
 
-#: tabs/train/train.py:827
+#: tabs/train/train.py:758
 msgid "Save the compact voice model files."
 msgstr ""
 
@@ -2154,11 +2072,11 @@ msgstr ""
 msgid "Save to"
 msgstr ""
 
-#: tabs/train/train.py:380
+#: tabs/train/train.py:354
 msgid "Save to preset"
 msgstr ""
 
-#: tabs/train/train.py:826
+#: tabs/train/train.py:757
 msgid "Save weight models"
 msgstr ""
 
@@ -2166,11 +2084,11 @@ msgstr ""
 msgid "Saved beside it as config.json.<old architecture>.bak."
 msgstr ""
 
-#: gui/views/inference.py:439
+#: gui/views/inference.py:450
 msgid "Saved to {path}"
 msgstr ""
 
-#: gui/views/training.py:351
+#: gui/views/training.py:345
 msgid "Saves a lot of disk on long runs."
 msgstr ""
 
@@ -2178,7 +2096,7 @@ msgstr ""
 msgid "Save…"
 msgstr ""
 
-#: tabs/train/train.py:680
+#: tabs/train/train.py:655
 msgid "Saving frequency"
 msgstr ""
 
@@ -2269,10 +2187,6 @@ msgstr ""
 msgid "Set name"
 msgstr ""
 
-#: tabs/train/train.py:793
-msgid "Set separate generator and discriminator learning rates."
-msgstr ""
-
 #: tabs/tts/tts.py:187
 msgid "Set the autotune strength - the more you increase it the more it will snap to the chromatic grid."
 msgstr ""
@@ -2286,7 +2200,7 @@ msgid "Set the pitch of the audio, the higher the value, the higher the pitch."
 msgstr ""
 
 #: gui/views/inference.py:380
-#: gui/views/inference.py:509
+#: gui/views/inference.py:520
 msgid "Settings"
 msgstr ""
 
@@ -2325,19 +2239,19 @@ msgstr ""
 msgid "Silence gate"
 msgstr ""
 
-#: tabs/train/train.py:618
+#: tabs/train/train.py:593
 msgid "Silent ( 'mute' ) files for training."
 msgstr ""
 
-#: gui/views/training.py:268
+#: gui/views/training.py:275
 msgid "Silent references that teach the model to stay quiet."
 msgstr ""
 
-#: gui/views/training.py:481
+#: gui/views/training.py:447
 msgid "Similarity"
 msgstr ""
 
-#: gui/views/training.py:184
+#: gui/views/training.py:191
 msgid "Simple cuts on a fixed grid; Automatic detects silence by level, New Automatic by neural VAD."
 msgstr ""
 
@@ -2353,15 +2267,15 @@ msgstr ""
 msgid "Skip existing slices, use fixed chunks, or detect silence automatically. New Automatic uses a neural VAD instead of an energy threshold."
 msgstr ""
 
-#: gui/views/training.py:169
+#: gui/views/training.py:176
 msgid "Slice and normalise the dataset."
 msgstr ""
 
-#: gui/views/training.py:184
+#: gui/views/training.py:191
 msgid "Slicing"
 msgstr ""
 
-#: gui/views/training.py:424
+#: gui/views/training.py:391
 msgid "Slow first epoch, faster afterwards."
 msgstr ""
 
@@ -2390,7 +2304,7 @@ msgid "Source"
 msgstr ""
 
 #: gui/views/inference.py:77
-#: gui/views/training.py:495
+#: gui/views/training.py:461
 msgid "Speaker"
 msgstr ""
 
@@ -2412,7 +2326,7 @@ msgstr ""
 msgid "Speaker id inside a multi-speaker model."
 msgstr ""
 
-#: tabs/train/train.py:995
+#: tabs/train/train.py:903
 msgid "Speaker to index"
 msgstr ""
 
@@ -2451,19 +2365,19 @@ msgstr ""
 msgid "Split the audio into chunks for inference to obtain better results in some cases."
 msgstr ""
 
-#: gui/views/training.py:212
+#: gui/views/training.py:219
 msgid "Standard cleanup pass on each slice."
 msgstr ""
 
-#: tabs/train/train.py:1013
+#: tabs/train/train.py:921
 msgid "Start Training"
 msgstr ""
 
-#: gui/views/training.py:310
+#: gui/views/training.py:317
 msgid "Start from a pretrained model"
 msgstr ""
 
-#: gui/views/training.py:446
+#: gui/views/training.py:413
 msgid "Start training"
 msgstr ""
 
@@ -2471,15 +2385,15 @@ msgstr ""
 msgid "Starting backend with {executable}"
 msgstr ""
 
-#: gui/widgets/status.py:147
+#: gui/widgets/status.py:284
 msgid "Starting backend…"
 msgstr ""
 
-#: tabs/train/train.py:697
+#: tabs/train/train.py:672
 msgid "Starting point"
 msgstr ""
 
-#: gui/widgets/progress.py:160
+#: gui/widgets/progress.py:169
 msgid "Starting the trainer… (loading models and dataset)"
 msgstr ""
 
@@ -2487,12 +2401,12 @@ msgstr ""
 msgid "Status messages and final file path will be displayed here."
 msgstr ""
 
-#: gui/widgets/progress.py:108
-#: gui/widgets/progress.py:236
+#: gui/widgets/progress.py:117
+#: gui/widgets/progress.py:245
 msgid "Stop"
 msgstr ""
 
-#: tabs/train/train.py:1063
+#: tabs/train/train.py:963
 msgid "Stop Training"
 msgstr ""
 
@@ -2500,21 +2414,21 @@ msgstr ""
 msgid "Stop convert"
 msgstr ""
 
-#: gui/views/training.py:370
+#: gui/views/training.py:358
 msgid "Stop once overtrained"
 msgstr ""
 
-#: gui/views/training.py:451
-#: gui/views/training.py:874
+#: gui/views/training.py:418
+#: gui/views/training.py:834
 msgid "Stop training"
 msgstr ""
 
-#: tabs/train/descs.py:53
+#: tabs/train/descs.py:49
 msgid "Stop when overtrained"
 msgstr ""
 
-#: gui/views/training.py:901
-#: gui/widgets/progress.py:240
+#: gui/views/training.py:861
+#: gui/widgets/progress.py:249
 msgid "Stopping…"
 msgstr ""
 
@@ -2554,10 +2468,6 @@ msgstr ""
 msgid "Synthesising…"
 msgstr ""
 
-#: gui/views/training.py:411
-msgid "TF32 matmuls"
-msgstr ""
-
 #: tabs/tts/tts.py:109
 msgid "TTS Speed"
 msgstr ""
@@ -2570,11 +2480,11 @@ msgstr ""
 msgid "TTS status."
 msgstr ""
 
-#: tabs/train/train.py:493
+#: tabs/train/train.py:468
 msgid "Target Level (LUFS)"
 msgstr ""
 
-#: gui/views/training.py:207
+#: gui/views/training.py:214
 msgid "Target level (LUFS)"
 msgstr ""
 
@@ -2582,7 +2492,7 @@ msgstr ""
 msgid "Target level for the normalization method. LUFS for BS.1770 loudness; dBFS for the legacy RMS mode."
 msgstr ""
 
-#: tabs/train/train.py:398
+#: tabs/train/train.py:372
 msgid "Target sample rate. Match it to the dataset when possible."
 msgstr ""
 
@@ -2631,7 +2541,7 @@ msgstr ""
 msgid "The audio you want converted."
 msgstr ""
 
-#: gui/views/training.py:737
+#: gui/views/training.py:703
 msgid "The dataset folder does not exist."
 msgstr ""
 
@@ -2659,7 +2569,7 @@ msgstr ""
 msgid "The final result."
 msgstr ""
 
-#: gui/views/inference.py:460
+#: gui/views/inference.py:471
 msgid "The input file does not exist."
 msgstr ""
 
@@ -2670,7 +2580,7 @@ msgid ""
 "Restart now?"
 msgstr ""
 
-#: gui/views/training.py:291
+#: gui/views/training.py:298
 msgid "The long part."
 msgstr ""
 
@@ -2683,7 +2593,7 @@ msgid "The output file will be saved as `<name>.pth`."
 msgstr ""
 
 #: tabs/settings/sections/model_author.py:44
-#: tabs/settings/sections/precision.py:58
+#: tabs/settings/sections/precision.py:72
 #: tabs/utilities/analyzer/analyzer.py:17
 #: tabs/utilities/processing/processing.py:23
 msgid "The output information will be displayed here."
@@ -2697,7 +2607,7 @@ msgstr ""
 msgid "The plot appears here."
 msgstr ""
 
-#: gui/views/training.py:371
+#: gui/views/training.py:359
 msgid "The pre-overtrain model is exported either way; this only ends the run."
 msgstr ""
 
@@ -2721,12 +2631,12 @@ msgstr ""
 msgid "There is no converted file to save yet."
 msgstr ""
 
-#: gui/views/training.py:977
+#: gui/views/training.py:935
 msgid "This GPU has no FP16 tensor cores: autocast still halves activation memory, but it may not make the steps any faster."
 msgstr ""
 
-#: gui/views/training.py:1027
-msgid "This GPU has no TF32 units, so the setting would do nothing."
+#: tabs/settings/sections/precision.py:50
+msgid "This GPU has no native BF16 support, so it would be emulated and slow."
 msgstr ""
 
 #: gui/views/monitor.py:302
@@ -2741,34 +2651,34 @@ msgstr ""
 msgid "Timbre for formant shifting"
 msgstr ""
 
-#: tabs/train/descs.py:38
+#: tabs/train/descs.py:34
 msgid "Torch compile mode"
 msgstr ""
 
-#: tabs/train/train.py:690
+#: tabs/train/train.py:665
 msgid "Total Epochs"
 msgstr ""
 
-#: gui/views/training.py:299
+#: gui/views/training.py:306
 msgid "Total epochs"
 msgstr ""
 
-#: tabs/train/train.py:691
+#: tabs/train/train.py:666
 msgid "Total training epochs."
 msgstr ""
 
-#: gui/views/training.py:406
+#: gui/views/training.py:379
 msgid "Trades speed for a much smaller VRAM footprint."
 msgstr ""
 
 #: gui/app.py:55
-#: gui/views/training.py:53
-#: gui/widgets/progress.py:97
-#: tabs/train/train.py:663
+#: gui/views/training.py:60
+#: gui/widgets/progress.py:106
+#: tabs/train/train.py:638
 msgid "Training"
 msgstr ""
 
-#: tabs/train/train.py:368
+#: tabs/train/train.py:342
 msgid "Training Presets"
 msgstr ""
 
@@ -2776,11 +2686,15 @@ msgstr ""
 msgid "Training is running; the new language applies at the next start."
 msgstr ""
 
-#: tabs/train/train.py:1006
+#: tabs/settings/sections/precision.py:61
+msgid "Training precision"
+msgstr ""
+
+#: tabs/train/train.py:914
 msgid "Training status."
 msgstr ""
 
-#: gui/views/training.py:212
+#: gui/views/training.py:219
 msgid "Trim and de-click"
 msgstr ""
 
@@ -2800,7 +2714,7 @@ msgstr ""
 msgid "Unload this audio."
 msgstr ""
 
-#: tabs/train/train.py:1170
+#: tabs/train/train.py:1070
 msgid "Upload"
 msgstr ""
 
@@ -2813,7 +2727,7 @@ msgstr ""
 msgid "Upload PTH file(s)"
 msgstr ""
 
-#: tabs/train/train.py:726
+#: tabs/train/train.py:701
 msgid "Upload Pretrained Model"
 msgstr ""
 
@@ -2825,47 +2739,39 @@ msgstr ""
 msgid "Upload index file(s) (optional)"
 msgstr ""
 
-#: tabs/train/train.py:1133
+#: tabs/train/train.py:1033
 msgid "Upload is available on Google Colab and saves exported files to your Google Drive."
 msgstr ""
 
-#: tabs/train/train.py:225
+#: tabs/train/train.py:224
 msgid "Uploading {path} to Google Drive..."
-msgstr ""
-
-#: tabs/train/train.py:882
-msgid "Use 'cuDNN benchmark' mode"
-msgstr ""
-
-#: tabs/train/train.py:891
-msgid "Use TF32 on supported GPUs for faster training."
 msgstr ""
 
 #: gui/views/inference.py:294
 msgid "Use a pre-computed pitch curve instead of extracting one."
 msgstr ""
 
-#: tabs/train/train.py:710
+#: tabs/train/train.py:685
 msgid "Use custom generator and discriminator pretrained files."
 msgstr ""
 
-#: tabs/train/train.py:773
+#: tabs/train/train.py:728
 msgid "Use linear learning-rate warmup."
 msgstr ""
 
-#: gui/views/training.py:337
+#: gui/views/training.py:331
 msgid "Use my own pretrained files"
 msgstr ""
 
-#: tabs/train/train.py:702
+#: tabs/train/train.py:677
 msgid "Use pretrained weights for fine-tuning."
 msgstr ""
 
-#: tabs/train/train.py:953
+#: tabs/train/train.py:861
 msgid "Used by the Generate Index button below, after training."
 msgstr ""
 
-#: gui/views/training.py:208
+#: gui/views/training.py:215
 msgid "Used by the loudness and RMS modes; ignored by the peak ones."
 msgstr ""
 
@@ -2886,8 +2792,8 @@ msgstr ""
 msgid "View"
 msgstr ""
 
-#: gui/views/training.py:157
-#: tabs/train/train.py:405
+#: gui/views/training.py:164
+#: tabs/train/train.py:379
 #: tabs/utilities/model_processing/model_processing.py:164
 msgid "Vocoder"
 msgstr ""
@@ -2897,7 +2803,7 @@ msgid "Vocoder / Architecture"
 msgstr ""
 
 #: gui/views/inference.py:375
-#: gui/views/inference.py:504
+#: gui/views/inference.py:515
 #: gui/views/tts.py:57
 msgid "Voice"
 msgstr ""
@@ -2928,32 +2834,32 @@ msgstr ""
 msgid "Volume envelope"
 msgstr ""
 
-#: gui/widgets/progress.py:135
+#: gui/views/base.py:164
+msgid "Waiting for the backend…"
+msgstr ""
+
+#: gui/widgets/progress.py:144
 msgid "Waiting for the first batch…"
 msgstr ""
 
-#: gui/views/training.py:385
+#: gui/views/training.py:372
 msgid "Warm up the learning rate"
 msgstr ""
 
-#: tabs/train/train.py:786
+#: tabs/train/train.py:741
 msgid "Warmup duration, in epochs."
 msgstr ""
 
-#: gui/views/training.py:392
+#: gui/views/training.py:375
 msgid "Warmup epochs"
 msgstr ""
 
-#: tabs/train/train.py:772
+#: tabs/train/train.py:727
 msgid "Warmup phase for training"
 msgstr ""
 
-#: tabs/train/train.py:779
+#: tabs/train/train.py:734
 msgid "Warmup settings"
-msgstr ""
-
-#: tabs/train/descs.py:60
-msgid "Weight averaging (EMA)"
 msgstr ""
 
 #: gui/views/tts.py:34
@@ -2964,7 +2870,7 @@ msgstr ""
 msgid "When set, this wins over the box above."
 msgstr ""
 
-#: gui/views/inference.py:496
+#: gui/views/inference.py:507
 msgid "Where to write the results"
 msgstr ""
 
@@ -3018,7 +2924,7 @@ msgstr ""
 msgid "absent"
 msgstr ""
 
-#: gui/views/training.py:318
+#: gui/views/training.py:325
 msgid "checkpoints, schedule, precision, compilation, gradient clipping"
 msgstr ""
 
@@ -3026,15 +2932,11 @@ msgstr ""
 msgid "contentvec, RMVPE, FCPE."
 msgstr ""
 
-#: gui/views/training.py:422
-msgid "cuDNN benchmark"
-msgstr ""
-
 #: gui/views/tools.py:262
 msgid "ffmpeg and ffprobe"
 msgstr ""
 
-#: gui/views/training.py:278
+#: gui/views/training.py:285
 msgid "fp32 doubles the feature cache on disk but keeps the retrieval index free of a quantisation floor; fp16 halves it. Either is readable without re-extracting."
 msgstr ""
 
@@ -3042,7 +2944,7 @@ msgstr ""
 msgid "https://…"
 msgstr ""
 
-#: gui/views/training.py:483
+#: gui/views/training.py:449
 msgid "l2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally."
 msgstr ""
 
@@ -3050,11 +2952,11 @@ msgstr ""
 msgid "librosa: high quality. ffmpeg: alternative resampler."
 msgstr ""
 
-#: gui/views/training.py:432
+#: gui/views/training.py:399
 msgid "max-autotune spends longer compiling for a faster steady state."
 msgstr ""
 
-#: gui/views/training.py:190
+#: gui/views/training.py:197
 msgid "normalisation, cleanup, format, threads"
 msgstr ""
 
@@ -3074,11 +2976,11 @@ msgstr ""
 msgid "step {step}"
 msgstr ""
 
-#: gui/views/training.py:259
+#: gui/views/training.py:266
 msgid "threads, mute samples, precision, cleanup"
 msgstr ""
 
-#: gui/views/training.py:424
+#: gui/views/training.py:391
 msgid "torch.compile the vocoder"
 msgstr ""
 
@@ -3090,11 +2992,7 @@ msgstr ""
 msgid "unrecognised -- this config predates the current registry"
 msgstr ""
 
-#: tabs/train/train.py:890
-msgid "use 'TF32' precision"
-msgstr ""
-
-#: gui/views/inference.py:534
+#: gui/views/inference.py:545
 msgid "{count} audio file found."
 msgid_plural "{count} audio files found."
 msgstr[0] ""
@@ -3111,11 +3009,11 @@ msgstr[1] ""
 msgid "{count} epochs with previews · {size} on disk, under logs/<model>/validation_samples/."
 msgstr ""
 
-#: gui/widgets/progress.py:295
+#: gui/widgets/progress.py:304
 msgid "{duration} elapsed"
 msgstr ""
 
-#: gui/views/base.py:157
+#: gui/views/base.py:197
 msgid "{field} is required."
 msgstr ""
 
@@ -3145,8 +3043,4 @@ msgstr ""
 
 #: tabs/utilities/experiment_config/experiment_config.py:216
 msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
-msgstr ""
-
-#: gui/views/base.py
-msgid "Waiting for the backend…"
 msgstr ""

@@ -17,7 +17,7 @@ cd /d "%INSTALL_DIR%"
 rem pythonw has no console, so a crash before Qt starts would vanish silently.
 rem Probe with the console interpreter first and only detach once we know the
 rem imports resolve.
-"%ENV_DIR%\python.exe" -c "import PySide6" 2>nul
+"%ENV_DIR%\python.exe" -c "import PySide6, pynvml" 2>nul
 if errorlevel 1 (
     echo The Qt interface needs its own dependencies.
     echo Installing them now...

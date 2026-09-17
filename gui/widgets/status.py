@@ -1,18 +1,26 @@
 """Status bar: backend state, GPU telemetry, activity.
 
 VRAM is the resource that decides whether a batch size works, and the usual way
-to find out is a crash twenty minutes in.  Polling ``nvidia-smi`` puts the
-number in front of the user while they are still choosing the batch size.
+to find out is a crash twenty minutes in.  Polling the driver puts the number in
+front of the user while they are still choosing the batch size.
 
-The poll runs as a detached ``QProcess`` rather than ``subprocess.run`` so a
-hung driver query stalls a timer, never the UI thread.
+The driver is read through NVML (``nvidia-ml-py``, imported as ``pynvml``).
+``nvidia-smi`` is itself a front end to that library, so calling it directly
+returns the same numbers in well under a millisecond, with no process spawn and
+no CSV to parse.  The query still runs on the thread pool: a busy driver can be
+slow to answer, and that must stall a timer, never the UI thread.
+
+``nvidia-smi`` through a detached ``QProcess`` remains as the fallback, for an
+install that predates the dependency or a driver NVML cannot open.
 """
 
 from __future__ import annotations
 
 import shutil
+import threading
+from typing import NamedTuple
 
-from PySide6.QtCore import QProcess, QSize, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QRunnable, QSize, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QWidget
 
 from . import icons
@@ -36,13 +44,107 @@ def _short_gpu_name(name: str) -> str:
     return name.strip()
 
 
+class GpuReading(NamedTuple):
+    name: str
+    utilization: int
+    used_bytes: int
+    total_bytes: int
+    temperature: int
+
+
+_nvml_lock = threading.Lock()
+#: ``None`` until the first query, then the device handle -- or ``False`` once
+#: NVML has failed to start, so a failure is remembered rather than retried.
+_nvml_handle = None
+
+
+def _nvml_installed() -> bool:
+    """Whether the binding is importable; says nothing about the driver yet."""
+    try:
+        import pynvml  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _read_nvml() -> GpuReading:
+    """One reading of the first device.  Raises if NVML is unusable."""
+    global _nvml_handle
+    import pynvml
+
+    with _nvml_lock:
+        if _nvml_handle is None:
+            try:
+                pynvml.nvmlInit()
+                _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            except pynvml.NVMLError:
+                _nvml_handle = False
+                raise
+        if _nvml_handle is False:
+            raise RuntimeError("NVML is unavailable")
+        handle = _nvml_handle
+
+    name = pynvml.nvmlDeviceGetName(handle)
+    if isinstance(name, bytes):  # bindings before 11.5 return bytes
+        name = name.decode("utf-8", "replace")
+    memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return GpuReading(
+        name=name,
+        utilization=int(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu),
+        used_bytes=int(memory.used),
+        total_bytes=int(memory.total),
+        temperature=int(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)),
+    )
+
+
+class _NvmlSignals(QObject):
+    done = Signal(object)
+    failed = Signal()
+
+
+class _NvmlJob(QRunnable):
+    """One NVML reading, off the UI thread."""
+
+    def __init__(self, signals: _NvmlSignals):
+        super().__init__()
+        self.signals = signals
+
+    def run(self) -> None:  # noqa: D102 - QRunnable's entry point
+        try:
+            reading = _read_nvml()
+        except Exception:  # noqa: BLE001 - the meter falls back, never raises into Qt
+            self._deliver(self.signals.failed)
+            return
+        self._deliver(self.signals.done, reading)
+
+    @staticmethod
+    def _deliver(signal, *args) -> None:
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            # The window closed while the query was in flight.
+            pass
+
+
 class GpuMeter(QWidget):
     """Live utilisation and memory for the first CUDA device."""
+
+    #: NVML answers in well under a millisecond, so it can afford a live tick.
+    #: ``nvidia-smi`` spawns a process each time (~66 ms of system work), so it
+    #: keeps the slower one -- still live enough to size a batch against.
+    NVML_INTERVAL_MS = 1000
+    SMI_INTERVAL_MS = 3000
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._process: QProcess | None = None
-        self._available = shutil.which("nvidia-smi") is not None
+        self._smi_available = shutil.which("nvidia-smi") is not None
+        self._use_nvml = _nvml_installed()
+        self._available = self._use_nvml or self._smi_available
+        self._nvml_busy = False
+        self._nvml_signals = _NvmlSignals(self)
+        self._nvml_signals.done.connect(self._on_nvml)
+        self._nvml_signals.failed.connect(self._on_nvml_failed)
         #: Filled by the first successful poll and reused: the device name does
         #: not change, and keeping it means a failed tick does not blank it.
         self._name = ""
@@ -68,23 +170,56 @@ class GpuMeter(QWidget):
             self.bar.hide()
             return
 
-        # Each tick spawns a process, which costs ~66 ms of system work even
-        # though it is off the UI thread.  Three seconds is still live enough
-        # to size a batch against, at two thirds of the churn.
         self._timer = QTimer(self)
-        self._timer.setInterval(3000)
+        self._timer.setInterval(self.NVML_INTERVAL_MS if self._use_nvml else self.SMI_INTERVAL_MS)
         self._timer.timeout.connect(self._poll)
         self._timer.start()
         self._poll()
 
     def _poll(self) -> None:
-        # Skip the tick rather than queue a second query: on a busy GPU the
-        # driver can take longer to answer than the poll interval.
-        if self._process is not None and self._process.state() != QProcess.NotRunning:
-            return
         # Nothing to report to a window nobody is looking at.
         window = self.window()
         if window is not None and (window.isMinimized() or not window.isVisible()):
+            return
+        if self._use_nvml:
+            self._poll_nvml()
+        else:
+            self._poll_smi()
+
+    def _poll_nvml(self) -> None:
+        # Skip the tick rather than queue a second query: on a busy GPU the
+        # driver can take longer to answer than the poll interval.
+        if self._nvml_busy:
+            return
+        self._nvml_busy = True
+        QThreadPool.globalInstance().start(_NvmlJob(self._nvml_signals))
+
+    def _on_nvml(self, reading: GpuReading) -> None:
+        self._nvml_busy = False
+        self._name = _short_gpu_name(reading.name) or self._name
+        self._show(
+            reading.utilization,
+            reading.used_bytes / 2**30,
+            reading.total_bytes / 2**30,
+            reading.temperature,
+        )
+
+    def _on_nvml_failed(self) -> None:
+        self._nvml_busy = False
+        # NVML could not open the driver.  nvidia-smi may still manage, or will
+        # at least fail in its own words; either way, switch for good.
+        self._use_nvml = False
+        if not self._smi_available:
+            self._timer.stop()
+            self.label.setText(_("GPU not detected"))
+            self.bar.hide()
+            return
+        self._timer.setInterval(self.SMI_INTERVAL_MS)
+        self._poll_smi()
+
+    def _poll_smi(self) -> None:
+        # Same skip-don't-queue rule as the NVML path.
+        if self._process is not None and self._process.state() != QProcess.NotRunning:
             return
         process = QProcess(self)
         process.finished.connect(lambda *_: self._read(process))
@@ -116,11 +251,13 @@ class GpuMeter(QWidget):
         except ValueError:
             return
         self._name = _short_gpu_name(", ".join(parts[:-4])) or self._name
+        self._show(used_percent, used_mb / 1024, total_mb / 1024, temperature)
 
-        self.bar.setValue(used_percent)
+    def _show(self, percent: int, used_gb: float, total_gb: float, temperature: int) -> None:
+        self.bar.setValue(percent)
         self.label.setText(
-            f"{self._name or 'GPU'}   {used_percent}%   "
-            f"{used_mb / 1024:.1f}/{total_mb / 1024:.1f} GB   {temperature}°C"
+            f"{self._name or 'GPU'}   {percent}%   "
+            f"{used_gb:.1f}/{total_gb:.1f} GB   {temperature}°C"
         )
 
 

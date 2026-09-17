@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCALE_DIR = ROOT / "locales"
+LOCALE_DIR = ROOT / "assets" / "locales"
 DOMAIN = "shiromiya"
 POT_PATH = LOCALE_DIR / f"{DOMAIN}.pot"
 
@@ -466,7 +466,7 @@ def stats() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("extract", help="scan the sources into locales/shiromiya.pot")
+    sub.add_parser("extract", help="scan the sources into assets/locales/shiromiya.pot")
     update_parser = sub.add_parser("update", help="merge the template into the .po files")
     update_parser.add_argument("--language", action="append", dest="languages")
     compile_parser = sub.add_parser("compile", help="build the .mo files")

@@ -1,25 +1,15 @@
 """The application name must have exactly one value.
 
-``APP_NAME`` is declared in several modules on purpose -- ``installer/`` is
-standalone by design, since it runs before the application is on disk, and
-``gui/`` has to keep working when nothing else is importable.  What is not
-optional is that they all say the same thing, because two of them are load
-bearing in a way nothing else checks:
-
-* the release workflow names the source archive ``<APP_NAME>-source-<tag>.zip``;
-* ``installer.config.source_url`` builds the URL the wizard downloads from the
-  same pattern.
-
-Disagree on those two and every install fails with a 404 at run time, while the
-build stays green -- the smoke test only proves the wizard opens a window, not
-that the thing it will later fetch exists.  This is the version-literal test's
-argument (``test_version.py``) applied to the other identifier a release is
-built out of.
+``APP_NAME`` is declared in more than one module on purpose -- ``gui/`` has to
+keep working when nothing else is importable.  What is not optional is that
+they all say the same thing.  This is the version-literal test's argument
+(``test_version.py``) applied to the other identifier a release is built out of.
 """
 
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,26 +43,9 @@ def test_every_app_name_literal_agrees():
     assert names, "APP_NAME should be declared somewhere"
     distinct = set(names.values())
     assert len(distinct) == 1, (
-        f"APP_NAME disagrees across the tree: {names}. The release workflow and "
-        "installer.config.source_url build the same filename from it, so a "
-        "mismatch is a 404 for every install."
+        f"APP_NAME disagrees across the tree: {names}; they must all say the "
+        "same thing."
     )
-
-
-def test_release_asset_name_matches_what_the_installer_fetches():
-    """The workflow's archive name and the wizard's URL must be the same string."""
-    import sys
-
-    sys.path.insert(0, str(ROOT))
-    from installer import build_windows, config
-
-    tag = "v9.9.9"
-    expected = f"{config.APP_NAME}-source-{tag}.zip"
-    url = f"https://github.com/owner/repo/releases/download/{tag}/{expected}"
-
-    assert build_windows.APP_NAME == config.APP_NAME
-    # Mirrors the branch of source_url() that a tagged release takes.
-    assert url.endswith(expected)
 
 
 def test_workflows_do_not_hardcode_the_app_name():
@@ -85,19 +58,19 @@ def test_workflows_do_not_hardcode_the_app_name():
     if not workflows.is_dir():
         return
 
-    from installer import config
+    sys.path.insert(0, str(ROOT))
+    import version
 
     offenders = [
         path.relative_to(ROOT).as_posix()
         for path in workflows.glob("*.yml")
         if re.search(
-            rf"""APP_NAME\s*:\s*["']?{re.escape(config.APP_NAME)}["']?\s*$""",
+            rf"""APP_NAME\s*:\s*["']?{re.escape(version.APP_NAME)}["']?\s*$""",
             path.read_text(encoding="utf-8"),
             re.MULTILINE,
         )
     ]
     assert not offenders, (
         f"These workflows hardcode the application name: {offenders}. Read it "
-        "from version.py instead so the archive name and the installer's URL "
-        "cannot drift apart."
+        "from version.py instead so the archive name cannot drift from the tree."
     )

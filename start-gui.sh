@@ -18,7 +18,7 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
-if ! "$PYTHON" -c "import PySide6" >/dev/null 2>&1; then
+if ! "$PYTHON" -c "import PySide6, pynvml" >/dev/null 2>&1; then
     echo "Installing the Qt interface dependencies..."
     "$PYTHON" -m pip install -r "$INSTALL_DIR/gui/requirements-gui.txt"
 fi

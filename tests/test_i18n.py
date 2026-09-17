@@ -57,7 +57,7 @@ def test_template_is_current():
         }
 
     assert messages(before) == messages(after), (
-        "locales/shiromiya.pot is out of date. Run: python tools/i18n_tool.py all"
+        "assets/locales/shiromiya.pot is out of date. Run: python tools/i18n_tool.py all"
     )
 
 

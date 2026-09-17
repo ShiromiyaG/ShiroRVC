@@ -22,11 +22,11 @@ import os
 import sys
 from pathlib import Path
 
-#: Catalog (``.mo``) base name, i.e. ``locales/<lang>/LC_MESSAGES/<DOMAIN>.mo``.
+#: Catalog (``.mo``) base name, i.e. ``assets/locales/<lang>/LC_MESSAGES/<DOMAIN>.mo``.
 DOMAIN = "shiromiya"
 
-#: ``locales/`` at the application root, three levels up from ``rvc/lib/``.
-LOCALE_DIR = Path(__file__).resolve().parents[2] / "locales"
+#: ``assets/locales/`` under the application root, three levels up from ``rvc/lib/``.
+LOCALE_DIR = Path(__file__).resolve().parents[2] / "assets" / "locales"
 
 #: Languages the application ships, in the order a selector should list them.
 #: The value is what a human picks in a menu; the key is what goes on disk, in

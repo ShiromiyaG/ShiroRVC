@@ -290,7 +290,9 @@ def test_pressing_the_icon_asks_the_owner(app, tmp_path, monkeypatch):
     destination = tmp_path / "Music"
     destination.mkdir()
     monkeypatch.setattr(
-        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(destination))
+        QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *a, **k: (str(destination / "result.wav"), "")),
     )
 
     page = InferencePage()
@@ -311,7 +313,9 @@ def test_save_a_copy_writes_where_it_was_told(app, tmp_path, monkeypatch):
     destination.mkdir()
 
     monkeypatch.setattr(
-        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(destination))
+        QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *a, **k: (str(destination / "result.wav"), "")),
     )
 
     page = InferencePage()
@@ -332,8 +336,19 @@ def test_a_second_copy_does_not_overwrite_the_first(app, tmp_path, monkeypatch):
     produced.write_bytes(b"first")
     destination = tmp_path / "Music"
     destination.mkdir()
+    suggestions = []
+
+    def accept_suggestion(parent, caption, start, filters):
+        # Pressing Enter in the dialog: take whatever name it proposed.
+        suggestions.append(Path(start).name)
+        return start, ""
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(accept_suggestion))
+
+    from gui.services import prefs
+
     monkeypatch.setattr(
-        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(destination))
+        prefs, "get", lambda key, default=None: str(destination) if key == "last_export_dir" else default
     )
 
     page = InferencePage()
@@ -343,6 +358,7 @@ def test_a_second_copy_does_not_overwrite_the_first(app, tmp_path, monkeypatch):
         produced.write_bytes(b"second")
         page._save_copy()
 
+        assert suggestions == ["result.wav", "result (2).wav"]
         assert (destination / "result.wav").read_bytes() == b"first"
         assert (destination / "result (2).wav").read_bytes() == b"second"
     finally:
@@ -357,7 +373,7 @@ def test_cancelling_the_dialog_writes_nothing(app, tmp_path, monkeypatch):
     destination = tmp_path / "Music"
     destination.mkdir()
     monkeypatch.setattr(
-        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: "")
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", ""))
     )
 
     page = InferencePage()

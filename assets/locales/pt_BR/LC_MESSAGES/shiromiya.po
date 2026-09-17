@@ -97,9 +97,6 @@ msgstr "4 · Treinar"
 msgid "5 · Index"
 msgstr "5 · Index"
 
-msgid "A GAN generator oscillates against its discriminator; the average is usually better than any single step. Costs one extra copy of it in VRAM."
-msgstr "Um gerador GAN oscila contra o seu discriminador; a média costuma ser melhor do que qualquer passo isolado. Custa uma cópia extra dele na VRAM."
-
 msgid "A folder under logs/ that already has a config.json."
 msgstr "Uma pasta em logs/ que já possui um config.json."
 
@@ -108,12 +105,6 @@ msgstr "Aceita Hugging Face, Google Drive, Pixeldrain e links diretos."
 
 msgid "Actual size"
 msgstr "Tamanho real"
-
-msgid "AdamW is the default. Sched-Free AdamW needs no LR scheduler and averages its own weights. Muon orthogonalises the update for matrix-shaped layers. Lion halves the optimizer memory and uses a smaller learning rate automatically."
-msgstr "AdamW é o padrão. O Sched-Free AdamW dispensa agendador de LR e faz a própria média dos pesos. O Muon ortogonaliza a atualização das camadas em forma de matriz. O Lion reduz à metade a memória do otimizador e usa automaticamente uma taxa de aprendizado menor."
-
-msgid "AdamW unless you have a reason. The others change the schedule too."
-msgstr "AdamW, a menos que você tenha um motivo. Os outros também mudam o schedule."
 
 msgid "Add silent examples so the model can reproduce silence."
 msgstr "Adiciona exemplos silenciosos para que o modelo consiga reproduzir silêncio."
@@ -139,6 +130,9 @@ msgstr "Configurações avançadas"
 msgid "Algorithm"
 msgstr "Algoritmo"
 
+msgid "All files"
+msgstr "Todos os arquivos"
+
 msgid "Also export inference weights each save"
 msgstr "Exportar também os pesos de inferência a cada salvamento"
 
@@ -157,8 +151,8 @@ msgstr "E selecione a taxa de amostragem."
 msgid "Applied on the next start. Takes effect immediately when launched with --language, which overrides this setting."
 msgstr "Aplicado na próxima inicialização. Tem efeito imediato quando iniciado com --language, que sobrepõe esta configuração."
 
-msgid "Applies to runs started after this is saved. Needs a CUDA GPU."
-msgstr "Vale para as execuções iniciadas depois de salvar. Requer uma GPU CUDA."
+msgid "Applies to runs started after this is saved. FP16 and BF16 need a CUDA GPU."
+msgstr ""
 
 msgid "Apply a soft autotune to your inferences, recommended for singing conversions."
 msgstr "Aplica um autotune suave às inferências; recomendado para conversões de canto."
@@ -219,9 +213,6 @@ msgstr "Intensidade do autotune"
 
 msgid "Autotuning"
 msgstr "Autotune"
-
-msgid "Average the weights (EMA)"
-msgstr "Média dos pesos (EMA)"
 
 msgid "Backdrop: off"
 msgstr "Fundo: desligado"
@@ -449,12 +440,6 @@ msgstr "Pré-treinado D personalizado"
 msgid "Custom Pretrained G"
 msgstr "Pré-treinado G personalizado"
 
-msgid "Custom lr for gen and disc"
-msgstr "LR personalizada para gerador e discriminador"
-
-msgid "Custom lr settings"
-msgstr "Configurações de LR personalizada"
-
 msgid "Cut into segments before converting. Helps on long files."
 msgstr "Corta em segmentos antes de converter. Ajuda em arquivos longos."
 
@@ -479,9 +464,6 @@ msgstr "Pasta do dataset"
 msgid "Dataset format"
 msgstr "Formato do dataset"
 
-msgid "Default is 1e-4 / 0.0001"
-msgstr "O padrão é 1e-4 / 0,0001"
-
 msgid "Default: 1.0."
 msgstr "Padrão: 1,0."
 
@@ -505,12 +487,6 @@ msgstr "Descartar o estado de treinamento anterior"
 
 msgid "Discriminator (D)"
 msgstr "Discriminador (D)"
-
-msgid "Discriminator LR"
-msgstr "LR do discriminador"
-
-msgid "Discriminator learning rate. Both rates are required."
-msgstr "Taxa de aprendizado do discriminador. As duas taxas são obrigatórias."
 
 msgid "Discriminator pretrained file."
 msgstr "Arquivo pré-treinado do discriminador."
@@ -575,9 +551,6 @@ msgstr "Vazio salva em logs usando o nome do primeiro modelo."
 msgid "Enable RMVPE high-register correction"
 msgstr "Ativar correção de registro agudo do RMVPE"
 
-msgid "Enable cuDNN benchmark mode."
-msgstr "Ativa o modo benchmark do cuDNN."
-
 msgid "End the run once held-out quality stops improving. The pre-overtrain model is exported either way; this only decides whether training keeps going."
 msgstr "Encerra a execução quando a qualidade no conjunto reservado para de melhorar. O modelo anterior ao overtraining é exportado de qualquer forma; isto só decide se o treinamento continua."
 
@@ -635,9 +608,6 @@ msgstr "Experimento"
 msgid "Experiment Config"
 msgstr "Config do experimento"
 
-msgid "Exponential decay is the default. Cosine annealing and none are alternatives."
-msgstr "O decaimento exponencial é o padrão. Cosine annealing e nenhum são alternativas."
-
 msgid "Export Audio"
 msgstr "Exportar áudio"
 
@@ -649,9 +619,6 @@ msgstr "Exportar modelo"
 
 msgid "Export Preset"
 msgstr "Exportar predefinição"
-
-msgid "Export a moving average of the generator instead of one step of it. A GAN generator oscillates against its discriminator, so the average is usually better than any single step, and it makes the overtrain curve much cleaner. Costs one extra copy of the generator in VRAM."
-msgstr "Exporta uma média móvel do gerador em vez de um passo isolado dele. Um gerador GAN oscila contra o seu discriminador, então a média costuma ser melhor do que qualquer passo isolado, e deixa a curva de overtraining muito mais limpa. Custa uma cópia extra do gerador na VRAM."
 
 msgid "Export format"
 msgstr "Formato de exportação"
@@ -692,17 +659,14 @@ msgstr "Arquivo da curva de F0"
 msgid "F0-guided model"
 msgstr "Modelo guiado por F0"
 
-msgid "FP16 autocast"
-msgstr "Autocast em FP16"
+msgid "FP16 uses a GradScaler; BF16 needs none and keeps precision-sensitive paths in FP32."
+msgstr ""
 
-msgid "FP16 training (autocast + GradScaler)"
-msgstr "Treinamento em FP16 (autocast + GradScaler)"
+msgid "FP16: less VRAM and faster steps, with a GradScaler. BF16 has no native kernels on this GPU."
+msgstr ""
 
-msgid "FP16 training disabled. Runs start from now on in FP32 with TF32 tensor cores."
-msgstr "Treinamento em FP16 desativado. As execuções a partir de agora começam em FP32 com tensor cores TF32."
-
-msgid "FP16 training enabled. Runs started from now on use autocast with a GradScaler."
-msgstr "Treinamento em FP16 ativado. As execuções iniciadas a partir de agora usam autocast com um GradScaler."
+msgid "FP16: less VRAM and faster steps, with a GradScaler. BF16: no scaler; precision-sensitive paths stay in FP32."
+msgstr ""
 
 msgid "Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."
 msgstr "Silencia a saída onde a entrada está mais baixa que isto, em dBFS. Silêncio não tem nível para o codificador de conteúdo, então o modelo o preenche com chiado. -120 desliga o gate."
@@ -712,12 +676,6 @@ msgstr "Silencia a saída onde a entrada está mais baixa que isto, em dBFS. Sil
 
 msgid "Faiss index. Picked automatically when there is only one next to the model."
 msgstr "Index Faiss. Escolhido automaticamente quando há apenas um ao lado do modelo."
-
-msgid "Faster on Ampere and newer, marginally less precise."
-msgstr "Mais rápido em Ampere e superiores, marginalmente menos preciso."
-
-msgid "Faster once shapes settle."
-msgstr "Mais rápido quando as formas se estabilizam."
 
 msgid "Favours matches that continue the previous frame's, instead of jumping between unrelated parts of the dataset. Needs an index built by this fork."
 msgstr "Favorece correspondências que dão continuidade às do frame anterior, em vez de pular entre partes não relacionadas do dataset. Requer um index construído por este fork."
@@ -865,12 +823,6 @@ msgstr "Gerado"
 
 msgid "Generator (G)"
 msgstr "Gerador (G)"
-
-msgid "Generator LR"
-msgstr "LR do gerador"
-
-msgid "Generator learning rate. Both rates are required."
-msgstr "Taxa de aprendizado do gerador. As duas taxas são obrigatórias."
 
 msgid "Generator pretrained file."
 msgstr "Arquivo pré-treinado do gerador."
@@ -1028,12 +980,6 @@ msgstr "Mantém apenas os checkpoints mais recentes do gerador e do discriminado
 msgid "Kept the previous config at `{}`."
 msgstr "Config anterior mantido em `{}`."
 
-msgid "LR scheduler"
-msgstr "Agendador de LR"
-
-msgid "LR scheduler (G/D)"
-msgstr "Agendador de LR (G/D)"
-
 msgid "Language set to {name}."
 msgstr "Idioma definido como {name}."
 
@@ -1049,17 +995,8 @@ msgstr "Batches maiores exigem mais VRAM. Reduza o valor se o treinamento ficar 
 msgid "Latest"
 msgstr "Mais recente"
 
-msgid "Learning rate for Discriminator"
-msgstr "Taxa de aprendizado do discriminador"
-
-msgid "Learning rate for Generator"
-msgstr "Taxa de aprendizado do gerador"
-
 msgid "Length of each KL annealing cycle, in epochs."
 msgstr "Duração de cada ciclo de annealing KL, em epochs."
-
-msgid "Less VRAM and faster steps. Master weights stay FP32; a GradScaler handles overflow."
-msgstr "Menos VRAM e steps mais rápidos. Os pesos mestres continuam em FP32; um GradScaler cuida do estouro."
 
 msgid "Light theme"
 msgstr "Tema claro"
@@ -1205,12 +1142,6 @@ msgstr "Só vale a pena em material de origem realmente ruidoso."
 msgid "Optimisation"
 msgstr "Otimização"
 
-msgid "Optimizer"
-msgstr "Otimizador"
-
-msgid "Optimizer (G/D)"
-msgstr "Otimizador (G/D)"
-
 msgid "Optional external pitch curve"
 msgstr "Curva de pitch externa opcional"
 
@@ -1277,9 +1208,6 @@ msgstr "Sobreposição entre os blocos do modo Simples, em segundos."
 msgid "Overlap length"
 msgstr "Duração da sobreposição"
 
-msgid "Override the learning rates"
-msgstr "Sobrepor as taxas de aprendizado"
-
 msgid "Overtrain detector"
 msgstr "Detector de overtraining"
 
@@ -1333,6 +1261,9 @@ msgstr "Deslocamento de pitch em semitons."
 
 msgid "Pitch shift in semitones. 12 = one octave up."
 msgstr "Deslocamento de pitch em semitons. 12 = uma oitava acima."
+
+msgid "Precision"
+msgstr ""
 
 msgid "Prepare a dataset and train a voice, one step at a time."
 msgstr "Prepare um dataset e treine uma voz, uma etapa por vez."
@@ -1505,6 +1436,15 @@ msgstr "Executar extração"
 msgid "Run preprocessing"
 msgstr "Executar pré-processamento"
 
+msgid "Runs started from now on train in FP32 with TF32 tensor cores."
+msgstr ""
+
+msgid "Runs started from now on use BF16 autocast without a GradScaler; precision-sensitive paths stay in FP32."
+msgstr ""
+
+msgid "Runs started from now on use FP16 autocast with a GradScaler."
+msgstr ""
+
 msgid "Sample Rate of the model (sr)"
 msgstr "Taxa de amostragem do modelo (sr)"
 
@@ -1520,8 +1460,8 @@ msgstr "Salvar apenas o G/D mais recente"
 msgid "Save a checkpoint every N epochs."
 msgstr "Salva um checkpoint a cada N epochs."
 
-msgid "Save a copy to"
-msgstr "Salvar uma cópia em"
+msgid "Save a copy as"
+msgstr "Salvar uma cópia como"
 
 msgid "Save a copy…"
 msgstr "Salvar uma cópia…"
@@ -1618,9 +1558,6 @@ msgstr "`vocoder_architecture` definido como `{}` no model_info.json."
 
 msgid "Set name"
 msgstr "Definir nome"
-
-msgid "Set separate generator and discriminator learning rates."
-msgstr "Define taxas de aprendizado separadas para gerador e discriminador."
 
 msgid "Set the autotune strength - the more you increase it the more it will snap to the chromatic grid."
 msgstr "Defina a intensidade do autotune - quanto mais você aumentar, mais ele prende à grade cromática."
@@ -1827,9 +1764,6 @@ msgstr "Fala sintetizada"
 msgid "Synthesising…"
 msgstr "Sintetizando…"
 
-msgid "TF32 matmuls"
-msgstr "Multiplicações de matriz em TF32"
-
 msgid "TTS Speed"
 msgstr "Velocidade do TTS"
 
@@ -1956,8 +1890,8 @@ msgstr "Ainda não há arquivo convertido para salvar."
 msgid "This GPU has no FP16 tensor cores: autocast still halves activation memory, but it may not make the steps any faster."
 msgstr "Esta GPU não tem tensor cores para FP16: o autocast ainda reduz pela metade a memória das ativações, mas pode não deixar os passos mais rápidos."
 
-msgid "This GPU has no TF32 units, so the setting would do nothing."
-msgstr "Esta GPU não tem unidades TF32, então a opção não faria nada."
+msgid "This GPU has no native BF16 support, so it would be emulated and slow."
+msgstr ""
 
 msgid "This run has not written validation previews yet. They appear every few hundred steps once training starts."
 msgstr "Este treino ainda não gravou previews de validação. Eles aparecem a cada algumas centenas de steps depois que o treino começa."
@@ -1991,6 +1925,9 @@ msgstr "Predefinições de treinamento"
 
 msgid "Training is running; the new language applies at the next start."
 msgstr "O treinamento está em andamento; o novo idioma será aplicado na próxima inicialização."
+
+msgid "Training precision"
+msgstr ""
 
 msgid "Training status."
 msgstr "Status do treinamento."
@@ -2033,12 +1970,6 @@ msgstr "O envio está disponível no Google Colab e salva os arquivos exportados
 
 msgid "Uploading {path} to Google Drive..."
 msgstr "Enviando {path} para o Google Drive..."
-
-msgid "Use 'cuDNN benchmark' mode"
-msgstr "Usar o modo 'benchmark do cuDNN'"
-
-msgid "Use TF32 on supported GPUs for faster training."
-msgstr "Usa TF32 em GPUs compatíveis para treinar mais rápido."
 
 msgid "Use a pre-computed pitch curve instead of extracting one."
 msgstr "Usa uma curva de pitch pré-calculada em vez de extrair uma."
@@ -2100,6 +2031,9 @@ msgstr "Envelope de volume"
 msgid "Volume envelope"
 msgstr "Envelope de volume"
 
+msgid "Waiting for the backend…"
+msgstr "Aguardando o backend…"
+
 msgid "Waiting for the first batch…"
 msgstr "Aguardando o primeiro batch…"
 
@@ -2117,9 +2051,6 @@ msgstr "Fase de warmup do treinamento"
 
 msgid "Warmup settings"
 msgstr "Configurações de warmup"
-
-msgid "Weight averaging (EMA)"
-msgstr "Média de pesos (EMA)"
 
 msgid "What should the voice say?"
 msgstr "O que a voz deve dizer?"
@@ -2172,9 +2103,6 @@ msgstr "checkpoints, agendamento, precisão, compilação, clipping de gradiente
 msgid "contentvec, RMVPE, FCPE."
 msgstr "contentvec, RMVPE, FCPE."
 
-msgid "cuDNN benchmark"
-msgstr "benchmark do cuDNN"
-
 msgid "ffmpeg and ffprobe"
 msgstr "ffmpeg e ffprobe"
 
@@ -2220,9 +2148,6 @@ msgstr "true_pitch grava o pitch real, limitado ao teto de F0. fold só corrige 
 msgid "unrecognised -- this config predates the current registry"
 msgstr "não reconhecida -- este config é anterior ao registro atual"
 
-msgid "use 'TF32' precision"
-msgstr "usar precisão 'TF32'"
-
 msgid "{count} audio file found."
 msgid_plural "{count} audio files found."
 msgstr[0] "{count} arquivo de áudio encontrado."
@@ -2262,7 +2187,3 @@ msgstr "{} checkpoint(s) foram deixados no lugar. O treino vai tentar retomar a 
 
 msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
 msgstr "{} não tem configuração para {} Hz (ele suporta {}). O áudio extraído fixa a taxa, então este experimento não pode usar esse vocoder."
-
-#: gui/views/base.py
-msgid "Waiting for the backend…"
-msgstr "Aguardando o backend…"

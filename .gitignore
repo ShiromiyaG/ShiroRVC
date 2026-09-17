@@ -25,10 +25,8 @@ dist/
 *.spec
 
 # Qt interface and packaging
-# gui/.state holds the window's own preferences; installer/release_info.json is
-# written by the release workflow just before PyInstaller runs.
+# gui/.state holds the window's own preferences.
 gui/.state/
-installer/release_info.json
 
 # Local environments and installers
 env/

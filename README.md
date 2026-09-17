@@ -160,12 +160,12 @@ and its messages end up quoted in bug reports.
 <details>
 <summary><b>Helping translate</b></summary>
 
-Catalogs are standard gettext `.po` files under `locales/`, so Poedit, Weblate
+Catalogs are standard gettext `.po` files under `assets/locales/`, so Poedit, Weblate
 and Crowdin all work on them directly. The toolchain is standard-library only —
 no Babel and no GNU gettext binaries to install:
 
 ```bash
-python tools/i18n_tool.py extract   # sources -> locales/shiromiya.pot
+python tools/i18n_tool.py extract   # sources -> assets/locales/shiromiya.pot
 python tools/i18n_tool.py update    # merge the template into every .po
 python tools/i18n_tool.py compile   # .po -> .mo, which is what gets loaded
 python tools/i18n_tool.py stats     # what is still untranslated
