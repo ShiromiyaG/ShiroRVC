@@ -47,6 +47,14 @@ class FloatingDock(QWidget):
         self._host = host
         self._panel: QWidget | None = None
         host.installEventFilter(self)
+        # A QStackedWidget raises the page it switches to above every sibling,
+        # this dock included, so going from one page to another that is not
+        # the card's own buried the card under the new page.  The page is
+        # raised before ``currentChanged`` is emitted, so raising back here
+        # wins.
+        current_changed = getattr(host, "currentChanged", None)
+        if current_changed is not None:
+            current_changed.connect(self._stay_on_top)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(
@@ -85,6 +93,10 @@ class FloatingDock(QWidget):
         return item.widget() if item is not None else None
 
     # -- placement ---------------------------------------------------------
+
+    def _stay_on_top(self, *_args) -> None:
+        if self.isVisible():
+            self.raise_()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         # The host moving is obvious; the panel resizing matters just as much,

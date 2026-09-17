@@ -82,6 +82,53 @@ def get_config():
     return Config()
 
 
+# Pipeline scripts
+def _run_stage(command, stage: str) -> None:
+    """Run one pipeline script and fail loudly when it fails.
+
+    These used to be bare ``subprocess.run`` calls, so a script that crashed
+    still reported "... successfully" and the only trace was whatever it had
+    printed.  ``stdin`` is detached because the Qt backend reads its commands
+    from its own stdin, and a child sharing that pipe has no business with it.
+    """
+    result = subprocess.run(command, stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{stage} failed: {os.path.basename(command[1])} exited with "
+            f"{describe_exit_code(result.returncode)}. The traceback is in the log above."
+        )
+
+
+def describe_exit_code(code: int) -> str:
+    """``code 1``, or the NTSTATUS name for a native crash on Windows."""
+    unsigned = code & 0xFFFFFFFF
+    name = _NTSTATUS.get(unsigned)
+    if name:
+        return f"code 0x{unsigned:08X} ({name})"
+    if code < 0 and os.name != "nt":
+        try:
+            return f"signal {signal.Signals(-code).name}"
+        except ValueError:
+            pass
+    return f"code {code}"
+
+
+_NTSTATUS = {
+    0xC0000005: "access violation - a native crash, usually a driver or a CUDA kernel",
+    0xC000001D: "illegal instruction",
+    0xC0000094: "integer division by zero",
+    0xC00000FD: "stack overflow",
+    0xC0000135: "a required DLL was not found",
+    0xC0000139: "entry point not found in a DLL",
+    0xC000013A: "interrupted with Ctrl+C",
+    0xC0000374: "heap corruption",
+    0xC0000409: "stack buffer overrun / fatal abort",
+    0xC0000417: "invalid parameter passed to the C runtime",
+    0xE06D7363: "unhandled C++ exception",
+    0x40010004: "the process was killed",
+}
+
+
 # Infer
 def run_infer_script(
     pitch: int,
@@ -292,7 +339,7 @@ def run_tts_script(
             ],
         ),
     ]
-    subprocess.run(command_tts)
+    _run_stage(command_tts, "Text to speech")
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(
         pitch=pitch,
@@ -371,7 +418,7 @@ def run_preprocess_script(
             ],
         ),
     ]
-    subprocess.run(command)
+    _run_stage(command, "Preprocessing")
     return f"Model {model_name} preprocessed successfully."
 
 
@@ -415,7 +462,7 @@ def run_extract_script(
         ),
     ]
 
-    subprocess.run(command_1)
+    _run_stage(command_1, "Extraction")
 
     return f"Model {model_name} extracted successfully."
 
@@ -526,11 +573,13 @@ def run_train_script(
         global training_process
         training_process = subprocess.Popen(
             command,
+            stdin=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
     else:
         training_process = subprocess.Popen(
             command,
+            stdin=subprocess.DEVNULL,
             preexec_fn=_trainer_preexec
         )
 
@@ -699,10 +748,11 @@ def run_index_script(
     # Checked, because it has not always succeeded: the script's ``rvc.``
     # import failed under the subprocess's sys.path and this reported success
     # regardless, so a missing index looked like a working one.
-    result = subprocess.run(command)
+    result = subprocess.run(command, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         return (
-            f"Index generation for {model_name} failed (exit {result.returncode}). "
+            f"Index generation for {model_name} failed "
+            f"({describe_exit_code(result.returncode)}). "
             "See the terminal for the traceback."
         )
     return f"Index file for {model_name} generated successfully."

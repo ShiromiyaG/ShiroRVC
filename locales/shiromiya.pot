@@ -3146,3 +3146,7 @@ msgstr ""
 #: tabs/utilities/experiment_config/experiment_config.py:216
 msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
 msgstr ""
+
+#: gui/views/base.py
+msgid "Waiting for the backend…"
+msgstr ""

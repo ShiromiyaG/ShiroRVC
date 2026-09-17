@@ -32,7 +32,7 @@ from ..services.runwatch import ReadSignals as _ReadSignals
 from ..services import catalog, prefs
 from ..services.tbreader import RunReader
 from ..widgets.metrics import MetricsPanel
-from ..widgets.progress import TrainingProgress
+from ..widgets.progress import TrainingProgress, progress_button
 from ..widgets.forms import (
     Card,
     Collapsible,
@@ -47,6 +47,13 @@ from ..widgets.forms import (
     primary_button,
 )
 from .base import Page
+
+
+#: Same as the Gradio tab: ``DEFAULT_CPU_THREADS`` in rvc/lib/terminal.py and
+#: the slider's ceiling in tabs/train/train.py.  Mirrored, not imported --
+#: gui/ may not import rvc.
+_MAX_CPU_THREADS = max(1, min(os.cpu_count() or 1, 192))
+_DEFAULT_CPU_THREADS = max(1, min(4, _MAX_CPU_THREADS))
 
 
 class TrainingPage(Page):
@@ -218,14 +225,14 @@ class TrainingPage(Page):
         self.dataset_format = SearchableCombo(editable=False)
         self.dataset_format.refresh_button.hide()
         self.dataset_format.set_items(catalog.DATASET_FORMATS)
-        self.preprocess_threads = SliderSpin(1, max(1, os.cpu_count() or 8), 1, decimals=0,
-                                             value=max(1, (os.cpu_count() or 8) // 2))
+        self.preprocess_threads = SliderSpin(1, _MAX_CPU_THREADS, 1, decimals=0,
+                                             value=_DEFAULT_CPU_THREADS)
         advanced.add_row(
             Field(_("Dataset format"), self.dataset_format, ""),
             Field(_("CPU threads"), self.preprocess_threads, ""),
         )
 
-        self.preprocess_button = primary_button(_("Run preprocessing"))
+        self.preprocess_button = progress_button(_("Run preprocessing"))
         self.preprocess_button.clicked.connect(self._preprocess)
         card.add(self.preprocess_button)
 
@@ -260,8 +267,8 @@ class TrainingPage(Page):
         )
         card.add(advanced)
 
-        self.extract_threads = SliderSpin(1, max(1, os.cpu_count() or 8), 1, decimals=0,
-                                          value=max(1, (os.cpu_count() or 8) // 2))
+        self.extract_threads = SliderSpin(1, _MAX_CPU_THREADS, 1, decimals=0,
+                                          value=_DEFAULT_CPU_THREADS)
         self.include_mutes = SliderSpin(0, 10, 1, decimals=0, value=5)
         advanced.add_row(
             Field(_("CPU threads"), self.extract_threads, ""),
@@ -282,7 +289,7 @@ class TrainingPage(Page):
         )
 
 
-        self.extract_button = primary_button(_("Run extraction"))
+        self.extract_button = progress_button(_("Run extraction"))
         self.extract_button.clicked.connect(self._extract)
         card.add(self.extract_button)
         return card
@@ -716,6 +723,7 @@ class TrainingPage(Page):
             },
             busy_text=_("Preprocessing dataset…"),
             buttons=[self.preprocess_button],
+            progress=self.preprocess_button,
         )
 
     def _extract(self) -> None:
@@ -736,6 +744,7 @@ class TrainingPage(Page):
             },
             busy_text=_("Extracting features…"),
             buttons=[self.extract_button],
+            progress=self.extract_button,
         )
 
     def train_args(self) -> dict:

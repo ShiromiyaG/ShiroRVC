@@ -18,6 +18,30 @@ from . import paths
 
 SENTINEL = "\x1e"
 
+#: NTSTATUS values a crashed Windows process exits with.  Mirrors
+#: ``core.describe_exit_code``; gui/ may not import core.
+_NTSTATUS = {
+    0xC0000005: "access violation - a native crash, usually a driver or a CUDA kernel",
+    0xC000001D: "illegal instruction",
+    0xC00000FD: "stack overflow",
+    0xC0000135: "a required DLL was not found",
+    0xC000013A: "interrupted with Ctrl+C",
+    0xC0000374: "heap corruption",
+    0xC0000409: "stack buffer overrun / fatal abort",
+    0xE06D7363: "unhandled C++ exception",
+}
+
+
+def describe_exit(exit_code: int, crashed: bool) -> str:
+    unsigned = exit_code & 0xFFFFFFFF
+    name = _NTSTATUS.get(unsigned)
+    if name:
+        return f"exit code 0x{unsigned:08X} ({name})"
+    if exit_code == 0 and not crashed:
+        return "exit code 0 (a clean exit: the worker was told to stop or lost its command pipe)"
+    return f"exit code {exit_code}" + (" (crashed)" if crashed else "")
+
+
 ResultCallback = Callable[[dict], None]
 ErrorCallback = Callable[[str], None]
 
@@ -33,6 +57,10 @@ class Engine(QObject):
     crashed = Signal(str)
     #: A job started or the last one finished.
     busy_changed = Signal(bool)
+    #: The worker began running this job id (it may have waited in its queue).
+    job_started = Signal(int)
+    #: This job id got its answer, or never will because the worker died.
+    job_finished = Signal(int)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -40,7 +68,7 @@ class Engine(QObject):
         self._stdout_buffer = ""
         self._stderr_buffer = ""
         self._next_id = 1
-        self._pending: dict[int, tuple[ResultCallback | None, ErrorCallback | None]] = {}
+        self._pending: dict[int, tuple[str, ResultCallback | None, ErrorCallback | None]] = {}
         self._running: set[int] = set()
         self._is_ready = False
         self._shutting_down = False
@@ -54,6 +82,10 @@ class Engine(QObject):
     @property
     def busy(self) -> bool:
         return bool(self._running)
+
+    def is_pending(self, job_id: int) -> bool:
+        """Whether this job was sent and still awaits its answer."""
+        return job_id in self._pending
 
     def start(self) -> None:
         if self._process is not None:
@@ -132,7 +164,7 @@ class Engine(QObject):
                 on_error("The backend is not running. Use Restart backend to recover.")
             return job_id
 
-        self._pending[job_id] = (on_result, on_error)
+        self._pending[job_id] = (cmd, on_result, on_error)
         payload = json.dumps({"id": job_id, "cmd": cmd, "args": args or {}})
         process.write(payload.encode("utf-8") + b"\n")
         return job_id
@@ -186,9 +218,11 @@ class Engine(QObject):
 
         if kind == "started":
             self._running.add(job_id)
+            if isinstance(job_id, int):
+                self.job_started.emit(job_id)
         elif kind in ("result", "error"):
             self._running.discard(job_id)
-            on_result, on_error = self._pending.pop(job_id, (None, None))
+            cmd, on_result, on_error = self._pending.pop(job_id, ("?", None, None))
             if kind == "result":
                 if on_result:
                     on_result(message.get("data") or {})
@@ -196,17 +230,32 @@ class Engine(QObject):
                 detail = message.get("traceback") or ""
                 if detail:
                     self.log.emit(detail.rstrip())
+                self.log.emit(f"✖ {cmd}: {message.get('error', 'unknown backend error')}")
                 if on_error:
                     on_error(message.get("error", "unknown backend error"))
+            if isinstance(job_id, int):
+                self.job_finished.emit(job_id)
 
         if self.busy != was_busy:
             self.busy_changed.emit(self.busy)
 
-    def _on_finished(self, exit_code: int, _status) -> None:
+    def _on_finished(self, exit_code: int, status) -> None:
+        # Whatever the worker wrote last -- usually the interesting part -- may
+        # still be unread or sitting in a buffer without its trailing newline.
+        self._drain_stdout()
+        self._drain_stderr()
+        for attr in ("_stdout_buffer", "_stderr_buffer"):
+            rest = getattr(self, attr).strip()
+            setattr(self, attr, "")
+            if rest:
+                self.log.emit(rest)
+
         self._is_ready = False
-        for _job_id, (_on_result, on_error) in list(self._pending.items()):
+        reason = describe_exit(exit_code, status == QProcess.CrashExit)
+        for job_id, (cmd, _on_result, on_error) in list(self._pending.items()):
             if on_error:
-                on_error("The backend exited before answering.")
+                on_error(f"The backend exited while running {cmd}: {reason}.")
+            self.job_finished.emit(job_id)
         self._pending.clear()
         had_jobs = bool(self._running)
         self._running.clear()
@@ -214,7 +263,7 @@ class Engine(QObject):
             self.busy_changed.emit(False)
         if not self._shutting_down:
             self.crashed.emit(
-                f"The backend process exited with code {exit_code}. "
+                f"The backend process stopped: {reason}. "
                 "The log above usually says why."
             )
 

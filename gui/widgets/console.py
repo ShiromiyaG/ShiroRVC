@@ -121,8 +121,11 @@ class LogConsole(QWidget):
     # -- input -------------------------------------------------------------
 
     def append(self, text: str) -> None:
+        # Stamped like the notices, so backend output can be lined up with
+        # them; listeners still get the bare line to parse.
+        stamp = time.strftime("%H:%M:%S")
         for line in clean(text).splitlines() or [""]:
-            self._pending.append(line)
+            self._pending.append(f"[{stamp}] {line}")
             self.lineLogged.emit(line)
 
     def append_notice(self, text: str) -> None:

@@ -22,10 +22,13 @@ output, so no escaping of the log stream is required in either direction.
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
+import queue
 import sys
 import threading
+import time
 import traceback
 
 SENTINEL = "\x1e"
@@ -37,8 +40,17 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 _write_lock = threading.Lock()
-_job_lock = threading.Lock()
-_current_job: threading.Thread | None = None
+#: Jobs waiting for the single job thread: ``(id, cmd, args)``.
+_jobs: queue.Queue = queue.Queue()
+#: Name of the command the job thread is running, for queue and exit notes.
+_current_cmd: str | None = None
+
+
+def note(text: str) -> None:
+    """A line of the worker's own narration, written to stderr for the console."""
+    with _write_lock:
+        sys.stderr.write(f"[backend] {text}\n")
+        sys.stderr.flush()
 
 
 def emit(payload: dict) -> None:
@@ -194,10 +206,16 @@ CONTROL = {"ping", "stop_train"}
 
 
 def run_job(job_id: int, cmd: str, args: dict) -> None:
+    started = time.perf_counter()
+    note(f"{cmd} started")
+    emit({"id": job_id, "type": "started"})
     try:
         result = HANDLERS[cmd](args)
+        note(f"{cmd} finished in {time.perf_counter() - started:.1f}s")
         emit({"id": job_id, "type": "result", "data": result})
     except BaseException as error:  # noqa: BLE001 - reported, never swallowed
+        note(f"{cmd} failed after {time.perf_counter() - started:.1f}s: "
+             f"{type(error).__name__}: {error}")
         emit(
             {
                 "id": job_id,
@@ -206,18 +224,34 @@ def run_job(job_id: int, cmd: str, args: dict) -> None:
                 "traceback": traceback.format_exc(),
             }
         )
-    finally:
-        _job_lock.release()
+
+
+def job_loop() -> None:
+    """Run queued jobs one at a time, in the order they arrived.
+
+    Jobs used to be refused while another ran, and the first one after launch
+    is ``gpu_info``, which pays the torch import: the GUI's own ``warmup``
+    was always turned away, and so was anything the user clicked in those
+    first twenty seconds.  Waiting in line is what the user meant.
+    """
+    global _current_cmd
+    while True:
+        job_id, cmd, args = _jobs.get()
+        _current_cmd = cmd
+        try:
+            run_job(job_id, cmd, args)
+        finally:
+            _current_cmd = None
 
 
 def dispatch(message: dict) -> None:
-    global _current_job
-
     job_id = message.get("id", -1)
     cmd = message.get("cmd", "")
     args = message.get("args") or {}
 
     if cmd == "shutdown":
+        note("shutdown requested by the GUI"
+             + (f" while {_current_cmd} was running" if _current_cmd else ""))
         emit({"id": job_id, "type": "result", "data": {"bye": True}})
         os._exit(0)
 
@@ -232,15 +266,44 @@ def dispatch(message: dict) -> None:
             emit({"id": job_id, "type": "error", "error": f"{type(error).__name__}: {error}"})
         return
 
-    if not _job_lock.acquire(blocking=False):
-        emit({"id": job_id, "type": "error", "error": "worker is busy"})
-        return
+    busy_with = _current_cmd
+    waiting = _jobs.qsize()
+    _jobs.put((job_id, cmd, args))
+    if busy_with:
+        ahead = f" and {waiting} more" if waiting else ""
+        note(f"{cmd} queued behind {busy_with}{ahead}")
 
-    emit({"id": job_id, "type": "started"})
-    _current_job = threading.Thread(
-        target=run_job, args=(job_id, cmd, args), name=f"job-{job_id}", daemon=True
-    )
-    _current_job.start()
+
+def _take_command_pipe():
+    """Move the GUI's command pipe off stdin, where children cannot inherit it.
+
+    Every child the backend starts -- the trainer, preprocess, extraction,
+    ffmpeg inside a library -- inherits stdin unless told otherwise, and on
+    Windows a child holding this pipe was followed by the worker reading EOF
+    on it and exiting with code 0 in the middle of the job ("command pipe
+    closed ... abandoning train").  Passing ``stdin=DEVNULL`` at each call site
+    only covers the call sites we know about.
+
+    ``os.dup`` returns a non-inheritable descriptor (PEP 446), so the commands
+    are read from a private copy, and descriptor 0 -- together with the Win32
+    standard input handle that CreateProcess hands to children -- is pointed
+    at the null device.
+    """
+    private = os.dup(sys.stdin.fileno())
+    null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(null, 0)
+    os.close(null)
+    if os.name == "nt":
+        try:
+            import ctypes
+            import msvcrt
+
+            STD_INPUT_HANDLE = -10
+            ctypes.windll.kernel32.SetStdHandle(STD_INPUT_HANDLE, msvcrt.get_osfhandle(0))
+        except (OSError, AttributeError):
+            pass
+    sys.stdin = open(os.devnull, encoding="utf-8")
+    return open(private, encoding="utf-8", errors="replace", closefd=True)
 
 
 def main() -> None:
@@ -255,9 +318,22 @@ def main() -> None:
     except AttributeError:
         pass
 
+    # A segfault or abort inside a native kernel otherwise ends the process
+    # with nothing but an exit code; this prints every thread's Python stack.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    threading.excepthook = lambda hook: note(
+        "uncaught error in thread {}:\n{}".format(
+            hook.thread.name if hook.thread else "?",
+            "".join(traceback.format_exception(hook.exc_type, hook.exc_value, hook.exc_traceback)),
+        )
+    )
+
+    commands = _take_command_pipe()
+
+    threading.Thread(target=job_loop, name="jobs", daemon=True).start()
     emit({"type": "ready", "pid": os.getpid()})
 
-    for line in sys.stdin:
+    for line in commands:
         line = line.strip()
         if not line:
             continue
@@ -269,6 +345,8 @@ def main() -> None:
         dispatch(message)
 
     # stdin closed: the GUI is gone.  Do not linger holding the GPU.
+    note("command pipe closed, exiting"
+         + (f" (abandoning {_current_cmd})" if _current_cmd else ""))
     os._exit(0)
 
 

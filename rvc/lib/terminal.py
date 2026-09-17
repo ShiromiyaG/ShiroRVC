@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import time
 import traceback
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -394,6 +395,77 @@ def _progress_columns(*, download: bool = False, training: bool = False):
     return columns
 
 
+#: Seconds between two ``[TASK]`` lines for the same bar.
+_TASK_LINE_INTERVAL = 0.5
+
+
+def _reports_to_a_pipe() -> bool:
+    """Whether output goes somewhere Rich's live bar cannot draw."""
+    try:
+        return not sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+class _ReportingProgress(Progress):
+    """A Rich progress that also prints parseable lines when piped.
+
+    Rich renders nothing live when stdout is not a terminal, and these bars
+    are transient, so a front-end reading the pipe saw no progress at all for
+    preprocessing or extraction.  Each bar now also prints
+
+        [TASK] 120/5166 Slicing & resampling
+
+    at most every :data:`_TASK_LINE_INTERVAL` seconds, plus once when it
+    starts and once when it completes.  ``?`` stands for an unknown total.
+    The trainer has its own ``[PROGRESS]`` line and does not use this.
+    """
+
+    def __init__(self, *args, report: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._report = report
+        self._last_report: dict[Any, float] = {}
+
+    def add_task(self, *args, **kwargs):
+        task_id = super().add_task(*args, **kwargs)
+        self._emit_task_line(task_id, force=True)
+        return task_id
+
+    def advance(self, task_id, advance: float = 1) -> None:
+        super().advance(task_id, advance)
+        self._emit_task_line(task_id)
+
+    def update(self, task_id, *args, **kwargs) -> None:
+        super().update(task_id, *args, **kwargs)
+        self._emit_task_line(task_id)
+
+    def _emit_task_line(self, task_id, force: bool = False) -> None:
+        if not self._report:
+            return
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        total = task.total
+        done = task.completed
+        finished = total is not None and done >= total
+        now = time.monotonic()
+        last = self._last_report.get(task_id)
+        if finished and last == float("inf"):
+            return
+        if not (force or finished) and last is not None and now - last < _TASK_LINE_INTERVAL:
+            return
+        self._last_report[task_id] = float("inf") if finished else now
+        shown_total = "?" if total is None else f"{int(total)}"
+        description = " ".join(str(task.description).split())
+        # Not ``print``: install_rich_print may have replaced it, and Rich
+        # would read ``[TASK]`` as markup.
+        try:
+            sys.stdout.write(f"[TASK] {int(done)}/{shown_total} {description}\n")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            self._report = False
+
+
 def create_progress(
     *,
     download: bool = False,
@@ -401,8 +473,9 @@ def create_progress(
     training: bool = False,
     disable: bool = False,
 ) -> Progress:
-    return Progress(
+    return _ReportingProgress(
         *_progress_columns(download=download, training=training),
+        report=not disable and not training and _reports_to_a_pipe(),
         console=get_console(),
         refresh_per_second=10,
         transient=not leave,

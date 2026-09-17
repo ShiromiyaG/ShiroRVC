@@ -1,4 +1,4 @@
-"""Training progress, driven by the trainer's own progress lines.
+"""Progress widgets, driven by the backend's own progress lines.
 
 The trainer prints ``[PROGRESS] epoch=7/500 batch=3600/8083 step=48500 ...``
 about once a second whenever stdout is not a terminal.  Everything here is
@@ -8,6 +8,9 @@ The estimate is deliberately conservative.  A rate measured over the last few
 seconds swings wildly -- a checkpoint write, a validation pass or another
 process taking the GPU all show up as a stall -- so it is smoothed over a long
 window and only shown once there is enough history to mean something.
+
+Preprocessing and extraction report through ``[TASK]`` lines instead, which
+:class:`ProgressButton` turns into a fill inside the button that started them.
 """
 
 from __future__ import annotations
@@ -20,14 +23,20 @@ from PySide6.QtCore import (
     QAbstractAnimation,
     QEasingCurve,
     QPropertyAnimation,
+    QRectF,
     Qt,
+    QTimer,
     Signal,
 )
+from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
+    QStyle,
+    QStyleOptionButton,
+    QStylePainter,
     QVBoxLayout,
     QWidget,
 )
@@ -312,3 +321,176 @@ class TrainingProgress(QWidget):
         rate = done / elapsed
         total = update["total_epochs"] * update["total_batches"]
         return max(0.0, (total - last_batch) / rate)
+
+
+#: Emitted by ``_ReportingProgress`` in rvc/lib/terminal.py for every Rich bar
+#: when the output is piped: ``[TASK] 120/5166 Slicing & resampling``.
+TASK_LINE = re.compile(r"\[TASK\]\s+(\d+)/(\d+|\?)\s+(.*)")
+
+
+def parse_task(line: str) -> tuple[str, int, int | None] | None:
+    """``(description, done, total)`` for one task line, or ``None``."""
+    match = TASK_LINE.search(line)
+    if not match:
+        return None
+    total = None if match.group(2) == "?" else int(match.group(2))
+    return match.group(3).strip(), int(match.group(1)), total
+
+
+class ProgressButton(QPushButton):
+    """A run button that fills up with the progress of the job it started.
+
+    While a job runs the button is disabled, so its face is free to become the
+    progress bar: the fill is painted between the stylesheet's bevel and the
+    label, and the label carries the stage and the percentage.
+
+    Several bars can run at once -- extraction starts one per device -- so
+    tasks are grouped by the first word of their description ("F0", "Features")
+    and the most recent group is summed.  A group that has not reported a total
+    yet, or no line at all, shows a sweeping band instead of a fake 0%.
+    """
+
+    _SWEEP_MS = 30
+
+    def __init__(self, text: str, parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self._idle_text = text
+        self._active = False
+        self._fraction: float | None = None
+        self._sweep = 0.0
+        self._tasks: dict[str, tuple[int, int | None]] = {}
+        self._phase = ""
+        self._fill = QColor(255, 255, 255, 60)
+        self._timer = QTimer(self)
+        self._timer.setInterval(self._SWEEP_MS)
+        self._timer.timeout.connect(self._advance_sweep)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt naming
+        """Remember the caller's label; the running label is ours."""
+        if not self._active:
+            self._idle_text = text
+        super().setText(text)
+
+    def queue(self, text: str) -> None:
+        """Submitted, possibly waiting behind another job in the worker."""
+        self._active = True
+        self._tasks.clear()
+        self._phase = ""
+        self._fraction = None
+        self._sweep = 0.0
+        super().setText(text)
+        self._set_running(True)
+        self._timer.start()
+        self.update()
+
+    def start(self, text: str) -> None:
+        """The worker has begun this job."""
+        if self._active and not self._tasks:
+            super().setText(text)
+
+    def finish(self) -> None:
+        self._active = False
+        self._timer.stop()
+        self._tasks.clear()
+        self._fraction = None
+        super().setText(self._idle_text)
+        self._set_running(False)
+        self.update()
+
+    def consume(self, line: str) -> bool:
+        """Feed a log line.  Returns whether it was a task line."""
+        if not self._active:
+            return False
+        parsed = parse_task(line)
+        if parsed is None:
+            return False
+        description, done, total = parsed
+        phase = description.split(" ", 1)[0]
+        if phase != self._phase:
+            # A new stage replaces the old one rather than adding to it: the
+            # stages run one after another, and summing them would make the
+            # bar jump backwards each time a new one reported its total.
+            self._phase = phase
+            self._tasks = {key: value for key, value in self._tasks.items()
+                           if key.split(" ", 1)[0] == phase}
+        self._tasks[description] = (done, total)
+
+        totals = [task_total for _done, task_total in self._tasks.values()]
+        finished = sum(task_done for task_done, _total in self._tasks.values())
+        if any(value is None for value in totals) or not sum(totals):
+            self._fraction = None
+            label = f"{description} · {finished}"
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            total = sum(totals)
+            self._fraction = max(0.0, min(1.0, finished / total))
+            self._timer.stop()
+            name = description if len(self._tasks) == 1 else phase
+            label = f"{name} · {finished}/{total} · {self._fraction * 100:.0f}%"
+        super().setText(label)
+        self.update()
+        return True
+
+    # -- appearance --------------------------------------------------------
+
+    def _set_running(self, running: bool) -> None:
+        """Flip the ``running`` property style.qss keys the label colour on.
+
+        A disabled button's label is faint, which is right for "not now" and
+        wrong for "this is what is happening".
+        """
+        self.setProperty("running", running)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def apply_theme(self, tokens: dict[str, str]) -> None:
+        colour = QColor(tokens.get("accent", "#8b5cf6"))
+        colour.setAlpha(110)
+        self._fill = colour
+        self.update()
+
+    def _advance_sweep(self) -> None:
+        self._sweep = (self._sweep + 0.012) % 1.0
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if not self._active:
+            super().paintEvent(event)
+            return
+
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        painter = QStylePainter(self)
+        painter.drawControl(QStyle.CE_PushButtonBevel, option)
+
+        inner = self.rect().adjusted(1, 1, -1, -1)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        clip = QPainterPath()
+        # 8 px in style.qss, less the 1 px border.
+        clip.addRoundedRect(QRectF(inner), 7, 7)
+        painter.setClipPath(clip)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(self._fill)
+        if self._fraction is None:
+            band = inner.width() * 0.3
+            left = inner.left() - band + (inner.width() + band) * self._sweep
+            painter.drawRect(QRectF(left, inner.top(), band, inner.height()))
+        else:
+            painter.drawRect(QRectF(inner.left(), inner.top(),
+                                    inner.width() * self._fraction, inner.height()))
+        painter.restore()
+
+        painter.drawControl(QStyle.CE_PushButtonLabel, option)
+
+
+def progress_button(text: str) -> ProgressButton:
+    """A :func:`~.forms.primary_button` that can show a job's progress."""
+    button = ProgressButton(text)
+    button.setObjectName("Primary")
+    button.setMinimumHeight(38)
+    button.setCursor(Qt.PointingHandCursor)
+    return button

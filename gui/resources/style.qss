@@ -341,6 +341,12 @@ QPushButton#Primary:disabled {
     color: @text_faint@;
 }
 
+/* A ProgressButton while its job runs: disabled, but the label is the status. */
+QPushButton#Primary[running="true"]:disabled {
+    border-color: @accent@;
+    color: @text@;
+}
+
 QPushButton#Danger {
     background: transparent;
     border: 1px solid @danger@;

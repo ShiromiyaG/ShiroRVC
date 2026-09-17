@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..services import engine
+from ..widgets.progress import ProgressButton
 
 from ..i18n import _
 
@@ -123,12 +124,46 @@ class Page(QWidget):
         on_result: Callable[[dict], None] | None = None,
         buttons: list[QWidget] | None = None,
         success_text: str | None = None,
+        progress: ProgressButton | None = None,
     ) -> None:
-        """Dispatch a command with the usual busy/enable/report cycle."""
+        """Dispatch a command with the usual busy/enable/report cycle.
+
+        ``progress`` is a button that shows the job's ``[TASK]`` lines while it
+        runs.  It only listens between the worker's "started" and the answer,
+        so output from a job queued ahead of this one is not taken for its own.
+        """
         buttons = buttons or []
         for button in buttons:
             button.setEnabled(False)
         self.busy.emit(True, busy_text)
+
+        job = {"id": None}
+        engine_ = self.engine
+
+        def on_started(job_id: int) -> None:
+            if job_id == job["id"] and progress is not None:
+                engine_.log.connect(progress.consume)
+                progress.start(busy_text)
+
+        def on_finished(job_id: int) -> None:
+            if job_id != job["id"]:
+                return
+            for signal, slot in ((engine_.job_started, on_started),
+                                 (engine_.job_finished, on_finished),
+                                 (engine_.log, progress.consume if progress else None)):
+                if slot is None:
+                    continue
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass  # never connected: the job failed before starting
+            if progress is not None:
+                progress.finish()
+
+        if progress is not None:
+            progress.queue(_("Waiting for the backend…"))
+            engine_.job_started.connect(on_started)
+            engine_.job_finished.connect(on_finished)
 
         def finish() -> None:
             for button in buttons:
@@ -147,7 +182,12 @@ class Page(QWidget):
             finish()
             self.notify.emit("error", error)
 
-        self.engine.call(cmd, args, on_result=handle_result, on_error=handle_error)
+        job["id"] = self.engine.call(
+            cmd, args, on_result=handle_result, on_error=handle_error
+        )
+        if progress is not None and not self.engine.is_pending(job["id"]):
+            # Refused on the spot (no backend): no signal will ever come.
+            on_finished(job["id"])
 
     def require(self, **fields: Any) -> bool:
         """Report the first empty required field.  Returns whether all are set."""

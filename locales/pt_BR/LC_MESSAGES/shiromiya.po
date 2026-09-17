@@ -2262,3 +2262,7 @@ msgstr "{} checkpoint(s) foram deixados no lugar. O treino vai tentar retomar a 
 
 msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
 msgstr "{} não tem configuração para {} Hz (ele suporta {}). O áudio extraído fixa a taxa, então este experimento não pode usar esse vocoder."
+
+#: gui/views/base.py
+msgid "Waiting for the backend…"
+msgstr "Aguardando o backend…"

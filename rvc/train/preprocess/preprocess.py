@@ -26,7 +26,6 @@ from rvc.lib.terminal import (
     install_rich_print,
     progress_task,
     success,
-    track,
 )
 
 install_rich_print()
@@ -1001,12 +1000,13 @@ def preprocess_training_set(
     # Everywhere else keeps the process pool: without the GPU there is nothing
     # to share, and processes still beat threads on the pure-CPU path.
     use_threads = cut_preprocess == "New Automatic" and vad_device == "cuda"
-    with _stage1_pool(stage1_workers, use_threads) as pool:
-        for speaker_dir, audio_paths in track(
-            speaker_map.items(),
-            total=len(speaker_map),
-            description="Processing Speakers",
-        ):
+    # Counted in files, not speakers: a single-speaker dataset -- the usual
+    # case -- otherwise sat at 0/1 for the whole of the longest stage.
+    total_files = sum(len(paths) for paths in speaker_map.values())
+    with _stage1_pool(stage1_workers, use_threads) as pool, progress_task(
+        total_files, "Slicing & resampling"
+    ) as (progress, task_id):
+        for speaker_dir, audio_paths in speaker_map.items():
 
             try:
                 if speaker_dir == input_root:
@@ -1044,6 +1044,7 @@ def preprocess_training_set(
             for result in pool.imap_unordered(_process_audio_worker, arg_list):
                 if result:
                     total_audio_length += result
+                progress.advance(task_id)
 
     #: Modes whose gain is solved once per source recording.  They write the
     #: slices back themselves, in their own branch below, so the generic
