@@ -447,7 +447,7 @@ class ProgressButton(QPushButton):
         self.style().polish(self)
 
     def apply_theme(self, tokens: dict[str, str]) -> None:
-        colour = QColor(tokens.get("accent", "#8b5cf6"))
+        colour = QColor(tokens.get("accent", "#60a5fa"))
         colour.setAlpha(110)
         self._fill = colour
         self.update()

@@ -12,6 +12,7 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from .services import paths
 
 ACCENTS = {
+    "blue": "#60a5fa",
     "violet": "#8b7cf6",
     "teal": "#2dd4bf",
     "amber": "#f59e0b",
@@ -60,7 +61,7 @@ LIGHT = {
 }
 
 
-def tokens(mode: str = "dark", accent: str = "violet") -> dict[str, str]:
+def tokens(mode: str = "dark", accent: str = "blue") -> dict[str, str]:
     """Palette for a theme.
 
     Deliberately independent of the compositor backdrop: that is toggled with
@@ -68,7 +69,7 @@ def tokens(mode: str = "dark", accent: str = "violet") -> dict[str, str]:
     the stylesheet.
     """
     base = dict(DARK if mode == "dark" else LIGHT)
-    colour = ACCENTS.get(accent, ACCENTS["violet"])
+    colour = ACCENTS.get(accent, ACCENTS["blue"])
     base["accent"] = colour
     base["accent_hover"] = _shift(colour, 18 if mode == "dark" else -12)
     base["accent_pressed"] = _shift(colour, -18)
@@ -90,7 +91,7 @@ def _alpha(hex_colour: str, alpha: int) -> str:
     return f"rgba({colour.red()}, {colour.green()}, {colour.blue()}, {alpha})"
 
 
-def stylesheet(mode: str = "dark", accent: str = "violet") -> str:
+def stylesheet(mode: str = "dark", accent: str = "blue") -> str:
     """The themed sheet.  Belongs on the main window, not on the application.
 
     Measured on this layout: applying it to the ``QApplication`` costs 2.1 s,

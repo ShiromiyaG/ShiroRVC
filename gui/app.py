@@ -199,7 +199,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1120, 720)
 
         self._mode = prefs.get("theme", "dark")
-        self._accent = prefs.get("accent", "violet")
+        self._accent = prefs.get("accent", "blue")
+        # The accent used to default to violet, and prefs.save() writes every
+        # key on close, defaults included -- so every existing install has
+        # "violet" stored without anyone having picked it.  There has never been
+        # an accent picker, so that value can only be the retired default.
+        if self._accent == "violet":
+            self._accent = "blue"
+            prefs.set("accent", self._accent)
         self._backdrop = prefs.get("backdrop", "none")
         if not native.supports_backdrop():
             self._backdrop = "none"
@@ -707,7 +714,7 @@ def _application_icon() -> QIcon:
     # icon; the drawn shiba stands in.
     fallback = QIcon()
     for size in (16, 24, 32, 48, 64, 128, 256):
-        fallback.addPixmap(icons.pixmap("shiba", theme.ACCENTS["violet"], size))
+        fallback.addPixmap(icons.pixmap("shiba", theme.ACCENTS["blue"], size))
     return fallback
 
 

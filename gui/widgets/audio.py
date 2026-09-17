@@ -106,7 +106,7 @@ class Waveform(QWidget):
         self.colours = {
             "bg": QColor("#14141a"),
             "wave": QColor("#3d3d4d"),
-            "played": QColor("#8b7cf6"),
+            "played": QColor("#60a5fa"),
             "head": QColor("#e8e8ef"),
             "text": QColor("#6b6b7d"),
             "mid": QColor("#2e2e3a"),

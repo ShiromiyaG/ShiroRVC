@@ -29,9 +29,9 @@ class NavList(QListWidget):
         super().__init__(parent)
         self._indicator_top = 0.0
         self._indicator_height = 0.0
-        self._pill = QColor("#8b7cf6")
+        self._pill = QColor("#60a5fa")
         self._pill.setAlpha(38)
-        self._accent = QColor("#8b7cf6")
+        self._accent = QColor("#60a5fa")
 
         self._animation = QPropertyAnimation(self, b"indicatorTop", self)
         self._animation.setDuration(190)

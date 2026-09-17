@@ -50,7 +50,7 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 #: Distinguishable at a glance and colour-blind-safe enough for six series,
 #: which is more than a training chart should show at once anyway.
 SERIES_COLOURS = [
-    "#8b7cf6", "#2dd4bf", "#f59e0b", "#fb7185", "#38bdf8", "#a3e635",
+    "#60a5fa", "#2dd4bf", "#f59e0b", "#fb7185", "#8b7cf6", "#a3e635",
 ]
 
 #: Hard ceiling on points per series after decimation.  The effective budget is

@@ -22,7 +22,7 @@ DEFAULTS: dict[str, Any] = {
     #: First run is dark. After that the stored value wins, and it is written
     #: the moment the user switches rather than at shutdown.
     "theme": "dark",
-    "accent": "violet",
+    "accent": "blue",
     "window_geometry": None,
     "console_visible": True,
     #: Whether the training monitor is folded away.  Worth remembering: on a
