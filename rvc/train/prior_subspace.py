@@ -37,69 +37,143 @@ def pick_clips(filelist: str, count: int = 24, seed: int = 0) -> list[list[str]]
     return clips
 
 
-def harmonic_masks(pitchf: np.ndarray, frames: int, sr: int, hop: int, device):
+#: Masks by ``(pitch file, frames, sr, hop)``.  They are a function of the
+#: clip, and the clips are picked once per process, while the estimate runs
+#: again at every checkpoint.
+_MASK_CACHE: dict = {}
+
+
+def harmonic_masks(pitchf: np.ndarray, frames: int, sr: int, hop: int, device, key=None):
     """Bins between the partials and on them, 1-12 kHz, voiced frames only."""
-    freqs = np.fft.rfftfreq(N_FFT, 1 / sr)
-    df = freqs[1]
-    valleys = np.zeros((len(freqs), frames), bool)
-    partials = np.zeros((len(freqs), frames), bool)
-    edge = int(0.2 * sr / HOP)
-    for i in range(edge, frames - edge):
-        f0 = pitchf[min(i * HOP // hop, len(pitchf) - 1)]
-        if f0 <= 0:
-            continue
-        for k in range(max(1, int(1000 / f0)), int(12000 / f0)):
-            c = int(round(k * f0 / df))
-            if c + 2 >= len(freqs):
-                break
-            partials[c - 1 : c + 2, i] = True
-            c = int(round((k + 0.5) * f0 / df))
-            w = max(1, int(0.15 * f0 / df))
-            valleys[c - w : c + w + 1, i] = True
+    cached = _MASK_CACHE.get((key, frames, sr, hop)) if key is not None else None
+    if cached is None:
+        freqs = np.fft.rfftfreq(N_FFT, 1 / sr)
+        df = freqs[1]
+        bins = len(freqs)
+        edge = int(0.2 * sr / HOP)
+        index = np.arange(edge, max(edge, frames - edge))
+        f0 = pitchf[np.minimum(index * HOP // hop, len(pitchf) - 1)]
+        voiced = f0 > 0
+        index, f0 = index[voiced], f0[voiced]
+
+        valleys = np.zeros((bins, frames), bool)
+        partials = np.zeros((bins, frames), bool)
+        if len(f0):
+            # ``k`` runs to the highest partial any frame reaches; the per-frame
+            # range is a mask over it rather than a loop bound.
+            orders = np.arange(1, max(2, int(12000 / f0.min()) + 1))[None, :]
+            centres = np.rint(orders * f0[:, None] / df).astype(np.int64)
+            low = np.maximum(1, (1000 / f0[:, None]).astype(np.int64))
+            high = (12000 / f0[:, None]).astype(np.int64)
+            wanted = (orders >= low) & (orders < high)
+            # ``break``, not ``continue``: once a partial runs off the top of
+            # the spectrum, neither it nor anything above it is marked.
+            wanted &= np.cumprod(centres + 2 < bins, axis=1).astype(bool)
+            rows = np.repeat(index[:, None], orders.shape[1], axis=1)
+
+            def mark(target, centre, offsets, keep):
+                for offset in offsets:
+                    taken = keep & (centre + offset >= 0) & (centre + offset < bins)
+                    target[(centre + offset)[taken], rows[taken]] = True
+
+            mark(partials, centres, range(-1, 2), wanted)
+
+            between = np.rint((orders + 0.5) * f0[:, None] / df).astype(np.int64)
+            width = np.maximum(1, (0.15 * f0 / df).astype(np.int64))
+            spread = range(-int(width.max()), int(width.max()) + 1)
+            for offset in spread:
+                taken = (
+                    wanted
+                    & (np.abs(offset) <= width[:, None])
+                    & (between + offset >= 0)
+                    & (between + offset < bins)
+                )
+                valleys[(between + offset)[taken], rows[taken]] = True
+        cached = (valleys, partials)
+        if key is not None:
+            _MASK_CACHE[(key, frames, sr, hop)] = cached
+
+    valleys, partials = cached
     return torch.tensor(valleys, device=device), torch.tensor(partials, device=device)
 
 
-def valley_gradient(net_g, parts: list[str], sr: int, hop: int, max_frames: int):
-    """d log(valley / partial energy) / dz at the noiseless prior, [channels, frames]."""
+def valley_gradients(net_g, batch: list[list[str]], sr: int, hop: int, max_frames: int):
+    """d log(valley / partial energy) / dz at the noiseless prior, per clip.
+
+    One batched pass: each clip's ratio reads only its own ``z``, so the
+    gradient of their sum is each clip's own gradient.  The batch is cropped to
+    its shortest clip, which is what lets them share a pass at all.
+    """
     device = net_g.emb_g.weight.device
-    phone = np.repeat(np.load(parts[1]), 2, axis=0)
-    pitch, pitchf = np.load(parts[2]), np.load(parts[3])
-    frames = min(len(phone), len(pitch), len(pitchf), max_frames)
-    phone = torch.FloatTensor(phone[:frames]).unsqueeze(0).to(device)
-    pitch_t = torch.LongTensor(pitch[:frames]).unsqueeze(0).to(device)
-    pitchf_t = torch.FloatTensor(pitchf[:frames]).unsqueeze(0).to(device)
-    sid = torch.LongTensor([int(parts[4])]).to(device)
+    loaded = []
+    for parts in batch:
+        phone = np.repeat(np.load(parts[1]), 2, axis=0)
+        pitch, pitchf = np.load(parts[2]), np.load(parts[3])
+        loaded.append((parts, phone, pitch, pitchf))
+    frames = min(
+        [max_frames] + [min(len(p), len(c), len(f)) for _, p, c, f in loaded]
+    )
+    phone = torch.FloatTensor(np.stack([p[:frames] for _, p, _, _ in loaded])).to(device)
+    pitch_t = torch.LongTensor(np.stack([c[:frames] for _, _, c, _ in loaded])).to(device)
+    pitchf_t = torch.FloatTensor(np.stack([f[:frames] for _, _, _, f in loaded])).to(device)
+    sid = torch.LongTensor([int(parts[4]) for parts, *_ in loaded]).to(device)
+    lengths = torch.full((len(loaded),), frames, dtype=torch.long, device=device)
 
     with torch.no_grad():
         g = net_g.emb_g(sid).unsqueeze(-1)
-        m_p, _, x_mask = net_g.enc_p(
-            phone=phone, pitch=pitch_t, lengths=torch.LongTensor([frames]).to(device)
-        )
+        m_p, _, x_mask = net_g.enc_p(phone=phone, pitch=pitch_t, lengths=lengths)
         z0 = net_g.flow(m_p * x_mask, x_mask, g=g, reverse=True)
 
     z = z0.clone().requires_grad_(True)
     # The excitation draws noise; fixing it keeps the gradient about z alone.
     torch.manual_seed(7)
     torch.cuda.manual_seed_all(7)
-    audio = net_g.dec(z * x_mask, pitchf_t, g).squeeze()
+    audio = net_g.dec(z * x_mask, pitchf_t, g).squeeze(1)
     window = torch.hann_window(N_FFT, device=device)
-    power = torch.stft(audio.float(), N_FFT, HOP, window=window, return_complex=True).abs().pow(2)
-    valleys, partials = harmonic_masks(pitchf[:frames], power.shape[1], sr, hop, device)
-    if not valleys.any():
-        return None
-    ratio = torch.log(torch.where(valleys, power, 0).sum() + 1e-9) - torch.log(
-        torch.where(partials, power, 0).sum() + 1e-9
-    )
+    power = torch.stft(
+        audio.float(), N_FFT, HOP, window=window, return_complex=True
+    ).abs().pow(2)
+
+    ratios, wanted = [], []
+    for index, (parts, _, _, pitchf) in enumerate(loaded):
+        valleys, partials = harmonic_masks(
+            pitchf[:frames], power.shape[-1], sr, hop, device, key=parts[3]
+        )
+        if not valleys.any():
+            continue
+        item = power[index]
+        ratios.append(
+            torch.log(torch.where(valleys, item, 0).sum() + 1e-9)
+            - torch.log(torch.where(partials, item, 0).sum() + 1e-9)
+        )
+        wanted.append(index)
+    if not ratios:
+        return []
     # Gradient with respect to z only, so no parameter's .grad is touched.
-    (grad,) = torch.autograd.grad(ratio, z)
-    return grad[0]
+    (grad,) = torch.autograd.grad(torch.stack(ratios).sum(), z)
+    return [grad[index] for index in wanted]
 
 
-def estimate_prior_subspace(net_g, clips, sr: int, hop: int, rank: int = 16, max_frames: int = 900):
+def valley_gradient(net_g, parts: list[str], sr: int, hop: int, max_frames: int):
+    """``valley_gradients`` for one clip, or ``None`` when it has no voiced bins."""
+    grads = valley_gradients(net_g, [parts], sr, hop, max_frames)
+    return grads[0] if grads else None
+
+
+def estimate_prior_subspace(
+    net_g,
+    clips,
+    sr: int,
+    hop: int,
+    rank: int = 16,
+    max_frames: int = 900,
+    batch_size: int = 4,
+):
     """The top ``rank`` directions as a CPU [channels, rank] tensor, and the share they capture.
 
     Runs the model in eval mode and restores its mode and the global RNG state
-    afterwards, so it can be called from inside a training loop.
+    afterwards, so it can be called from inside a training loop.  ``batch_size``
+    clips share a pass, cropped to the shortest of them.
     """
     device = net_g.emb_g.weight.device
     covariance = None
@@ -108,15 +182,14 @@ def estimate_prior_subspace(net_g, clips, sr: int, hop: int, rank: int = 16, max
     devices = [device] if device.type == "cuda" else []
     try:
         with torch.random.fork_rng(devices=devices):
-            for parts in clips:
-                grad = valley_gradient(net_g, parts, sr, hop, max_frames)
-                if grad is None:
-                    continue
-                grad = grad.double()
-                outer = grad @ grad.T
-                # Normalised so a loud clip does not choose the directions alone.
-                outer = outer / (outer.trace() + 1e-12)
-                covariance = outer if covariance is None else covariance + outer
+            for start in range(0, len(clips), max(1, int(batch_size))):
+                batch = clips[start : start + max(1, int(batch_size))]
+                for grad in valley_gradients(net_g, batch, sr, hop, max_frames):
+                    grad = grad.double()
+                    outer = grad @ grad.T
+                    # Normalised so a loud clip does not choose the directions alone.
+                    outer = outer / (outer.trace() + 1e-12)
+                    covariance = outer if covariance is None else covariance + outer
     finally:
         net_g.train(was_training)
     if covariance is None:

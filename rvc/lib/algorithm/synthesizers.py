@@ -180,6 +180,10 @@ class Synthesizer(torch.nn.Module):
                 source_tilt=float(
                     decoder_config.get("refinegan2_source_tilt", 1.0)
                 ),
+                # ``always`` is RefineGAN's own; ``train`` is what this fork
+                # shipped and what its earlier checkpoints were trained with.
+                # See ``ADAIN_NOISE_MODES``.
+                adain_noise=decoder_config.get("refinegan2_adain_noise", "always"),
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")

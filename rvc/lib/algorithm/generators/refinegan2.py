@@ -99,6 +99,31 @@ DEFAULT_UPSAMPLE_BETA = (6.0, 6.0, 6.0, 9.0)
 SOURCE_GAIN_KERNEL = 5
 
 
+#: What ``AdaIN`` does with its noise.  ``always`` is RefineGAN's -- the
+#: paper's Figure 1 draws this block as gaussian noise, a learnable weight, the
+#: sum and a LeakyReLU, with no mention of dropping it at inference, and the
+#: reference implementation adds it unconditionally.
+#:
+#: ``train`` was this fork's, as an inference saving, and it is the one setting
+#: that is not self-consistent: the decoder builds its high-frequency floor out
+#: of a noise the render then does not have -- 3.1 dB of 8-13 kHz on a 220k-step
+#: checkpoint -- and the discriminator, seeing the same noisy output, never asks
+#: for the floor either.
+ADAIN_NOISE_MODES = ("always", "train", "off")
+
+
+def adain_noise_mode(value):
+    """``ADAIN_NOISE_MODES`` entry for a config value; bools are the old spelling."""
+    if isinstance(value, bool):
+        return "train" if value else "off"
+    mode = str(value).lower()
+    if mode not in ADAIN_NOISE_MODES:
+        raise ValueError(
+            f"adain_noise must be one of {ADAIN_NOISE_MODES}; received {value!r}."
+        )
+    return mode
+
+
 class ResBlock(nn.Module):
     """Residual block of dilated convolutions at multiple dilation rates."""
 
@@ -165,10 +190,10 @@ class ResBlock(nn.Module):
 
 
 class AdaIN(nn.Module):
-    """Noise-regularised activation.
+    """RefineGAN's noise-injecting activation.
 
     There are two of these wrapped around every ``ResBlock`` -- six per
-    ``ParallelResBlock``.
+    ``ParallelResBlock``.  ``noise`` is one of ``ADAIN_NOISE_MODES``.
     """
 
     def __init__(
@@ -176,22 +201,18 @@ class AdaIN(nn.Module):
         *,
         channels: int,
         leaky_relu_slope: float = 0.2,
+        noise: str = "always",
     ):
         super().__init__()
 
-        self.weight = nn.Parameter(torch.ones(channels) * 1e-4)
+        self.noise = adain_noise_mode(noise)
+        if self.noise != "off":
+            self.weight = nn.Parameter(torch.ones(channels) * 1e-4)
         # safe to use in-place as it is used on a new x+gaussian tensor
         self.activation = nn.LeakyReLU(leaky_relu_slope)
 
     def forward(self, x: torch.Tensor):
-        # The noise is a training-time regulariser, and at inference it is pure
-        # cost: this module runs six times per decoder stage, so at the output
-        # rate it draws 13.5 M samples per forward.  Measured on CPU at batch 4
-        # over 0.4 s, dropping it in eval takes the whole generator from 418 ms
-        # to 313 ms -- 25% of the forward.  Inference stays stochastic anyway:
-        # the excitation draws its own noise, and that one is not optional --
-        # it *is* the unvoiced content.
-        if not self.training:
+        if self.noise == "off" or (self.noise == "train" and not self.training):
             return self.activation(x)
 
         gaussian = torch.randn_like(x) * self.weight[None, :, None]
@@ -210,6 +231,7 @@ class ParallelResBlock(nn.Module):
         kernel_sizes: tuple[int] = (3, 7, 11),
         dilation: tuple[int] = (1, 3, 5),
         leaky_relu_slope: float = 0.2,
+        adain_noise: str = "always",
     ):
         super().__init__()
 
@@ -232,6 +254,7 @@ class ParallelResBlock(nn.Module):
                     AdaIN(
                         channels=out_channels,
                         leaky_relu_slope=leaky_relu_slope,
+                        noise=adain_noise,
                     ),
                     ResBlock(
                         out_channels,
@@ -242,6 +265,7 @@ class ParallelResBlock(nn.Module):
                     AdaIN(
                         channels=out_channels,
                         leaky_relu_slope=leaky_relu_slope,
+                        noise=adain_noise,
                     ),
                 )
                 for kernel_size in kernel_sizes
@@ -386,8 +410,15 @@ class SineGenerator(nn.Module):
         # can shape the tilt with a handful of channels at any harmonic count.
         band = torch.floor(torch.log2(orders)).long()
         self.register_buffer("gain_band", band, persistent=False)
+        #: Noise gain channels: a first-order lowpass of the draw, the draw
+        #: itself, and a first-order highpass of it, each with its own gain.
+        #: One gain on white noise can only move the floor as a block, and what
+        #: the floor is short of is *tilt* -- measured against a reference, too
+        #: little above 8 kHz and too much below 1.5.  Mixing the three is a
+        #: slope the projection can choose per frame.
+        self.noise_gain_channels = 3
         #: Gain channels ``forward`` takes: one per octave band, then the noise.
-        self.gain_channels = int(band.max()) + 2
+        self.gain_channels = int(band.max()) + 1 + self.noise_gain_channels
 
     def _f02uv(self, f0):
         uv = torch.ones_like(f0)
@@ -463,6 +494,11 @@ class SineGenerator(nn.Module):
 
         # merge with grad
         if gain is not None:
+            # Unit variance each, so the three start out interchangeable and a
+            # gain reads as a level rather than as a filter's own scale.
+            previous = F.pad(noise[:, :-1], (0, 0, 1, 0))
+            lowpass = (noise + previous) * 0.7071067811865476
+            highpass = (noise - previous) * 0.7071067811865476
             # No Tanh under a gain: a learned gain can push the sum into
             # saturation, and saturating a harmonic sum at the output rate
             # folds.  The gain used to multiply after the Tanh, so the output
@@ -471,7 +507,11 @@ class SineGenerator(nn.Module):
             # indexing backpropagates through a sort-based ``index_put_`` over
             # every (sample, partial), ``index_select`` through ``index_add_``.
             sine_waves = sine_waves * torch.index_select(gain, -1, self.gain_band)
-            noise = noise * gain[..., -1:]
+            noise = (
+                lowpass * gain[..., -3:-2]
+                + noise * gain[..., -2:-1]
+                + highpass * gain[..., -1:]
+            )
 
         if self.dim == 1:
             merged = self.merge[0](sine_waves + noise)
@@ -536,6 +576,7 @@ class RefineGAN2Generator(nn.Module):
         filter_beta: "float | Sequence[float]" = DEFAULT_UPSAMPLE_BETA,
         source_gain: bool = False,
         source_noise_std: float = 0.003,
+        adain_noise: str = "always",
         source_harmonics: int = 0,
         source_tilt: float = 1.0,
     ):
@@ -720,6 +761,7 @@ class RefineGAN2Generator(nn.Module):
         # render), which the sweep above cannot see -- it measures only whether
         # the band gets filled.
         self.source_noise_std = float(source_noise_std)
+        self.adain_noise = adain_noise_mode(adain_noise)
         # How many partials the excitation carries, and how steeply they fall.
         # 0 is what this shipped with and what every checkpoint before
         # 2026-09-09 was trained on; ``source_harmonics`` sizes
@@ -815,6 +857,12 @@ class RefineGAN2Generator(nn.Module):
             # rescale a fine-tune's source on step zero.
             nn.init.zeros_(self.source_gain.weight)
             nn.init.constant_(self.source_gain.bias, 0.5413248546129181)
+            # The two tilt channels start muted (``softplus(-6) = 0.0025``), so
+            # the excitation at initialisation is the white draw it always was
+            # and a slope is something the projection has to ask for.
+            with torch.no_grad():
+                self.source_gain.bias[-3] = -6.0
+                self.source_gain.bias[-1] = -6.0
             if gin_channels != 0:
                 # Zero as well, so the speaker term starts out adding nothing.
                 self.source_gain_cond = nn.Conv1d(gin_channels, gain_channels, 1)
@@ -877,6 +925,7 @@ class RefineGAN2Generator(nn.Module):
                     kernel_sizes=(3, 7, 11),
                     dilation=(1, 3, 5),
                     leaky_relu_slope=leaky_relu_slope,
+                    adain_noise=self.adain_noise,
                 )
             )
 

@@ -18,8 +18,8 @@ from rvc.lib.terminal import warning
 
 #: Applio's branch layouts, under their names so a diff is a diff.  ``v2`` is
 #: HiFi-GAN's; ``v3`` trades its three widest period branches for three
-#: multi-resolution spectrogram branches.  ``v4`` is this fork's: ``v3`` minus
-#: its longest period.
+#: multi-resolution spectrogram branches.  ``v4`` is this fork's: ``v3``'s
+#: periods with pre-emphasis and multi-band spectrogram branches.
 #:
 #: ``DiscriminatorR``'s frequency axis can be decimated -- ``(1, 2, 2)`` in the
 #: last two layers measured no worse than Applio's ``(1, 1, 1)`` on both probe
@@ -82,7 +82,6 @@ def rate_scaled_periods(periods, sample_rate, reference_rate=REFERENCE_SAMPLE_RA
 #: guard is the only thing that can tell.
 PERIODS_BY_RATE = {
     "v3": {32000: (3, 5, 7, 11, 17)},
-    "v4": {32000: (3, 5, 7, 11)},
 }
 
 
@@ -101,20 +100,31 @@ DISCRIMINATOR_VERSIONS = {
     "v1": ([2, 3, 5, 7, 11, 17], [], (1, 1, 1)),
     "v2": ([2, 3, 5, 7, 11, 17, 23, 37], [], (1, 1, 1)),
     "v3": ([2, 3, 5, 7, 11], V3_RESOLUTIONS, (1, 1, 1)),
-    # ``v3`` minus its longest period (17 at 32 kHz), and nothing else.  The
-    # spectrogram branches keep full frequency resolution: they are the only
-    # part of this D with any resolution above 10 kHz, which is the band being
-    # chased.  A longer period folds at a lower rate, so it is the branch least
-    # able to say anything up there -- the cheapest one to lose.
-    "v4": ([2, 3, 5, 7], V4_RESOLUTIONS, (1, 1, 1)),
+    # Not rate-scaled: period 2 is kept on purpose, it is the only branch that
+    # folds near Nyquist.  The spectral and pre-emphasis changes are in the
+    # tables below.
+    "v4": ([2, 3, 5, 7, 11], V4_RESOLUTIONS, (1, 2, 2)),
 }
+
+#: Versions whose spectrogram branches are ``MultiBandDiscriminatorR``.
+MULTIBAND_MRD_VERSIONS = {"v4"}
+
+#: Pre-emphasis coefficient applied to the period branches' input, per version.
+#: Off on v4: at 0.97 periods 5, 7 and 11 stayed near chance for 12k steps.
+MPD_PRE_EMPHASIS_BY_VERSION = {"v4": 0.0}
+
+#: R1 strength per version; absent or 0 turns the penalty off.  Opt in with
+#: ``d_r1_gamma`` and tune it from ``r1/penalty``.
+R1_GAMMA_BY_VERSION = {}
 
 
 #: How much of the objective UnivHD is allowed to be, per version.
 #:
 #: ``1.0`` -- the paper's additive setting, and what every version outside this
-#: table gets -- is wrong for the branch set ``v4`` actually runs, and the
-#: pretrain that showed it is the argument for the number here.  ``disc_sep``
+#: table gets -- was wrong for the branch set ``v4`` first ran (four
+#: rate-scaled periods, single-band spectrogram branches), and the pretrain
+#: that showed it is the argument for the number here; it has not been
+#: re-measured on the current layout.  ``disc_sep``
 #: is ``mean(real logit) - mean(fake logit)`` per branch, i.e. how decisively a
 #: head is separating.  Measured on a 32 kHz pretrain over these nine branches,
 #: SAN on, rolling mean over 50 steps, between steps 2k and 8.5k:
@@ -199,8 +209,25 @@ class MPD_MSD_Combined(torch.nn.Module):
         univhd_half_harmonic: bool = True,
         univhd_weight: Optional[float] = None,
         mrd_fp32_input: bool = True,
+        mrd_multiband: Optional[bool] = None,
+        mrd_channels: int = 32,
+        mpd_pre_emphasis: Optional[float] = None,
+        r1_gamma: Optional[float] = None,
+        r1_interval: int = 16,
+        r1_batch_fraction: float = 0.5,
+        r1_segment: int = 6400,
     ):
         """``version`` picks a preset; the overrides edit it branch by branch.
+
+        ``mrd_multiband`` and ``mpd_pre_emphasis`` default to what the version
+        says (``MULTIBAND_MRD_VERSIONS``, ``MPD_PRE_EMPHASIS_BY_VERSION``);
+        ``mrd_channels`` is the width of the multi-band branches only.
+
+        ``r1_gamma`` defaults to ``R1_GAMMA_BY_VERSION``.  The trainer penalises
+        one branch at a time, each about every ``r1_interval`` steps, on the
+        loudest ``r1_batch_fraction`` of the real batch cropped to
+        ``r1_segment`` samples (0 keeps the whole segment); the discriminator
+        only provides :meth:`real_score`.
 
         ``None`` means "whatever the version says"; an empty list means "none of
         this family" -- a distinction a falsy check would lose.
@@ -267,6 +294,25 @@ class MPD_MSD_Combined(torch.nn.Module):
         self.use_msd = bool(use_msd)
         self.use_fast_mpd = bool(use_fast_mpd)
         self.mrd_fp32_input = bool(mrd_fp32_input)
+        self.mrd_multiband = (
+            version in MULTIBAND_MRD_VERSIONS
+            if mrd_multiband is None
+            else bool(mrd_multiband)
+        )
+        self.mrd_channels = int(mrd_channels)
+        self.mpd_pre_emphasis = float(
+            MPD_PRE_EMPHASIS_BY_VERSION.get(version, 0.0)
+            if mpd_pre_emphasis is None
+            else mpd_pre_emphasis
+        )
+        self.r1_gamma = float(
+            R1_GAMMA_BY_VERSION.get(version, 0.0) if r1_gamma is None else r1_gamma
+        )
+        if self.r1_gamma < 0.0:
+            raise ValueError(f"r1_gamma cannot be negative; received {self.r1_gamma}.")
+        self.r1_interval = max(1, int(r1_interval))
+        self.r1_batch_fraction = min(1.0, max(0.0, float(r1_batch_fraction)))
+        self.r1_segment = max(0, int(r1_segment))
         self.use_univhd = bool(use_univhd)
         # ``None`` means "whatever the version pins", the same convention the
         # branch overrides above use; an explicit number wins on any version.
@@ -300,19 +346,36 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
         period_branch = FastDiscriminatorP if self.use_fast_mpd else DiscriminatorP
         branches += [
-            period_branch(p, use_spectral_norm=use_spectral_norm, use_san=self.use_san)
+            period_branch(
+                p,
+                use_spectral_norm=use_spectral_norm,
+                use_san=self.use_san,
+                pre_emphasis=self.mpd_pre_emphasis,
+            )
             for p in self.periods
         ]
-        branches += [
-            DiscriminatorR(
-                list(r),
-                use_spectral_norm=use_spectral_norm,
-                frequency_strides=self.frequency_strides,
-                use_san=self.use_san,
-                fp32_input=self.mrd_fp32_input,
-            )
-            for r in self.resolutions
-        ]
+        if self.mrd_multiband:
+            branches += [
+                MultiBandDiscriminatorR(
+                    list(r),
+                    channels=self.mrd_channels,
+                    frequency_strides=self.frequency_strides,
+                    use_spectral_norm=use_spectral_norm,
+                    use_san=self.use_san,
+                )
+                for r in self.resolutions
+            ]
+        else:
+            branches += [
+                DiscriminatorR(
+                    list(r),
+                    use_spectral_norm=use_spectral_norm,
+                    frequency_strides=self.frequency_strides,
+                    use_san=self.use_san,
+                    fp32_input=self.mrd_fp32_input,
+                )
+                for r in self.resolutions
+            ]
         if self.use_univhd:
             from rvc.lib.algorithm.discriminators.univhd import UnivHDDiscriminator
 
@@ -450,6 +513,26 @@ class MPD_MSD_Combined(torch.nn.Module):
         self._compile_mode = mode
         return True
 
+    @property
+    def spectral_branch_indices(self) -> tuple:
+        """Indices of the spectrogram and UnivHD branches, in branch order."""
+        return tuple(
+            index
+            for index, label in enumerate(self.branch_labels)
+            if label.startswith("resolution_") or label == "univhd"
+        )
+
+    def real_score(self, x, index):
+        """Per-sample R1 score of branch ``index``: its weighted mean logit.
+
+        Calls the branch directly, so it stays eager under ``enable_compile``
+        -- the penalty needs a double backward the compiled graph cannot give.
+        Under SAN it reads the function output, the one the generator is
+        scored by.
+        """
+        logits, _ = self.discriminators[index](x)
+        return self.branch_weights[index] * logits.float().mean(dim=1)
+
     def forward(
         self,
         y,
@@ -457,6 +540,8 @@ class MPD_MSD_Combined(torch.nn.Module):
         no_grad_real: bool = False,
         san_training: bool = False,
         combine_inputs: bool = False,
+        extra=None,
+        extra_branches=(),
     ):
         """``no_grad_real`` runs the real branch under ``no_grad``.
 
@@ -497,8 +582,14 @@ class MPD_MSD_Combined(torch.nn.Module):
         be under ``no_grad`` -- which is why only the discriminator update
         asks for it, and it is off under spectral norm for the reason given at
         ``self.use_spectral_norm``.
+
+        ``extra`` is a third batch run through the branches in
+        ``extra_branches`` only; their logits come back as a fifth element, one
+        per listed branch.  With ``combine_inputs`` it joins those branches'
+        batch, so it adds no kernel launches.
         """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+        extra_outputs = []
         checkpointing = self.training and self.use_checkpointing
         # Only the discriminator update asks for the direction output.  In the
         # generator's pass the direction is not something the generator may
@@ -509,33 +600,49 @@ class MPD_MSD_Combined(torch.nn.Module):
 
         if combined:
             paired = torch.cat((y, y_hat), dim=0)
-            sizes = (y.shape[0], y_hat.shape[0])
-            for d in self.discriminators:
+            for index, d in enumerate(self.discriminators):
+                with_extra = extra is not None and index in extra_branches
+                batch = torch.cat((paired, extra), dim=0) if with_extra else paired
+                sizes = (y.shape[0], y_hat.shape[0]) + (
+                    (extra.shape[0],) if with_extra else ()
+                )
                 if checkpointing:
                     y_d, fmap = checkpoint(
-                        d, paired, san_training=san, use_reentrant=False
+                        d, batch, san_training=san, use_reentrant=False
                     )
                 else:
-                    y_d, fmap = d(paired, san_training=san)
+                    y_d, fmap = d(batch, san_training=san)
                 # Under SAN a branch returns ``[function, direction]`` rather
                 # than one tensor, and both halves have to be split.
                 if isinstance(y_d, (list, tuple)):
                     split = [torch.split(part, sizes, dim=0) for part in y_d]
                     y_d_r = [part[0] for part in split]
                     y_d_g = [part[1] for part in split]
+                    if with_extra:
+                        extra_outputs.append([part[2] for part in split])
                 else:
-                    y_d_r, y_d_g = torch.split(y_d, sizes, dim=0)
+                    split = torch.split(y_d, sizes, dim=0)
+                    y_d_r, y_d_g = split[0], split[1]
+                    if with_extra:
+                        extra_outputs.append(split[2])
                 fmap_r, fmap_g = [], []
                 for feature in fmap:
-                    feature_r, feature_g = torch.split(feature, sizes, dim=0)
-                    fmap_r.append(feature_r)
-                    fmap_g.append(feature_g)
+                    if isinstance(feature, tuple):
+                        parts = [torch.split(band, sizes, dim=0) for band in feature]
+                        fmap_r.append(tuple(part[0] for part in parts))
+                        fmap_g.append(tuple(part[1] for part in parts))
+                        continue
+                    parts = torch.split(feature, sizes, dim=0)
+                    fmap_r.append(parts[0])
+                    fmap_g.append(parts[1])
 
                 y_d_rs.append(y_d_r)
                 y_d_gs.append(y_d_g)
                 fmap_rs.append(fmap_r)
                 fmap_gs.append(fmap_g)
 
+            if extra is not None:
+                return y_d_rs, y_d_gs, fmap_rs, fmap_gs, extra_outputs
             return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
         for d in self.discriminators:
@@ -562,6 +669,12 @@ class MPD_MSD_Combined(torch.nn.Module):
             fmap_rs.append(fmap_r)
             fmap_gs.append(fmap_g)
 
+        if extra is not None:
+            extra_outputs = [
+                self.discriminators[i](extra, san_training=san)[0]
+                for i in extra_branches
+            ]
+            return y_d_rs, y_d_gs, fmap_rs, fmap_gs, extra_outputs
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
@@ -600,6 +713,14 @@ class DiscriminatorS(torch.nn.Module):
         return san_tail(self, x, fmap, san_training)
 
 
+def pre_emphasize(x, coefficient):
+    """``x[t] - coefficient * x[t-1]``; the waveform is otherwise dominated by
+    its low band, which leaves a period branch nearly blind above a few kHz."""
+    if not coefficient:
+        return x
+    return torch.cat((x[..., :1], x[..., 1:] - coefficient * x[..., :-1]), dim=-1)
+
+
 class DiscriminatorP(torch.nn.Module):
     """Multi-period discriminator branch: reshapes the waveform onto a period-`p` grid."""
 
@@ -610,9 +731,11 @@ class DiscriminatorP(torch.nn.Module):
         stride: int = 3,
         use_spectral_norm: bool = False,
         use_san: bool = False,
+        pre_emphasis: float = 0.0,
     ):
         super().__init__()
         self.period = period
+        self.pre_emphasis = float(pre_emphasis)
         norm_f = spectral_norm if use_spectral_norm else weight_norm
 
         in_channels = [1, 32, 128, 512, 1024]
@@ -644,6 +767,7 @@ class DiscriminatorP(torch.nn.Module):
 
     def forward(self, x, san_training: bool = False):
         fmap = []
+        x = pre_emphasize(x, self.pre_emphasis)
         b, c, t = x.shape
         if t % self.period != 0:
             n_pad = self.period - (t % self.period)
@@ -698,9 +822,11 @@ class FastDiscriminatorP(torch.nn.Module):
         n_layers: int = 4,
         use_spectral_norm: bool = False,
         use_san: bool = False,
+        pre_emphasis: float = 0.0,
     ):
         super().__init__()
         self.period = period
+        self.pre_emphasis = float(pre_emphasis)
         norm_f = spectral_norm if use_spectral_norm else weight_norm
 
         self.convs = torch.nn.ModuleList()
@@ -742,6 +868,7 @@ class FastDiscriminatorP(torch.nn.Module):
 
     def forward(self, x, san_training: bool = False):
         fmap = []
+        x = pre_emphasize(x, self.pre_emphasis)
         b, c, t = x.shape
         if t % self.period != 0:
             n_pad = self.period - (t % self.period)
@@ -840,7 +967,10 @@ class DiscriminatorR(torch.nn.Module):
             center=False,
             return_complex=True,
         )
-        return torch.norm(torch.view_as_real(x), p=2, dim=-1)
+        # Floored for the same reason as ``UnivHDDiscriminator.spectrogram``;
+        # in FP32 because the floor underflows in FP16.
+        x = torch.view_as_real(x).float()
+        return torch.sqrt(x.square().sum(dim=-1) + 1e-8)
 
     def forward(self, x, san_training: bool = False):
         fmap = []
@@ -867,3 +997,115 @@ class DiscriminatorR(torch.nn.Module):
             x = F.leaky_relu(layer(x), self.lrelu_slope)
             fmap.append(x)
         return san_tail(self, x, fmap, san_training)
+
+
+class MultiBandDiscriminatorR(torch.nn.Module):
+    """Spectrogram branch on a compressed complex STFT, one conv stack per band.
+
+    Three input channels: log magnitude, and the real and imaginary parts of
+    the STFT with its magnitude raised to ``compression`` (phase kept).  The
+    linear magnitude ``DiscriminatorR`` reads leaves the noise floor and the
+    upper bands numerically near zero, and it has no phase at all.  The
+    frequency axis is split into ``BANDS`` (fractions of the bins), each with
+    its own stack, as in DAC's MRD, so the low band cannot claim every filter.
+    ``frequency_strides`` and the window rule are ``DiscriminatorR``'s.
+    """
+
+    BANDS = ((0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
+    # Power floor: keeps log and the compression gain finite in silence,
+    # about 94 dB under a full-scale sine at these magnitudes.
+    POWER_EPS = 1e-4
+
+    def __init__(
+        self,
+        resolution,
+        channels: int = 32,
+        use_spectral_norm: bool = False,
+        use_san: bool = False,
+        compression: float = 0.3,
+        frequency_strides=(1, 1, 1),
+    ):
+        super().__init__()
+        self.resolution = resolution
+        self.compression = float(compression)
+        self.lrelu_slope = 0.1
+        self.frequency_strides = tuple(int(s) for s in frequency_strides)
+        if len(self.frequency_strides) != 3:
+            raise ValueError(
+                "MultiBandDiscriminatorR has three strided layers; "
+                f"received {len(self.frequency_strides)} frequency strides."
+            )
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
+
+        n_fft, _hop, win_length = self.resolution
+        n_bins = int(n_fft) // 2 + 1
+        self.band_edges = tuple(
+            (int(round(lo * n_bins)), int(round(hi * n_bins))) for lo, hi in self.BANDS
+        )
+
+        def band_stack():
+            return torch.nn.ModuleList(
+                [norm_f(torch.nn.Conv2d(3, channels, (3, 9), padding=(1, 4)))]
+                + [
+                    norm_f(
+                        torch.nn.Conv2d(
+                            channels, channels, (3, 9), stride=(s, 2), padding=(1, 4)
+                        )
+                    )
+                    for s in self.frequency_strides
+                ]
+                + [norm_f(torch.nn.Conv2d(channels, channels, (3, 3), padding=(1, 1)))]
+            )
+
+        self.bands = torch.nn.ModuleList(band_stack() for _ in self.BANDS)
+        self.use_san = bool(use_san)
+        self.conv_post = (
+            SANConv2d(channels, 1, (3, 3), padding=(1, 1))
+            if self.use_san
+            else norm_f(torch.nn.Conv2d(channels, 1, (3, 3), padding=(1, 1)))
+        )
+        self.register_buffer(
+            "window",
+            torch.hann_window(int(win_length))
+            if int(win_length) == int(n_fft)
+            else torch.ones(int(win_length)),
+            persistent=False,
+        )
+
+    def spectrogram(self, x):
+        n_fft, hop_length, win_length = self.resolution
+        pad = int((n_fft - hop_length) / 2)
+        x = F.pad(x, (pad, pad), mode="reflect").squeeze(1)
+        x = torch.stft(
+            x,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=self.window,
+            center=False,
+            return_complex=True,
+        )
+        # Written through the power rather than ``abs`` so the gradient stays
+        # finite at a zero bin.
+        power = x.real.square() + x.imag.square() + self.POWER_EPS
+        gain = power ** ((self.compression - 1.0) / 2.0)
+        return torch.stack(
+            (0.5 * torch.log(power), x.real * gain, x.imag * gain), dim=1
+        )
+
+    def forward(self, x, san_training: bool = False):
+        # Only the STFT leaves autocast; after compression the input is in the
+        # range the other branches see.
+        with torch.autocast(x.device.type, enabled=False):
+            x = self.spectrogram(x.float())
+        layers = [[] for _ in self.bands[0]]
+        for (lo, hi), stack in zip(self.band_edges, self.bands):
+            h = x[:, :, lo:hi]
+            for index, layer in enumerate(stack):
+                h = F.leaky_relu(layer(h), self.lrelu_slope)
+                layers[index].append(h)
+        # One entry per layer, a tuple of its band maps: ``feature_loss`` takes
+        # their joint mean, so the branch weighs what ``DiscriminatorR`` does
+        # without copying the activations into one tensor.
+        fmap = [tuple(maps) for maps in layers]
+        return san_tail(self, torch.cat(layers[-1], dim=2), fmap, san_training)

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Only on a terminal: `clear` would write escape codes into a redirected log.
+if [ -t 1 ]; then
+    clear
+fi
+
 # Run from the repo root regardless of where the script was invoked from.
 cd -- "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 

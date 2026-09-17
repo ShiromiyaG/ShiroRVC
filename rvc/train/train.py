@@ -60,13 +60,13 @@ from rvc.train.overtrain import (
     holdout_metrics_resilient,
     materialise_holdout,
 )
+from rvc.train.balance import FamilyReducer, build_balancer, head_accuracies
 from rvc.train.diagnostics import (
     branch_separation,
     cache_mean,
     clip_or_sample_grad_norm,
     generator_gradient_metrics,
     prior_gap,
-    split_branch_outputs,
 )
 from rvc.train.progress import EpochRecorder, emit_machine_progress
 from rvc.train.schedules import (
@@ -138,6 +138,8 @@ from losses import (
     kl_loss,
     mel_low_frequency_weights,
     mel_frequency_tilt_weights,
+    loud_crop,
+    r1_penalty,
     BandWeightedSpectralLoss,
     HighFrequencyFloorNegative,
 )
@@ -280,6 +282,8 @@ resumed_run = False
 # Steps the GradScaler discarded for non-finite gradients. A steady run of
 # skips looks like a stalled loss otherwise. Cumulative across resumes.
 amp_skipped_steps = 0
+# Adaptive D learning rate (``d_lr_balance``); ``None`` when off.
+d_lr_balancer = None
 
 
 # ========  Advanced / Manual and exp tweaks  ========================
@@ -358,19 +362,31 @@ def eval_infer(net_g, reference):
     return o
 
 
-# Clips the burst-direction estimate reads, picked once per process.
+# Clips the burst-direction estimate reads, picked once per process, and the
+# last basis with the step it was estimated at.
 _prior_subspace_clips = None
+_prior_subspace_cache = None
 
 
-def prior_subspace_for(model_g):
+def prior_subspace_for(model_g, force: bool = False):
     """``prior_noise_subspace`` for the weights ``model_g`` holds now, or None.
 
     RefineGAN2 only; see ``rvc/train/prior_subspace.py``.  A failure costs the
     checkpoint its key, never the save.
+
+    The estimate is a pass per clip with a backward, and the directions move
+    slowly, so a preview reuses one younger than ``prior_subspace_interval``
+    steps.  ``force`` re-estimates whatever the age, which is what a checkpoint
+    asks for: its basis has to belong to the weights it ships.
     """
-    global _prior_subspace_clips
+    global _prior_subspace_clips, _prior_subspace_cache
     if vocoder != "refinegan2":
         return None
+    interval = int(getattr(config.train, "prior_subspace_interval", 5000))
+    if not force and _prior_subspace_cache is not None:
+        estimated_at, basis = _prior_subspace_cache
+        if interval <= 0 or global_step - estimated_at < interval:
+            return basis
     try:
         if _prior_subspace_clips is None:
             _prior_subspace_clips = pick_clips(config.data.training_files)
@@ -382,7 +398,13 @@ def prior_subspace_for(model_g):
             int(config.data.sample_rate),
             int(config.data.hop_length),
             max_frames=400,
+            batch_size=int(getattr(config.train, "prior_subspace_batch", 4)),
         )
+        # Only the preview path caches: ``force`` estimates for weights that
+        # are not the live ones -- the EMA average, or another checkpoint's --
+        # and a preview must not inherit their basis.
+        if not force:
+            _prior_subspace_cache = (global_step, basis)
         return basis
     except Exception as error:
         warning(
@@ -400,7 +422,7 @@ def prior_subspace_for_state(model_g, state_dict):
     live = {key: value.detach().to("cpu", copy=True) for key, value in model_g.state_dict().items()}
     try:
         model_g.load_state_dict(state_dict, strict=False)
-        return prior_subspace_for(model_g)
+        return prior_subspace_for(model_g, force=True)
     finally:
         model_g.load_state_dict(live)
 
@@ -586,6 +608,8 @@ def _checkpoint_extra(grad_scaler):
     if grad_scaler is not None:
         extra["grad_scaler"] = grad_scaler.state_dict()
         extra["amp_skipped_steps"] = int(amp_skipped_steps)
+    if d_lr_balancer is not None:
+        extra["d_lr_balance"] = d_lr_balancer.state_dict()
     if lr_horizon_per_stage:
         extra["stage_freeze_mode"] = freeze_mode
         extra["stage_start_step"] = int(stage_start_step)
@@ -1292,8 +1316,19 @@ def run(
     # growth interval.  Restarting it at ``init_scale`` on every resume replays
     # the initial overflow-and-back-off search, which throws away a handful of
     # steps each time -- and hides a run that had settled at a much lower scale.
-    global amp_skipped_steps
+    global amp_skipped_steps, d_lr_balancer
     amp_skipped_steps = int(resumed_extra_d.get("amp_skipped_steps") or 0)
+    d_lr_balancer = build_balancer(config.train)
+    if d_lr_balancer is not None:
+        balance_state = resumed_extra_d.get("d_lr_balance")
+        if balance_state:
+            d_lr_balancer.load_state_dict(balance_state)
+        if rank == 0:
+            info(
+                f"Adaptive D learning rate per head family: target accuracy "
+                f"{d_lr_balancer.target:g}.",
+                tag="[INIT]",
+            )
     if grad_scaler is not None:
         scaler_state = resumed_extra_d.get("grad_scaler")
         if scaler_state:
@@ -1506,6 +1541,14 @@ def run(
                 scheduler_d.step()
 
 
+def spectral_loss_weight():
+    """``c_mel_scratch`` for a run without pretrains, when set; ``c_mel`` otherwise."""
+    scratch_weight = getattr(config.train, "c_mel_scratch", None)
+    if from_scratch and scratch_weight is not None:
+        return float(scratch_weight)
+    return float(config.train.c_mel)
+
+
 def warmup_active():
     """True if the linear warmup should run: CLI flag or manual step control."""
     return use_warmup or warmup_steps > 0
@@ -1608,6 +1651,7 @@ def training_loop(
     data_iterator = enumerate(train_loader)
 
     epoch_recorder = EpochRecorder()
+    c_mel = spectral_loss_weight()
 
     if not from_scratch:
         # Tensors init for averaged losses:
@@ -1654,6 +1698,8 @@ def training_loop(
     # FP16 throw away" rather than a lifetime average that a bad first epoch
     # would dominate forever.
     amp_skip_cache = deque(maxlen=rolling_loss_steps)
+    d_accuracy_cache = deque(maxlen=rolling_loss_steps)
+    r1_cache = deque(maxlen=rolling_loss_steps * 2)
 
     diagnostics_interval = max(
         1,
@@ -1682,6 +1728,44 @@ def training_loop(
         tuple(model_d.branch_weights)
         if getattr(model_d, "uses_branch_weights", False)
         else None
+    )
+    # Built once: a per-step host-to-device copy of the weights would block.
+    family_reducer = FamilyReducer(
+        getattr(model_d, "branch_labels", ()), branch_weights, device
+    )
+    # Branchwise lazy R1: one branch every ``r1_every`` steps, in turn, so each
+    # branch is penalised once per ``r1_period`` steps.
+    r1_gamma = float(getattr(model_d, "r1_gamma", 0.0))
+    r1_branches = len(getattr(model_d, "discriminators", ())) if r1_gamma > 0.0 else 0
+    r1_every = (
+        max(1, math.ceil(int(getattr(model_d, "r1_interval", 16)) / r1_branches))
+        if r1_branches
+        else 1
+    )
+    r1_period = r1_every * r1_branches
+    r1_batch_fraction = float(getattr(model_d, "r1_batch_fraction", 0.5))
+    r1_segment = int(getattr(model_d, "r1_segment", 0))
+    # The HF floor negative: spectral heads only (every head on a
+    # discriminator without any), on the loudest share of the batch.
+    hf_floor_branches = tuple(getattr(model_d, "spectral_branch_indices", ())) or tuple(
+        range(len(getattr(model_d, "discriminators", ())))
+    )
+    hf_floor_weights = (
+        [branch_weights[i] for i in hf_floor_branches]
+        if branch_weights is not None
+        else None
+    )
+    hf_floor_count = max(
+        1,
+        int(
+            round(
+                batch_size
+                * float(getattr(config.train, "hf_floor_negative_batch_fraction", 0.25))
+            )
+        ),
+    )
+    accuracy_sample_every = (
+        d_lr_balancer.sample_every if d_lr_balancer is not None else 4
     )
     kl_active_threshold = max(
         0.0,
@@ -1756,20 +1840,24 @@ def training_loop(
                 # it; the generator's runs the real side under ``no_grad``,
                 # and half a batch cannot be.
                 #
-                # The synthetic negative rides in the same tensor rather than
-                # in a second call: the real side is then computed once for
-                # both, so the pass is ``3B`` instead of ``2B`` and not ``4B``.
-                fake = y_hat.detach()
-                if fn_hf_floor_negative is not None:
-                    fake = torch.cat((fake, fn_hf_floor_negative(y)), dim=0)
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(
-                    y, fake, san_training=san_active, combine_inputs=True
+                # The HF floor negative rides in the same pass, through the
+                # spectral heads only: a separate eager pass cost ~14% of the
+                # step in kernel launches alone.
+                negative = (
+                    fn_hf_floor_negative(loud_crop(y, hf_floor_count, 0))
+                    if fn_hf_floor_negative is not None
+                    else None
                 )
-                y_d_hat_neg = None
-                if fn_hf_floor_negative is not None:
-                    y_d_hat_g, y_d_hat_neg = split_branch_outputs(
-                        y_d_hat_g, (y_hat.shape[0], y.shape[0])
-                    )
+                d_outputs = net_d(
+                    y,
+                    y_hat.detach(),
+                    san_training=san_active,
+                    combine_inputs=True,
+                    extra=negative,
+                    extra_branches=hf_floor_branches,
+                )
+                y_d_hat_r, y_d_hat_g = d_outputs[0], d_outputs[1]
+                y_d_hat_neg = d_outputs[4] if negative is not None else None
 
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 disc_loss_parts = discriminator_loss(
@@ -1782,36 +1870,72 @@ def training_loop(
                 )
                 loss_disc, loss_disc_real, loss_disc_fake = disc_loss_parts[:3]
                 if y_d_hat_neg is not None:
-                    # Only the fake half of the second call is wanted: the real
-                    # half is the same logits already charged for above, and
-                    # counting them twice would double the weight on one side
-                    # of a two-sided loss.
+                    # Only the fake half is wanted: the real half is the same
+                    # logits already charged for above, and counting them twice
+                    # would double the weight on one side of a two-sided loss.
                     loss_hf_floor = discriminator_loss(
-                        y_d_hat_r,
+                        [y_d_hat_r[i] for i in hf_floor_branches],
                         y_d_hat_neg,
                         san_direction_weight=san_direction_weight,
                         normalize=False,
                         per_branch=False,
-                        branch_weights=branch_weights,
+                        branch_weights=hf_floor_weights,
                     )[2]
                     loss_disc = loss_disc + hf_floor_weight * loss_hf_floor
 
+            # Weighted by the period so each branch's average strength is
+            # ``r1_gamma``.  Joined to this backward so DDP and the scaler see
+            # one pass; kept out of the logged loss.
+            loss_disc_step = loss_disc
+            if r1_branches and global_step % r1_every == 0:
+                r1_branch = (global_step // r1_every) % r1_branches
+                r1_count = max(1, int(round(y.shape[0] * r1_batch_fraction)))
+                r1_value = r1_penalty(
+                    model_d,
+                    loud_crop(y, r1_count, r1_segment),
+                    r1_branch,
+                    dtype=amp_dtype if use_amp else None,
+                )
+                loss_disc_step = (
+                    loss_disc + 0.5 * r1_gamma * r1_period * r1_value
+                )
+                if rank == 0:
+                    r1_cache.append((r1_branch, r1_value.detach()))
+
+            # Sampled, and read from the logits this update was computed on.
+            if (
+                family_reducer.names
+                and global_step % accuracy_sample_every == 0
+            ):
+                d_accuracy = family_reducer(head_accuracies(y_d_hat_r, y_d_hat_g))
+                if rank == 0:
+                    d_accuracy_cache.append(d_accuracy)
+                if d_lr_balancer is not None:
+                    d_lr_balancer.observe(
+                        d_accuracy, family_reducer.names, global_step
+                    )
+
             optim_d.zero_grad(set_to_none=True)
             if grad_scaler is not None:
-                grad_scaler.scale(loss_disc).backward()
+                grad_scaler.scale(loss_disc_step).backward()
                 grad_scaler.unscale_(optim_d)
             else:
-                loss_disc.backward()
+                loss_disc_step.backward()
             grad_norm_d = clip_or_sample_grad_norm(
                 net_d.parameters(),
                 grad_clip_value_d,
                 global_step,
                 metrics_update_interval,
             )
-            if grad_scaler is not None:
-                grad_scaler.step(optim_d)
-            else:
-                optim_d.step()
+            with (
+                d_lr_balancer.applied(optim_d)
+                if d_lr_balancer is not None
+                else nullcontext()
+            ):
+                if grad_scaler is not None:
+                    grad_scaler.step(optim_d)
+                else:
+                    optim_d.step()
             if san_active:
                 normalize_san_weights(net_d, optim_d)
 
@@ -1830,7 +1954,9 @@ def training_loop(
                     # The series this switch exists to move: without it the
                     # heads that can see the floor sat at -0.13 and -0.82.
                     branch_neg_cache.append(
-                        branch_separation(y_d_hat_r, y_d_hat_neg)
+                        branch_separation(
+                            [y_d_hat_r[i] for i in hf_floor_branches], y_d_hat_neg
+                        )
                     )
 
             # Temp accumulation
@@ -1935,8 +2061,8 @@ def training_loop(
                         # Loss swap: L1 mel fades out, Multi-Scale mel fades in over swap_duration_steps
                         swap_progress = min(1.0, max(0.0, (global_step - swap_start_step) / max(1, swap_duration_steps)))
                         swap_alpha = 0.5 * (1.0 - math.cos(math.pi * swap_progress))  # smooth 0->1 ramp
-                        loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
-                        loss_ms_mel = fn_spectral_loss_ms(y, y_hat) * config.train.c_mel
+                        loss_l1_mel = fn_spectral_loss(y_mel, y_hat_mel) * c_mel
+                        loss_ms_mel = fn_spectral_loss_ms(y, y_hat) * c_mel
                         loss_spectral = (1.0 - swap_alpha) * loss_l1_mel + swap_alpha * loss_ms_mel
                         loss_spectral_parts = {
                             "loss_spectral_l1_mel": loss_l1_mel,
@@ -1946,9 +2072,9 @@ def training_loop(
                             swap_completed = True
                             success(f"Loss swap complete at step {global_step}; now using multi-scale mel loss.", tag="[TRAIN]")
                     else:
-                        loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
+                        loss_spectral = fn_spectral_loss(y_mel, y_hat_mel) * c_mel
                 elif spectral_loss == "Multi-Scale Mel Loss":
-                    loss_spectral = fn_spectral_loss(y, y_hat) * config.train.c_mel
+                    loss_spectral = fn_spectral_loss(y, y_hat) * c_mel
                 loss_fm = (
                     feature_loss(
                         fmap_r,
@@ -2378,6 +2504,35 @@ def training_loop(
                         "learning_rate/lr_g": optim_g.param_groups[0]["lr"],
                     })
 
+                if d_accuracy_cache:
+                    family_means = torch.stack(list(d_accuracy_cache)).mean(0).tolist()
+                    for family, value in zip(family_reducer.names, family_means):
+                        scalar_dict_rolling[
+                            f"balance_accuracy_{rolling_loss_steps}/{family}"
+                        ] = value
+                if r1_cache:
+                    values = torch.stack([value for _, value in r1_cache]).tolist()
+                    per_branch = {}
+                    for (branch, _), value in zip(r1_cache, values):
+                        per_branch.setdefault(branch, []).append(value)
+                    r1_labels = getattr(model_d, "branch_labels", ())
+                    r1_total = 0.0
+                    for branch, branch_values in sorted(per_branch.items()):
+                        mean = sum(branch_values) / len(branch_values)
+                        r1_total += mean
+                        label = r1_labels[branch] if branch < len(r1_labels) else str(branch)
+                        scalar_dict_rolling[f"r1_grad_sq/{label}"] = mean
+                    # What the penalty adds to D's loss per step, on average.
+                    scalar_dict_rolling["r1/penalty"] = 0.5 * r1_gamma * r1_total
+                if d_lr_balancer is not None:
+                    for group in optim_d.param_groups:
+                        family = group.get("family")
+                        if family is None:
+                            continue
+                        ratio = d_lr_balancer.ratio(family)
+                        scalar_dict_rolling[f"balance_lr_ratio/{family}"] = ratio
+                        scalar_dict_rolling[f"balance_lr_d/{family}"] = group["lr"] * ratio
+
                 # AMP health.  ``scale`` is the diagnostic: a healthy FP16 run
                 # settles at a scale and grows it back after the occasional
                 # overflow, so a scale walking down decade by decade, or a
@@ -2433,17 +2588,22 @@ def training_loop(
                     "branch_labels",
                     (),
                 )
-                for prefix, cache in (
-                    (f"disc_sep_{rolling_loss_steps}", branch_disc_cache),
-                    (f"disc_sep_floor_{rolling_loss_steps}", branch_neg_cache),
+                floor_labels = [labels[i] for i in hf_floor_branches if i < len(labels)]
+                for prefix, cache, cache_labels in (
+                    (f"disc_sep_{rolling_loss_steps}", branch_disc_cache, labels),
+                    (
+                        f"disc_sep_floor_{rolling_loss_steps}",
+                        branch_neg_cache,
+                        floor_labels,
+                    ),
                     # Post-weight, so the series sums to ``loss_adv`` and a
                     # head's share can be read off it directly.
-                    (f"adv_sep_{rolling_loss_steps}", branch_adv_cache),
+                    (f"adv_sep_{rolling_loss_steps}", branch_adv_cache, labels),
                 ):
                     if not cache:
                         continue
                     branch_mean = torch.stack(list(cache)).mean(0)
-                    for index, label in enumerate(labels[: branch_mean.shape[0]]):
+                    for index, label in enumerate(cache_labels[: branch_mean.shape[0]]):
                         scalar_dict_rolling[f"{prefix}/{label}"] = branch_mean[
                             index
                         ].item()
@@ -2720,7 +2880,8 @@ def training_loop(
                 # the same weights the generator is saved with.
                 with ema.applied(net_g) if ema is not None else nullcontext():
                     subspace_g = prior_subspace_for(
-                        net_g.module if hasattr(net_g, "module") else net_g
+                        net_g.module if hasattr(net_g, "module") else net_g,
+                        force=True,
                     )
                 with uninterruptible_save("checkpoint write"):
                     # The generator is written as if there were no EMA: the

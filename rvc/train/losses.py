@@ -33,15 +33,26 @@ def feature_loss(fmap_r, fmap_g, normalize=False, branch_weights=None):
     it was told to discount.
     """
 
+    def distance(rl, gl):
+        # A tuple is one map split into bands: the mean over all its elements.
+        if isinstance(rl, tuple):
+            total = sum(
+                torch.sum(torch.abs(r.float() - g.float())) for r, g in zip(rl, gl)
+            )
+            return total / sum(r.numel() for r in rl)
+        return torch.mean(torch.abs(rl.float() - gl.float()))
+
     terms = []
     weights = []
     for index, (dr, dg) in enumerate(zip(fmap_r, fmap_g)):
         weight = _branch_weight(branch_weights, index)
         for rl, gl in zip(dr, dg):
-            terms.append(weight * torch.mean(torch.abs(rl.float() - gl.float())))
+            terms.append(weight * distance(rl, gl))
             weights.append(weight)
     if not terms:
-        return torch.zeros((), device=fmap_r[0][0].device)
+        first = fmap_r[0][0]
+        device = (first[0] if isinstance(first, tuple) else first).device
+        return torch.zeros((), device=device)
     loss = sum(terms)
     if not normalize:
         return loss
@@ -49,6 +60,44 @@ def feature_loss(fmap_r, fmap_g, normalize=False, branch_weights=None):
     # weights this is ``len(terms)`` and the two agree exactly.
     total = sum(weights)
     return loss / total if total else loss
+
+
+def loud_crop(real, count, segment):
+    """One random ``segment``-sample window of ``real``, then its ``count``
+    loudest clips.
+
+    For the extra discriminator passes (R1, the HF floor negative): a shorter
+    window costs proportionally less, and the loudest clips skip mutes, which
+    cost the same and say nothing.  ``segment`` 0 keeps the whole clip.
+    Neither choice touches the host.
+    """
+    real = real.detach()
+    length = real.shape[-1]
+    if 0 < segment < length:
+        start = int(torch.randint(0, length - segment + 1, ()))
+        real = real[..., start : start + segment]
+    if count < real.shape[0]:
+        loudness = real.float().square().mean(dim=tuple(range(1, real.dim())))
+        real = real.index_select(0, loudness.topk(count).indices)
+    return real
+
+
+def r1_penalty(discriminator, real, branch, dtype=None):
+    """R1 for one branch: batch mean of ``||d score / d real||^2``,
+    differentiable in D's weights.
+
+    ``discriminator`` is the unwrapped ``MPD_MSD_Combined``.  One branch per
+    call keeps the double-backward graph, and the VRAM it peaks at, to that
+    branch.  ``dtype`` is the autocast type to run under; pass ``bfloat16``
+    only -- in FP16 the squared input gradient can underflow, so anything else
+    runs in FP32.
+    """
+    real = real.float().requires_grad_(True)
+    enabled = dtype == torch.bfloat16
+    with torch.autocast(real.device.type, dtype=torch.bfloat16, enabled=enabled):
+        score = discriminator.real_score(real, branch)
+        (grad,) = torch.autograd.grad(score.sum(), real, create_graph=True)
+    return grad.float().square().flatten(1).sum(1).mean()
 
 
 def discriminator_loss(

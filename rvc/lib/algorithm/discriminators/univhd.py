@@ -359,7 +359,9 @@ class UnivHDDiscriminator(torch.nn.Module):
             pad_mode="reflect",
             return_complex=True,
         )
-        return torch.abs(spec)
+        # Through the power, with a floor far below any real bin: ``abs`` of a
+        # complex zero has a NaN second derivative, which R1 reaches.
+        return torch.sqrt(spec.real.square() + spec.imag.square() + 1e-8)
 
     def forward(self, x, san_training: bool = False):
         fmap = []

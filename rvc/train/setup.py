@@ -79,7 +79,7 @@ def get_d_model(config, vocoder, use_checkpointing):
     )
 
     # The registry names the branch layout directly -- ``v2`` is Applio's (8
-    # periods), ``v4`` is RefineGAN2's (4 periods + 3 multi-resolution
+    # periods), ``v4`` is RefineGAN2's (5 periods + 3 multi-band
     # spectrogram branches) -- so this only has to check that the name exists.  Checked rather than passed through: it used to be
     # ``"v3" if id == "mpd_msd_v3" else "v2"``, which handed Applio's v2 to any
     # id it did not recognise, and a vocoder registered against the wrong name
@@ -113,6 +113,16 @@ def get_d_model(config, vocoder, use_checkpointing):
         # outside FP16 autocast, where their unnormalised magnitude overflowed
         # at a raised learning rate.  ``false`` restores the all-FP16 path.
         mrd_fp32_input=bool(setting("d_mrd_fp32_input", True)),
+        # ``None`` keeps what the version says; see ``MULTIBAND_MRD_VERSIONS``
+        # and ``MPD_PRE_EMPHASIS_BY_VERSION``.
+        mrd_multiband=setting("d_mrd_multiband", None),
+        mrd_channels=int(setting("d_mrd_channels", 32)),
+        mpd_pre_emphasis=setting("d_mpd_pre_emphasis", None),
+        # ``None`` keeps the version's gamma; see ``R1_GAMMA_BY_VERSION``.
+        r1_gamma=setting("d_r1_gamma", None),
+        r1_interval=int(setting("d_r1_interval", 16)),
+        r1_batch_fraction=float(setting("d_r1_batch_fraction", 0.5)),
+        r1_segment=int(setting("d_r1_segment", 6400)),
         # UnivHD (arXiv 2512.03486) is opt-in and *additive*: it appends a
         # harmonic-order branch and removes nothing, which is how the paper
         # runs it.  Off by default because it is unmeasured on this fork -- the
@@ -383,12 +393,21 @@ def get_optimizers(
     )
 
     optim_g = _make_optimizer(net_g, optimizer_choice_g, lr_g, num_epochs=total_epoch_count, num_batches=num_batches, param_groups=g_param_groups)
+    # The adaptive D learning rate scales each head family's group on its own.
+    d_param_groups = None
+    if bool(getattr(config.train, "d_lr_balance", False)) and hasattr(
+        getattr(net_d, "module", net_d), "branch_labels"
+    ):
+        from rvc.train.balance import discriminator_param_groups
+
+        d_param_groups = discriminator_param_groups(net_d, lr_d)
     optim_d = _make_optimizer(
         net_d,
         optimizer_choice_d,
         lr_d,
         num_epochs=total_epoch_count,
         num_batches=num_batches,
+        param_groups=d_param_groups,
         lazy_reg_interval=None,
     )
 

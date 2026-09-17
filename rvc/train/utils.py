@@ -330,6 +330,10 @@ def decoder_layout(model):
     return {
         "upsample_rates": [int(rate) for rate in rates],
         "source_gain": bool(getattr(decoder, "has_source_gain", False)),
+        # ``off`` drops one parameter per ``AdaIN``, which a strict load
+        # already refuses, but ``always`` and ``train`` differ only in what
+        # inference does -- and nothing in the weights records that.
+        "adain_noise": str(getattr(decoder, "adain_noise", "always")),
         "source_bands": int(getattr(decoder, "source_bands", 0)),
         # The excitation's harmonic slope: partial ``j`` at ``j ** -tilt``.
         # The *count* sizes ``m_source.merge.0.weight`` and so a strict load
@@ -364,6 +368,7 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             ),
             "source_gain": False,
             "source_bands": 0,
+            "adain_noise": "train",
             "source_harmonics": 0,
             "source_tilt": 1.0,
             "upsample_filter": None,
@@ -373,6 +378,7 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
         "upsample_rates": [int(r) for r in found.get("upsample_rates", [])],
         "source_gain": bool(found.get("source_gain", False)),
         "source_bands": int(found.get("source_bands", 0)),
+        "adain_noise": str(found.get("adain_noise", "train")),
         # Absent means the one-partial sine at the tilt a single partial
         # cannot express: every run before 2026-09-09 is that, and reading
         # the tilt as "whatever this run builds" would let a harmonic-rich

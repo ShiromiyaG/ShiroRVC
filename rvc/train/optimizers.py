@@ -197,5 +197,9 @@ def _make_optimizer(
                 group["lr"] = group["lr"] * LR_SCALE
 
     for group in optimizer.param_groups:
+        # Explicit groups carry their own lr, which the scaled ``lr`` above
+        # never reached.
+        if param_groups is not None and lazy_scale != 1.0:
+            group["lr"] = group["lr"] * lazy_scale
         group["lazy_reg_scale"] = lazy_scale
     return optimizer
