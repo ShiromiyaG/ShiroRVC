@@ -356,7 +356,7 @@ def _vocoder_registry() -> dict:
 
 def tts_voices() -> list[tuple[str, str]]:
     """``(display, short_name)`` for every Edge-TTS voice."""
-    path = paths.ROOT / "rvc" / "lib" / "tools" / "tts_voices.json"
+    path = paths.ROOT / "rvc" / "lib" / "extras" / "tts_voices.json"
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)

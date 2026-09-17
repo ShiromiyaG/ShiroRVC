@@ -31,7 +31,7 @@ torch = pytest.importorskip("torch", reason="needs torch", exc_type=ImportError)
 
 from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
 
-from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined  # noqa: E402
+from rvc.lib.algorithm.discriminators.discriminator import MPD_MSD_Combined  # noqa: E402
 from rvc.lib.algorithm.synthesizers import Synthesizer  # noqa: E402
 
 CONFIG = ROOT / "rvc" / "configs" / "refinegan2" / "32000.json"

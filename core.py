@@ -3,7 +3,6 @@ import psutil
 import os
 import sys
 import json
-import shutil
 
 import atexit
 import platform
@@ -34,7 +33,7 @@ install_rich_print()
 current_script_directory = os.path.dirname(os.path.realpath(__file__))
 logs_path = os.path.join(current_script_directory, "logs")
 
-from rvc.lib.tools.prerequisites_download import (
+from rvc.lib.extras.prerequisites_download import (
     download_vocoder_pretraineds,
     prequisites_download_pipeline,
 )
@@ -59,7 +58,7 @@ training_process = None
 @lru_cache(maxsize=1)  # Cache only one result since the file is static
 def load_voices_data():
     with open(
-        os.path.join("rvc", "lib", "tools", "tts_voices.json"), "r", encoding="utf-8"
+        os.path.join("rvc", "lib", "extras", "tts_voices.json"), "r", encoding="utf-8"
     ) as file:
         return json.load(file)
 
@@ -204,14 +203,7 @@ def run_infer_script(
     if not os.path.exists(export_path):
         export_path = output_path
 
-    try:
-        tmp_dir = os.path.join(os.environ.get("TEMP", os.path.join(now_dir, "temp")), "infer_preview")
-        os.makedirs(tmp_dir, exist_ok=True)
-        preview_path = os.path.join(tmp_dir, os.path.basename(export_path))
-        shutil.copy2(export_path, preview_path)
-        return f"File {input_path} inferred successfully. Saved to: {export_path}", preview_path
-    except Exception:
-        return f"File {input_path} inferred successfully. Saved to: {export_path}", export_path
+    return f"File {input_path} inferred successfully. Saved to: {export_path}", export_path
 
 
 # Batch infer
@@ -320,7 +312,7 @@ def run_tts_script(
     noise_scale: float = None,
 ):
 
-    tts_script_path = os.path.join("rvc", "lib", "tools", "tts.py")
+    tts_script_path = os.path.join("rvc", "lib", "extras", "tts.py")
 
     if os.path.exists(output_tts_path) and os.path.abspath(output_tts_path).startswith(os.path.abspath("assets")):
         os.remove(output_tts_path)
@@ -524,7 +516,7 @@ def run_train_script(
             f"{vocoder} does not provide a configuration for {sample_rate} Hz."
         )
     if pretrained == True:
-        from rvc.lib.tools.pretrained_selector import pretrained_selector
+        from rvc.lib.extras.pretrained_selector import pretrained_selector
 
         if custom_pretrained == False:
             # A link added after the app's startup download would otherwise be
@@ -784,14 +776,14 @@ def run_model_blender_script(
 
 # Tensorboard
 def run_tensorboard_script():
-    from rvc.lib.tools.launch_tensorboard import launch_tensorboard_pipeline
+    from rvc.lib.extras.launch_tensorboard import launch_tensorboard_pipeline
 
     launch_tensorboard_pipeline()
 
 
 # Download
 def run_download_script(model_link: str):
-    from rvc.lib.tools.model_download import model_download_pipeline
+    from rvc.lib.extras.model_download import model_download_pipeline
 
     model_download_pipeline(model_link)
     return f"Model downloaded successfully."
@@ -815,7 +807,7 @@ def run_prerequisites_script(
 def run_audio_analyzer_script(
     input_path: str, save_plot_path: str = "logs/audio_analysis.png"
 ):
-    from rvc.lib.tools.analyzer import analyze_audio
+    from rvc.lib.extras.analyzer import analyze_audio
 
     audio_info, plot_path = analyze_audio(input_path, save_plot_path)
     print_settings_panel(

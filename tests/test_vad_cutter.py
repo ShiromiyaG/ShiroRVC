@@ -148,7 +148,7 @@ def test_the_option_is_offered_by_every_interface():
 
 def test_the_weights_are_a_download_prerequisite():
     """Offering the mode without shipping a way to get its model is a dead end."""
-    from rvc.lib.tools import prerequisites_download as prereq
+    from rvc.lib.extras import prerequisites_download as prereq
 
     folders = [entry[0] for entry in prereq.models_list]
     assert "fireredvad/VAD/" in folders

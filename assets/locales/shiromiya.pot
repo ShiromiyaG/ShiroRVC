@@ -9,14 +9,14 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: tabs/utilities/model_processing/model_processing.py:124
+#: tabs/utilities/model_processing.py:124
 msgid ""
 "\n"
 "            # Checkpoint Extractor ⚙️\n"
 "            "
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:119
+#: tabs/utilities/model_bundle.py:119
 msgid ""
 "# Model Bundle Maker\n"
 "Combine one or more RVC `.pth` models into a compressed `{extension}` bundle.\n"
@@ -46,23 +46,23 @@ msgstr ""
 msgid "### Language"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:137
+#: tabs/utilities/experiment_config.py:137
 msgid "**Architecture id in config.json:** `{}`"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:136
+#: tabs/utilities/experiment_config.py:136
 msgid "**Sample rate:** {} Hz -- fixed by the extracted audio."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:138
+#: tabs/utilities/experiment_config.py:138
 msgid "**Vocoder that stamps it:** {}"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:143
+#: tabs/utilities/experiment_config.py:143
 msgid "**model_info.json says:** `{}`"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:171
+#: tabs/utilities/experiment_config.py:171
 msgid "**{} checkpoint(s) in this folder.** They belong to the old architecture and cannot be resumed under a different one."
 msgstr ""
 
@@ -87,7 +87,7 @@ msgstr ""
 msgid "1 · Model"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:131
+#: tabs/utilities/model_processing.py:131
 msgid "1. Generator network checkpoint (.pth)"
 msgstr ""
 
@@ -99,7 +99,7 @@ msgstr ""
 msgid "2 · Preprocess"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:150
+#: tabs/utilities/model_bundle.py:150
 msgid "3 balances size and speed."
 msgstr ""
 
@@ -115,7 +115,7 @@ msgstr ""
 msgid "5 · Index"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:302
+#: tabs/utilities/experiment_config.py:302
 msgid "A folder under logs/ that already has a config.json."
 msgstr ""
 
@@ -212,7 +212,7 @@ msgstr ""
 msgid "Apply spectral-gating noise reduction."
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:141
+#: tabs/utilities/model_bundle.py:141
 msgid "Attach one uploaded index to every model."
 msgstr ""
 
@@ -494,7 +494,7 @@ msgstr ""
 msgid "Compile vocoder decoder"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:149
+#: tabs/utilities/model_bundle.py:149
 msgid "Compression level"
 msgstr ""
 
@@ -565,7 +565,7 @@ msgstr ""
 msgid "Could not save the log: {error}"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:164
+#: tabs/utilities/model_bundle.py:164
 msgid "Create model bundle"
 msgstr ""
 
@@ -736,7 +736,7 @@ msgstr ""
 msgid "Embedders and pitch models"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:154
+#: tabs/utilities/model_bundle.py:154
 msgid "Empty saves to logs using the first model name."
 msgstr ""
 
@@ -766,7 +766,7 @@ msgstr ""
 msgid "Enter output path"
 msgstr ""
 
-#: tabs/utilities/processing/processing.py:18
+#: tabs/utilities/processing.py:18
 #: tabs/voice_blender/voice_blender.py:40
 #: tabs/voice_blender/voice_blender.py:51
 msgid "Enter path to model"
@@ -816,7 +816,7 @@ msgstr ""
 msgid "Everything below has a working default."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:301
+#: tabs/utilities/experiment_config.py:301
 msgid "Experiment"
 msgstr ""
 
@@ -854,7 +854,7 @@ msgstr ""
 msgid "Exported Pth file"
 msgstr ""
 
-#: tabs/utilities/f0_extractor/f0_extractor.py:50
+#: tabs/utilities/f0_extractor.py:50
 msgid "Extract F0 Curve"
 msgstr ""
 
@@ -862,7 +862,7 @@ msgstr ""
 msgid "Extract Features"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:197
+#: tabs/utilities/model_processing.py:197
 msgid "Extract Small Model"
 msgstr ""
 
@@ -878,7 +878,7 @@ msgstr ""
 msgid "Extraction status."
 msgstr ""
 
-#: tabs/utilities/f0_extractor/f0_extractor.py:53
+#: tabs/utilities/f0_extractor.py:53
 #: tabs/utilities/utilities.py:27
 msgid "F0 Curve"
 msgstr ""
@@ -891,7 +891,7 @@ msgstr ""
 msgid "F0 curve file"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:172
+#: tabs/utilities/model_processing.py:172
 msgid "F0-guided model"
 msgstr ""
 
@@ -1103,7 +1103,7 @@ msgstr ""
 msgid "GPU query failed: {error}"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:329
+#: tabs/utilities/experiment_config.py:329
 msgid "G_*.pth / D_*.pth from the old architecture are moved into a subfolder instead of being deleted."
 msgstr ""
 
@@ -1324,7 +1324,7 @@ msgstr ""
 
 #: tabs/utilities/model_information.py:10
 #: tabs/utilities/model_information.py:11
-#: tabs/utilities/processing/processing.py:15
+#: tabs/utilities/processing.py:15
 msgid "Introduce the model pth path"
 msgstr ""
 
@@ -1340,7 +1340,7 @@ msgstr ""
 msgid "Invalid training preset name: {name}"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:322
+#: tabs/utilities/experiment_config.py:322
 msgid "Keep a backup of the current config"
 msgstr ""
 
@@ -1352,7 +1352,7 @@ msgstr ""
 msgid "Keep only the latest generator and discriminator checkpoints."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:238
+#: tabs/utilities/experiment_config.py:238
 msgid "Kept the previous config at `{}`."
 msgstr ""
 
@@ -1496,11 +1496,11 @@ msgstr ""
 msgid "Model used to extract speaker-independent content features."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:328
+#: tabs/utilities/experiment_config.py:328
 msgid "Move existing checkpoints aside"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:266
+#: tabs/utilities/experiment_config.py:266
 msgid "Moved {} checkpoint(s) into `{}/`."
 msgstr ""
 
@@ -1612,7 +1612,7 @@ msgstr ""
 msgid "Output"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:145
+#: tabs/utilities/model_processing.py:145
 msgid "Output Directory"
 msgstr ""
 
@@ -1630,15 +1630,15 @@ msgstr ""
 #: tabs/train/train.py:615
 #: tabs/train/train.py:913
 #: tabs/tts/tts.py:314
-#: tabs/utilities/analyzer/analyzer.py:16
+#: tabs/utilities/analyzer.py:16
 #: tabs/utilities/model_information.py:15
-#: tabs/utilities/model_processing/model_processing.py:200
-#: tabs/utilities/processing/processing.py:22
+#: tabs/utilities/model_processing.py:200
+#: tabs/utilities/processing.py:22
 #: tabs/voice_blender/voice_blender.py:65
 msgid "Output Information"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:138
+#: tabs/utilities/model_processing.py:138
 msgid "Output Model Name"
 msgstr ""
 
@@ -1663,7 +1663,7 @@ msgstr ""
 msgid "Output format for sliced audio. WAV is larger; FLAC is lossless."
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:159
+#: tabs/utilities/model_bundle.py:159
 msgid "Output information"
 msgstr ""
 
@@ -1671,7 +1671,7 @@ msgstr ""
 msgid "Output name"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:153
+#: tabs/utilities/model_bundle.py:153
 msgid "Output path"
 msgstr ""
 
@@ -1700,7 +1700,7 @@ msgid "Path for infer outputs"
 msgstr ""
 
 #: tabs/utilities/model_information.py:9
-#: tabs/utilities/processing/processing.py:14
+#: tabs/utilities/processing.py:14
 #: tabs/voice_blender/voice_blender.py:37
 #: tabs/voice_blender/voice_blender.py:48
 msgid "Path to Model"
@@ -1736,7 +1736,7 @@ msgstr ""
 msgid "Pitch (semitones)"
 msgstr ""
 
-#: tabs/utilities/f0_extractor/f0_extractor.py:46
+#: tabs/utilities/f0_extractor.py:46
 msgid "Pitch / f0 estimation algorithm used in extraction."
 msgstr ""
 
@@ -1759,7 +1759,7 @@ msgstr ""
 #: tabs/inference/inference.py:992
 #: tabs/train/train.py:572
 #: tabs/tts/tts.py:287
-#: tabs/utilities/f0_extractor/f0_extractor.py:45
+#: tabs/utilities/f0_extractor.py:45
 msgid "Pitch extraction algorithm"
 msgstr ""
 
@@ -1920,7 +1920,7 @@ msgstr ""
 msgid "Ready"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:337
+#: tabs/utilities/experiment_config.py:337
 msgid "Rebuild config"
 msgstr ""
 
@@ -1940,7 +1940,7 @@ msgstr ""
 #: tabs/train/train.py:432
 #: tabs/train/train.py:1068
 #: tabs/tts/tts.py:78
-#: tabs/utilities/experiment_config/experiment_config.py:314
+#: tabs/utilities/experiment_config.py:314
 msgid "Refresh"
 msgstr ""
 
@@ -2003,7 +2003,7 @@ msgstr ""
 msgid "Restarts the run instead of resuming it."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:290
+#: tabs/utilities/experiment_config.py:290
 msgid "Rewrite an extracted experiment's `config.json` for a different vocoder, without re-running preprocessing or feature extraction. The new config is the shipped one for that vocoder at this experiment's sample rate, so anything hand-tuned in the old file is replaced rather than merged."
 msgstr ""
 
@@ -2031,7 +2031,7 @@ msgstr ""
 msgid "Runs started from now on use FP16 autocast with a GradScaler."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:156
+#: tabs/utilities/model_processing.py:156
 msgid "Sample Rate of the model (sr)"
 msgstr ""
 
@@ -2080,7 +2080,7 @@ msgstr ""
 msgid "Save weight models"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:323
+#: tabs/utilities/experiment_config.py:323
 msgid "Saved beside it as config.json.<old architecture>.bak."
 msgstr ""
 
@@ -2142,12 +2142,12 @@ msgstr ""
 msgid "Select a run to see its validation previews."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:194
+#: tabs/utilities/experiment_config.py:194
 msgid "Select an experiment first."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:117
-#: tabs/utilities/experiment_config/experiment_config.py:317
+#: tabs/utilities/experiment_config.py:117
+#: tabs/utilities/experiment_config.py:317
 msgid "Select an experiment to see what its config was written for."
 msgstr ""
 
@@ -2155,7 +2155,7 @@ msgstr ""
 msgid "Select file to import"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:180
+#: tabs/utilities/model_processing.py:180
 msgid "Select one that corresponds to your training."
 msgstr ""
 
@@ -2179,7 +2179,7 @@ msgstr ""
 msgid "Select two voice models, set your desired blend percentage, and blend them into an entirely new voice."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:257
+#: tabs/utilities/experiment_config.py:257
 msgid "Set `vocoder_architecture` to `{}` in model_info.json."
 msgstr ""
 
@@ -2255,7 +2255,7 @@ msgstr ""
 msgid "Simple cuts on a fixed grid; Automatic detects silence by level, New Automatic by neural VAD."
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:140
+#: tabs/utilities/model_bundle.py:140
 msgid "Single index"
 msgstr ""
 
@@ -2397,7 +2397,7 @@ msgstr ""
 msgid "Starting the trainer… (loading models and dataset)"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:201
+#: tabs/utilities/model_processing.py:201
 msgid "Status messages and final file path will be displayed here."
 msgstr ""
 
@@ -2529,7 +2529,7 @@ msgstr ""
 msgid "The HiFi-GAN generator trained against RefineGAN v2's discriminator: multi-resolution spectrogram branches, UnivHD and SAN. Needs its own pretrain. 32 kHz only."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:309
+#: tabs/utilities/experiment_config.py:309
 msgid "The architecture the rebuilt config will be written for."
 msgstr ""
 
@@ -2545,11 +2545,11 @@ msgstr ""
 msgid "The dataset folder does not exist."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:280
+#: tabs/utilities/experiment_config.py:280
 msgid "The dataset, filelist and extracted features are untouched: none of them depend on the vocoder."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:146
+#: tabs/utilities/model_processing.py:146
 msgid "The directory where the final .pth file will be saved."
 msgstr ""
 
@@ -2588,14 +2588,14 @@ msgstr ""
 msgid "The name that will appear in the model information."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:139
+#: tabs/utilities/model_processing.py:139
 msgid "The output file will be saved as `<name>.pth`."
 msgstr ""
 
 #: tabs/settings/sections/model_author.py:44
 #: tabs/settings/sections/precision.py:72
-#: tabs/utilities/analyzer/analyzer.py:17
-#: tabs/utilities/processing/processing.py:23
+#: tabs/utilities/analyzer.py:17
+#: tabs/utilities/processing.py:23
 msgid "The output information will be displayed here."
 msgstr ""
 
@@ -2611,11 +2611,11 @@ msgstr ""
 msgid "The pre-overtrain model is exported either way; this only ends the run."
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:174
+#: tabs/utilities/model_processing.py:174
 msgid "The selected vocoder requires F0 guidance."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:227
+#: tabs/utilities/experiment_config.py:227
 msgid "The shipped config is missing: {}"
 msgstr ""
 
@@ -2623,7 +2623,7 @@ msgstr ""
 msgid "The stock RVC v2 NSF-HiFi-GAN with Applio's 8-period discriminator. Loads the public RVC v2 pretrains. 32, 40 and 48 kHz."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:162
+#: tabs/utilities/experiment_config.py:162
 msgid "The two disagree. Rebuilding writes both, which is how that gets resolved."
 msgstr ""
 
@@ -2719,11 +2719,11 @@ msgid "Upload"
 msgstr ""
 
 #: tabs/inference/inference.py:475
-#: tabs/utilities/f0_extractor/f0_extractor.py:43
+#: tabs/utilities/f0_extractor.py:43
 msgid "Upload Audio"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:129
+#: tabs/utilities/model_bundle.py:129
 msgid "Upload PTH file(s)"
 msgstr ""
 
@@ -2735,7 +2735,7 @@ msgstr ""
 msgid "Upload a .txt file"
 msgstr ""
 
-#: tabs/utilities/model_bundle/model_bundle.py:134
+#: tabs/utilities/model_bundle.py:134
 msgid "Upload index file(s) (optional)"
 msgstr ""
 
@@ -2784,21 +2784,21 @@ msgstr ""
 msgid "Validation sample"
 msgstr ""
 
-#: tabs/utilities/model_processing/model_processing.py:179
+#: tabs/utilities/model_processing.py:179
 msgid "Version"
 msgstr ""
 
-#: tabs/utilities/processing/processing.py:27
+#: tabs/utilities/processing.py:27
 msgid "View"
 msgstr ""
 
 #: gui/views/training.py:164
 #: tabs/train/train.py:379
-#: tabs/utilities/model_processing/model_processing.py:164
+#: tabs/utilities/model_processing.py:164
 msgid "Vocoder"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:308
+#: tabs/utilities/experiment_config.py:308
 msgid "Vocoder / Architecture"
 msgstr ""
 
@@ -2894,7 +2894,7 @@ msgstr ""
 msgid "Written to logs/ under this name."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:242
+#: tabs/utilities/experiment_config.py:242
 msgid "Wrote `{}` from `{}`."
 msgstr ""
 
@@ -2903,24 +2903,24 @@ msgstr ""
 msgid "You can also use a custom path."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:204
+#: tabs/utilities/experiment_config.py:204
 msgid "`{}` has a config.json with no data.sample_rate, so there is nothing to match a new one against."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:199
+#: tabs/utilities/experiment_config.py:199
 msgid "`{}` has no config.json to rebuild."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:125
+#: tabs/utilities/experiment_config.py:125
 msgid "`{}` has no readable config.json."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:155
+#: tabs/utilities/experiment_config.py:155
 msgid "`{}` is not a vocoder this build knows -- it was likely removed from the registry. Rebuilding writes a current one."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:137
-#: tabs/utilities/experiment_config/experiment_config.py:143
+#: tabs/utilities/experiment_config.py:137
+#: tabs/utilities/experiment_config.py:143
 msgid "absent"
 msgstr ""
 
@@ -2988,7 +2988,7 @@ msgstr ""
 msgid "true_pitch writes the real pitch, capped at the F0 ceiling. fold only repairs wrong-octave frames using half-pitch drives; use it with models trained on uncorrected labels to keep their timbre."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:141
+#: tabs/utilities/experiment_config.py:141
 msgid "unrecognised -- this config predates the current registry"
 msgstr ""
 
@@ -3037,10 +3037,10 @@ msgstr ""
 msgid "{tags} metrics · {points} points"
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:272
+#: tabs/utilities/experiment_config.py:272
 msgid "{} checkpoint(s) were left in place. Training will try to resume from them and they are not loadable under the new architecture -- move or delete them before starting a run."
 msgstr ""
 
-#: tabs/utilities/experiment_config/experiment_config.py:216
+#: tabs/utilities/experiment_config.py:216
 msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
 msgstr ""

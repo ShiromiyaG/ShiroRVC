@@ -6,8 +6,8 @@ import librosa
 import numpy as np
 import torch
 
-from rvc.lib.predictors.RMVPE import RMVPE0Predictor
-from rvc.lib.predictors.FCPE import spawn_infer_model_from_pt as fcpe_f0_predictor
+from rvc.lib.predictors.rmvpe import RMVPE0Predictor
+from rvc.lib.predictors.fcpe import spawn_infer_model_from_pt as fcpe_f0_predictor
 import torchcrepe
 
 # Defaults for the "rmvpe_high_register" section of assets/config.json

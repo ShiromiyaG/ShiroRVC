@@ -203,8 +203,6 @@ def generate_filelist(
 
     if embedder_model == "contentvec":
         mute_folder = "mute"
-    elif embedder_model == "spin_v1":
-        mute_folder = "mute_spin_v1"
     else:
         mute_folder = "mute_spin_v2"
 

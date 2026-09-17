@@ -2,7 +2,7 @@
 
 ``convert_to_cuda.py`` keeps a checkpoint resumable; this makes it a starting
 point instead.  The pair is first loaded strictly into the CUDA models, then
-written the way ``tools/clean_pretrain.py`` writes a pretrain: ``model`` in fp32
+written the way ``tools/pretrain/clean_pretrain.py`` writes a pretrain: ``model`` in fp32
 plus the metadata the pretrain guards read, without optimizer state or
 counters.  The TPU trainer already saves the EMA weights as G's ``model``.
 
@@ -64,7 +64,7 @@ def main(argv=None):
         assert_periods_match,
         load_config_from_json,
     )
-    from tools.clean_pretrain import KEEP_METADATA
+    from tools.pretrain.clean_pretrain import KEEP_METADATA
     from train_tpu import resolve_vocoder
 
     directory = os.path.join(REPO_ROOT, "logs", args.model_name)
@@ -91,7 +91,7 @@ def main(argv=None):
 
     if args.install:
         out_dir = os.path.join("rvc", "models", "pretraineds", get_vocoder_spec(vocoder).get("pretrained_dir", vocoder))
-        # The names ``rvc/lib/tools/pretrained_selector.py`` looks up.
+        # The names ``rvc/lib/extras/pretrained_selector.py`` looks up.
         names = {role: f"f0{role}{str(sample_rate)[:2]}k.pth" for role in ("G", "D")}
     else:
         out_dir = args.output_dir or directory

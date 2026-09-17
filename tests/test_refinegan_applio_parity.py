@@ -27,8 +27,8 @@ sys.path.insert(0, str(ROOT))
 torch = pytest.importorskip("torch", reason="needs torch", exc_type=ImportError)
 
 from rvc.configs.vocoders import get_discriminator_id  # noqa: E402
-from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined  # noqa: E402
-from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (  # noqa: E402
+from rvc.lib.algorithm.discriminators.discriminator import MPD_MSD_Combined  # noqa: E402
+from rvc.lib.algorithm.discriminators.discriminator import (  # noqa: E402
     DISCRIMINATOR_VERSIONS,
     DiscriminatorP,
     DiscriminatorR,
@@ -795,7 +795,7 @@ def test_fast_mpd_is_off_unless_asked_for():
     means the old behaviour" is the contract that must not.
     """
 
-    from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (
+    from rvc.lib.algorithm.discriminators.discriminator import (
         FastDiscriminatorP,
     )
 
@@ -813,7 +813,7 @@ def test_fast_mpd_swaps_the_period_family_and_nothing_else():
     same six feature maps per period branch, so the feature-matching loss keeps
     its shape and only its width changes."""
 
-    from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (
+    from rvc.lib.algorithm.discriminators.discriminator import (
         FastDiscriminatorP,
     )
 

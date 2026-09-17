@@ -19,7 +19,7 @@ pytest.importorskip("librosa", reason="rvc.train.losses imports it", exc_type=Im
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rvc" / "train"))
 
-from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined  # noqa: E402
+from rvc.lib.algorithm.discriminators.discriminator import MPD_MSD_Combined  # noqa: E402
 
 SR = 32000
 

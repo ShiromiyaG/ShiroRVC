@@ -286,7 +286,7 @@ class Synthesizer(torch.nn.Module):
         """Keep the prior draw out of ``basis``, [inter_channels, k], in ``infer``.
 
         These are the latent directions the decoder renders as bursts between
-        the harmonics; ``tools/estimate_prior_subspace.py`` stores them in the
+        the harmonics; ``tools/pretrain/estimate_prior_subspace.py`` stores them in the
         checkpoint. Without the bursts the draw can use the usual 0.66666.
         """
         if basis is None:

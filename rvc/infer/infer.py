@@ -30,7 +30,7 @@ install_rich_print()
 from rvc.infer.pipeline import Pipeline as VC
 from rvc.infer.retrieval import RetrievalConfig
 from rvc.lib.utils import load_audio_infer, load_embedder_model
-from rvc.lib.tools.split_audio import process_audio, merge_audio
+from rvc.lib.extras.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.algorithm.commons import strip_parametrizations
 from rvc.lib.model_bundle import get_bundle_models, is_model_bundle, load_model_bundle

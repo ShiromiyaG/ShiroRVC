@@ -30,7 +30,7 @@ sys.path.append(now_dir)
 
 model_root = os.path.join(now_dir, "logs")
 audio_root = os.path.join(now_dir, "assets", "audios")
-PRESETS_DIR = os.path.join(now_dir, "assets", "presets")
+PRESETS_DIR = os.path.join(now_dir, "assets", "inference_presets")
 FORMANTSHIFT_DIR = os.path.join(now_dir, "assets", "formant_shift")
 
 os.makedirs(audio_root, exist_ok=True)

@@ -490,7 +490,7 @@ def assert_periods_match(model, checkpoint_dict, origin="checkpoint"):
         return
     found = checkpoint_dict.get("discriminator_periods")
     if found is None:
-        from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import (
+        from rvc.lib.algorithm.discriminators.discriminator import (
             DISCRIMINATOR_VERSIONS,
         )
 

@@ -8,12 +8,12 @@ from rvc.lib.i18n import _
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from tabs.utilities.processing.processing import processing_tab
-from tabs.utilities.analyzer.analyzer import analyzer_tab
-from tabs.utilities.f0_extractor.f0_extractor import f0_extractor_tab
-from tabs.utilities.model_bundle.model_bundle import model_bundle_tab
-from tabs.utilities.model_processing.model_processing import extract_small_model_tab
-from tabs.utilities.experiment_config.experiment_config import experiment_config_tab
+from tabs.utilities.processing import processing_tab
+from tabs.utilities.analyzer import analyzer_tab
+from tabs.utilities.f0_extractor import f0_extractor_tab
+from tabs.utilities.model_bundle import model_bundle_tab
+from tabs.utilities.model_processing import extract_small_model_tab
+from tabs.utilities.experiment_config import experiment_config_tab
 
 def utilities_tab():
     gr.Markdown(

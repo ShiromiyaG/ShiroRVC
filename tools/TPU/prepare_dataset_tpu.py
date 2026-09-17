@@ -110,7 +110,7 @@ def ensure_models(embedder):
     ]
     if all(os.path.isfile(path) for path in wanted):
         return
-    from rvc.lib.tools.prerequisites_download import prequisites_download_pipeline
+    from rvc.lib.extras.prerequisites_download import prequisites_download_pipeline
 
     prequisites_download_pipeline(False, True, False)
 
@@ -181,7 +181,7 @@ def _mp_fn(index, plan):
 
     xla_patches.apply_extract()
 
-    from rvc.lib.predictors.RMVPE import RMVPE0Predictor
+    from rvc.lib.predictors.rmvpe import RMVPE0Predictor
     from rvc.lib.utils import extract_features, load_embedder_model
     from rvc.train.extract.extract import FEATURE_PRECISIONS
 

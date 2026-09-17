@@ -22,12 +22,12 @@ sys.path.insert(0, str(ROOT))
 
 torch = pytest.importorskip("torch", reason="needs torch", exc_type=ImportError)
 
-from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined  # noqa: E402
-from rvc.lib.algorithm.discriminators.single import (  # noqa: E402
+from rvc.lib.algorithm.discriminators.discriminator import MPD_MSD_Combined  # noqa: E402
+from rvc.lib.algorithm.discriminators.univhd import (  # noqa: E402
     HarmonicFilterBank,
     UnivHDDiscriminator,
 )
-from rvc.lib.algorithm.discriminators.single.univhd import (  # noqa: E402
+from rvc.lib.algorithm.discriminators.univhd import (  # noqa: E402
     ERB_OFFSET,
     ERB_SLOPE,
     center_frequencies,

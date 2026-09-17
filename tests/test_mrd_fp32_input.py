@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined
-from rvc.lib.algorithm.discriminators.multi.mpd_msd_combined import DiscriminatorR
+from rvc.lib.algorithm.discriminators.discriminator import MPD_MSD_Combined
+from rvc.lib.algorithm.discriminators.discriminator import DiscriminatorR
 
 ROOT = Path(__file__).resolve().parents[1]
 RESOLUTION = [512, 50, 240]

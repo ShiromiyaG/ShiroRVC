@@ -73,7 +73,7 @@ def get_d_model(config, vocoder, use_checkpointing):
         value = getattr(config.model, name, None)
         return default if value is None else value
 
-    from rvc.lib.algorithm.discriminators.multi import (
+    from rvc.lib.algorithm.discriminators.discriminator import (
         DISCRIMINATOR_VERSIONS,
         MPD_MSD_Combined,
     )

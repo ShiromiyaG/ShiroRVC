@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "rvc" / "train"))
 
 torch = pytest.importorskip("torch", reason="needs torch", exc_type=ImportError)
 
-from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined  # noqa: E402
+from rvc.lib.algorithm.discriminators.discriminator import MPD_MSD_Combined  # noqa: E402
 from rvc.lib.algorithm.discriminators.san import (  # noqa: E402
     SANConv1d,
     SANConv2d,

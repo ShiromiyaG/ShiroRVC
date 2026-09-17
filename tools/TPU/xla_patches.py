@@ -307,12 +307,11 @@ def apply_extract() -> None:
 def apply() -> None:
     global _ORIGINAL_POLYPHASE, _ORIGINAL_SINC_KERNEL
     from rvc.lib.algorithm import resampling, wavenet
-    from rvc.lib.algorithm.discriminators.multi import mpd_msd_combined
-    from rvc.lib.algorithm.discriminators.single import univhd
+    from rvc.lib.algorithm.discriminators import discriminator, univhd
     from rvc.lib.algorithm.generators import hifigan_nsf, refinegan2
     from rvc.train import mel_processing
 
-    mpd_msd_combined.DiscriminatorR.spectrogram = _mrd_spectrogram
+    discriminator.DiscriminatorR.spectrogram = _mrd_spectrogram
     univhd.UnivHDDiscriminator.spectrogram = _univhd_spectrogram
     modules = [mel_processing]
     # The trainer's modules also import it script-relative, as a second module.

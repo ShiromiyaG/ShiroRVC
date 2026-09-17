@@ -23,7 +23,7 @@ from tabs.inference.inference import (
 
 
 with open(
-    os.path.join("rvc", "lib", "tools", "tts_voices.json"), "r", encoding="utf-8"
+    os.path.join("rvc", "lib", "extras", "tts_voices.json"), "r", encoding="utf-8"
 ) as file:
     tts_voices_data = json.load(file)
 

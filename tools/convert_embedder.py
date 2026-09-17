@@ -38,7 +38,7 @@ checkpoint.  The optimizer moments are shaped for the old width and cannot be
 carried across, so they are dropped rather than left in the file to fail a
 resume later.
 
-Run ``tools/clean_pretrain.py`` on the checkpoint *first*, and point this script
+Run ``tools/pretrain/clean_pretrain.py`` on the checkpoint *first*, and point this script
 at its output rather than at a raw ``G_<step>.pth``.  The order is not
 cosmetic.  The weights read here are ``checkpoint["model"]``, which in a
 training checkpoint is the live last step; the EMA average lives under ``ema``
@@ -68,7 +68,7 @@ extracted with the source embedder the widths do not even match.
 
 Usage:
 
-    python tools/clean_pretrain.py --model-dir logs/pretrain \\
+    python tools/pretrain/clean_pretrain.py --model-dir logs/pretrain \\
         --output-dir logs/pretrains
 
     python tools/convert_embedder.py \\

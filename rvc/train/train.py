@@ -309,14 +309,14 @@ swap_completed = False
 # ( enc_p + enc_q + flow ).  Legacy spelling of `freeze_mode = "frontend"`,
 # kept because it is edited here by hand; when True it wins over the spec's
 # `freeze_mode`.  For a staged pretrain use the spec field instead -- see
-# `rvc.train.setup.FREEZE_MODES` and `tools/pretrain_stage1_vocoder.py`.
+# `rvc.train.setup.FREEZE_MODES` and `tools/pretrain/pretrain_stage1_vocoder.py`.
 freeze_vae = False # If true, lets only vocoder ( dec ), spk embedding and discriminator learn
 
 # ----  Global LR scales  ----
 # Multipliers of the base LR ( 0.1 = 10%, 1.0 = 100% ).
 # These four are edited here by hand *or* carried on the run spec, whichever
 # is set: the spec wins when it names a value, so a launcher can set them
-# per-run ( see `tools/pretrain_stage3_endtoend.py` ) without this file being
+# per-run ( see `tools/pretrain/pretrain_stage3_endtoend.py` ) without this file being
 # edited, and an edit here still works when the spec leaves them unset.
 dec_lr_scale = None  # everything under `dec.` ( the decoder/vocoder )
 vae_lr_scale = None  # everything else ( frontend + emb_g ), see `freeze_vae` above
@@ -2727,7 +2727,7 @@ def training_loop(
                     # average goes in ``model`` and no ``ema`` key is kept, so
                     # the checkpoint is a plain one for anything that reads it
                     # and is a pretrain as it stands, like
-                    # ``tools/clean_pretrain.py`` makes.  A resume therefore
+                    # ``tools/pretrain/clean_pretrain.py`` makes.  A resume therefore
                     # continues from the average, and the shadow restarts from
                     # it -- see the ``ema.load_state_dict`` fallback.
                     with ema.applied(net_g) if ema is not None else nullcontext():

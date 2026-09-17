@@ -93,11 +93,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-GUI_CSS_PATH = os.path.join(
+GRADIO_CSS_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "assets",
-    "themes",
-    "gui.css",
+    "gradio.css",
 )
 
 # Language, before anything builds a widget.
@@ -140,12 +139,12 @@ run_prerequisites_script(
 )
 
 # Check installation
-import assets.installation_checker as installation_checker
+import tabs.installation_checker as installation_checker
 
 installation_checker.check_installation()
 
 # Load theme
-import assets.themes.loadThemes as loadThemes
+import tabs.themes.loadThemes as loadThemes
 
 APP_THEME = loadThemes.load_theme() or "ShiromiyaBlue"
 
@@ -227,7 +226,7 @@ def launch_gradio(port):
         inbrowser="--open" in sys.argv,
         server_port=port,
         theme=APP_THEME,
-        css_paths=GUI_CSS_PATH,
+        css_paths=GRADIO_CSS_PATH,
         footer_links=[],
         quiet=True,
         prevent_thread_lock=True,
