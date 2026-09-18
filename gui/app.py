@@ -221,6 +221,9 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
 
         self.engine = engine.instance()
+        #: The status bar holds a job's outcome, which the idle report that
+        #: follows it must not replace.  Cleared by the next job to start.
+        self._showing_result = False
 
         self.sidebar = Sidebar()
         self.sidebar.currentChanged.connect(self._on_nav)
@@ -310,9 +313,26 @@ class MainWindow(QMainWindow):
         self.engine.start()
 
     def _restart_engine(self) -> None:
+        if self.engine.is_training:
+            answer = QMessageBox.question(
+                self,
+                _("Restart backend"),
+                _("A training run is active, and restarting the backend stops it.\n\n"
+                  "Restart anyway?"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
         self.console.append_notice(_("Restarting the backend."))
         self.status.set_starting(_("Restarting backend…"))
-        self.engine.restart()
+        # Stopping a run can take the better part of a minute, during which
+        # this thread is waiting on the worker; say so rather than look hung.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.engine.restart()
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _on_engine_ready(self) -> None:
         self.status.set_idle(_("Ready"))
@@ -348,7 +368,10 @@ class MainWindow(QMainWindow):
         self.console.append_notice(message)
 
     def _on_engine_busy(self, busy: bool) -> None:
-        if not busy:
+        # The worker reports idle *after* the job's callbacks have run, so an
+        # unconditional "Ready" here overwrote the result they had just put in
+        # the status bar -- success and error alike were never readable there.
+        if not busy and not self._showing_result:
             self.status.set_idle(_("Ready"))
 
     # -- page plumbing -----------------------------------------------------
@@ -425,6 +448,7 @@ class MainWindow(QMainWindow):
 
     def _on_page_busy(self, active: bool, description: str) -> None:
         if active:
+            self._showing_result = False
             self.status.set_busy(description)
         elif not self.engine.busy:
             self.status.set_idle(_("Ready"))
@@ -435,9 +459,11 @@ class MainWindow(QMainWindow):
     def _on_notify(self, level: str, message: str) -> None:
         self.console.append_notice(message)
         if level == "error":
+            self._showing_result = True
             self.status.set_error(message.splitlines()[0][:120])
             QMessageBox.warning(self, _("Something went wrong"), message)
         elif level == "success":
+            self._showing_result = True
             self.status.set_idle(message.splitlines()[0][:120])
 
     # -- chrome ------------------------------------------------------------
@@ -583,9 +609,9 @@ class MainWindow(QMainWindow):
         self.sidebar.update_backdrop_label(self._backdrop)
         self.console.append_notice(
             {
-                "none": "Window backdrop off.",
-                "acrylic": "Window backdrop: acrylic (blurs what is behind the window).",
-                "mica": "Window backdrop: mica (tints with the wallpaper; subtle by design).",
+                "none": _("Window backdrop off."),
+                "acrylic": _("Window backdrop: acrylic (blurs what is behind the window)."),
+                "mica": _("Window backdrop: mica (tints with the wallpaper; subtle by design)."),
             }[self._backdrop]
         )
 
@@ -672,9 +698,9 @@ class MainWindow(QMainWindow):
         if training:
             answer = QMessageBox.question(
                 self,
-                "Training is running",
-                "A training run is still active. Closing the window stops it.\n\n"
-                "Stop training and quit?",
+                _("Training is running"),
+                _("A training run is still active. Closing the window stops it.\n\n"
+                  "Stop training and quit?"),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -684,6 +710,10 @@ class MainWindow(QMainWindow):
 
         prefs.set("window_geometry", bytes(self.saveGeometry().toBase64()).decode("ascii"))
         prefs.save()
+        # Out of sight first: with a run going, the shutdown below waits for
+        # the trainer to stop, and a window that sits frozen for that long
+        # reads as a crash.
+        self.hide()
         self.engine.shutdown()
         event.accept()
 

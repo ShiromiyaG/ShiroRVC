@@ -265,7 +265,7 @@ class TrainingProgress(QWidget):
         self.set_stoppable(False)
         self.overall.setRange(0, 1000)
         self.overall.setValue(1000 if not message else self.overall.value())
-        self.detail.setText(message or "Finished.")
+        self.detail.setText(message or _("Finished."))
 
     # -- updates -----------------------------------------------------------
 
@@ -301,8 +301,8 @@ class TrainingProgress(QWidget):
 
         parts = [
             f"{fraction * 100:.1f}%",
-            f"batch {batch:,} / {total_batches:,}",
-            f"step {update['step']:,}",
+            _("batch {done} / {total}").format(done=f"{batch:,}", total=f"{total_batches:,}"),
+            _("step {step}").format(step=f"{update['step']:,}"),
         ]
         if update["metrics"]:
             parts.append(update["metrics"])
@@ -311,7 +311,7 @@ class TrainingProgress(QWidget):
             parts.append(_rate_text(rate))
         remaining = self._remaining_seconds(update, rate)
         if remaining is not None:
-            parts.append(f"~{_clock(remaining)} left")
+            parts.append(_("~{duration} left").format(duration=_clock(remaining)))
         self.detail.setText("   ·   ".join(parts))
 
         if self._started:

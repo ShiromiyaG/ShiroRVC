@@ -24,12 +24,15 @@ from ..widgets.forms import (
     PathPicker,
     SearchableCombo,
     SliderSpin,
+    TabPage,
     Toggle,
+    fit_to_current_tab,
     primary_button,
 )
+from ..widgets.facts import Fact, FactsPanel, set_tone
 from .base import Page
 
-from ..i18n import _, N_
+from ..i18n import _, N_, ngettext
 
 _MODEL_FILTER = "Models (*.pth *.srvc);;All files (*.*)"
 
@@ -41,6 +44,77 @@ def _details_label() -> QLabel:
     label.setWordWrap(True)
     label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     return label
+
+
+def _experiment_facts(status) -> tuple[list[Fact], list[tuple[str, str]]]:
+    """The experiment panel's rows and callouts, from an ``ExperimentStatus``.
+
+    A value that is missing or unknown is a coloured pill, so it stands out
+    from a healthy one -- the Markdown this replaced set "absent" in the same
+    type as ``vits_gaussian_v1``.
+    """
+    recognised = status.vocoder is not None
+    facts = [
+        Fact(
+            _("Sample rate"),
+            f"{status.sample_rate} Hz" if status.sample_rate else _("absent"),
+            None if status.sample_rate else "warning",
+            _("Fixed by the audio already extracted."),
+        ),
+        Fact(
+            _("Current vocoder"),
+            status.vocoder_label if recognised else _("unrecognised"),
+            "accent" if recognised else "warning",
+            _("Read from the architecture id below."),
+        ),
+        Fact(
+            _("Architecture id"),
+            status.architecture_id or _("absent"),
+            "neutral" if status.architecture_id else "warning",
+            _("In config.json."),
+            code=bool(status.architecture_id),
+        ),
+        Fact(
+            "model_info.json",
+            status.recorded or _("absent"),
+            "danger" if status.recorded_unknown else "neutral",
+            _("The vocoder recorded when the features were extracted."),
+            code=bool(status.recorded),
+        ),
+    ]
+    if status.checkpoints:
+        facts.append(
+            Fact(
+                _("Checkpoints"),
+                ngettext(
+                    "{count} G/D file", "{count} G/D files", status.checkpoints
+                ).format(count=status.checkpoints),
+                "warning",
+                _("Trained for the current architecture; they cannot resume under another."),
+            )
+        )
+
+    notices: list[tuple[str, str]] = []
+    if not recognised:
+        notices.append((
+            "warning",
+            _("Nothing in this config names an architecture this build knows -- it "
+              "predates the current vocoder registry. Rebuild it for the one in "
+              "\"Vocoder / Architecture\"."),
+        ))
+    if status.recorded_unknown:
+        notices.append((
+            "danger",
+            _("model_info.json names \"{name}\", which this build no longer ships. "
+              "Rebuilding writes a current one.").format(name=status.recorded),
+        ))
+    if status.disagrees:
+        notices.append((
+            "warning",
+            _("config.json and model_info.json name different vocoders. "
+              "Rebuilding writes both, which resolves it."),
+        ))
+    return facts, notices
 
 
 def _markdown(text: str, object_name: str = "") -> QLabel:
@@ -64,19 +138,20 @@ class ToolsPage(Page):
         super().__init__(parent)
 
         tabs = QTabWidget()
-        tabs.addTab(self._build_info(), "Model info")
-        tabs.addTab(self._build_blender(), "Blender")
-        tabs.addTab(self._build_download(), "Download")
-        tabs.addTab(self._build_analyzer(), "Audio analyzer")
-        tabs.addTab(self._build_prerequisites(), "Prerequisites")
+        tabs.addTab(self._build_info(), _("Model info"))
+        tabs.addTab(self._build_blender(), _("Blender"))
+        tabs.addTab(self._build_download(), _("Download"))
+        tabs.addTab(self._build_analyzer(), _("Audio analyzer"))
+        tabs.addTab(self._build_prerequisites(), _("Prerequisites"))
         tabs.addTab(self._build_experiment_config(), _("Experiment Config"))
         tabs.addTab(self._build_bundles(), _("Model Bundles"))
+        fit_to_current_tab(tabs)
         self.content.addWidget(tabs, 1)
 
     # -- model info --------------------------------------------------------
 
     def _build_info(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -100,7 +175,7 @@ class ToolsPage(Page):
         return page
 
     def _inspect(self) -> None:
-        if not self.require(**{"A model file": self.info_path.path()}):
+        if not self.require(**{_("A model file"): self.info_path.path()}):
             return
         self.run(
             "model_info",
@@ -114,7 +189,7 @@ class ToolsPage(Page):
     # -- blender -----------------------------------------------------------
 
     def _build_blender(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -151,9 +226,9 @@ class ToolsPage(Page):
 
     def _blend(self) -> None:
         if not self.require(**{
-            "An output name": self.blend_name.text().strip(),
-            "Model A": self.blend_a.path(),
-            "Model B": self.blend_b.path(),
+            _("An output name"): self.blend_name.text().strip(),
+            _("Model A"): self.blend_a.path(),
+            _("Model B"): self.blend_b.path(),
         }):
             return
         self.run(
@@ -174,7 +249,7 @@ class ToolsPage(Page):
     # -- download ----------------------------------------------------------
 
     def _build_download(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -200,7 +275,7 @@ class ToolsPage(Page):
 
     def _download(self) -> None:
         link = self.download_url.text().strip()
-        if not self.require(**{"A link": link}):
+        if not self.require(**{_("A link"): link}):
             return
         self.run(
             "download",
@@ -212,7 +287,7 @@ class ToolsPage(Page):
     # -- analyzer ----------------------------------------------------------
 
     def _build_analyzer(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -243,7 +318,7 @@ class ToolsPage(Page):
         return page
 
     def _analyze(self) -> None:
-        if not self.require(**{"An audio file": self.analyze_path.path()}):
+        if not self.require(**{_("An audio file"): self.analyze_path.path()}):
             return
         target = str(paths.LOGS_DIR / "audio_analysis.png")
         self.run(
@@ -272,7 +347,7 @@ class ToolsPage(Page):
     # -- prerequisites -----------------------------------------------------
 
     def _build_prerequisites(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -311,7 +386,7 @@ class ToolsPage(Page):
     # -- experiment config -------------------------------------------------
 
     def _build_experiment_config(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -342,10 +417,11 @@ class ToolsPage(Page):
                   _("The architecture the rebuilt config will be written for.")),
         )
 
-        self.exp_details = _markdown(
+        self.exp_facts = FactsPanel()
+        self.exp_facts.set_message(
             _("Select an experiment to see what its config was written for.")
         )
-        card.add(self.exp_details)
+        card.add(self.exp_facts)
 
         self.exp_backup = Toggle(
             _("Keep a backup of the current config"),
@@ -365,7 +441,9 @@ class ToolsPage(Page):
         self.exp_button.clicked.connect(self._rebuild_config)
         card.add(self.exp_button)
 
-        self.exp_report = _markdown("")
+        # The rebuild's outcome, as a callout: green for the report, red for a
+        # refusal.  ``_show_report`` sets which.
+        self.exp_report = _markdown("", "Notice")
         self.exp_report.hide()
         card.add(self.exp_report)
 
@@ -383,15 +461,26 @@ class ToolsPage(Page):
 
     def _describe_experiment(self, experiment: str) -> None:
         if not experiment:
-            self.exp_details.setText(
+            self.exp_facts.set_message(
                 _("Select an experiment to see what its config was written for.")
             )
             return
-        text, current = experiments.describe(experiment)
-        self.exp_details.setText(text)
+        status = experiments.status(experiment)
+        if not status.readable:
+            self.exp_facts.set_message(
+                _("{name} has no readable config.json.").format(name=experiment),
+                "danger",
+            )
+            return
+        self.exp_facts.set_facts(*_experiment_facts(status))
         # Unrecognised or disabled: leave the target where the user put it.
-        if current:
-            self._select_vocoder(current)
+        if status.vocoder:
+            self._select_vocoder(status.vocoder)
+
+    def _show_report(self, text: str, tone: str) -> None:
+        self.exp_report.setText(text)
+        set_tone(self.exp_report, tone)
+        self.exp_report.show()
 
     def _rebuild_config(self) -> None:
         experiment = self.exp_name.value()
@@ -407,19 +496,17 @@ class ToolsPage(Page):
             )
         except Exception as error:  # noqa: BLE001 - refusal or I/O, both shown
             message = str(error)
-            self.exp_report.setText(message)
-            self.exp_report.show()
+            self._show_report(message, "danger")
             self.notify.emit("error", message.replace("`", ""))
             return
-        self.exp_report.setText(report)
-        self.exp_report.show()
+        self._show_report(report, "success")
         self._describe_experiment(experiment)
         self.notify.emit("success", _("Config rebuilt."))
 
     # -- model bundles -----------------------------------------------------
 
     def _build_bundles(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -509,7 +596,7 @@ class ToolsPage(Page):
 
     def _extract_bundle(self) -> None:
         bundle = self.bundle_file.path()
-        if not self.require(**{"A bundle": bundle}):
+        if not self.require(**{_("A bundle"): bundle}):
             return
         self.run(
             "bundle_extract",

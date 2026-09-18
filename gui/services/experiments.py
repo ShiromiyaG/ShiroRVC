@@ -29,11 +29,15 @@ def default_vocoder() -> str:
     return experiments.default_target_vocoder()
 
 
-def describe(experiment: str) -> tuple[str, str | None]:
-    """Markdown status, and the vocoder the current config is for (or None)."""
+def status(experiment: str):
+    """What the experiment's config was written for, as an ``ExperimentStatus``.
+
+    The data behind the web tab's Markdown ``describe``; the window lays it out
+    itself.
+    """
     from rvc.configs import experiments
 
-    return experiments.describe(paths.LOGS_DIR / experiment)
+    return experiments.experiment_status(paths.LOGS_DIR / experiment)
 
 
 def rebuild(experiment: str, vocoder: str, keep_backup: bool, move_checkpoints: bool) -> str:

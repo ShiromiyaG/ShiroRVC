@@ -650,7 +650,7 @@ def train_tab():
             epoch_save_frequency = gr.Slider(
                 1,
                 100,
-                1,
+                10,
                 step=1,
                 label=_("Saving frequency"),
                 info=_("Save a checkpoint every N epochs."),
@@ -660,7 +660,7 @@ def train_tab():
             total_epoch_count = gr.Slider(
                 1,
                 10000,
-                500,
+                250,
                 step=1,
                 label=_("Total Epochs"),
                 info=_("Total training epochs."),

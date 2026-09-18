@@ -25,6 +25,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..i18n import _
+
 #: Written by ``TENSORBOARD_VALIDATION_PREVIEW_DIR`` on the training side.
 PREVIEW_DIR_NAME = "validation_samples"
 
@@ -47,7 +49,7 @@ class Sample:
 
     @property
     def label(self) -> str:
-        return f"Sample {self.index:02d}"
+        return _("Sample {index}").format(index=f"{self.index:02d}")
 
     @property
     def has_audio(self) -> bool:
@@ -64,7 +66,7 @@ class EpochPreviews:
 
     @property
     def label(self) -> str:
-        return f"Epoch {self.epoch}"
+        return _("Epoch {epoch}").format(epoch=self.epoch)
 
     @property
     def mel_count(self) -> int:

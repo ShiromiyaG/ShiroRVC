@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from . import paths
+from ..i18n import _
 
 # Kept in sync with core.py's click choices.  These are small closed sets that
 # the backend validates anyway, so mirroring them costs nothing and keeps the
@@ -157,7 +158,23 @@ def default_output_path(input_path: str) -> str:
     stem = Path(input_path).name.rsplit(".", 1)[0]
     return str(paths.AUDIO_DIR / f"{stem}{OUTPUT_SUFFIX}.wav")
 
-_EPOCH_RE = re.compile(r"_e(\d+)_s(\d+)", re.IGNORECASE)
+
+def conversion_outputs(output_path: str, export_format: str) -> list[str]:
+    """Every file a conversion to ``output_path`` writes.
+
+    The path itself, which the pipeline always writes as WAV, and the copy it
+    makes for any other export format -- named by the same ``.wav`` substitution
+    ``core.run_infer_script`` and ``core.run_tts_script`` use.
+    """
+    converted = output_path.replace(".wav", f".{export_format.lower()}")
+    return [output_path] if converted == output_path else [output_path, converted]
+
+#: ``<name>_<epoch>e_<step>s.pth``, the name ``extract_model`` exports under --
+#: the pattern the Gradio tab's ``extract_model_and_epoch`` reads.  This used to
+#: look for ``_e<epoch>_s<step>``, which no file has ever been called, so every
+#: checkpoint tied and the list kept the filesystem's string order: ``_100e``
+#: ahead of ``_20e``.
+_EPOCH_RE = re.compile(r"_(\d+)e_(\d+)s", re.IGNORECASE)
 
 
 def _walk_models(root: Path):
@@ -187,21 +204,27 @@ def _walk_models(root: Path):
 def sort_key(path: str) -> tuple:
     """Order checkpoints by training progress, newest last.
 
-    Filenames carry ``_e<epoch>_s<step>``; sorting on that instead of
-    lexicographically is what stops ``_e100`` from landing before ``_e20``.
+    Filenames carry ``_<epoch>e_<step>s``; sorting on that instead of
+    lexicographically is what stops ``_100e`` from landing before ``_20e``.
+    Names without it sort by name, ahead of the numbered ones in their folder.
     """
-    match = _EPOCH_RE.search(Path(path).name)
+    name = Path(path).name
+    folder = Path(path).parent.name.lower()
+    match = _EPOCH_RE.search(name)
     if match:
-        return (Path(path).parent.name.lower(), int(match.group(1)), int(match.group(2)))
-    return (Path(path).parent.name.lower(), -1, -1)
+        return (folder, int(match.group(1)), int(match.group(2)), name.lower())
+    return (folder, -1, -1, name.lower())
 
 
 def list_models() -> list[str]:
     """Voice checkpoints and model bundles under ``logs/``, repo-relative."""
     found = []
-    for dirpath, _, filenames in _walk_models(paths.LOGS_DIR):
+    for dirpath, _dirnames, filenames in _walk_models(paths.LOGS_DIR):
         for name in filenames:
-            if name.lower().endswith((".pth", ".srvc")) and "G_" not in name and "D_" not in name:
+            # A prefix, as the Gradio tab tests it: training checkpoints are
+            # ``G_<step>.pth`` / ``D_<step>.pth``.  Testing for the substring
+            # hid any model whose name merely contains one, "SNOOP_DOG_..." say.
+            if name.lower().endswith((".pth", ".srvc")) and not name.startswith(("G_", "D_")):
                 found.append(paths.relative(Path(dirpath) / name))
     return sorted(found, key=sort_key)
 
@@ -214,7 +237,7 @@ def list_bundles() -> list[str]:
 def list_indexes() -> list[str]:
     """Faiss indexes under ``logs/``, repo-relative."""
     found = []
-    for dirpath, _, filenames in _walk_models(paths.LOGS_DIR):
+    for dirpath, _dirnames, filenames in _walk_models(paths.LOGS_DIR):
         for name in filenames:
             if name.lower().endswith(".index") and "trained" not in name:
                 found.append(paths.relative(Path(dirpath) / name))
@@ -435,9 +458,9 @@ def describe_age(stamp: float) -> str:
         return ""
     delta = max(0.0, time.time() - stamp)
     if delta < 90:
-        return "active now"
+        return _("active now")
     if delta < 3600:
-        return f"{int(delta // 60)} min ago"
+        return _("{count} min ago").format(count=int(delta // 60))
     if delta < 86400:
-        return f"{int(delta // 3600)} h ago"
-    return f"{int(delta // 86400)} d ago"
+        return _("{count} h ago").format(count=int(delta // 3600))
+    return _("{count} d ago").format(count=int(delta // 86400))

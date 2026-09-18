@@ -66,6 +66,7 @@ class TtsPage(Page):
 
         settings_card = Card(_("Conversion settings"), icon="sliders")
         self.settings = ConversionSettings("tts")
+        self.settings.notify.connect(self.notify)
         # These have no meaning for a synthesised source: there is no formant
         # mismatch to correct and no external pitch curve to apply.
         self.settings.formant.setChecked(False)
@@ -108,8 +109,8 @@ class TtsPage(Page):
             self.notify.emit("error", _("Enter some text, or pick a text file."))
             return
         if not self.require(**{
-            "A voice model": values["pth_path"],
-            "An output path": self.rvc_output.path(),
+            _("A voice model"): values["pth_path"],
+            _("An output path"): self.rvc_output.path(),
         }):
             return
 
@@ -132,6 +133,11 @@ class TtsPage(Page):
         }
         for path in (args["output_tts_path"], args["output_rvc_path"]):
             os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        # The converted path is fixed, so every run rewrites the file the
+        # player is holding from the last one.
+        self.player.release(
+            *catalog.conversion_outputs(args["output_rvc_path"], args["export_format"])
+        )
 
         self.run(
             "tts",
@@ -148,6 +154,7 @@ class TtsPage(Page):
 
     def on_shown(self) -> None:
         self.selector.refresh()
+        self.settings.presets.refresh()
 
     def apply_theme(self, tokens: dict[str, str]) -> None:
         super().apply_theme(tokens)

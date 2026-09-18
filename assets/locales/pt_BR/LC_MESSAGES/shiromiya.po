@@ -107,8 +107,53 @@ msgstr "5 · Index"
 msgid "A .srvc under logs/, or type a path."
 msgstr "Um .srvc dentro de logs/, ou digite um caminho."
 
+msgid "A bundle"
+msgstr "Bundle"
+
+msgid "A dataset folder"
+msgstr "Pasta do dataset"
+
 msgid "A folder under logs/ that already has a config.json."
 msgstr "Uma pasta em logs/ que já possui um config.json."
+
+msgid "A link"
+msgstr "Link"
+
+msgid "A model file"
+msgstr "Arquivo de modelo"
+
+msgid "A model name"
+msgstr "Nome do modelo"
+
+msgid "A preset name cannot contain \\ / : * ? \" < > |"
+msgstr "O nome de uma predefinição não pode conter \\ / : * ? \" < > |"
+
+msgid "A sample rate"
+msgstr "Taxa de amostragem"
+
+msgid "A speaker to index"
+msgstr "Speaker a indexar"
+
+msgid ""
+"A training run is active, and restarting the backend stops it.\n"
+"\n"
+"Restart anyway?"
+msgstr ""
+"Há um treinamento em andamento, e reiniciar o backend o interrompe.\n"
+"\n"
+"Reiniciar mesmo assim?"
+
+msgid ""
+"A training run is still active. Closing the window stops it.\n"
+"\n"
+"Stop training and quit?"
+msgstr ""
+"Ainda há um treinamento em andamento. Fechar a janela o interrompe.\n"
+"\n"
+"Interromper o treinamento e sair?"
+
+msgid "A voice model"
+msgstr "Modelo de voz"
 
 msgid "Accepts Hugging Face, Google Drive, Pixeldrain and direct links."
 msgstr "Aceita Hugging Face, Google Drive, Pixeldrain e links diretos."
@@ -152,6 +197,24 @@ msgstr "Todos os arquivos"
 msgid "Also export inference weights each save"
 msgstr "Exportar também os pesos de inferência a cada salvamento"
 
+msgid "An audio file"
+msgstr "Arquivo de áudio"
+
+msgid "An input file"
+msgstr "Arquivo de entrada"
+
+msgid "An input folder"
+msgstr "Pasta de entrada"
+
+msgid "An output folder"
+msgstr "Pasta de saída"
+
+msgid "An output name"
+msgstr "Nome de saída"
+
+msgid "An output path"
+msgstr "Caminho de saída"
+
 msgid "Analysis complete."
 msgstr "Análise concluída."
 
@@ -181,6 +244,9 @@ msgstr "Aplica autotune."
 
 msgid "Apply spectral-gating noise reduction."
 msgstr "Aplica redução de ruído por spectral gating."
+
+msgid "Architecture id"
+msgstr "Id de arquitetura"
 
 msgid "Attach one uploaded index to every model."
 msgstr "Anexa um index enviado a todos os modelos."
@@ -269,6 +335,9 @@ msgstr "Proporção da mistura"
 msgid "Blend status."
 msgstr "Status da mistura."
 
+msgid "Blender"
+msgstr "Mesclador"
+
 msgid "Blending models…"
 msgstr "Misturando modelos…"
 
@@ -281,6 +350,9 @@ msgstr ""
 
 msgid "Both use SoXr. ffmpeg keeps more of the top octave; librosa uses a shorter filter with less pre-ringing on transients."
 msgstr "Ambos usam SoXr. O ffmpeg preserva mais da oitava superior; o librosa usa um filtro mais curto, com menos pre-ringing nos transientes."
+
+msgid "Bring the chart back."
+msgstr "Mostrar o gráfico de novo."
 
 msgid "Browse"
 msgstr "Procurar"
@@ -336,8 +408,14 @@ msgstr "Checkpoint lido."
 msgid "Checkpointing"
 msgstr "Checkpointing"
 
+msgid "Checkpoints"
+msgstr "Checkpoints"
+
 msgid "Checkpoints and quality"
 msgstr "Checkpoints e qualidade"
+
+msgid "Choose a preset…"
+msgstr "Escolha uma predefinição…"
 
 msgid "Choose a vocoder; its available sample rates are selected automatically."
 msgstr "Escolha um vocoder; as taxas de amostragem disponíveis para ele são selecionadas automaticamente."
@@ -441,6 +519,9 @@ msgstr "Convertendo…"
 msgid "Copy"
 msgstr "Copiar"
 
+msgid "Copy a preset file into the presets folder and apply it."
+msgstr "Copia um arquivo de predefinição para a pasta de predefinições e o aplica."
+
 msgid "Correction mode"
 msgstr "Modo de correção"
 
@@ -459,6 +540,9 @@ msgstr "Não foi possível salvar a cópia: {error}"
 msgid "Could not save the log: {error}"
 msgstr "Não foi possível salvar o log: {error}"
 
+msgid "Could not save the preset: {error}"
+msgstr "Não foi possível salvar a predefinição: {error}"
+
 msgid "Create a bundle"
 msgstr "Criar um bundle"
 
@@ -470,6 +554,9 @@ msgstr "Cria logs/<nome>/. Reutilize um nome para continuar uma execução."
 
 msgid "Creating model bundle…"
 msgstr "Criando o bundle…"
+
+msgid "Current vocoder"
+msgstr "Vocoder atual"
 
 msgid "Custom Pretrained"
 msgstr "Pré-treinado personalizado"
@@ -603,6 +690,9 @@ msgstr "Ativar correção de registro agudo do RMVPE"
 msgid "End the run once held-out quality stops improving. The pre-overtrain model is exported either way; this only decides whether training keeps going."
 msgstr "Encerra a execução quando a qualidade no conjunto reservado para de melhorar. O modelo anterior ao overtraining é exportado de qualquer forma; isto só decide se o treinamento continua."
 
+msgid "Enter a preset name first."
+msgstr "Digite um nome para a predefinição primeiro."
+
 msgid "Enter a valid dataset name."
 msgstr "Digite um nome de dataset válido."
 
@@ -635,6 +725,9 @@ msgstr "Digite o seu apelido"
 
 msgid "Epoch"
 msgstr "Época"
+
+msgid "Epoch {epoch}"
+msgstr "Época {epoch}"
 
 msgid "Error uploading to Google Drive"
 msgstr "Erro ao enviar para o Google Drive"
@@ -762,11 +855,17 @@ msgstr "Raio do filtro"
 msgid "Filter…"
 msgstr "Filtrar…"
 
+msgid "Finished."
+msgstr "Concluído."
+
 msgid "First model"
 msgstr "Primeiro modelo"
 
 msgid "Fit to window"
 msgstr "Ajustar à janela"
+
+msgid "Fixed by the audio already extracted."
+msgstr "Fixada pelo áudio já extraído."
 
 msgid "Fixes the octave errors rmvpe.pt makes above ~1040 Hz (flutes, high strings, whistle register) with a second pass on octave-down-resampled audio. Off by default; when disabled RMVPE behaves exactly as before."
 msgstr "Corrige os erros de oitava que o rmvpe.pt comete acima de ~1040 Hz (flautas, cordas agudas, registro de apito) com uma segunda passagem sobre o áudio reamostrado uma oitava abaixo. Desativado por padrão; quando desativado, o RMVPE se comporta exatamente como antes."
@@ -791,6 +890,9 @@ msgstr "Pasta com o seu áudio de treinamento"
 
 msgid "Folders"
 msgstr "Pastas"
+
+msgid "Follow"
+msgstr "Acompanhar"
 
 msgid "Follow ✓"
 msgstr "Acompanhar ✓"
@@ -879,6 +981,9 @@ msgstr "Gere fala com o EdgeTTS e depois converta-a com o modelo RVC selecionado
 msgid "Generated"
 msgstr "Gerado"
 
+msgid "Generation"
+msgstr "Geração"
+
 msgid "Generator (G)"
 msgstr "Gerador (G)"
 
@@ -930,6 +1035,15 @@ msgstr "Como os embeddings extraídos são armazenados. Eles são tanto a entrad
 msgid "If the number is greater than or equal to three, employing median filtering on the collected tone results has the potential to decrease respiration."
 msgstr "Se o número for maior ou igual a três, aplicar filtragem por mediana aos resultados de tom coletados pode reduzir a respiração."
 
+msgid "Import preset"
+msgstr "Importar predefinição"
+
+msgid "Import…"
+msgstr "Importar…"
+
+msgid "In config.json."
+msgstr "No config.json."
+
 msgid "Increase or decrease TTS speed."
 msgstr "Aumenta ou diminui a velocidade do TTS."
 
@@ -965,6 +1079,9 @@ msgstr "Método de index para datasets grandes."
 
 msgid "Index one speaker only"
 msgstr "Indexar apenas um speaker"
+
+msgid "Index retrieval"
+msgstr "Busca no índice"
 
 msgid "Indexes (optional)"
 msgstr "Indexes (opcional)"
@@ -1119,6 +1236,9 @@ msgstr "Misturador de modelos"
 msgid "Model file"
 msgstr "Arquivo do modelo"
 
+msgid "Model info"
+msgstr "Informações do modelo"
+
 msgid "Model information"
 msgstr "Informações do modelo"
 
@@ -1127,6 +1247,9 @@ msgstr "Informações do modelo."
 
 msgid "Model name"
 msgstr "Nome do modelo"
+
+msgid "Model selection"
+msgstr "Seleção de modelo"
 
 msgid "Model used for learning speaker embedding."
 msgstr "Modelo usado para aprender o embedding do locutor."
@@ -1173,8 +1296,17 @@ msgstr "Próximo"
 msgid "No audio loaded"
 msgstr "Nenhum áudio carregado"
 
+msgid "No finite positive values for a log axis"
+msgstr "Nenhum valor finito e positivo para um eixo logarítmico"
+
+msgid "No finite values to plot"
+msgstr "Nenhum valor finito para plotar"
+
 msgid "No preview image for this epoch."
 msgstr "Sem imagem de preview para esta época."
+
+msgid "No training logs found"
+msgstr "Nenhum log de treinamento encontrado"
 
 msgid "No training logs found under logs/. They appear once a run starts writing TensorBoard events."
 msgstr "Nenhum log de treino encontrado em logs/. Eles aparecem assim que um treino começa a gravar eventos do TensorBoard."
@@ -1193,6 +1325,9 @@ msgstr "Intensidade da redução de ruído"
 
 msgid "Normalisation"
 msgstr "Normalização"
+
+msgid "Nothing in this config names an architecture this build knows -- it predates the current vocoder registry. Rebuild it for the one in \"Vocoder / Architecture\"."
+msgstr "Nada neste config identifica uma arquitetura que esta versão conheça -- ele é anterior ao registro atual de vocoders. Regere-o para o escolhido em \"Vocoder / Arquitetura\"."
 
 msgid "Off means training from scratch, which needs far more data."
 msgstr "Desligado significa treinar do zero, o que exige muito mais dados."
@@ -1332,6 +1467,9 @@ msgstr "Deslocamento de pitch em semitons."
 msgid "Pitch shift in semitones. 12 = one octave up."
 msgstr "Deslocamento de pitch em semitons. 12 = uma oitava acima."
 
+msgid "Post-processing"
+msgstr "Pós-processamento"
+
 msgid "Precision"
 msgstr "Precisão"
 
@@ -1359,14 +1497,26 @@ msgstr "Pré-requisitos"
 msgid "Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing."
 msgstr "Verificação de pré-requisitos concluída. Os arquivos faltantes foram baixados e você já pode começar o pré-processamento."
 
+msgid "Preset"
+msgstr "Predefinição"
+
 msgid "Preset Name"
 msgstr "Nome da predefinição"
 
 msgid "Preset Settings"
 msgstr "Configurações da predefinição"
 
+msgid "Preset applied: {name}"
+msgstr "Predefinição aplicada: {name}"
+
 msgid "Preset does not exist: {name}"
 msgstr "A predefinição não existe: {name}"
+
+msgid "Preset name:"
+msgstr "Nome da predefinição:"
+
+msgid "Preset saved: {}"
+msgstr "Predefinição salva: {}"
 
 msgid "Presets from assets/formant_shift."
 msgstr "Predefinições de assets/formant_shift."
@@ -1418,6 +1568,9 @@ msgstr "Proporção"
 
 msgid "Raw"
 msgstr "Bruto"
+
+msgid "Read from the architecture id below."
+msgstr "Deduzido do id de arquitetura abaixo."
 
 msgid "Read from the extracted features."
 msgstr "Lido das features extraídas."
@@ -1473,6 +1626,9 @@ msgstr "Remover"
 msgid "Remove DC offset and low-frequency noise."
 msgstr "Remove o offset DC e o ruído de baixa frequência."
 
+msgid "Replace the preset \"{name}\"?"
+msgstr "Substituir a predefinição \"{name}\"?"
+
 msgid "Resampler"
 msgstr "Reamostrador"
 
@@ -1527,6 +1683,9 @@ msgstr "Taxa de amostragem do modelo (sr)"
 msgid "Sample rate"
 msgstr "Taxa de amostragem"
 
+msgid "Sample {index}"
+msgstr "Amostra {index}"
+
 msgid "Sampling Rate"
 msgstr "Taxa de amostragem"
 
@@ -1548,8 +1707,17 @@ msgstr "Salvar como"
 msgid "Save every N epochs"
 msgstr "Salvar a cada N epochs"
 
+msgid "Save log"
+msgstr "Salvar log"
+
+msgid "Save preset"
+msgstr "Salvar predefinição"
+
 msgid "Save the compact voice model files."
 msgstr "Salva os arquivos compactos do modelo de voz."
+
+msgid "Save the current settings as a preset."
+msgstr "Salva as configurações atuais como uma predefinição."
 
 msgid "Save to"
 msgstr "Salvar em"
@@ -1563,6 +1731,9 @@ msgstr "Salvar modelos de pesos"
 msgid "Saved beside it as config.json.<old architecture>.bak."
 msgstr "Salvo ao lado dele como config.json.<arquitetura antiga>.bak."
 
+msgid "Saved settings, shared with the web interface. Picking one applies it; the model, index and file paths are not part of a preset."
+msgstr "Configurações salvas, compartilhadas com a interface web. Escolher uma a aplica; o modelo, o índice e os caminhos de arquivo não fazem parte de uma predefinição."
+
 msgid "Saved to {path}"
 msgstr "Salvo em {path}"
 
@@ -1574,6 +1745,9 @@ msgstr "Salvar…"
 
 msgid "Saving frequency"
 msgstr "Frequência de salvamento"
+
+msgid "Schedule"
+msgstr "Cronograma"
 
 msgid "Search Feature Ratio"
 msgstr "Proporção de busca por características"
@@ -1601,6 +1775,9 @@ msgstr "Selecionar entrada de áudio"
 
 msgid "Select Custom Preset"
 msgstr "Selecionar predefinição personalizada"
+
+msgid "Select a metric below to plot it"
+msgstr "Selecione uma métrica abaixo para plotá-la"
 
 msgid "Select a run to see its validation previews."
 msgstr "Selecione um treino para ver seus previews de validação."
@@ -1825,11 +2002,20 @@ msgstr "Parar conversão"
 msgid "Stop once overtrained"
 msgstr "Parar ao detectar overtraining"
 
+msgid "Stop requested."
+msgstr "Parada solicitada."
+
+msgid "Stop requested; waiting for the current checkpoint to finish writing."
+msgstr "Parada solicitada; aguardando o checkpoint atual terminar de ser gravado."
+
 msgid "Stop training"
 msgstr "Parar treinamento"
 
 msgid "Stop when overtrained"
 msgstr "Parar quando houver overtraining"
+
+msgid "Stopped: {error}"
+msgstr "Interrompido: {error}"
 
 msgid "Stopping…"
 msgstr "Parando…"
@@ -1984,6 +2170,9 @@ msgstr "O NSF-HiFi-GAN padrão do RVC v2, com o discriminador de 8 períodos do 
 msgid "The two disagree. Rebuilding writes both, which is how that gets resolved."
 msgstr "Os dois discordam. Regerar escreve os dois, que é como isso se resolve."
 
+msgid "The vocoder recorded when the features were extracted."
+msgstr "O vocoder registrado quando as features foram extraídas."
+
 msgid "There is no converted file to save yet."
 msgstr "Ainda não há arquivo convertido para salvar."
 
@@ -1992,6 +2181,9 @@ msgstr "Esta GPU não tem tensor cores para FP16: o autocast ainda reduz pela me
 
 msgid "This GPU has no native BF16 support, so it would be emulated and slow."
 msgstr "Esta GPU não tem suporte nativo a BF16, então ele seria emulado e ficaria lento."
+
+msgid "This run has not written any scalar events yet."
+msgstr "Esta execução ainda não gravou nenhum evento escalar."
 
 msgid "This run has not written validation previews yet. They appear every few hundred steps once training starts."
 msgstr "Este treino ainda não gravou previews de validação. Eles aparecem a cada algumas centenas de steps depois que o treino começa."
@@ -2017,11 +2209,20 @@ msgstr "Total de epochs de treinamento."
 msgid "Trades speed for a much smaller VRAM footprint."
 msgstr "Troca velocidade por um consumo de VRAM bem menor."
 
+msgid "Trained for the current architecture; they cannot resume under another."
+msgstr "Treinados para a arquitetura atual; não podem ser retomados em outra."
+
 msgid "Training"
 msgstr "Treinamento"
 
 msgid "Training Presets"
 msgstr "Predefinições de treinamento"
+
+msgid "Training finished."
+msgstr "Treinamento concluído."
+
+msgid "Training is running"
+msgstr "Treinamento em andamento"
 
 msgid "Training is running; the new language applies at the next start."
 msgstr "O treinamento está em andamento; o novo idioma será aplicado na próxima inicialização."
@@ -2031,6 +2232,9 @@ msgstr "Precisão do treino"
 
 msgid "Training status."
 msgstr "Status do treinamento."
+
+msgid "Training…"
+msgstr "Treinando…"
 
 msgid "Trim and de-click"
 msgstr "Aparar e remover cliques"
@@ -2173,6 +2377,15 @@ msgstr "Qual voz dentro do pacote .srvc usar."
 msgid "Window"
 msgstr "Janela"
 
+msgid "Window backdrop off."
+msgstr "Fundo da janela desligado."
+
+msgid "Window backdrop: acrylic (blurs what is behind the window)."
+msgstr "Fundo da janela: acrylic (desfoca o que está atrás da janela)."
+
+msgid "Window backdrop: mica (tints with the wallpaper; subtle by design)."
+msgstr "Fundo da janela: mica (tinge com o papel de parede; sutil de propósito)."
+
 msgid "Writes each model back out as <name>/<name>.pth and .index, the layout Applio pairs by name."
 msgstr "Grava cada modelo de volta como <nome>/<nome>.pth e .index, o formato que o Applio pareia pelo nome."
 
@@ -2200,8 +2413,17 @@ msgstr "`{}` não é um vocoder que esta versão conhece -- provavelmente foi re
 msgid "absent"
 msgstr "ausente"
 
+msgid "active now"
+msgstr "ativa agora"
+
+msgid "batch {done} / {total}"
+msgstr "batch {done} / {total}"
+
 msgid "checkpoints, schedule, precision, compilation, gradient clipping"
 msgstr "checkpoints, agendamento, precisão, compilação, clipping de gradiente"
+
+msgid "config.json and model_info.json name different vocoders. Rebuilding writes both, which resolves it."
+msgstr "config.json e model_info.json citam vocoders diferentes. Regerar grava os dois e resolve isso."
 
 msgid "contentvec, RMVPE, FCPE."
 msgstr "contentvec, RMVPE, FCPE."
@@ -2221,6 +2443,9 @@ msgstr "l2 é o que o RVC original constrói. O cosseno compara apenas a direç�
 msgid "max-autotune spends longer compiling for a faster steady state."
 msgstr "max-autotune passa mais tempo compilando para chegar a um regime estável mais rápido."
 
+msgid "model_info.json names \"{name}\", which this build no longer ships. Rebuilding writes a current one."
+msgstr "model_info.json cita \"{name}\", que esta versão não inclui mais. Regerar grava um valor atual."
+
 msgid "normalisation, cleanup, format, threads"
 msgstr "normalização, limpeza, formato, threads"
 
@@ -2232,6 +2457,9 @@ msgstr "formato de saída, pós-processamento, formantes, seed"
 
 msgid "rmvpe is the recommended default."
 msgstr "rmvpe é o padrão recomendado."
+
+msgid "step"
+msgstr "step"
 
 msgid "step {step}"
 msgstr "step {step}"
@@ -2245,8 +2473,16 @@ msgstr "compilar o vocoder com torch.compile"
 msgid "true_pitch writes the real pitch, capped at the F0 ceiling. fold only repairs wrong-octave frames using half-pitch drives; use it with models trained on uncorrected labels to keep their timbre."
 msgstr "true_pitch grava o pitch real, limitado ao teto de F0. fold só corrige os frames na oitava errada usando excitações a meio pitch; use-o com modelos treinados com rótulos sem correção para manter o timbre deles."
 
+msgid "unrecognised"
+msgstr "não reconhecido"
+
 msgid "unrecognised -- this config predates the current registry"
 msgstr "não reconhecida -- este config é anterior ao registro atual"
+
+msgid "{count} G/D file"
+msgid_plural "{count} G/D files"
+msgstr[0] "{count} arquivo G/D"
+msgstr[1] "{count} arquivos G/D"
 
 msgid "{count} audio file found."
 msgid_plural "{count} audio files found."
@@ -2258,20 +2494,35 @@ msgid_plural "{count} characters"
 msgstr[0] "{count} caractere"
 msgstr[1] "{count} caracteres"
 
+msgid "{count} d ago"
+msgstr "há {count} d"
+
 msgid "{count} epochs with previews · {size} on disk, under logs/<model>/validation_samples/."
 msgstr "{count} épocas com previews · {size} em disco, em logs/<modelo>/validation_samples/."
+
+msgid "{count} h ago"
+msgstr "há {count} h"
+
+msgid "{count} metrics is the limit — untick one, or click a line in the legend to drop it."
+msgstr "O limite é {count} métricas — desmarque uma, ou clique numa linha da legenda para removê-la."
+
+msgid "{count} min ago"
+msgstr "há {count} min"
 
 msgid "{duration} elapsed"
 msgstr "{duration} decorridos"
 
 msgid "{field} is required."
-msgstr "{field} é obrigatório."
+msgstr "Campo obrigatório: {field}."
 
 msgid "{label} · {n} sample(s){detail}"
 msgstr "{label} · {n} amostra(s){detail}"
 
 msgid "{label}, {sample} — the generated clip is the model's own inference path, so it is what conversion will sound like."
 msgstr "{label}, {sample} — o clipe gerado usa o próprio caminho de inferência do modelo, então é assim que a conversão vai soar."
+
+msgid "{name} has no readable config.json."
+msgstr "{name} não tem um config.json legível."
 
 msgid "{name} is not available at {rate}."
 msgstr "{name} não esta disponível em {rate}."
@@ -2287,3 +2538,6 @@ msgstr "{} checkpoint(s) foram deixados no lugar. O treino vai tentar retomar a 
 
 msgid "{} has no configuration for {} Hz (it supports {}). The extracted audio fixes the rate, so this experiment cannot use that vocoder."
 msgstr "{} não tem configuração para {} Hz (ele suporta {}). O áudio extraído fixa a taxa, então este experimento não pode usar esse vocoder."
+
+msgid "~{duration} left"
+msgstr "~{duration} restantes"

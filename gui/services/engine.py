@@ -9,6 +9,7 @@ is allowed to know about.
 
 from __future__ import annotations
 
+import codecs
 import json
 from typing import Any, Callable
 
@@ -17,6 +18,14 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 from . import paths
 
 SENTINEL = "\x1e"
+
+#: How long :meth:`Engine.shutdown` waits for a worker that is stopping a
+#: training run.  The trainer defers a stop until any checkpoint write in
+#: flight is on disk, and ``core.TRAINING_STOP_GRACE_SECONDS`` (45 s) plus the
+#: tree kill after it is what the worker may spend; mirrored, since gui/ may
+#: not import core.  Killing the worker sooner orphans the trainer on Windows.
+TRAINING_SHUTDOWN_MS = 60_000
+SHUTDOWN_MS = 3_000
 
 #: NTSTATUS values a crashed Windows process exits with.  Mirrors
 #: ``core.describe_exit_code``; gui/ may not import core.
@@ -67,6 +76,11 @@ class Engine(QObject):
         self._process: QProcess | None = None
         self._stdout_buffer = ""
         self._stderr_buffer = ""
+        # Incremental, because a pipe read ends wherever it ends: a character
+        # split across two reads -- any accented one in a Portuguese log line
+        # or a path -- decoded chunk by chunk came out as two "�".
+        self._stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._next_id = 1
         self._pending: dict[int, tuple[str, ResultCallback | None, ErrorCallback | None]] = {}
         self._running: set[int] = set()
@@ -86,6 +100,11 @@ class Engine(QObject):
     def is_pending(self, job_id: int) -> bool:
         """Whether this job was sent and still awaits its answer."""
         return job_id in self._pending
+
+    @property
+    def is_training(self) -> bool:
+        """Whether a training job was sent and has not answered yet."""
+        return any(cmd == "train" for cmd, _result, _error in self._pending.values())
 
     def start(self) -> None:
         if self._process is not None:
@@ -107,6 +126,8 @@ class Engine(QObject):
         environment.insert("TERM", "dumb")
         process.setProcessEnvironment(environment)
 
+        self._stdout_decoder.reset()
+        self._stderr_decoder.reset()
         process.readyReadStandardOutput.connect(self._drain_stdout)
         process.readyReadStandardError.connect(self._drain_stderr)
         process.finished.connect(self._on_finished)
@@ -121,6 +142,10 @@ class Engine(QObject):
         A training run can hold the GPU for hours; leaving the worker behind
         because the window closed is how people end up rebooting to reclaim
         VRAM.  Terminate is the polite ask, kill is the guarantee.
+
+        With a run going the worker stops it first, which can take most of a
+        minute; killing the worker three seconds in would leave the trainer
+        running without it.
         """
         self._shutting_down = True
         process = self._process
@@ -132,7 +157,8 @@ class Engine(QObject):
                 process.waitForBytesWritten(200)
             except (OSError, RuntimeError):
                 pass
-            if not process.waitForFinished(3000):
+            grace = TRAINING_SHUTDOWN_MS if self.is_training else SHUTDOWN_MS
+            if not process.waitForFinished(grace):
                 process.kill()
                 process.waitForFinished(1000)
         self._process = None
@@ -175,7 +201,7 @@ class Engine(QObject):
         process = self._process
         if process is None:
             return
-        chunk = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        chunk = self._stdout_decoder.decode(bytes(process.readAllStandardOutput()))
         self._stdout_buffer += chunk
         while "\n" in self._stdout_buffer:
             line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
@@ -185,7 +211,7 @@ class Engine(QObject):
         process = self._process
         if process is None:
             return
-        chunk = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+        chunk = self._stderr_decoder.decode(bytes(process.readAllStandardError()))
         self._stderr_buffer += chunk
         while "\n" in self._stderr_buffer:
             line, self._stderr_buffer = self._stderr_buffer.split("\n", 1)
@@ -194,12 +220,20 @@ class Engine(QObject):
                 self.log.emit(line)
 
     def _handle_line(self, line: str) -> None:
-        if not line.startswith(SENTINEL):
+        # Searched for, not expected at column zero.  Only the worker's own
+        # messages go through its write lock; a library writing a line in
+        # pieces -- or straight to the descriptor from C -- can leave a
+        # fragment ahead of one.  Read as a log line, that message was lost,
+        # and a lost ``result`` leaves its job running forever.
+        head, sentinel, payload = line.partition(SENTINEL)
+        if not sentinel:
             if line:
                 self.log.emit(line)
             return
+        if head.strip():
+            self.log.emit(head)
         try:
-            message = json.loads(line[len(SENTINEL):])
+            message = json.loads(payload)
         except ValueError:
             self.log.emit(line)
             return

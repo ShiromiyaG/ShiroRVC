@@ -696,6 +696,100 @@ QProgressBar#Secondary::chunk {
     font-weight: 600;
 }
 
+/* ---- facts: a labelled summary, and callouts under it -------------- */
+
+#FactsPanel {
+    background: @input@;
+    border: 1px solid @border@;
+    border-radius: 10px;
+}
+
+#FactLabel {
+    color: @text_dim@;
+    font-size: 12px;
+}
+
+#FactValue {
+    color: @text@;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+#FactNote {
+    color: @text_faint@;
+    font-size: 11px;
+}
+
+#Pill {
+    background: @surface_alt@;
+    border: 1px solid @border_strong@;
+    border-radius: 7px;
+    padding: 1px 8px;
+    color: @text@;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+#Pill[tone="accent"] {
+    background: @accent_ghost@;
+    border-color: @accent_soft@;
+    color: @accent@;
+}
+
+#Pill[tone="success"] {
+    background: @success_ghost@;
+    border-color: @success_soft@;
+    color: @success@;
+}
+
+#Pill[tone="warning"] {
+    background: @warning_ghost@;
+    border-color: @warning_soft@;
+    color: @warning@;
+}
+
+#Pill[tone="danger"] {
+    background: @danger_ghost@;
+    border-color: @danger_soft@;
+    color: @danger@;
+}
+
+/* A callout: the tone on the left edge, the text in normal colour so it
+ * stays readable whatever the tone. */
+#Notice {
+    background: @surface_alt@;
+    border: 1px solid @border@;
+    border-left: 3px solid @border_strong@;
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: @text@;
+    font-size: 12px;
+}
+
+#Notice[tone="info"] {
+    background: @accent_ghost@;
+    border-color: @accent_soft@;
+    border-left-color: @accent@;
+}
+
+#Notice[tone="success"] {
+    background: @success_ghost@;
+    border-color: @success_soft@;
+    border-left-color: @success@;
+}
+
+#Notice[tone="warning"] {
+    background: @warning_ghost@;
+    border-color: @warning_soft@;
+    border-left-color: @warning@;
+}
+
+#Notice[tone="danger"] {
+    background: @danger_ghost@;
+    border-color: @danger_soft@;
+    border-left-color: @danger@;
+}
+
 /* ---- drop zone ----------------------------------------------------- */
 
 #DropZone {

@@ -199,7 +199,12 @@ class MonitorPage(Page):
             found = self.run_picker.findData(wanted)
             if found >= 0:
                 index = found
+        # Blocked here too: a selection that moves would reach ``_attach``
+        # through ``_on_run_selected`` and then again below -- two media scans
+        # and two reads started for one rescan.
+        blocked = self.run_picker.blockSignals(True)
         self.run_picker.setCurrentIndex(index)
+        self.run_picker.blockSignals(blocked)
         self._attach(self.run_picker.itemData(index) or "")
 
     def _on_run_selected(self, index: int) -> None:

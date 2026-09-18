@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from rvc.configs.vocoders import (
@@ -116,66 +117,125 @@ def _checkpoints(experiment_dir: Path) -> list[Path]:
     )
 
 
+@dataclass(frozen=True)
+class ExperimentStatus:
+    """What an experiment's config was written for.
+
+    The facts :func:`describe` words as Markdown for the web interface, kept
+    as data so the Qt window can lay them out as a panel of its own instead
+    of rendering the same prose.
+    """
+
+    experiment: str
+    #: Whether ``config.json`` exists and parses.  Nothing else is filled
+    #: when it does not.
+    readable: bool
+    sample_rate: int | None = None
+    architecture_id: str | None = None
+    #: The registry vocoder that stamps ``architecture_id``, or ``None`` when
+    #: this build does not recognise it.
+    vocoder: str | None = None
+    vocoder_label: str | None = None
+    #: ``model_info.json``'s ``vocoder_architecture``, verbatim.
+    recorded: str | None = None
+    #: That value resolved against the registry; ``None`` when it names a
+    #: vocoder this build no longer ships.
+    recorded_vocoder: str | None = None
+    #: ``G_*.pth`` / ``D_*.pth`` files in the folder.
+    checkpoints: int = 0
+
+    @property
+    def recorded_unknown(self) -> bool:
+        return bool(self.recorded) and self.recorded_vocoder is None
+
+    @property
+    def disagrees(self) -> bool:
+        return bool(
+            self.recorded_vocoder
+            and self.vocoder
+            and self.recorded_vocoder != self.vocoder
+        )
+
+
+def experiment_status(experiment_dir: Path) -> ExperimentStatus:
+    """Read what an experiment's config and ``model_info.json`` say."""
+    experiment = experiment_dir.name
+    config = _read_json(experiment_dir / "config.json")
+    if not config:
+        return ExperimentStatus(experiment=experiment, readable=False)
+
+    architecture_id = config.get("model", {}).get("architecture_id")
+    current_vocoder = _vocoder_from_architecture(architecture_id)
+    recorded = _read_json(experiment_dir / "model_info.json").get("vocoder_architecture")
+    recorded_vocoder = None
+    if recorded:
+        try:
+            recorded_vocoder = normalize_vocoder(recorded)
+        except ValueError:
+            # ``model_info.json`` can name a vocoder this build no longer ships.
+            # Reporting that kind of drift is what the status is for, so it
+            # must not raise on it.
+            recorded_vocoder = None
+
+    return ExperimentStatus(
+        experiment=experiment,
+        readable=True,
+        sample_rate=config.get("data", {}).get("sample_rate"),
+        architecture_id=architecture_id,
+        vocoder=current_vocoder,
+        vocoder_label=(
+            get_vocoder_spec(current_vocoder)["label"] if current_vocoder else None
+        ),
+        recorded=recorded,
+        recorded_vocoder=recorded_vocoder,
+        checkpoints=len(_checkpoints(experiment_dir)),
+    )
+
+
 def describe(experiment_dir: Path) -> tuple[str, str | None]:
     """Markdown status for an experiment, and the vocoder its config is for.
 
     The vocoder is ``None`` when the config's architecture is not one this
     build recognises.
     """
-    experiment = experiment_dir.name
-    config = _read_json(experiment_dir / "config.json")
-    if not config:
-        return _("`{}` has no readable config.json.").format(experiment), None
-
-    architecture_id = config.get("model", {}).get("architecture_id")
-    sample_rate = config.get("data", {}).get("sample_rate")
-    current_vocoder = _vocoder_from_architecture(architecture_id)
-    model_info = _read_json(experiment_dir / "model_info.json")
-    recorded = model_info.get("vocoder_architecture")
+    status = experiment_status(experiment_dir)
+    if not status.readable:
+        return _("`{}` has no readable config.json.").format(status.experiment), None
 
     lines = [
-        _("**Sample rate:** {} Hz -- fixed by the extracted audio.").format(sample_rate),
-        _("**Architecture id in config.json:** `{}`").format(architecture_id or _("absent")),
-        _("**Vocoder that stamps it:** {}").format(
-            get_vocoder_spec(current_vocoder)["label"]
-            if current_vocoder
-            else _("unrecognised -- this config predates the current registry")
+        _("**Sample rate:** {} Hz -- fixed by the extracted audio.").format(status.sample_rate),
+        _("**Architecture id in config.json:** `{}`").format(
+            status.architecture_id or _("absent")
         ),
-        _("**model_info.json says:** `{}`").format(recorded or _("absent")),
+        _("**Vocoder that stamps it:** {}").format(
+            status.vocoder_label
+            or _("unrecognised -- this config predates the current registry")
+        ),
+        _("**model_info.json says:** `{}`").format(status.recorded or _("absent")),
     ]
-
-    if recorded:
-        try:
-            recorded_id = normalize_vocoder(recorded)
-        except ValueError:
-            # ``model_info.json`` can name a vocoder this build no longer ships.
-            # This panel exists to *report* that kind of drift, so it must not
-            # raise on it -- say so and let Rebuild write a value that resolves.
-            recorded_id = None
-            lines.append(
-                _(
-                    "`{}` is not a vocoder this build knows -- it was likely "
-                    "removed from the registry. Rebuilding writes a current one."
-                ).format(recorded)
+    if status.recorded_unknown:
+        lines.append(
+            _(
+                "`{}` is not a vocoder this build knows -- it was likely "
+                "removed from the registry. Rebuilding writes a current one."
+            ).format(status.recorded)
+        )
+    if status.disagrees:
+        lines.append(
+            _(
+                "The two disagree. Rebuilding writes both, which is how that "
+                "gets resolved."
             )
-        if recorded_id and current_vocoder and recorded_id != current_vocoder:
-            lines.append(
-                _(
-                    "The two disagree. Rebuilding writes both, which is how that "
-                    "gets resolved."
-                )
-            )
-
-    existing_checkpoints = _checkpoints(experiment_dir)
-    if existing_checkpoints:
+        )
+    if status.checkpoints:
         lines.append(
             _(
                 "**{} checkpoint(s) in this folder.** They belong to the old "
                 "architecture and cannot be resumed under a different one."
-            ).format(len(existing_checkpoints))
+            ).format(status.checkpoints)
         )
 
-    return "\n\n".join(lines), current_vocoder
+    return "\n\n".join(lines), status.vocoder
 
 
 def rebuild(

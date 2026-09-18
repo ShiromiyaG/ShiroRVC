@@ -171,7 +171,7 @@ class LogConsole(QWidget):
 
     def _set_autoscroll(self, enabled: bool) -> None:
         self._autoscroll = enabled
-        self.autoscroll_button.setText("Follow ✓" if enabled else "Follow")
+        self.autoscroll_button.setText(_("Follow ✓") if enabled else _("Follow"))
         if enabled:
             self.view.moveCursor(QTextCursor.End)
 
@@ -184,7 +184,7 @@ class LogConsole(QWidget):
 
     def _save(self) -> None:
         target, _chosen_filter = QFileDialog.getSaveFileName(
-            self, "Save log", "shirorvc-log.txt", "Text files (*.txt)"
+            self, _("Save log"), "shirorvc-log.txt", "Text files (*.txt)"
         )
         if not target:
             return

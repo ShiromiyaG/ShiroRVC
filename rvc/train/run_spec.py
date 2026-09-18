@@ -57,7 +57,7 @@ class TrainRunSpec:
     vocoder: str = "hifi"
 
     # -- schedule ---------------------------------------------------------
-    total_epoch_count: int = 300
+    total_epoch_count: int = 250
     epoch_save_frequency: int = 10
     batch_size: int = 8
     gpus: str = "0"

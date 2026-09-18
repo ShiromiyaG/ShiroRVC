@@ -80,6 +80,12 @@ def quiet_media_logs() -> None:
 _PEAK_BUCKETS = 1200
 
 
+def _same_path(a: str, b: str) -> bool:
+    """Whether two paths name one file.  ``samefile`` needs both to exist,
+    and the point of asking is often a file that is about to be written."""
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
 class _PeakSignals(QObject):
     done = Signal(str, list, float)
     failed = Signal(str, str)
@@ -397,8 +403,27 @@ class AudioPlayer(QWidget):
         self.clear_button.setEnabled(True)
         self.save_button.setEnabled(True)
         self.waveform.set_message(_("Reading waveform…"))
-        self._player.setSource(QUrl.fromLocalFile(os.path.abspath(self._path)))
+        url = QUrl.fromLocalFile(os.path.abspath(self._path))
+        if self._player.source() == url:
+            # ``setSource`` with the URL it already has stops and returns
+            # without reopening the file.  A result rewritten in place -- the
+            # same input converted again, every TTS run -- got its new
+            # waveform while playback kept the old decode and duration.
+            self._player.setSource(QUrl())
+        self._player.setSource(url)
         self._pool.start(_PeakJob(self._path, self._signals))
+
+    def release(self, *paths: str) -> None:
+        """Unload, if what is loaded is one of ``paths``, before it is rewritten.
+
+        The media backend holds a loaded file open.  On Windows that handle
+        lets another process write the file but not delete it, so a conversion
+        rewrote the result under a player still decoding it, and the pipeline's
+        cleanup of its intermediate WAV failed without a word.  Let go first,
+        and :meth:`load` the new file once it exists.
+        """
+        if self._path and any(path and _same_path(self._path, path) for path in paths):
+            self.clear()
 
     def clear(self) -> None:
         self._path = ""

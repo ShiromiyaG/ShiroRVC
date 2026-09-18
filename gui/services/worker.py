@@ -39,6 +39,10 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Filesystem and JSON only, so it costs the worker nothing to share the GUI's
+# rule for which files a conversion writes.
+from . import catalog  # noqa: E402
+
 _write_lock = threading.Lock()
 #: Jobs waiting for the single job thread: ``(id, cmd, args)``.
 _jobs: queue.Queue = queue.Queue()
@@ -86,8 +90,41 @@ def cmd_warmup(args):
     return {"ready": True}
 
 
+def _snapshot(paths: list[str]) -> dict[str, tuple[int, int] | None]:
+    """``(mtime_ns, size)`` per path, ``None`` where there is no file yet."""
+    found: dict[str, tuple[int, int] | None] = {}
+    for path in paths:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            found[path] = None
+        else:
+            found[path] = (stat.st_mtime_ns, stat.st_size)
+    return found
+
+
+def _require_written(before: dict, produced: str) -> None:
+    """Raise unless ``produced`` was written since ``before`` was taken.
+
+    ``VoiceConverter.convert_audio`` catches every error and prints it, so
+    ``core`` reports success for a conversion that wrote nothing.  The window
+    then said "converted" and loaded whatever was already on disk -- the
+    *previous* take, when the same input is converted twice.
+    """
+    try:
+        stat = os.stat(produced)
+    except OSError:
+        raise RuntimeError("The conversion failed; the log above says why.") from None
+    if before.get(produced) == (stat.st_mtime_ns, stat.st_size):
+        raise RuntimeError("The conversion failed; the log above says why.")
+
+
 def cmd_infer(args):
+    before = _snapshot(
+        catalog.conversion_outputs(args["output_path"], args.get("export_format", "WAV"))
+    )
     message, preview = _core().run_infer_script(**args)
+    _require_written(before, preview)
     return {"message": message, "preview": preview}
 
 
@@ -96,7 +133,11 @@ def cmd_batch_infer(args):
 
 
 def cmd_tts(args):
+    before = _snapshot(
+        catalog.conversion_outputs(args["output_rvc_path"], args.get("export_format", "WAV"))
+    )
     message, output = _core().run_tts_script(**args)
+    _require_written(before, output)
     return {"message": message, "output": output}
 
 
@@ -260,10 +301,26 @@ HANDLERS = {
 #: precisely while a job is occupying the worker.
 CONTROL = {"ping", "stop_train"}
 
+#: Commands that get a thread of their own instead of a place in the queue.
+#: ``run_train_script`` waits on the trainer process for the whole run, and a
+#: conversion clicked during training used to queue behind it -- "Converting…"
+#: for hours.  The trainer is a process of its own, so converting beside it is
+#: what the web interface has always allowed; the queue is for work that would
+#: actually collide.
+DETACHED = {"train"}
+#: Detached commands running now, so a second one of the same kind is refused
+#: rather than started on top of the first.
+_detached: set[str] = set()
+_detached_lock = threading.Lock()
+
 
 def run_job(job_id: int, cmd: str, args: dict) -> None:
     started = time.perf_counter()
-    note(f"{cmd} started")
+    with _detached_lock:
+        alongside = sorted(_detached - {cmd})
+    note(f"{cmd} started" + (
+        f" while {', '.join(alongside)} runs; both share the GPU" if alongside else ""
+    ))
     emit({"id": job_id, "type": "started"})
     try:
         result = HANDLERS[cmd](args)
@@ -300,14 +357,56 @@ def job_loop() -> None:
             _current_cmd = None
 
 
+def _run_detached(job_id: int, cmd: str, args: dict) -> None:
+    try:
+        run_job(job_id, cmd, args)
+    finally:
+        with _detached_lock:
+            _detached.discard(cmd)
+
+
+def _running() -> list[str]:
+    """Every command running now, queued or detached, for exit notes."""
+    with _detached_lock:
+        detached = sorted(_detached)
+    return [cmd for cmd in (_current_cmd, *detached) if cmd]
+
+
+def _stop_training_before_exit() -> None:
+    """Take a trainer this worker started down with it.
+
+    Every exit here is ``os._exit``, which skips ``atexit`` -- and ``core``'s
+    ``_stop_training_at_exit`` is an ``atexit`` hook, so it never ran.  On
+    Linux the trainer's ``PR_SET_PDEATHSIG`` still ended it; on Windows a child
+    outlives its parent, so closing the window left training running on the
+    GPU with nothing left to stop it, while the dialog had just said closing
+    stops it.
+
+    Only the trainer this process launched: ``stop_train_script`` with none
+    tracked goes looking for any trainer by command line, which would include
+    one started from the web interface.
+    """
+    core = sys.modules.get("core")
+    process = getattr(core, "training_process", None) if core else None
+    if process is None or process.poll() is not None:
+        return
+    note("stopping the training run before exiting")
+    try:
+        note(core.stop_train_script())
+    except Exception as error:  # noqa: BLE001 - exiting regardless
+        note(f"could not stop the training run: {type(error).__name__}: {error}")
+
+
 def dispatch(message: dict) -> None:
     job_id = message.get("id", -1)
     cmd = message.get("cmd", "")
     args = message.get("args") or {}
 
     if cmd == "shutdown":
+        running = _running()
         note("shutdown requested by the GUI"
-             + (f" while {_current_cmd} was running" if _current_cmd else ""))
+             + (f" while {', '.join(running)} was running" if running else ""))
+        _stop_training_before_exit()
         emit({"id": job_id, "type": "result", "data": {"bye": True}})
         os._exit(0)
 
@@ -320,6 +419,18 @@ def dispatch(message: dict) -> None:
             emit({"id": job_id, "type": "result", "data": HANDLERS[cmd](args)})
         except BaseException as error:  # noqa: BLE001
             emit({"id": job_id, "type": "error", "error": f"{type(error).__name__}: {error}"})
+        return
+
+    if cmd in DETACHED:
+        with _detached_lock:
+            already = cmd in _detached
+            _detached.add(cmd)
+        if already:
+            emit({"id": job_id, "type": "error", "error": f"{cmd} is already running"})
+            return
+        threading.Thread(
+            target=_run_detached, args=(job_id, cmd, args), name=cmd, daemon=True
+        ).start()
         return
 
     busy_with = _current_cmd
@@ -401,8 +512,10 @@ def main() -> None:
         dispatch(message)
 
     # stdin closed: the GUI is gone.  Do not linger holding the GPU.
+    running = _running()
     note("command pipe closed, exiting"
-         + (f" (abandoning {_current_cmd})" if _current_cmd else ""))
+         + (f" (abandoning {', '.join(running)})" if running else ""))
+    _stop_training_before_exit()
     os._exit(0)
 
 

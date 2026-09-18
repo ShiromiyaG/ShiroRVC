@@ -22,6 +22,7 @@ from rvc.lib.model_bundle import (
     walk_models,
 )
 from tabs.settings.sections.restart import stop_infer
+from rvc.lib import inference_presets as presets_lib
 from rvc.lib.i18n import _
 
 now_dir = os.getcwd()
@@ -81,18 +82,11 @@ audio_paths = [
     and "_output" not in name
 ]
 
-def update_sliders(preset):
-    with open(
-        os.path.join(PRESETS_DIR, f"{preset}.json"), "r", encoding="utf-8"
-    ) as json_file:
-        values = json.load(json_file)
-    return (
-        values["pitch"],
-        values["filter_radius"],
-        values["index_rate"],
-        values["rms_mix_rate"],
-        values["protect"],
-    )
+# The preset validation checks choices against these same sets, so a preset
+# can never name one the controls below do not offer.
+F0_METHODS = list(presets_lib.F0_METHODS)
+EMBEDDER_MODELS = list(presets_lib.EMBEDDER_MODELS)
+EXPORT_FORMATS = list(presets_lib.EXPORT_FORMATS)
 
 
 def update_sliders_formant(preset):
@@ -106,45 +100,10 @@ def update_sliders_formant(preset):
     )
 
 
-def export_presets(presets, file_path):
-    with open(file_path, "w", encoding="utf-8") as json_file:
-        json.dump(presets, json_file, ensure_ascii=False, indent=4)
-
-
-def import_presets(file_path):
-    with open(file_path, "r", encoding="utf-8") as json_file:
-        presets = json.load(json_file)
-    return presets
-
-
-def get_presets_data(pitch, filter_radius, index_rate, rms_mix_rate, protect):
-    return {
-        "pitch": pitch,
-        "filter_radius": filter_radius,
-        "index_rate": index_rate,
-        "rms_mix_rate": rms_mix_rate,
-        "protect": protect,
-    }
-
-
-def export_presets_button(
-    preset_name, pitch, filter_radius, index_rate, rms_mix_rate, protect
-):
-    if preset_name:
-        file_path = os.path.join(PRESETS_DIR, f"{preset_name}.json")
-        presets_data = get_presets_data(
-            pitch, filter_radius, index_rate, rms_mix_rate, protect
-        )
-        with open(file_path, "w", encoding="utf-8") as json_file:
-            json.dump(presets_data, json_file, ensure_ascii=False, indent=4)
-        return "Export successful"
-    return "Export cancelled"
-
-
 def import_presets_button(file_path):
     """Copy a preset file into ``PRESETS_DIR`` and reselect it in the dropdown.
 
-    The dropdown lists the *files* in ``PRESETS_DIR`` and ``update_sliders``
+    The dropdown lists the *files* in ``PRESETS_DIR`` and ``read_preset``
     loads the selection back as ``PRESETS_DIR/<name>.json``, so an entry that
     was never written there cannot be loaded.  This used to return three values
     -- names, the parsed dict and a status string -- into a single dropdown
@@ -161,17 +120,18 @@ def import_presets_button(file_path):
     try:
         # Parsed before copying, so an unreadable file is refused rather than
         # landing in the folder as a preset that breaks on selection.
-        import_presets(file_path)
+        presets_lib.parse_preset(file_path)
     except (OSError, ValueError) as error:
         gr.Warning(_("Could not read that preset file: {}").format(error))
         return gr.update()
 
+    os.makedirs(PRESETS_DIR, exist_ok=True)
     target_path = os.path.join(PRESETS_DIR, name)
     if os.path.abspath(target_path) != os.path.abspath(file_path):
         shutil.copyfile(file_path, target_path)
 
     return gr.update(
-        choices=list_json_files(PRESETS_DIR), value=name.rsplit(".", 1)[0]
+        choices=presets_lib.list_presets(PRESETS_DIR), value=name.rsplit(".", 1)[0]
     )
 
 
@@ -180,8 +140,7 @@ def list_json_files(directory):
 
 
 def refresh_presets():
-    json_files = list_json_files(PRESETS_DIR)
-    return gr.update(choices=json_files)
+    return gr.update(choices=presets_lib.list_presets(PRESETS_DIR))
 
 
 def output_path_fn(input_audio_path):
@@ -483,7 +442,7 @@ def inference_tab():
                 export_format = gr.Radio(
                     label=_("Export Format"),
                     info=_("Output audio format."),
-                    choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
+                    choices=EXPORT_FORMATS,
                     value="WAV",
                     interactive=True,
                 )
@@ -582,7 +541,7 @@ def inference_tab():
                     with gr.Row():
                         preset_dropdown = gr.Dropdown(
                             label=_("Select Custom Preset"),
-                            choices=list_json_files(PRESETS_DIR),
+                            choices=presets_lib.list_presets(PRESETS_DIR),
                             interactive=True,
                         )
                         presets_refresh_button = gr.Button(_("Refresh Presets"))
@@ -696,45 +655,17 @@ def inference_tab():
                     value=-60,
                     interactive=True,
                 )
-                preset_dropdown.change(
-                    update_sliders,
-                    inputs=preset_dropdown,
-                    outputs=[
-                        pitch,
-                        filter_radius,
-                        index_rate,
-                        rms_mix_rate,
-                        protect,
-                    ],
-                    show_progress="hidden",
-                )
-                export_button.click(
-                    export_presets_button,
-                    inputs=[
-                        preset_name_input,
-                        pitch,
-                        filter_radius,
-                        index_rate,
-                        rms_mix_rate,
-                        protect,
-                    ],
-                )
                 f0_method = gr.Radio(
                     label=_("Pitch extraction algorithm"),
                     info=_("Pitch algorithm. RMVPE is the recommended default."),
-                    choices=[
-                        "crepe",
-                        "crepe-tiny",
-                        "rmvpe",
-                        "fcpe",
-                    ],
+                    choices=F0_METHODS,
                     value="rmvpe",
                     interactive=True,
                 )
                 embedder_model = gr.Radio(
                     label=_("Embedder Model"),
                     info=_("Model used for speaker features."),
-                    choices=["contentvec", "spin_v1", "spin_v2"],
+                    choices=EMBEDDER_MODELS,
                     value="contentvec",
                     interactive=True,
                 )
@@ -771,7 +702,7 @@ def inference_tab():
                 export_format_batch = gr.Radio(
                     label=_("Export Format"),
                     info=_("Output audio format."),
-                    choices=["WAV", "MP3", "FLAC", "OGG", "M4A"],
+                    choices=EXPORT_FORMATS,
                     value="WAV",
                     interactive=True,
                 )
@@ -950,46 +881,17 @@ def inference_tab():
                     value=-60,
                     interactive=True,
                 )
-                preset_dropdown.change(
-                    update_sliders,
-                    inputs=preset_dropdown,
-                    outputs=[
-                        pitch_batch,
-                        filter_radius_batch,
-                        index_rate_batch,
-                        rms_mix_rate_batch,
-                        protect_batch,
-                    ],
-                    show_progress="hidden",
-                )
-                export_button.click(
-                    export_presets_button,
-                    inputs=[
-                        preset_name_input,
-                        pitch,
-                        filter_radius,
-                        index_rate,
-                        rms_mix_rate,
-                        protect,
-                    ],
-                    outputs=[],
-                )
                 f0_method_batch = gr.Radio(
                     label=_("Pitch extraction algorithm"),
                     info=_("Pitch algorithm. RMVPE is the recommended default."),
-                    choices=[
-                        "crepe",
-                        "crepe-tiny",
-                        "rmvpe",
-                        "fcpe",
-                    ],
+                    choices=F0_METHODS,
                     value="rmvpe",
                     interactive=True,
                 )
                 embedder_model_batch = gr.Radio(
                     label=_("Embedder Model"),
                     info=_("Model used for speaker features."),
-                    choices=["contentvec", "spin_v1", "spin_v2"],
+                    choices=EMBEDDER_MODELS,
                     value="contentvec",
                     interactive=True,
                 )
@@ -1041,6 +943,86 @@ def inference_tab():
                 gr.update(visible=False),
             )
 
+    # Every key of ``rvc.lib.inference_presets.PRESET_KEYS`` -> (single-input
+    # control, batch control).  Saved from the single-input tab, where the
+    # preset controls are, and loaded into both.  The seed has no batch twin;
+    # the batch run reads the single tab's.  What a preset leaves out, and why,
+    # is in that module.
+    preset_controls = {
+        "export_format": (export_format, export_format_batch),
+        "seed": (seed, None),
+        "split_audio": (split_audio, split_audio_batch),
+        "autotune": (autotune, autotune_batch),
+        "autotune_strength": (autotune_strength, autotune_strength_batch),
+        "clean_audio": (clean_audio, clean_audio_batch),
+        "clean_strength": (clean_strength, clean_strength_batch),
+        "formant_shifting": (formant_shifting, formant_shifting_batch),
+        "formant_qfrency": (formant_qfrency, formant_qfrency_batch),
+        "formant_timbre": (formant_timbre, formant_timbre_batch),
+        "pitch": (pitch, pitch_batch),
+        "index_rate": (index_rate, index_rate_batch),
+        "index_k": (index_k, index_k_batch),
+        "index_power": (index_power, index_power_batch),
+        "index_continuity": (index_continuity, index_continuity_batch),
+        "rms_mix_rate": (rms_mix_rate, rms_mix_rate_batch),
+        "protect": (protect, protect_batch),
+        "silence_gate_db": (silence_gate_db, silence_gate_db_batch),
+        "f0_method": (f0_method, f0_method_batch),
+        "embedder_model": (embedder_model, embedder_model_batch),
+    }
+    preset_sources = [single for single, _batch in preset_controls.values()]
+    preset_targets = [
+        control
+        for pair in preset_controls.values()
+        for control in pair
+        if control is not None
+    ]
+
+    def apply_preset(preset):
+        if not preset:
+            return [gr.skip()] * len(preset_targets)
+        try:
+            values = presets_lib.read_preset(PRESETS_DIR, preset)
+        except (OSError, ValueError) as error:
+            gr.Warning(_("Could not read that preset file: {}").format(error))
+            return [gr.skip()] * len(preset_targets)
+        # In ``preset_targets`` order.  The checkboxes' own ``.change`` events
+        # then show or hide their strength and formant controls.
+        return [
+            gr.update(value=values[key]) if key in values else gr.skip()
+            for key, pair in preset_controls.items()
+            for control in pair
+            if control is not None
+        ]
+
+    def save_preset(preset_name, *values):
+        name = (preset_name or "").strip()
+        if not name:
+            gr.Warning(_("Enter a preset name first."))
+            return gr.skip()
+        if not presets_lib.is_valid_name(name):
+            gr.Warning(_('A preset name cannot contain \\ / : * ? " < > |'))
+            return gr.skip()
+        presets_lib.write_preset(
+            PRESETS_DIR, name, dict(zip(preset_controls, values))
+        )
+        gr.Info(_("Preset saved: {}").format(name))
+        # Only the list is refreshed.  Selecting the new preset would load it,
+        # and that would copy this tab's settings over the batch tab's.
+        return gr.update(choices=presets_lib.list_presets(PRESETS_DIR))
+
+    preset_dropdown.change(
+        apply_preset,
+        inputs=preset_dropdown,
+        outputs=preset_targets,
+        show_progress="hidden",
+    )
+    export_button.click(
+        save_preset,
+        inputs=[preset_name_input, *preset_sources],
+        outputs=preset_dropdown,
+    )
+
     model_file.change(
         fn=on_model_change,
         inputs=[model_file],
@@ -1083,7 +1065,7 @@ def inference_tab():
     )
     formant_shifting_batch.change(
         fn=toggle_visible_formant_shifting,
-        inputs=[formant_shifting],
+        inputs=[formant_shifting_batch],
         outputs=[
             formant_row_batch,
             formant_preset_batch,
@@ -1112,8 +1094,8 @@ def inference_tab():
         fn=update_sliders_formant,
         inputs=[formant_preset_batch],
         outputs=[
-            formant_qfrency,
-            formant_timbre,
+            formant_qfrency_batch,
+            formant_timbre_batch,
         ],
         show_progress="hidden",
     )

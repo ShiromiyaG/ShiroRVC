@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStyledItemDelegate,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -373,6 +374,10 @@ class SliderSpin(QWidget):
     def value(self) -> float:
         return float(self.spin.value())
 
+    def is_integral(self) -> bool:
+        """Whether the value is a whole number, i.e. built with ``decimals=0``."""
+        return not self._decimals
+
     def setValue(self, value: float) -> None:  # noqa: N802 - matches Qt naming
         self.spin.setValue(value if self._decimals else int(round(value)))
 
@@ -486,7 +491,7 @@ class SearchableCombo(QWidget):
     """A combo box with type-ahead filtering and a refresh button.
 
     Model lists routinely run to hundreds of checkpoints; scrolling a plain
-    dropdown to find ``_e320_s41600`` is not a workable interaction.
+    dropdown to find ``_320e_41600s`` is not a workable interaction.
     """
 
     currentTextChanged = Signal(str)
@@ -841,6 +846,65 @@ class Toggle(QCheckBox):
         self.setChecked(checked)
         if hint:
             self.setToolTip(hint)
+
+
+class TabPage(QWidget):
+    """A tab's page that claims no height while another tab is showing.
+
+    See :func:`fit_to_current_tab`, which switches it.  A subclass because the
+    sizes involved are asked for through C++ virtuals, which Qt only routes to
+    Python for a Python subclass.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._active = True
+
+    def set_active(self, active: bool) -> None:
+        if active != self._active:
+            self._active = active
+            self.updateGeometry()
+
+    # The width stays whatever the page wants, so switching tabs does not move
+    # the column sideways; only the height goes.
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt's spelling
+        hint = super().sizeHint()
+        return hint if self._active else QSize(hint.width(), 0)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt's spelling
+        hint = super().minimumSizeHint()
+        return hint if self._active else QSize(hint.width(), 0)
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt's spelling
+        return super().heightForWidth(width) if self._active else 0
+
+
+def fit_to_current_tab(tabs: QTabWidget) -> None:
+    """Size ``tabs`` to the tab on show rather than to its tallest one.
+
+    A ``QTabWidget`` asks for the height of its tallest page whichever is
+    showing, so on a scrolling page a short tab scrolled on into a blank the
+    height of its neighbour -- the batch tab under the single-file one, the
+    download tab under the bundle one.
+
+    Setting the hidden pages' vertical policy to ``Ignored`` is the usual
+    answer, and it does not work here: the pages hold word-wrapped hints, so
+    the scroll area sizes them by ``heightForWidth``, and ``QStackedLayout``
+    takes the maximum of that over *every* page without looking at any
+    policy.  So the pages are :class:`TabPage`, and the hidden ones report no
+    height at all.
+    """
+
+    def refit(index: int) -> None:
+        for position in range(tabs.count()):
+            page = tabs.widget(position)
+            if isinstance(page, TabPage):
+                page.set_active(position == index)
+        tabs.updateGeometry()
+
+    tabs.currentChanged.connect(refit)
+    refit(tabs.currentIndex())
 
 
 def primary_button(text: str) -> QPushButton:

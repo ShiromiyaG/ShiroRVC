@@ -519,7 +519,8 @@ TRAIN_OWN = [
     click.option(
         "--epoch_save_frequency",
         type=click.IntRange(1, 100),
-        required=True,
+        default=10,
+        show_default=True,
         help="Save the model every specified number of epochs.",
     ),
     click.option(
@@ -539,7 +540,7 @@ TRAIN_OWN = [
     click.option(
         "--total_epoch_count",
         type=click.IntRange(1, 10000),
-        default=500,
+        default=250,
         show_default=True,
         help="Total number of epochs to train for.",
     ),

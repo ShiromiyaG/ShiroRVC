@@ -16,6 +16,10 @@ them:
 * **A window on the x-axis.**  Once a run is 300k steps long, the interesting
   part is the last few thousand.
 * **Decimation that keeps extremes**, so a spike is never sampled away.
+* **Survive a diverged run.**  A NaN or inf is what a chart most needs to
+  report and least able to draw: one of them in the smoothing makes every
+  later value NaN, then the bounds, then the ticks.  They are kept out of the
+  geometry and shown in the legend, where the latest reading says ``NaN``.
 
 Performance
 -----------
@@ -47,6 +51,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
+from ..i18n import _
+
 #: Distinguishable at a glance and colour-blind-safe enough for six series,
 #: which is more than a training chart should show at once anyway.
 SERIES_COLOURS = [
@@ -73,6 +79,11 @@ WINDOWS: list[tuple[str, int | None]] = [
     ("10k", 10_000),
     ("2k", 2_000),
 ]
+
+
+def _same_value(a: float, b: float) -> bool:
+    """``==``, except that two NaNs match -- as a repeated reading they do."""
+    return a == b or (a != a and b != b)
 
 
 def _decimate(steps: Sequence[float], values: Sequence[float], budget: int = _MAX_POINTS):
@@ -288,10 +299,12 @@ class LiveChart(QWidget):
         # The training view re-pushes selected series on every poll. Skipping
         # an unchanged one keeps the cached scene alive instead of re-rendering
         # the whole chart three times a second for nothing.
+        # NaN-aware, or a run whose last reading is NaN never compares equal to
+        # itself and rebuilds the scene on every poll.
         if (
             existing is not None
             and len(existing[1]) == len(values)
-            and (not values or existing[1][-1] == values[-1])
+            and (not values or _same_value(existing[1][-1], values[-1]))
         ):
             return
         if name not in self._order:
@@ -342,7 +355,8 @@ class LiveChart(QWidget):
         window = min(span, len(values) // 2)
         recent = sum(values[-window:]) / window
         earlier = sum(values[-2 * window:-window]) / window
-        if earlier == 0:
+        # A NaN anywhere in either window has no direction to report.
+        if earlier == 0 or not (math.isfinite(recent) and math.isfinite(earlier)):
             return None
         return (recent - earlier) / abs(earlier)
 
@@ -354,28 +368,53 @@ class LiveChart(QWidget):
         return font
 
     def paintEvent(self, _event) -> None:  # noqa: N802
+        # Ended in ``finally``: an exception that leaves this painter active
+        # does not stay a traceback.  Qt reports "endPaint() called with active
+        # painter", the next paint finds the device still claimed, and the
+        # process dies with SIGSEGV -- the whole GUI, over one bad number.
         painter = QPainter(self)
-        font = self._chart_font()
-        painter.setFont(font)
-        metrics = QFontMetrics(font)
+        try:
+            font = self._chart_font()
+            painter.setFont(font)
+            metrics = QFontMetrics(font)
 
-        self._rebuild(metrics)
+            self._rebuild(metrics)
 
-        if not self._prepared or self._scene is None:
-            painter.fillRect(self.rect(), self.colours["bg"])
-            painter.setPen(self.colours["faint"])
-            painter.drawText(
-                self.rect(), Qt.AlignCenter, "Select a metric below to plot it"
-            )
-            return
+            names = self._active_names()
+            if self._scene is None:
+                painter.fillRect(self.rect(), self.colours["bg"])
+                painter.setPen(self.colours["faint"])
+                # A metric whose every reading is NaN is still selected, and
+                # its legend row is the one place that can say so.
+                if not names:
+                    message = _("Select a metric below to plot it")
+                elif self._log_scale:
+                    message = _("No finite positive values for a log axis")
+                else:
+                    message = _("No finite values to plot")
+                painter.drawText(
+                    self._plot if names else self.rect(), Qt.AlignCenter, message
+                )
+                if not names:
+                    return
+            else:
+                # Grid and series come from the cache; only the two interactive
+                # layers below are drawn per paint.
+                painter.drawPixmap(0, 0, self._scene)
+            painter.setRenderHint(QPainter.Antialiasing)
+            self._draw_legend(painter, metrics)
+            if (
+                self._scene is not None
+                and self._hover
+                and self._plot.contains(QPointF(self._hover))
+            ):
+                self._draw_crosshair(painter, metrics)
+        finally:
+            painter.end()
 
-        # Grid and series come from the cache; only the two interactive layers
-        # below are drawn per paint.
-        painter.drawPixmap(0, 0, self._scene)
-        painter.setRenderHint(QPainter.Antialiasing)
-        self._draw_legend(painter, metrics)
-        if self._hover and self._plot.contains(QPointF(self._hover)):
-            self._draw_crosshair(painter, metrics)
+    def _active_names(self) -> list[str]:
+        """Series with at least one reading, finite or not, in legend order."""
+        return [name for name in self._order if self._series.get(name, ([], []))[1]]
 
     def _rebuild(self, metrics: QFontMetrics) -> None:
         """Recompute the prepared series and re-render the scene, if needed."""
@@ -385,12 +424,8 @@ class LiveChart(QWidget):
         )
         if key == self._scene_key:
             return
-        self._scene_key = key
 
-        active = [
-            name for name in self._order
-            if self._series.get(name, ([], []))[1]
-        ]
+        active = self._active_names()
         legend_height = self._legend_height(metrics, len(active))
         self._plot = QRectF(
             58, 14,
@@ -401,11 +436,14 @@ class LiveChart(QWidget):
         # itself. Halving the old budget halves the segment count, which is
         # what the rebuild actually spends its time on.
         budget = int(max(_MIN_POINTS, min(_MAX_POINTS, self._plot.width())))
+        # Dropped first, so a rebuild that raises leaves no stale scene drawn
+        # against the new series; the key is only stored once it succeeds.
+        self._scene = None
         self._prepared = self._prepare(budget)
 
         if not self._prepared:
-            self._scene = None
             self._bounds = None
+            self._scene_key = key
             return
 
         self._bounds = self._bounds_of(self._prepared)
@@ -418,12 +456,15 @@ class LiveChart(QWidget):
         scene.fill(self.colours["bg"])
 
         painter = QPainter(scene)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setFont(self._chart_font())
-        self._draw_grid(painter, metrics)
-        self._draw_series(painter)
-        painter.end()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setFont(self._chart_font())
+            self._draw_grid(painter, metrics)
+            self._draw_series(painter)
+        finally:
+            painter.end()
         self._scene = scene
+        self._scene_key = key
 
     def _prepare(self, budget: int) -> dict[str, tuple[list[float], list[float], list[float]]]:
         """``{name: (steps, smoothed, raw)}`` after windowing and decimation."""
@@ -443,6 +484,14 @@ class LiveChart(QWidget):
                 steps, values = steps[start:], values[start:]
                 if not values:
                     continue
+
+            # Out of the geometry, not out of the chart: ``latest`` still reads
+            # the raw series, so the legend reports the NaN this cannot draw.
+            finite = [(s, v) for s, v in zip(steps, values) if math.isfinite(v)]
+            if not finite:
+                continue
+            steps = [s for s, _ in finite]
+            values = [v for _, v in finite]
 
             steps, values = _decimate(steps, values, budget)
             smoothed = _smooth(values, self._smoothing)
@@ -553,7 +602,7 @@ class LiveChart(QWidget):
         painter.setPen(self.colours["faint"])
         painter.drawText(
             QRectF(0, plot.bottom() + 5, plot.left() - 9, 15),
-            Qt.AlignRight | Qt.AlignVCenter, "step",
+            Qt.AlignRight | Qt.AlignVCenter, _("step"),
         )
 
     def _draw_series(self, painter) -> None:
@@ -634,7 +683,7 @@ class LiveChart(QWidget):
         return 8 + rows * (metrics.height() + 8)
 
     def _active_count(self) -> int:
-        return sum(1 for name in self._order if self._series.get(name, ([], []))[1])
+        return len(self._active_names())
 
     # Height genuinely depends on width here: a narrower chart fits fewer
     # legend entries per row, needs more rows, and each row comes out of the
@@ -665,16 +714,21 @@ class LiveChart(QWidget):
 
     def _draw_legend(self, painter, metrics) -> None:
         self._legend_rows = []
-        if not self._prepared:
+        # Every selected series, not just the drawable ones: a metric that is
+        # NaN from its first reading has nothing in ``_prepared``, and its row
+        # is the only place that says what happened to it.  The same list the
+        # plot reserved room for in ``_rebuild``.
+        names = self._active_names()
+        if not names:
             return
 
         row_height = metrics.height() + 8
-        columns = self._legend_columns(len(self._prepared))
-        legend_height = self._legend_height(metrics, len(self._prepared))
+        columns = self._legend_columns(len(names))
+        legend_height = self._legend_height(metrics, len(names))
         top = self.height() - legend_height + 2
         column_width = (self.width() - 24) / columns
 
-        for index, name in enumerate(self._prepared):
+        for index, name in enumerate(names):
             column = index % columns
             row = index // columns
             box = QRectF(
@@ -784,7 +838,7 @@ class LiveChart(QWidget):
         painter.drawText(
             QRectF(box.left() + 11, box.top() + 6, box.width() - 22, line_height),
             Qt.AlignLeft | Qt.AlignVCenter,
-            f"step {self._format(step, integral=True)}",
+            _("step {step}").format(step=self._format(step, integral=True)),
         )
         for index, (name, value, colour, _point) in enumerate(rows):
             top = box.top() + 6 + line_height * (index + 1)
@@ -807,6 +861,9 @@ class LiveChart(QWidget):
 
     @staticmethod
     def _format(value: float, integral: bool = False) -> str:
+        # Before any rounding: ``round`` raises on NaN and inf.
+        if not math.isfinite(value):
+            return "NaN" if value != value else ("inf" if value > 0 else "-inf")
         if integral:
             if abs(value) >= 1_000_000:
                 return f"{value / 1_000_000:.1f}M".replace(".0M", "M")

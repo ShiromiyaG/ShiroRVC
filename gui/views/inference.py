@@ -6,16 +6,21 @@ import os
 import shutil
 from pathlib import Path
 
+from typing import Callable
+
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QMessageBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from ..services import catalog, paths, prefs
+from ..services import catalog, paths, prefs, presets
 from ..widgets.audio import AudioPlayer
 from ..widgets.forms import (
     Card,
@@ -25,8 +30,11 @@ from ..widgets.forms import (
     SearchableCombo,
     SectionHeader,
     SliderSpin,
+    TabPage,
     Toggle,
     danger_button,
+    fit_to_current_tab,
+    ghost_button,
     primary_button,
 )
 from .base import Page
@@ -71,19 +79,23 @@ class ModelSelector(QWidget):
     def __init__(self, page: Page, parent: QWidget | None = None):
         super().__init__(parent)
         self._page = page
+        #: The model the speaker list was last requested for.  See
+        #: :meth:`_on_model_changed`.
+        self._model_for_speakers: str | None = None
 
         self.model = SearchableCombo()
-        self.model.refreshRequested.connect(self.refresh)
+        self.model.refreshRequested.connect(self.rescan)
         self.model.currentTextChanged.connect(self._on_model_changed)
 
         self.index = SearchableCombo()
-        self.index.refreshRequested.connect(self.refresh)
+        self.index.refreshRequested.connect(self.rescan)
 
         self.speaker = SearchableCombo(editable=False)
         self.speaker.refresh_button.hide()
 
         self.submodel = SearchableCombo(editable=False)
         self.submodel.refresh_button.hide()
+        self.submodel.currentTextChanged.connect(self._on_submodel_changed)
         self.submodel_field = Field(
             _("Bundle voice"),
             self.submodel,
@@ -102,14 +114,43 @@ class ModelSelector(QWidget):
         layout.addWidget(Field(_("Index"), self.index, _("Faiss index. Picked automatically when there is only one next to the model.")))
         layout.addWidget(self.submodel_field)
 
+        page.engine.ready.connect(self._on_engine_ready)
         self.refresh()
+
+    def _on_engine_ready(self) -> None:
+        """Ask again for what was asked before there was a backend to answer.
+
+        The first :meth:`refresh` runs while the window is being built, and
+        the backend is only started after its first paint -- so the speaker
+        request for the model selected at launch was refused on the spot, and
+        a multi-speaker model offered speaker 0 alone until another model was
+        picked and this one picked back.  Also covers a restarted backend.
+        Nothing is sent for a model whose answer already arrived.
+        """
+        self._on_model_changed(self.model.text())
 
     def refresh(self) -> None:
         self.model.set_items(catalog.list_models())
         self.index.set_items([""] + catalog.list_indexes())
 
+    def rescan(self) -> None:
+        """The refresh buttons: rescan, and re-read the model's speakers too.
+
+        Unlike a page visit, this is someone asking because something on disk
+        changed -- a checkpoint rewritten under the same name included.
+        """
+        self._model_for_speakers = None
+        self.refresh()
+
     def _on_model_changed(self, model: str) -> None:
         if not model:
+            return
+        # ``set_items`` reports the selection on every refresh, and the page
+        # refreshes on every visit.  Asking the worker again for a model it has
+        # already answered for put two jobs in its queue per visit -- behind
+        # whatever it was running.  Only an answer counts: a request refused
+        # because the backend was still starting is retried on the next visit.
+        if model == self._model_for_speakers:
             return
         guess = catalog.guess_index_for(model)
         if guess and not self.index.text():
@@ -123,26 +164,55 @@ class ModelSelector(QWidget):
 
         is_bundle = model.lower().endswith(".srvc")
         self.submodel_field.setVisible(is_bundle)
-        if is_bundle:
-            self._page.engine.call(
-                "bundle_models",
-                {"model": model},
-                on_result=lambda data: self.submodel.set_items(data.get("names", [])),
-                on_error=lambda _error: self.submodel.set_items([]),
-            )
-        self._reload_speakers()
+        if not is_bundle:
+            # Hidden is not enough: ``values`` would still hand the previous
+            # bundle's voice name along with a plain checkpoint.
+            self.submodel.set_items([])
+            self._reload_speakers()
+            return
+
+        def names_arrived(names: list[str]) -> None:
+            if self.model.text() == model:  # not switched away meanwhile
+                self.submodel.set_items(names)
+
+        # A bundle's speakers belong to one of its voices, so they are read
+        # once the names are in and one is selected -- by
+        # ``_on_submodel_changed``, which ``set_items`` always reaches.
+        self._page.engine.call(
+            "bundle_models",
+            {"model": model},
+            on_result=lambda data: names_arrived(data.get("names", [])),
+            on_error=lambda _error: names_arrived([]),
+        )
+
+    def _on_submodel_changed(self, _name: str) -> None:
+        """Speakers follow the voice picked inside a bundle.
+
+        Nothing reloaded them before: they were read once, when the bundle was
+        picked -- before its voice names had even arrived -- and stayed the
+        first voice's whatever was chosen after.
+        """
+        if self.model.text().lower().endswith(".srvc"):
+            self._reload_speakers()
 
     def _reload_speakers(self) -> None:
         model = self.model.text()
         if not model:
             return
+
+        def arrived(data: dict) -> None:
+            self._model_for_speakers = model
+            self.speaker.set_items([str(value) for value in data.get("speakers", [0])])
+
+        def failed(_error: str) -> None:
+            self._model_for_speakers = None
+            self.speaker.set_items(["0"])
+
         self._page.engine.call(
             "speakers",
             {"model": model, "sub_model": self.submodel.text() or None},
-            on_result=lambda data: self.speaker.set_items(
-                [str(value) for value in data.get("speakers", [0])]
-            ),
-            on_error=lambda _error: self.speaker.set_items(["0"]),
+            on_result=arrived,
+            on_error=failed,
         )
 
     def values(self) -> dict:
@@ -154,6 +224,134 @@ class ModelSelector(QWidget):
         }
 
 
+class PresetBar(QWidget):
+    """Pick, save and import inference presets.
+
+    Same folder and format as the Gradio tab (``services.presets``), so a
+    preset made in either interface is offered by both.
+    """
+
+    notify = Signal(str, str)
+
+    def __init__(
+        self,
+        collect: Callable[[], dict],
+        apply: Callable[[dict], None],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._collect = collect
+        self._apply = apply
+        #: The preset last applied or saved here, which the picker keeps
+        #: showing across rescans.
+        self._current = ""
+
+        self.picker = SearchableCombo(editable=False)
+        self.picker.combo.setPlaceholderText(_("Choose a preset…"))
+        self.picker.refreshRequested.connect(self.refresh)
+        # ``activated``, not ``currentTextChanged``: only a pick by the user
+        # applies a preset.  A rescan re-selects the current entry, and that
+        # must not put back values edited since.
+        self.picker.combo.activated.connect(self._on_activated)
+
+        save_button = ghost_button(_("Save…"))
+        save_button.setToolTip(_("Save the current settings as a preset."))
+        save_button.clicked.connect(self._save)
+        import_button = ghost_button(_("Import…"))
+        import_button.setToolTip(_("Copy a preset file into the presets folder and apply it."))
+        import_button.clicked.connect(self._import)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.picker, 1)
+        layout.addWidget(save_button)
+        layout.addWidget(import_button)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.picker.set_items(presets.list_presets())
+        # ``set_items`` falls back to the first entry, which would show a
+        # preset that was never applied.  Nothing picked shows the placeholder.
+        combo = self.picker.combo
+        combo.blockSignals(True)
+        combo.setCurrentIndex(combo.findText(self._current) if self._current else -1)
+        combo.blockSignals(False)
+
+    def _on_activated(self, index: int) -> None:
+        name = self.picker.combo.itemText(index)
+        if name:
+            self._load(name)
+
+    def _load(self, name: str) -> None:
+        try:
+            values = presets.load(name)
+        except (OSError, ValueError) as error:
+            self.notify.emit("error", _("Could not read that preset file: {}").format(error))
+            return
+        self._apply(values)
+        self._current = name
+        self.notify.emit("success", _("Preset applied: {name}").format(name=name))
+
+    def _save(self) -> None:
+        name, accepted = QInputDialog.getText(
+            self, _("Save preset"), _("Preset name:"), text=self._current
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            self.notify.emit("error", _("Enter a preset name first."))
+            return
+        if not presets.is_valid_name(name):
+            self.notify.emit("error", _('A preset name cannot contain \\ / : * ? " < > |'))
+            return
+        if presets.exists(name) and not self._confirm_replace(name, _("Save preset")):
+            return
+        try:
+            presets.save(name, self._collect())
+        except (OSError, ValueError) as error:
+            self.notify.emit("error", _("Could not save the preset: {error}").format(error=error))
+            return
+        self._current = name
+        self.refresh()
+        self.notify.emit("success", _("Preset saved: {}").format(name))
+
+    def _import(self) -> None:
+        source, _filter = QFileDialog.getOpenFileName(
+            self, _("Import preset"), str(Path.home()),
+            "Presets (*.json);;All files (*.*)",
+        )
+        if not source:
+            return
+        target = paths.INFERENCE_PRESET_DIR / f"{Path(source).stem}.json"
+        if (
+            target.exists()
+            and not os.path.samefile(source, target)
+            and not self._confirm_replace(target.stem, _("Import preset"))
+        ):
+            return
+        try:
+            name = presets.import_file(source)
+        except (OSError, ValueError) as error:
+            self.notify.emit("error", _("Could not read that preset file: {}").format(error))
+            return
+        self._current = name
+        self.refresh()
+        self._load(name)
+
+    def _confirm_replace(self, name: str, title: str) -> bool:
+        answer = QMessageBox.question(
+            self,
+            title,
+            _('Replace the preset "{name}"?').format(name=name),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+
 class ConversionSettings(QWidget):
     """The parameter block shared by single, batch and TTS conversion.
 
@@ -161,6 +359,9 @@ class ConversionSettings(QWidget):
     three differ, and matching them is what keeps an untouched form in this
     interface producing the same audio as an untouched form in that one.
     """
+
+    #: The preset bar's reports, for the page to forward to the window.
+    notify = Signal(str, str)
 
     def __init__(self, profile: str = "single", parent: QWidget | None = None):
         super().__init__(parent)
@@ -240,6 +441,15 @@ class ConversionSettings(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
+        self.presets = PresetBar(self.preset_values, self.apply_preset)
+        self.presets.notify.connect(self.notify)
+        layout.addWidget(Field(
+            _("Preset"),
+            self.presets,
+            _("Saved settings, shared with the web interface. Picking one applies "
+              "it; the model, index and file paths are not part of a preset."),
+        ))
+
         # -- always visible: the six controls a conversion actually turns on --
         layout.addWidget(Field(_("Pitch (semitones)"), self.pitch, _("12 = one octave up, -12 = one octave down.")))
         row = QHBoxLayout()
@@ -261,7 +471,7 @@ class ConversionSettings(QWidget):
         )
         layout.addWidget(self.advanced)
 
-        self.advanced.add_group("Output")
+        self.advanced.add_group(_("Output"))
         self.advanced.add_row(
             Field(_("Export format"), self.export_format, ""),
             self.filter_radius_field,
@@ -273,7 +483,7 @@ class ConversionSettings(QWidget):
         # frame it takes to be reparented into this layout.
         self.filter_radius_field.setVisible(defaults["filter_radius_visible"])
 
-        self.advanced.add_group("Index retrieval")
+        self.advanced.add_group(_("Index retrieval"))
         self.advanced.add_row(
             Field(
                 _("Neighbours"),
@@ -298,7 +508,7 @@ class ConversionSettings(QWidget):
             ),
         )
 
-        self.advanced.add_group("Post-processing")
+        self.advanced.add_group(_("Post-processing"))
         self.advanced.add(
             self.split_audio,
             self.clean_audio,
@@ -312,7 +522,7 @@ class ConversionSettings(QWidget):
             Field(_("Formant timbre"), self.formant_timbre, ""),
         )
 
-        self.advanced.add_group("Generation")
+        self.advanced.add_group(_("Generation"))
         self.advanced.add(
             Field(_("F0 curve file"), self.f0_file, _("Use a pre-computed pitch curve instead of extracting one.")),
         )
@@ -361,6 +571,66 @@ class ConversionSettings(QWidget):
             "seed": int(self.seed.value()),
         }
 
+    def _preset_controls(self) -> dict[str, QWidget]:
+        """Preset key -> the control holding it.
+
+        The keys are the preset file's (``rvc.lib.inference_presets``), not
+        :meth:`values`' -- the two name the envelope blend and the autotune
+        pair differently, and the file's names are the ones the Gradio tab
+        reads.
+        """
+        return {
+            "export_format": self.export_format,
+            "seed": self.seed,
+            "split_audio": self.split_audio,
+            "autotune": self.autotune,
+            "autotune_strength": self.autotune_strength,
+            "clean_audio": self.clean_audio,
+            "clean_strength": self.clean_strength,
+            "formant_shifting": self.formant,
+            "formant_qfrency": self.formant_quefrency,
+            "formant_timbre": self.formant_timbre,
+            "pitch": self.pitch,
+            "index_rate": self.index_rate,
+            "index_k": self.index_k,
+            "index_power": self.index_power,
+            "index_continuity": self.index_continuity,
+            "rms_mix_rate": self.volume_envelope,
+            "protect": self.protect,
+            "silence_gate_db": self.silence_gate_db,
+            "f0_method": self.f0_method,
+            "embedder_model": self.embedder,
+        }
+
+    def preset_values(self) -> dict:
+        values = {}
+        for key, control in self._preset_controls().items():
+            if isinstance(control, Toggle):
+                values[key] = control.isChecked()
+            elif isinstance(control, SliderSpin):
+                value = control.value()
+                values[key] = int(value) if control.is_integral() else value
+            else:
+                values[key] = control.text()
+        return values
+
+    def apply_preset(self, values: dict) -> None:
+        """Set every control the preset names; the rest keep their values.
+
+        The values arrive validated, choices included, so a combo is only ever
+        handed an entry it has.  The toggles' own signals then enable or
+        disable their strength sliders, as a click would.
+        """
+        controls = self._preset_controls()
+        for key, value in values.items():
+            control = controls.get(key)
+            if isinstance(control, Toggle):
+                control.setChecked(bool(value))
+            elif isinstance(control, SliderSpin):
+                control.setValue(float(value))
+            elif control is not None:
+                control.set_text(str(value))
+
 
 class InferencePage(Page):
     title = N_("Inference")
@@ -375,13 +645,14 @@ class InferencePage(Page):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_single(), _("Single file"))
         self.tabs.addTab(self._build_batch(), _("Batch folder"))
+        fit_to_current_tab(self.tabs)
         self.content.addWidget(self.tabs)
         self.content.addStretch(1)
 
     # -- single ------------------------------------------------------------
 
     def _build_single(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -408,6 +679,7 @@ class InferencePage(Page):
 
         settings_card = Card(_("Settings"), _("Everything below has a working default."), icon="sliders")
         self.settings = ConversionSettings("single")
+        self.settings.notify.connect(self.notify)
         settings_card.add(self.settings)
         layout.addWidget(settings_card)
 
@@ -431,6 +703,10 @@ class InferencePage(Page):
         self.output_player.saveRequested.connect(self._save_copy)
         output_card.add(self.output_player)
         layout.addWidget(output_card)
+        # A QTabWidget gives every tab the tallest tab's height, and without a
+        # stretch the extra goes to the cards: the last one grew into a tall
+        # empty panel under its button.
+        layout.addStretch(1)
 
         return page
 
@@ -491,9 +767,9 @@ class InferencePage(Page):
     def _convert(self) -> None:
         values = self.selector.values()
         if not self.require(**{
-            "An input file": self.input_path.path(),
-            "A voice model": values["pth_path"],
-            "An output path": self.output_path.path(),
+            _("An input file"): self.input_path.path(),
+            _("A voice model"): values["pth_path"],
+            _("An output path"): self.output_path.path(),
         }):
             return
         if not os.path.isfile(self.input_path.path()):
@@ -507,6 +783,12 @@ class InferencePage(Page):
             "output_path": self.output_path.path(),
         }
         os.makedirs(os.path.dirname(os.path.abspath(args["output_path"])) or ".", exist_ok=True)
+        # Out of the players before the backend rewrites it: converting the
+        # same input again targets the file the output player still holds, and
+        # an output path pointed at the input would do the same to the other.
+        written = catalog.conversion_outputs(args["output_path"], args["export_format"])
+        self.output_player.release(*written)
+        self.input_player.release(*written)
         _remember_input(args["input_path"])
         self.input_path.set_suggestions(_input_suggestions())
 
@@ -528,7 +810,7 @@ class InferencePage(Page):
     # -- batch -------------------------------------------------------------
 
     def _build_batch(self) -> QWidget:
-        page = QWidget()
+        page = TabPage()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
@@ -550,6 +832,7 @@ class InferencePage(Page):
 
         settings_card = Card(_("Settings"), icon="sliders")
         self.batch_settings = ConversionSettings("batch")
+        self.batch_settings.notify.connect(self.notify)
         settings_card.add(self.batch_settings)
         layout.addWidget(settings_card)
 
@@ -560,6 +843,9 @@ class InferencePage(Page):
         self.batch_hint.setObjectName("FieldHint")
         run_card.add(self.batch_button, self.batch_hint)
         layout.addWidget(run_card)
+        # See ``_build_single``: this tab is the shorter one, so it is the one
+        # whose last card was stretched to the single-file tab's height.
+        layout.addStretch(1)
 
         self.batch_input.pathChanged.connect(self._count_batch)
         return page
@@ -580,9 +866,9 @@ class InferencePage(Page):
     def _convert_batch(self) -> None:
         values = self.batch_selector.values()
         if not self.require(**{
-            "An input folder": self.batch_input.path(),
-            "An output folder": self.batch_output.path(),
-            "A voice model": values["pth_path"],
+            _("An input folder"): self.batch_input.path(),
+            _("An output folder"): self.batch_output.path(),
+            _("A voice model"): values["pth_path"],
         }):
             return
 
@@ -613,6 +899,9 @@ class InferencePage(Page):
         self.selector.refresh()
         self.batch_selector.refresh()
         self.input_path.set_suggestions(_input_suggestions())
+        # A preset saved from the other tab, or from the web interface, since.
+        self.settings.presets.refresh()
+        self.batch_settings.presets.refresh()
 
     def apply_theme(self, tokens: dict[str, str]) -> None:
         super().apply_theme(tokens)

@@ -298,9 +298,9 @@ class TrainingPage(Page):
     def _build_train_card(self) -> Card:
         card = Card(_("4 · Train"), _("The long part."), icon="trend")
 
-        self.total_epochs = SliderSpin(1, 10000, 1, decimals=0, value=500)
+        self.total_epochs = SliderSpin(1, 10000, 1, decimals=0, value=250)
         self.batch_size = SliderSpin(1, 64, 1, decimals=0, value=8)
-        self.save_every = SliderSpin(1, 100, 1, decimals=0, value=1)
+        self.save_every = SliderSpin(1, 100, 1, decimals=0, value=10)
 
         row = QHBoxLayout()
         row.setSpacing(12)
@@ -331,7 +331,7 @@ class TrainingPage(Page):
         card.add(advanced)
 
         # -- pretrained -----------------------------------------------------
-        advanced.add_group("Pretrained")
+        advanced.add_group(_("Pretrained"))
         self.custom_pretrained = Toggle(_("Use my own pretrained files"), "")
         self.pretrained_g = PathPicker(filters="Generator (*.pth)")
         self.pretrained_d = PathPicker(filters="Discriminator (*.pth)")
@@ -345,14 +345,14 @@ class TrainingPage(Page):
         )
 
         # -- checkpoints ----------------------------------------------------
-        advanced.add_group("Checkpoints")
+        advanced.add_group(_("Checkpoints"))
         self.save_latest_only = Toggle(_("Keep only the latest G/D"), _("Saves a lot of disk on long runs."), checked=True)
         self.save_weights = Toggle(_("Also export inference weights each save"), "", checked=True)
         self.cleanup = Toggle(_("Discard previous training state"), _("Restarts the run instead of resuming it."))
         advanced.add(self.save_latest_only, self.save_weights, self.cleanup)
 
         # -- which weights you end up with -----------------------------------
-        advanced.add_group("Model selection")
+        advanced.add_group(_("Model selection"))
         self.overtrain_detector = Toggle(
             _("Detect overtraining"),
             _("Holds whole source recordings out of training and scores them as it goes. "
@@ -372,14 +372,14 @@ class TrainingPage(Page):
         self.stop_on_overtrain.setVisible(self.overtrain_detector.isChecked())
 
         # -- schedule -------------------------------------------------------
-        advanced.add_group("Schedule")
+        advanced.add_group(_("Schedule"))
         self.use_warmup = Toggle(_("Warm up the learning rate"), "")
         self.warmup_duration = SliderSpin(1, 100, 1, decimals=0, value=5)
 
         advanced.add(self.use_warmup, Field(_("Warmup epochs"), self.warmup_duration, ""))
 
         # -- performance ----------------------------------------------------
-        advanced.add_group("Performance")
+        advanced.add_group(_("Performance"))
         self.checkpointing = Toggle(_("Gradient checkpointing"), _("Trades speed for a much smaller VRAM footprint."))
         # Autocast dtype over FP32 master weights.  Disabled until a CUDA device
         # is reported; see ``_apply_precision_support`` for the default.
@@ -635,14 +635,14 @@ class TrainingPage(Page):
             self._reader = None
             self._poll_timer.stop()
             self.metrics.set_status(
-                "No training logs found under logs/. They appear once a run "
-                "starts writing TensorBoard events."
+                _("No training logs found under logs/. They appear once a run "
+                  "starts writing TensorBoard events.")
             )
             return
 
         # Shared with the diagnostics page, so a run open on both is parsed once.
         self._reader = runwatch.reader_for(run_dir)
-        self.metrics.set_status("Reading history…")
+        self.metrics.set_status(_("Reading history…"))
         self._poll_metrics(initial=True)
         self._poll_timer.start()
 
@@ -669,7 +669,7 @@ class TrainingPage(Page):
 
         self.metrics.set_status(
             "" if self._reader.series
-            else "This run has not written any scalar events yet."
+            else _("This run has not written any scalar events yet.")
         )
         self.metrics.set_available_tags(self._reader.tags())
         self._push_series(self.metrics.checked_tags())
@@ -677,12 +677,12 @@ class TrainingPage(Page):
         last_step = max(
             (steps[-1] for steps, _ in self._reader.series.values() if steps), default=0
         )
-        self.metrics.set_run("", f"step {last_step:,}")
+        self.metrics.set_run("", _("step {step}").format(step=f"{last_step:,}"))
 
     def _on_metrics_read_failed(self, error: str) -> None:
         self._reading = False
         self._pending_initial = False
-        self.metrics.set_status(f"Could not read the event file: {error}")
+        self.metrics.set_status(_("Could not read the event file: {error}").format(error=error))
 
     def _on_metric_selection(self, tags: list[str]) -> None:
         self._push_series(tags)
@@ -699,8 +699,9 @@ class TrainingPage(Page):
 
     def _preprocess(self) -> None:
         if not self.require(**{
-            "A model name": self.model_name.text().strip(),
-            "A dataset folder": self.dataset.path(),
+            _("A model name"): self.model_name.text().strip(),
+            _("A dataset folder"): self.dataset.path(),
+            _("A sample rate"): self.sample_rate.text(),
         }):
             return
         if not os.path.isdir(self.dataset.path()):
@@ -731,7 +732,10 @@ class TrainingPage(Page):
         )
 
     def _extract(self) -> None:
-        if not self.require(**{"A model name": self.model_name.text().strip()}):
+        if not self.require(**{
+            _("A model name"): self.model_name.text().strip(),
+            _("A sample rate"): self.sample_rate.text(),
+        }):
             return
         self.run(
             "extract",
@@ -787,14 +791,17 @@ class TrainingPage(Page):
         }
 
     def _start_training(self) -> None:
-        if not self.require(**{"A model name": self.model_name.text().strip()}):
+        if not self.require(**{
+            _("A model name"): self.model_name.text().strip(),
+            _("A sample rate"): self.sample_rate.text(),
+        }):
             return
 
         args = self.train_args()
 
         self._training = True
         self._set_training_controls(True)
-        self.busy.emit(True, "Training…")
+        self.busy.emit(True, _("Training…"))
         # A previous run's card may still be on its way out.
         self._dismiss_timer.stop()
         self.progress.begin(int(self.total_epochs.value()))
@@ -817,14 +824,14 @@ class TrainingPage(Page):
 
         def on_result(data: dict) -> None:
             finish()
-            message = str(data.get("message", "Training finished."))
+            message = str(data.get("message") or _("Training finished."))
             self.progress.finish(message)
             self._hold_then_dismiss()
             self.notify.emit("success", message)
 
         def on_error(error: str) -> None:
             finish()
-            self.progress.finish(f"Stopped: {error}")
+            self.progress.finish(_("Stopped: {error}").format(error=error))
             self._hold_then_dismiss()
             self.notify.emit("error", error)
 
@@ -863,21 +870,21 @@ class TrainingPage(Page):
         # invites a second run on top of the first.
         self.stop_button.setEnabled(False)
         self.stop_button.setText(_("Stopping…"))
-        self.log.emit("Stop requested; waiting for the current checkpoint to finish writing.")
+        self.log.emit(_("Stop requested; waiting for the current checkpoint to finish writing."))
         self.engine.call(
             "stop_train",
             {},
-            on_result=lambda data: self.notify.emit("info", str(data.get("message", "Stop requested."))),
+            on_result=lambda data: self.notify.emit("info", str(data.get("message") or _("Stop requested."))),
             on_error=lambda error: self.notify.emit("error", error),
         )
 
     def _build_index(self) -> None:
-        if not self.require(**{"A model name": self.model_name.text().strip()}):
+        if not self.require(**{_("A model name"): self.model_name.text().strip()}):
             return
         speaker = "all"
         if self.index_single_speaker.isChecked():
             speaker = self.index_speaker.text().strip()
-            if not self.require(**{"A speaker to index": speaker}):
+            if not self.require(**{_("A speaker to index"): speaker}):
                 return
         self.run(
             "index",

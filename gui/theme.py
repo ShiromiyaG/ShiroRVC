@@ -81,6 +81,11 @@ def tokens(mode: str = "dark", accent: str = "blue") -> dict[str, str]:
     base["accent_soft"] = _alpha(colour, 38)
     base["accent_ghost"] = _alpha(colour, 20)
     base["accent_selection"] = _alpha(colour, 90)
+    # The same pair for the status colours, for pills and callouts that carry
+    # a tone rather than the accent.
+    for tone in ("success", "warning", "danger"):
+        base[f"{tone}_soft"] = _alpha(base[tone], 60)
+        base[f"{tone}_ghost"] = _alpha(base[tone], 22)
     base["mode"] = mode
     return base
 

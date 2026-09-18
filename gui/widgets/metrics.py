@@ -290,7 +290,7 @@ class MetricsPanel(QWidget):
         for label, path, age in runs:
             self.run_combo.addItem(f"{label}   ·   {age}" if age else label, path)
         if not runs:
-            self.run_combo.addItem("No training logs found", "")
+            self.run_combo.addItem(_("No training logs found"), "")
         index = self.run_combo.findData(current) if current else -1
         self.run_combo.setCurrentIndex(index if index >= 0 else 0)
         self.run_combo.blockSignals(False)
@@ -324,10 +324,10 @@ class MetricsPanel(QWidget):
         self._collapsed = collapsed
         for widget in (self.run_row, *self._body):
             widget.setVisible(not collapsed)
-        self.collapse_button.setText("Metrics" if collapsed else "Hide")
+        self.collapse_button.setText(_("Metrics") if collapsed else _("Hide"))
         self.collapse_button.setToolTip(
-            "Bring the chart back." if collapsed
-            else "Fold the chart away and give the width to the steps."
+            _("Bring the chart back.") if collapsed
+            else _("Fold the chart away and give the width to the steps.")
         )
         self.collapsedChanged.emit(collapsed)
 
@@ -444,8 +444,8 @@ class MetricsPanel(QWidget):
     def _update_hint(self) -> None:
         if len(self._checked) >= MAX_SERIES:
             self.hint.setText(
-                f"{MAX_SERIES} metrics is the limit — untick one, or click a "
-                "line in the legend to drop it."
+                _("{count} metrics is the limit — untick one, or click a "
+                  "line in the legend to drop it.").format(count=MAX_SERIES)
             )
         elif not self._checked:
             self.hint.setText(_("Pick a preset above, or tick metrics below."))

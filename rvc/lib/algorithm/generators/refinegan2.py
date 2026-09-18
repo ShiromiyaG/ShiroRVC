@@ -12,7 +12,10 @@ from torchaudio.functional.functional import (
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
-from torch.nn.utils.parametrize import remove_parametrizations
+from torch.nn.utils.parametrize import (
+    register_parametrization,
+    remove_parametrizations,
+)
 from torch.utils.checkpoint import checkpoint
 
 from rvc.lib.algorithm.commons import (
@@ -122,6 +125,77 @@ def adain_noise_mode(value):
             f"adain_noise must be one of {ADAIN_NOISE_MODES}; received {value!r}."
         )
     return mode
+
+
+class UnitNorm(nn.Module):
+    """Weight norm without the gain: every output channel's filter at unit norm.
+
+    This parametrizes ``conv_post``, and the reason is the gain it removes.
+    Under ``weight_norm`` that layer's ``g`` is one scalar standing between the
+    whole trunk and the ``tanh``, and every nonlinearity before it is a
+    ``leaky_relu``, so the loss sees only the *product* of ``g`` and the
+    trunk's scale.  Nothing in the objective decides the split; the optimizer
+    decides it.  Each stage's ``input_conv`` is a plain conv, and under Adam a
+    plain weight's norm grows by random walk, about ``lr * sqrt(fan_in *
+    steps)`` per row -- predicted against measured row norms:
+
+        run                          stage 0         stage 3
+        this decoder, 2e-4, 98k     4.2 / 3.27      1.5 / 2.11
+        RefineGAN,    1e-4, 53k     1.5 / 1.42      0.54 / 0.47
+
+    Four stages in series multiply that, and ``g`` shrinks to keep the output
+    at its level.  The first 32 kHz pretrain ended at ``g = 2.9e-4`` from
+    0.574 at init.  ``dL/dg`` grows with the trunk's features, so that one
+    scalar carried 99.9% of the generator's gradient norm (~14k, from the
+    optimizer's second moment).  BF16 carried it; the first FP16 finetune of
+    that pretrain went to NaN.
+
+    With the norm fixed there is no such direction: the trunk's last features
+    *are* the output's amplitude, so their scale is something the loss pins
+    rather than something the optimizer drifts along.  Only the direction is
+    learned.
+    """
+
+    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+        return weight / torch.linalg.vector_norm(
+            weight, dim=tuple(range(1, weight.dim())), keepdim=True
+        )
+
+
+#: What a ``conv_post`` with a learned gain leaves in a state dict: the new
+#: ``weight_norm`` API's gain, then the old one's.
+LEGACY_OUTPUT_GAIN_KEYS = (
+    "conv_post.parametrizations.weight.original0",
+    "conv_post.weight_g",
+)
+
+
+def _refuse_learned_output_gain(
+    module, state_dict, prefix, local_metadata, strict, missing_keys,
+    unexpected_keys, error_msgs,
+):
+    """Load hook: refuse a decoder trained with a gain on ``conv_post``.
+
+    Such a checkpoint cannot be converted.  Its trunk was trained against that
+    gain, so without it the output is ``1 / g`` too loud -- ~3400x on the
+    pretrain that motivated ``UnitNorm``.  And inference loads non-strictly, so
+    without this the gain key would be dropped as unexpected, ``conv_post``
+    left at its random init, and the old trunk's inflated features would drive
+    the ``tanh`` into clipping without a single error.
+    """
+
+    found = [
+        prefix + key
+        for key in LEGACY_OUTPUT_GAIN_KEYS
+        if prefix + key in state_dict
+    ]
+    if found:
+        error_msgs.append(
+            f"'{found[0]}' is a learned output gain, and RefineGAN2's conv_post "
+            "no longer has one (unit-norm since 2026-09-18; see UnitNorm). This "
+            "decoder was trained against that gain and cannot be converted -- "
+            "train a fresh pretrain."
+        )
 
 
 class ResBlock(nn.Module):
@@ -535,8 +609,9 @@ class RefineGAN2Generator(nn.Module):
     upsamples through parallel residual blocks.  Against the original: a
     tilted harmonic sine instead of the truncated-sinc comb, a windowed-sinc
     interpolation filter that crops its own group delay, an excitation gain
-    projected from the conditioning, and f0 interpolated in log with a hard
-    voiced/unvoiced gate.
+    projected from the conditioning, f0 interpolated in log with a hard
+    voiced/unvoiced gate, and an output projection with no learned gain
+    (``UnitNorm``).
 
     Args:
         source_gain (bool, optional): Scale the excitation by envelopes
@@ -931,10 +1006,13 @@ class RefineGAN2Generator(nn.Module):
 
             channels = new_channels
 
-        self.conv_post = weight_norm(
-            nn.Conv1d(channels, 1, 7, 1, padding=3, bias=False)
-        )
-        self.conv_post.apply(init_weights)
+        # Unit-norm rather than ``weight_norm``: see ``UnitNorm`` for the gain
+        # this leaves out and what it did.  No ``init_weights`` -- on a
+        # parametrized conv it writes into a temporary and never did anything,
+        # and with only a direction to learn any isotropic draw is as good.
+        self.conv_post = nn.Conv1d(channels, 1, 7, 1, padding=3, bias=False)
+        register_parametrization(self.conv_post, "weight", UnitNorm())
+        self.register_load_state_dict_pre_hook(_refuse_learned_output_gain)
 
         self.out_tanh = nn.Tanh()
 
@@ -1139,7 +1217,8 @@ class RefineGAN2Generator(nn.Module):
         return x
 
     def remove_weight_norm(self) -> None:
-        """Fold every weight norm back into its weight, by walking the modules.
+        """Fold every weight parametrization into its weight -- the weight norms
+        and ``conv_post``'s ``UnitNorm`` alike -- by walking the modules.
 
         Walking rather than listing layers by name: a hand-written list goes
         stale the moment one is added, and nothing catches it because
