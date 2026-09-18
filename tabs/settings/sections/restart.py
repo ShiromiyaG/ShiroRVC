@@ -15,7 +15,7 @@ def stop_infer():
         for pid in pids:
             os.kill(pid, 9)
         os.remove(pid_file_path)
-    except:
+    except (OSError, ValueError):
         pass
 
 

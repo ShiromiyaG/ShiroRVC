@@ -783,10 +783,15 @@ def run_tensorboard_script():
 
 # Download
 def run_download_script(model_link: str):
-    from rvc.lib.extras.model_download import model_download_pipeline
+    from rvc.lib.extras.model_download import DownloadError, model_download_pipeline
 
-    model_download_pipeline(model_link)
-    return f"Model downloaded successfully."
+    # Checked, like run_index_script: this used to report success whatever the
+    # pipeline returned, so a failed download looked like a finished one.
+    try:
+        folder = model_download_pipeline(model_link)
+    except DownloadError as error:
+        return f"Model download failed: {error}"
+    return f"Model downloaded to {os.path.relpath(folder)}."
 
 
 # Prerequisites
@@ -1623,7 +1628,12 @@ def tensorboard():
 @apply_options(DOWNLOAD_OWN)
 def download(**kwargs):
     """Download a model from a link."""
-    run_download_script(**kwargs)
+    from rvc.lib.extras.model_download import DownloadError, model_download_pipeline
+
+    try:
+        model_download_pipeline(kwargs["model_link"])
+    except DownloadError:
+        raise SystemExit(1)  # the pipeline has printed why
 
 
 @cli.command("prerequisites")

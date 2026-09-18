@@ -29,7 +29,7 @@ class TtsPage(Page):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
 
-        text_card = Card(_("Text"), _("Type a line, or load a .txt file to read from."))
+        text_card = Card(_("Text"), _("Type a line, or load a .txt file to read from."), icon="speech")
         self.text = QPlainTextEdit()
         self.text.setPlaceholderText(_("What should the voice say?"))
         self.text.setMinimumHeight(110)
@@ -47,7 +47,7 @@ class TtsPage(Page):
         text_card.add(Field(_("Text file"), self.text_file, _("When set, this wins over the box above.")))
         self.content.addWidget(text_card)
 
-        voice_card = Card(_("Synthesis voice"), _("The Edge TTS voice used before conversion."))
+        voice_card = Card(_("Synthesis voice"), _("The Edge TTS voice used before conversion."), icon="volume")
         self.voice = SearchableCombo()
         self.voice.refresh_button.hide()
         self.voice.set_pairs(catalog.tts_voices())
@@ -59,12 +59,12 @@ class TtsPage(Page):
         voice_card.body.addLayout(row)
         self.content.addWidget(voice_card)
 
-        model_card = Card(_("Target voice"))
+        model_card = Card(_("Target voice"), icon="mic")
         self.selector = ModelSelector(self)
         model_card.add(self.selector)
         self.content.addWidget(model_card)
 
-        settings_card = Card(_("Conversion settings"))
+        settings_card = Card(_("Conversion settings"), icon="sliders")
         self.settings = ConversionSettings("tts")
         # These have no meaning for a synthesised source: there is no formant
         # mismatch to correct and no external pitch curve to apply.
@@ -74,7 +74,7 @@ class TtsPage(Page):
         settings_card.add(self.settings)
         self.content.addWidget(settings_card)
 
-        output_card = Card(_("Output"))
+        output_card = Card(_("Output"), icon="download")
         self.tts_output = PathPicker(mode="save", filters="Audio (*.wav)")
         self.tts_output.set_path(str(paths.AUDIO_DIR / catalog.TTS_RAW_NAME))
         self.rvc_output = PathPicker(mode="save", filters="Audio (*.wav)")

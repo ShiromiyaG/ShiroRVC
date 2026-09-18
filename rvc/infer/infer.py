@@ -33,7 +33,14 @@ from rvc.lib.utils import load_audio_infer, load_embedder_model
 from rvc.lib.extras.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.algorithm.commons import strip_parametrizations
-from rvc.lib.model_bundle import get_bundle_models, is_model_bundle, load_model_bundle
+from rvc.lib import index_meta
+from rvc.lib.model_bundle import (
+    default_model_name,
+    get_bundle_model_state,
+    get_bundle_models,
+    is_model_bundle,
+    load_model_bundle,
+)
 from rvc.configs.config import Config
 from rvc.configs.vocoders import normalize_vocoder
 from rvc.infer.messages import (
@@ -56,14 +63,13 @@ class VoiceConverter:
         self.tgt_sr = None
         self.net_g = None
         self.vc = None
-        self.cpt = None
         self.active_cpt = None  # Active checkpoint for the selected speaker
         self.version = None
         self.n_spk = None
         self.use_f0 = None
         self.loaded_model = None
         self.loaded_index = None  # Deserialized Faiss index
-        self.loaded_index_meta = None  # Serialised sidecar for the bundle index
+        self.loaded_index_meta = None  # Metadata for the bundle index
         # Whether the embedder wants its input layer-normalised.  Extraction has
         # always honoured this; inference used to drop it on the floor, so an
         # embedder whose config asked for normalisation produced training
@@ -360,49 +366,35 @@ class VoiceConverter:
                 torch.cuda.empty_cache()
             return
 
-        if not self.loaded_model or self.loaded_model != weight_root:
-            self.load_model(weight_root)
-
-        bundle_models = get_bundle_models(self.cpt) if isinstance(self.cpt, dict) else {}
-        if bundle_models:
-            target_key = bundle_submodel
-            if target_key and target_key in bundle_models:
-                model_data = bundle_models[target_key]
-                self.active_cpt = model_data["model_state"]
-
-                self.loaded_index = None
-                self.loaded_index_meta = model_data.get("index_meta")
-                if "index_data" in model_data:
-                    try:
-                        self.loaded_index = faiss.deserialize_index(model_data["index_data"])
-                    except Exception as e:
-                        warning(f"Bundled index could not be read, retrieval is off: {e}", tag="[INFER]")
-            else:
-                print_error(f"Sub-model '{bundle_submodel}' is not in the bundle.", tag="[INFER]")
-                self.cleanup_model()
-                return
-        else:
-            self.active_cpt = self.cpt
+        # A bundle is loaded one sub-model at a time, so switching sub-models
+        # is a reload rather than a lookup.
+        key = (weight_root, bundle_submodel or None)
+        if self.loaded_model != key:
+            self.load_model(weight_root, bundle_submodel)
 
         if self.active_cpt is not None:
             self.setup_network()
             self.setup_vc_instance()
-            self.loaded_model = weight_root
+            self.loaded_model = key
         else:
             self.vc = None
             self.loaded_model = None
 
     def cleanup_model(self):
         import gc
-        for attr in ("net_g", "n_spk", "vc", "hubert_model", "tgt_sr", "cpt", "active_cpt", "loaded_model", "loaded_index", "loaded_index_meta"):
+        for attr in ("net_g", "n_spk", "vc", "hubert_model", "tgt_sr", "active_cpt", "loaded_model", "loaded_index", "loaded_index_meta"):
             setattr(self, attr, None)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def load_model(self, weight_root):
-        """Handles both plain .pth checkpoints and model bundles."""
-        self.cpt = None
+    def load_model(self, weight_root, bundle_submodel=None):
+        """Handles both plain .pth checkpoints and model bundles.
+
+        Of a bundle only ``bundle_submodel`` is kept -- the first model when
+        none is named -- so the others are not held in memory for the session.
+        """
+        self.active_cpt = None
         self.loaded_index = None
         self.loaded_index_meta = None
 
@@ -411,29 +403,42 @@ class VoiceConverter:
             return
 
         info(f"Loading model '{os.path.basename(weight_root)}'", tag="[INFER]")
-        if is_model_bundle(weight_root):
+        if not is_model_bundle(weight_root):
+            self.active_cpt = torch.load(weight_root, map_location="cpu", weights_only=True)
+            return
+
+        try:
+            bundle_data = load_model_bundle(weight_root)
+        except Exception as e:
+            print_error(f"Could not load the model bundle: {e}", tag="[INFER]")
+            return
+
+        models = get_bundle_models(bundle_data)
+        if models:
+            name = bundle_submodel or default_model_name(models)
+            if name not in models:
+                print_error(f"Sub-model '{name}' is not in the bundle.", tag="[INFER]")
+                return
+            if not bundle_submodel:
+                info(f"No sub-model chosen; using '{name}'.", tag="[INFER]")
+            info(f"Bundle holds {len(models)} models; loaded '{name}'.", tag="[INFER]")
+            entry = models[name]
+            state = entry.get("model_state")
+        else:  # the older single-model layout
+            entry = bundle_data
+            state = get_bundle_model_state(bundle_data)
+
+        self.active_cpt = state
+        self.loaded_index_meta = entry.get("index_meta")
+        index_data = entry.get("index_data")
+        if index_data is not None:
+            # Without a separate copy, the index file's own footer has it.
+            if self.loaded_index_meta is None:
+                self.loaded_index_meta = index_meta.from_index_bytes(index_data)
             try:
-                bundle_data = load_model_bundle(weight_root)
-
-                if "models" in bundle_data:
-                    self.cpt = bundle_data
-                    info(f"Bundle holds {len(bundle_data['models'])} models.", tag="[INFER]")
-                else:  # old single-model bundle format
-                    self.cpt = bundle_data.get("model_state")
-                    serialized_index = bundle_data.get("index_data")
-                    self.loaded_index_meta = bundle_data.get("index_meta")
-                    if serialized_index is not None:
-                        try:
-                            self.loaded_index = faiss.deserialize_index(serialized_index)
-                        except Exception as e:
-                            warning(f"Bundled index could not be read, retrieval is off: {e}", tag="[INFER]")
+                self.loaded_index = faiss.deserialize_index(index_data)
             except Exception as e:
-                print_error(f"Could not load the model bundle: {e}", tag="[INFER]")
-                self.cpt = None
-
-        else:
-            self.cpt = torch.load(weight_root, map_location="cpu", weights_only=True)
-
+                warning(f"Bundled index could not be read, retrieval is off: {e}", tag="[INFER]")
 
     def setup_network(self):
         if self.active_cpt is not None:

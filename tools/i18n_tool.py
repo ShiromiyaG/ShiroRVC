@@ -37,7 +37,7 @@ POT_PATH = LOCALE_DIR / f"{DOMAIN}.pot"
 #: Where translatable strings live.  ``core.py`` is absent on purpose: the CLI
 #: stays English (see rvc/lib/i18n.py), and so does everything under rvc/train/
 #: whose stdout the GUI parses.
-SOURCE_DIRS = ("tabs", "gui", "rvc/infer", "rvc/lib")
+SOURCE_DIRS = ("tabs", "gui", "rvc/infer", "rvc/lib", "rvc/configs")
 
 EXCLUDE_PARTS = {"__pycache__", ".git", "env", "logs", ".tmp"}
 

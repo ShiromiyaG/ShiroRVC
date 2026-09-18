@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from .chart import WINDOWS, LiveChart
 from .flow import FlowRow
-from .forms import SliderSpin, ghost_button
+from .forms import SliderSpin, ghost_button, polish_combo
 
 from ..i18n import _
 
@@ -155,6 +155,7 @@ class MetricsPanel(QWidget):
         run_row.setContentsMargins(0, 0, 0, 0)
         run_row.setSpacing(6)
         self.run_combo = QComboBox()
+        polish_combo(self.run_combo)
         self.run_combo.setToolTip(_("Which training log to follow."))
         self.run_combo.currentIndexChanged.connect(self._on_run_selected)
         rescan = ghost_button(_("Rescan"))

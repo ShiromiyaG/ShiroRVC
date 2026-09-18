@@ -228,7 +228,11 @@ def download(
             re.search(r"filename\*=UTF-8''(.*)", content_disposition)
             or re.search(r'filename=["\']?(.*?)["\']?$', content_disposition)
         ).group(1)
-        filename_from_url = filename_from_url.replace(os.path.sep, "_")
+        # Both separators: ``os.path.sep`` alone let ``/`` through on Windows,
+        # and the name comes from the server.
+        filename_from_url = (
+            os.path.basename(filename_from_url.replace("\\", "/")) or "downloaded_file"
+        )
     else:
         filename_from_url = os.path.basename(url)
 

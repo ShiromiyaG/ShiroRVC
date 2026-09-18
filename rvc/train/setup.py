@@ -466,8 +466,6 @@ def apply_frontend_freeze(net_g, rank, freeze_vae=False, freeze_mode="none"):
 
     prefixes = FREEZE_MODES[freeze_mode]
     if prefixes is None:
-        if rank == 0:
-            info("Freeze: nothing frozen.", tag="[INIT]")
         return
 
     model = net_g.module if hasattr(net_g, "module") else net_g

@@ -1450,19 +1450,6 @@ def run(
     # Cache for training with " cache " enabled
     cache = []
 
-    # Logged here rather than in ``training_loop``: the weights are constants of
-    # the assembled discriminator, and the loop runs once per epoch, so saying
-    # it there reprinted an [INIT] line after every epoch's save.
-    if rank == 0:
-        model_d = net_d.module if hasattr(net_d, "module") else net_d
-        if getattr(model_d, "uses_branch_weights", False):
-            weighted = ", ".join(
-                f"{label} {weight:g}"
-                for label, weight in zip(model_d.branch_labels, model_d.branch_weights)
-                if weight != 1.0
-            )
-            info(f"Discriminator branch weights: {weighted}.", tag="[INIT]")
-
     # Both of these live across epochs.  ``training_loop`` is called once per
     # epoch, so anything built inside it is silently reconstructed every epoch:
     # the governor kept there lost its ramp progress, its best-headroom
@@ -2888,7 +2875,7 @@ def training_loop(
                 for f in old_files:
                     try:
                         os.remove(f)
-                    except:
+                    except OSError:
                         pass
 
             # Both writes sit in one protected region: a stop between them would

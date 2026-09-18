@@ -342,6 +342,25 @@ def _shiba_details(path: QPainterPath) -> None:
     path.closeSubpath()
 
 
+def _mic(path: QPainterPath) -> None:
+    """Voice: a microphone in its cradle."""
+    path.addRoundedRect(QRectF(9, 3, 6, 11), 3, 3)
+    path.moveTo(5.5, 11)
+    path.cubicTo(5.5, 19, 18.5, 19, 18.5, 11)
+    path.moveTo(12, 17)
+    path.lineTo(12, 21)
+    path.moveTo(8.5, 21)
+    path.lineTo(15.5, 21)
+
+
+def _globe(path: QPainterPath) -> None:
+    """Language: a globe with one meridian and the equator."""
+    path.addEllipse(QPointF(12, 12), 9, 9)
+    path.addEllipse(QPointF(12, 12), 3.8, 9)
+    path.moveTo(3, 12)
+    path.lineTo(21, 12)
+
+
 def _chip(path: QPainterPath) -> None:
     """GPU / device."""
     path.addRoundedRect(QRectF(6, 6, 12, 12), 2, 2)
@@ -378,6 +397,8 @@ DRAWINGS = {
     "moon": _moon,
     "terminal": _terminal,
     "chip": _chip,
+    "globe": _globe,
+    "mic": _mic,
     "shiba": _shiba,
 }
 

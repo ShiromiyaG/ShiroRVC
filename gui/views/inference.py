@@ -35,6 +35,29 @@ from ..i18n import _, N_, ngettext
 
 _AUDIO_FILTER = "Audio (*.wav *.mp3 *.flac *.ogg *.m4a *.opus);;All files (*.*)"
 
+#: Inputs converted from this window, newest first.  The GUI uses files where
+#: they are rather than copying them into assets/audios as the Gradio tab does,
+#: so without this they would never show up among the previous audios.
+_RECENT_INPUTS = "recent_inputs"
+_RECENT_LIMIT = 15
+
+
+def _input_suggestions() -> list[str]:
+    """Recent inputs that still exist, then the uploads in assets/audios."""
+    items = [
+        path
+        for path in prefs.get(_RECENT_INPUTS, [])
+        if (paths.ROOT / path).is_file()
+    ]
+    items += [path for path in catalog.list_audios() if path not in items]
+    return items
+
+
+def _remember_input(path: str) -> None:
+    path = paths.relative(path)
+    recent = [item for item in prefs.get(_RECENT_INPUTS, []) if item != path]
+    prefs.set(_RECENT_INPUTS, [path, *recent][:_RECENT_LIMIT])
+
 
 class ModelSelector(QWidget):
     """Model, index and speaker, kept consistent with each other.
@@ -350,8 +373,8 @@ class InferencePage(Page):
         self._last_output: str = ""
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_single(), "Single file")
-        self.tabs.addTab(self._build_batch(), "Batch folder")
+        self.tabs.addTab(self._build_single(), _("Single file"))
+        self.tabs.addTab(self._build_batch(), _("Batch folder"))
         self.content.addWidget(self.tabs)
         self.content.addStretch(1)
 
@@ -363,26 +386,32 @@ class InferencePage(Page):
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
 
-        source = Card(_("Source"), _("The audio you want converted."))
+        source = Card(_("Source"), _("The audio you want converted."), icon="waveform")
         self.input_path = PathPicker(filters=_AUDIO_FILTER, placeholder=_("Drop an audio file here or browse…"))
         self.input_path.pathChanged.connect(self._on_input_changed)
-        source.add(Field(_("Input file"), self.input_path, ""))
+        source.add(Field(
+            _("Input file"),
+            self.input_path,
+            _("The arrow lists audios converted before and the ones in assets/audios."),
+        ))
 
         self.input_player = AudioPlayer()
+        self.input_player.accept_drops(catalog.AUDIO_EXTENSIONS)
+        self.input_player.fileDropped.connect(self.input_path.set_path)
         source.add(self.input_player)
         layout.addWidget(source)
 
-        model_card = Card(_("Voice"), _("Which model to convert into."))
+        model_card = Card(_("Voice"), _("Which model to convert into."), icon="mic")
         self.selector = ModelSelector(self)
         model_card.add(self.selector)
         layout.addWidget(model_card)
 
-        settings_card = Card(_("Settings"), _("Everything below has a working default."))
+        settings_card = Card(_("Settings"), _("Everything below has a working default."), icon="sliders")
         self.settings = ConversionSettings("single")
         settings_card.add(self.settings)
         layout.addWidget(settings_card)
 
-        output_card = Card(_("Output"))
+        output_card = Card(_("Output"), icon="download")
         self.output_path = PathPicker(mode="save", filters=_AUDIO_FILTER)
         self.output_path.set_path(str(paths.AUDIO_DIR / f"filename{catalog.OUTPUT_SUFFIX}.wav"))
         output_card.add(Field(_("Save to"), self.output_path, ""))
@@ -478,6 +507,8 @@ class InferencePage(Page):
             "output_path": self.output_path.path(),
         }
         os.makedirs(os.path.dirname(os.path.abspath(args["output_path"])) or ".", exist_ok=True)
+        _remember_input(args["input_path"])
+        self.input_path.set_suggestions(_input_suggestions())
 
         self.run(
             "infer",
@@ -502,7 +533,7 @@ class InferencePage(Page):
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(18)
 
-        folders = Card(_("Folders"), _("Every audio file in the input folder is converted."))
+        folders = Card(_("Folders"), _("Every audio file in the input folder is converted."), icon="folder")
         self.batch_input = PathPicker(mode="dir", placeholder=_("Folder with audio to convert"))
         self.batch_output = PathPicker(mode="dir", placeholder=_("Where to write the results"))
         self.batch_output.set_path(str(paths.AUDIO_DIR / "batch"))
@@ -512,12 +543,12 @@ class InferencePage(Page):
         )
         layout.addWidget(folders)
 
-        model_card = Card(_("Voice"))
+        model_card = Card(_("Voice"), icon="mic")
         self.batch_selector = ModelSelector(self)
         model_card.add(self.batch_selector)
         layout.addWidget(model_card)
 
-        settings_card = Card(_("Settings"))
+        settings_card = Card(_("Settings"), icon="sliders")
         self.batch_settings = ConversionSettings("batch")
         settings_card.add(self.batch_settings)
         layout.addWidget(settings_card)
@@ -581,6 +612,7 @@ class InferencePage(Page):
     def on_shown(self) -> None:
         self.selector.refresh()
         self.batch_selector.refresh()
+        self.input_path.set_suggestions(_input_suggestions())
 
     def apply_theme(self, tokens: dict[str, str]) -> None:
         super().apply_theme(tokens)

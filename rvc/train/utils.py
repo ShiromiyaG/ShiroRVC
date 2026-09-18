@@ -830,6 +830,23 @@ def plot_validation_preview_to_figure(
     return figure
 
 
+def _write_atomically(path, write):
+    """Write ``path`` through a temporary file and a rename.
+
+    A reader -- the GUI polls these files -- or an interrupted run then sees
+    the old file or the new one, never a WAV whose header was not finalised.
+    """
+    temporary = f"{path}.tmp"
+    write(temporary)
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        # Windows refuses to replace a file another process has open, such as
+        # the GUI playing the previous preview; fall back to writing in place.
+        os.remove(temporary)
+        write(path)
+
+
 def log_validation_preview(
     writer,
     experiment_dir,
@@ -882,7 +899,10 @@ def log_validation_preview(
         # ``figure.dpi`` rather than the module default: the figure may have
         # been built at an overridden dpi, and saving at a different one would
         # write a PNG that does not match what TensorBoard received.
-        figure.savefig(image_path, dpi=figure.dpi)
+        _write_atomically(
+            image_path,
+            lambda target: figure.savefig(target, dpi=figure.dpi, format="png"),
+        )
 
         if writer is not None:
             writer.add_image(
@@ -914,8 +934,13 @@ def log_validation_preview(
 
     generated_path = os.path.join(audio_dir, f"{sample_stem}_generated.wav")
     original_path = os.path.join(audio_dir, f"{sample_stem}_original.wav")
-    sf.write(generated_path, predicted_wave.numpy(), int(sample_rate), subtype="PCM_16")
-    sf.write(original_path, target_wave.numpy(), int(sample_rate), subtype="PCM_16")
+    for path, wave in ((generated_path, predicted_wave), (original_path, target_wave)):
+        _write_atomically(
+            path,
+            lambda target, wave=wave: sf.write(
+                target, wave.numpy(), int(sample_rate), subtype="PCM_16", format="WAV"
+            ),
+        )
 
     if writer is not None:
         writer.add_audio(
@@ -1143,7 +1168,7 @@ def block_tensorboard_flush_on_exit(writer):
         )
         try:
             writer.close()
-        except:
+        except Exception:
             pass
         os._exit(1)
 

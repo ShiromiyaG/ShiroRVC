@@ -11,8 +11,10 @@ enough to drop frames if it happens on the UI thread.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from PySide6.QtCore import (
+    QLoggingCategory,
     QObject,
     QRectF,
     QRunnable,
@@ -38,6 +40,40 @@ from PySide6.QtWidgets import (
 from .. import theme
 from ..i18n import _
 from . import icons
+
+#: FFmpeg's ``AV_LOG_WARNING``.
+_AV_LOG_WARNING = 24
+
+
+def quiet_media_logs() -> None:
+    """Keep the media backend's per-file chatter out of the terminal.
+
+    Qt leaves FFmpeg at its default INFO level, so every file the player opens
+    prints a full stream dump.  Warnings still come through: they are how a
+    malformed file shows up.  ``QT_LOGGING_RULES`` still overrides the Qt half.
+    """
+    QLoggingCategory.setFilterRules("qt.multimedia.ffmpeg.info=false")
+    try:
+        import ctypes
+
+        import PySide6
+
+        # The copy PySide6 bundles is the one Qt's plugin links against, and
+        # loading it first means the plugin gets this same instance.
+        base = Path(PySide6.__file__).parent
+        found = sorted(
+            [
+                *base.glob("Qt/lib/libavutil.so.*"),
+                *base.glob("Qt/lib/libavutil.*.dylib"),
+                *base.glob("avutil-*.dll"),
+            ],
+            key=lambda path: len(path.name),
+        )
+        if found:
+            ctypes.CDLL(str(found[0])).av_log_set_level(_AV_LOG_WARNING)
+    except Exception:  # noqa: BLE001 - cosmetic; never block startup
+        pass
+
 
 #: Envelope resolution.  More than this and the extra detail is sub-pixel on
 #: any window a person actually uses.
@@ -94,6 +130,8 @@ class Waveform(QWidget):
     """Envelope view with a playhead; click or drag to seek."""
 
     seekRequested = Signal(float)  # 0..1
+    #: A local audio file dropped on the view; see :meth:`accept_files`.
+    fileDropped = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -102,7 +140,10 @@ class Waveform(QWidget):
         self.setCursor(Qt.PointingHandCursor)
         self._peaks: list[tuple[float, float]] = []
         self._progress = 0.0
-        self._message = "No audio loaded"
+        self._empty_message = _("No audio loaded")
+        self._message = self._empty_message
+        self._drop_suffixes: tuple[str, ...] = ()
+        self._drop_hover = False
         self.colours = {
             "bg": QColor("#14141a"),
             "wave": QColor("#3d3d4d"),
@@ -123,8 +164,39 @@ class Waveform(QWidget):
 
     def set_peaks(self, peaks: list[tuple[float, float]]) -> None:
         self._peaks = peaks
-        self._message = "" if peaks else "No audio loaded"
+        self._message = "" if peaks else self._empty_message
         self.update()
+
+    def accept_files(self, suffixes: tuple[str, ...], empty_message: str) -> None:
+        """Take drops of files with these suffixes, and say so while empty."""
+        self._drop_suffixes = tuple(suffix.lower() for suffix in suffixes)
+        if self._message == self._empty_message:
+            self._message = empty_message
+        self._empty_message = empty_message
+        self.setAcceptDrops(True)
+
+    def _dropped_path(self, event) -> str:
+        urls = event.mimeData().urls()
+        path = os.path.normpath(urls[0].toLocalFile()) if urls and urls[0].isLocalFile() else ""
+        return path if os.path.isfile(path) and path.lower().endswith(self._drop_suffixes) else ""
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if self._dropped_path(event):
+            event.acceptProposedAction()
+            self._drop_hover = True
+            self.update()
+
+    def dragLeaveEvent(self, _event) -> None:  # noqa: N802
+        self._drop_hover = False
+        self.update()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        self._drop_hover = False
+        self.update()
+        path = self._dropped_path(event)
+        if path:
+            event.acceptProposedAction()
+            self.fileDropped.emit(path)
 
     def set_message(self, text: str) -> None:
         self._peaks = []
@@ -137,11 +209,18 @@ class Waveform(QWidget):
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        # Smoothed for the rounded box only; the columns below stay crisp.
+        painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setPen(Qt.NoPen)
+        # An accent outline while a droppable file hovers over the box.
+        if self._drop_hover:
+            rect = rect.adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.setPen(QPen(self.colours["played"], 2))
+        else:
+            painter.setPen(QPen(self.colours["mid"], 1))
         painter.setBrush(self.colours["bg"])
         painter.drawRoundedRect(rect, 8, 8)
+        painter.setRenderHint(QPainter.Antialiasing, False)
 
         if not self._peaks:
             painter.setPen(self.colours["text"])
@@ -195,6 +274,9 @@ class AudioPlayer(QWidget):
     #: The save icon was pressed.  The owner decides where the copy goes; the
     #: player has no business opening a file dialog of its own.
     saveRequested = Signal()
+    #: An audio file dropped on the waveform, once :meth:`accept_drops` is on.
+    #: The owner loads it, since what loading means is its decision.
+    fileDropped = Signal(str)
 
     def __init__(self, title: str = "", parent: QWidget | None = None):
         super().__init__(parent)
@@ -214,17 +296,20 @@ class AudioPlayer(QWidget):
 
         self.waveform = Waveform()
         self.waveform.seekRequested.connect(self._seek_fraction)
+        self.waveform.fileDropped.connect(self.fileDropped)
 
         # Drawn icons rather than "▶"/"⏸"/"✕"/"🔊" as button text.  Those came
         # from whatever font on the machine happened to carry them -- four
         # different designs at four weights, and the speaker was a colour emoji
         # on Windows -- sitting next to an otherwise hand-drawn icon set.
         self._icon_colour = theme.tokens()["text_dim"]
+        self._accent_colour = theme.tokens()["accent"]
 
         self.play_button = QPushButton()
-        self.play_button.setObjectName("IconButton")
-        self.play_button.setFixedWidth(40)
-        self.play_button.setIconSize(QSize(15, 15))
+        self.play_button.setObjectName("PlayButton")
+        self.play_button.setFixedSize(32, 32)
+        self.play_button.setIconSize(QSize(14, 14))
+        self.play_button.setCursor(Qt.PointingHandCursor)
         self.play_button.clicked.connect(self.toggle)
         self.play_button.setEnabled(False)
 
@@ -273,6 +358,8 @@ class AudioPlayer(QWidget):
 
         self.open_button = QPushButton(_("Show in folder"))
         self.open_button.setObjectName("Ghost")
+        self.open_button.setIconSize(QSize(14, 14))
+        self.open_button.setCursor(Qt.PointingHandCursor)
         self.open_button.clicked.connect(self._reveal)
         self.open_button.setEnabled(False)
 
@@ -309,7 +396,7 @@ class AudioPlayer(QWidget):
         self.open_button.setEnabled(True)
         self.clear_button.setEnabled(True)
         self.save_button.setEnabled(True)
-        self.waveform.set_message("Reading waveform…")
+        self.waveform.set_message(_("Reading waveform…"))
         self._player.setSource(QUrl.fromLocalFile(os.path.abspath(self._path)))
         self._pool.start(_PeakJob(self._path, self._signals))
 
@@ -330,6 +417,11 @@ class AudioPlayer(QWidget):
         """Show the save icon.  Off by default; only results are worth keeping."""
         self.save_button.setVisible(bool(enabled))
 
+    def accept_drops(self, suffixes: tuple[str, ...]) -> None:
+        """Let the waveform take a dropped audio file.  Off by default: a
+        result player has nothing to receive."""
+        self.waveform.accept_files(suffixes, _("Drop an audio file here"))
+
     def path(self) -> str:
         """What is loaded, for an owner that needs to act on the file."""
         return self._path
@@ -346,6 +438,7 @@ class AudioPlayer(QWidget):
     def apply_theme(self, tokens: dict[str, str]) -> None:
         self.waveform.apply_theme(tokens)
         self._icon_colour = tokens["text_dim"]
+        self._accent_colour = tokens["accent"]
         self._paint_icons()
 
     def _paint_icons(self) -> None:
@@ -354,10 +447,11 @@ class AudioPlayer(QWidget):
             icons.icon(
                 "pause" if self._player.playbackState() == QMediaPlayer.PlayingState
                 else "play",
-                self._icon_colour,
-                size=15,
+                self._accent_colour,
+                size=14,
             )
         )
+        self.open_button.setIcon(icons.icon("folder", self._icon_colour, size=14))
         self.clear_button.setIcon(icons.icon("close", self._icon_colour, size=13))
         # "download" rather than a floppy: an arrow into a tray is what this
         # means now, and it is the glyph the rest of the set already carries.
@@ -376,7 +470,7 @@ class AudioPlayer(QWidget):
         if path == self._path:
             # Playback may still work even when we cannot decode for display,
             # so this is a degraded view rather than a failure.
-            self.waveform.set_message(f"Preview unavailable ({error})")
+            self.waveform.set_message(_("Preview unavailable ({error})").format(error=error))
 
     def _on_position(self, position: int) -> None:
         duration = self._player.duration()

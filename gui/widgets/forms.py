@@ -9,11 +9,12 @@ stay a description of *what* is configurable rather than of how it is laid out.
 from __future__ import annotations
 
 import os
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
-from PySide6.QtCore import QEvent, QLocale, QSize, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QElapsedTimer, QEvent, QLocale, QObject, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
@@ -24,10 +25,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QPushButton,
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -45,26 +48,61 @@ def _label(text: str, object_name: str) -> QLabel:
 
 
 class Card(QFrame):
-    """A titled surface.  The content goes into :attr:`body`."""
+    """A titled surface.  The content goes into :attr:`body`.
 
-    def __init__(self, title: str = "", subtitle: str = "", parent: QWidget | None = None):
+    ``icon`` names a glyph from :mod:`icons`, shown in a tinted badge beside
+    the title.
+    """
+
+    def __init__(
+        self,
+        title: str = "",
+        subtitle: str = "",
+        parent: QWidget | None = None,
+        icon: str = "",
+    ):
         super().__init__(parent)
         self.setObjectName("Card")
+        self._icon = icon
+        self._badge: QLabel | None = None
+        # No outer margins: the divider under the header runs edge to edge, so
+        # the header and the body carry their own.
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 14, 16, 16)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         if title:
-            header = QVBoxLayout()
-            header.setSpacing(2)
-            header.addWidget(_label(title, "CardTitle"))
+            header = QHBoxLayout()
+            header.setContentsMargins(18, 14, 18, 14)
+            header.setSpacing(12)
+            if icon:
+                self._badge = QLabel()
+                self._badge.setObjectName("CardIcon")
+                self._badge.setFixedSize(32, 32)
+                self._badge.setAlignment(Qt.AlignCenter)
+                header.addWidget(self._badge, 0, Qt.AlignVCenter)
+            text = QVBoxLayout()
+            text.setSpacing(2)
+            text.addWidget(_label(title, "CardTitle"))
             if subtitle:
-                header.addWidget(_label(subtitle, "CardSubtitle"))
+                text.addWidget(_label(subtitle, "CardSubtitle"))
+            header.addLayout(text, 1)
             outer.addLayout(header)
+            outer.addWidget(separator())
 
         self.body = QVBoxLayout()
+        self.body.setContentsMargins(18, 16 if title else 18, 18, 18)
         self.body.setSpacing(12)
-        outer.addLayout(self.body)
+        outer.addLayout(self.body, 1)
+        self._paint_badge(theme.tokens()["accent"])
+
+    def _paint_badge(self, colour: str) -> None:
+        if self._badge is not None:
+            self._badge.setPixmap(icons.pixmap(self._icon, colour, 18))
+
+    def apply_theme(self, tokens: dict[str, str]) -> None:
+        """Recolour the badge glyph; QSS cannot reach a rendered pixmap."""
+        self._paint_badge(tokens["accent"])
 
     def add(self, *widgets: QWidget) -> None:
         for widget in widgets:
@@ -298,7 +336,7 @@ class SliderSpin(QWidget):
             self.spin = QSpinBox()
             self.spin.setRange(int(round(minimum)), int(round(maximum)))
             self.spin.setSingleStep(max(1, int(round(step))))
-        self.spin.setFixedWidth(84)
+        self.spin.setFixedWidth(72)
         self.spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.spin.setAlignment(Qt.AlignCenter)
         # Force a decimal point rather than the system separator: every value
@@ -339,6 +377,111 @@ class SliderSpin(QWidget):
         self.spin.setValue(value if self._decimals else int(round(value)))
 
 
+class _PopupDelegate(QStyledItemDelegate):
+    """Popup rows with a tick on the entry whose text is ``current()``.
+
+    The highlight follows the mouse, so without the tick nothing in an open
+    list says which entry is the one already chosen.  Matched by text rather
+    than row because a completer's rows are a filtered subset.
+    """
+
+    def __init__(self, current: Callable[[], str], parent: QWidget):
+        super().__init__(parent)
+        self._current = current
+
+    def paint(self, painter, option, index) -> None:
+        super().paint(painter, option, index)
+        if index.data(Qt.DisplayRole) != self._current():
+            return
+        colour = option.palette.color(QPalette.Text).name()
+        tick = icons.pixmap("check", colour, 14, 2.2)
+        # Inside the right padding that ``::item`` reserves for it in the QSS.
+        painter.drawPixmap(option.rect.right() - 24, option.rect.center().y() - 7, tick)
+
+
+#: ``popup.qss`` for the current theme, and the tokens it was built from;
+#: see :func:`restyle_popups`.
+_popup_sheet = ""
+_popup_tokens: dict[str, str] = {}
+
+
+def _current_popup_sheet() -> str:
+    global _popup_sheet
+    if not _popup_sheet:
+        _popup_sheet = theme.popup_stylesheet(theme.tokens())
+    return _popup_sheet
+
+
+class _PopupBackground(QObject):
+    """Paints a completer popup's fill and border, which QSS cannot.
+
+    The completer's list is itself the translucent popup window, and Qt never
+    paints a translucent window's styled background.  A dropdown's list sits
+    inside a container window instead, so its QSS fill does show.
+    """
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt's spelling
+        if event.type() == QEvent.Paint:
+            tokens = _popup_tokens or theme.tokens()
+            painter = QPainter(watched)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(QPen(QColor(tokens["border_strong"]), 1))
+            painter.setBrush(QColor(tokens["surface"]))
+            # The radius popup.qss gives the dropdown lists.
+            painter.drawRoundedRect(QRectF(watched.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
+            painter.end()
+        return False
+
+
+def _style_popup(window: QWidget) -> None:
+    """Give a popup window its own sheet, with a rounded border for a shape."""
+    window.setWindowFlag(Qt.NoDropShadowWindowHint, True)
+    window.setAttribute(Qt.WA_TranslucentBackground)
+    window.setStyleSheet(_current_popup_sheet())
+
+
+def restyle_popups(root: QWidget, tokens: dict[str, str]) -> None:
+    """Re-apply ``popup.qss`` to every list popup under ``root``.
+
+    Popups carry their own sheet, so a theme change has to reach them here
+    rather than through the window's.
+    """
+    global _popup_sheet, _popup_tokens
+    _popup_sheet = theme.popup_stylesheet(tokens)
+    _popup_tokens = dict(tokens)
+    for combo in root.findChildren(QComboBox):
+        combo.view().window().setStyleSheet(_popup_sheet)
+    for edit in root.findChildren(QLineEdit):
+        completer = edit.completer()
+        if completer is not None:
+            completer.popup().setStyleSheet(_popup_sheet)
+
+
+def polish_combo(combo: QComboBox) -> None:
+    """The application's dropdown: a list below the field, ticked on the value.
+
+    Needs ``combobox-popup: 0`` from the QSS as well; the default menu-style
+    popup ignores the ``::item`` rules and shows three rows with scroll arrows.
+    """
+    combo.setItemDelegate(
+        _PopupDelegate(lambda: combo.itemText(combo.currentIndex()), combo)
+    )
+    combo.setMaxVisibleItems(12)
+    _style_popup(combo.view().window())
+
+
+def polish_completer(completer: QCompleter, current: Callable[[], str]) -> None:
+    """Style a completer's list like the dropdowns, ticked on ``current()``.
+
+    Its own delegate is a ``QItemDelegate``, which ignores the QSS ``::item``
+    rules, so it is replaced.
+    """
+    popup = completer.popup()
+    popup.setItemDelegate(_PopupDelegate(current, popup))
+    popup.installEventFilter(_PopupBackground(popup))
+    _style_popup(popup)
+
+
 class SearchableCombo(QWidget):
     """A combo box with type-ahead filtering and a refresh button.
 
@@ -355,11 +498,20 @@ class SearchableCombo(QWidget):
         self.combo.setEditable(editable)
         self.combo.setInsertPolicy(QComboBox.NoInsert)
         self.combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._list_closed = QElapsedTimer()
         if editable:
             completer = self.combo.completer()
             completer.setCompletionMode(QCompleter.PopupCompletion)
             completer.setFilterMode(Qt.MatchContains)
             completer.setCaseSensitivity(Qt.CaseInsensitive)
+            polish_completer(
+                completer, lambda: self.combo.itemText(self.combo.currentIndex())
+            )
+            # A click anywhere on the text opens the list, not only the arrow;
+            # typing then narrows the same list.
+            self.combo.lineEdit().installEventFilter(self)
+            completer.popup().installEventFilter(self)
+        polish_combo(self.combo)
 
         # A drawn icon rather than the "↻" character: the glyph came from
         # whatever font happened to have it, at whatever weight and baseline
@@ -367,7 +519,8 @@ class SearchableCombo(QWidget):
         # rest of the icon set.
         self.refresh_button = QPushButton()
         self.refresh_button.setObjectName("IconButton")
-        self.refresh_button.setFixedWidth(34)
+        # Square, at the height of the combo beside it.
+        self.refresh_button.setFixedSize(34, 34)
         self.refresh_button.setIconSize(QSize(15, 15))
         self.refresh_button.setToolTip(_("Rescan"))
         self.refresh_button.clicked.connect(self.refreshRequested)
@@ -381,6 +534,39 @@ class SearchableCombo(QWidget):
         layout.addWidget(self.refresh_button, 0)
 
         self.combo.currentTextChanged.connect(self.currentTextChanged)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt's spelling
+        completer = self.combo.completer()
+        if completer is None:
+            return super().eventFilter(watched, event)
+        popup = completer.popup()
+        if watched is popup and event.type() == QEvent.Hide:
+            self._list_closed.start()
+        elif (
+            watched is self.combo.lineEdit()
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.LeftButton
+            and not popup.isVisible()
+            # The click that dismissed the list can land here as well, and
+            # reopening on it would make clicking away impossible.
+            and not (self._list_closed.isValid() and self._list_closed.elapsed() < 250)
+        ):
+            self._open_list(completer)
+            return True
+        return super().eventFilter(watched, event)
+
+    def _open_list(self, completer: QCompleter) -> None:
+        """Show every entry, the current one highlighted, text ready to replace."""
+        line = self.combo.lineEdit()
+        line.setFocus(Qt.MouseFocusReason)
+        completer.setCompletionPrefix("")
+        completer.complete()
+        row = self.combo.currentIndex()
+        if row >= 0:
+            completer.popup().setCurrentIndex(completer.completionModel().index(row, 0))
+        # After the highlight, which rewrites the text: selected, the first
+        # keystroke replaces it and starts a search instead of appending.
+        line.selectAll()
 
     def _paint_icon(self) -> None:
         self.refresh_button.setIcon(
@@ -448,9 +634,20 @@ class PathPicker(QWidget):
         self._completer: QCompleter | None = None
 
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText(placeholder or "Drop a file here or browse…")
+        self.edit.setPlaceholderText(placeholder or _("Drop a file here or browse…"))
         self.edit.textChanged.connect(self.pathChanged)
         self.edit.installEventFilter(self)
+
+        # The suggestions' dropdown arrow, for when the field is not empty and
+        # a click no longer opens them.  Shown only while there are any.
+        self._icon_colour = theme.tokens()["text_dim"]
+        self._list_action = self.edit.addAction(
+            icons.icon("chevron", self._icon_colour, size=14), QLineEdit.TrailingPosition
+        )
+        self._list_action.setToolTip(_("Show the list"))
+        self._list_action.setVisible(False)
+        self._list_action.triggered.connect(self._open_list)
+        self._list_closed = QElapsedTimer()
 
         self.button = QPushButton(_("Browse"))
         self.button.setFixedWidth(84)
@@ -477,6 +674,9 @@ class PathPicker(QWidget):
         remember a path.
         """
         items = [str(path) for path in paths]
+        if self._completer is not None:
+            self._completer.deleteLater()
+        self._list_action.setVisible(bool(items))
         if not items:
             self.edit.setCompleter(None)
             self._completer = None
@@ -491,10 +691,39 @@ class PathPicker(QWidget):
         completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
         completer.setMaxVisibleItems(12)
         self.edit.setCompleter(completer)
+        polish_completer(completer, self.edit.text)
+        completer.popup().installEventFilter(self)
         self._completer = completer
+
+    def _open_list(self) -> None:
+        """Every suggestion, the current path highlighted."""
+        # The click that dismissed the list can trigger the arrow as well.
+        if self._completer is None or (
+            self._list_closed.isValid() and self._list_closed.elapsed() < 250
+        ):
+            return
+        self._completer.setCompletionPrefix("")
+        self._completer.complete()
+        model = self._completer.completionModel()
+        for row in range(model.rowCount()):
+            index = model.index(row, 0)
+            if index.data() == self.edit.text():
+                self._completer.popup().setCurrentIndex(index)
+                break
+
+    def apply_theme(self, tokens: dict[str, str]) -> None:
+        """Recolour the drawn arrow; QSS cannot reach an action's icon."""
+        self._icon_colour = tokens["text_dim"]
+        self._list_action.setIcon(icons.icon("chevron", self._icon_colour, size=14))
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt's spelling
         if (
+            self._completer is not None
+            and watched is self._completer.popup()
+            and event.type() == QEvent.Hide
+        ):
+            self._list_closed.start()
+        elif (
             watched is self.edit
             and self._completer is not None
             and event.type() in (QEvent.MouseButtonPress, QEvent.FocusIn)
@@ -508,11 +737,11 @@ class PathPicker(QWidget):
     def _browse(self) -> None:
         start = self.edit.text() or os.getcwd()
         if self.mode == "dir":
-            chosen = QFileDialog.getExistingDirectory(self, "Select folder", start)
+            chosen = QFileDialog.getExistingDirectory(self, _("Select folder"), start)
         elif self.mode == "save":
-            chosen, _filter = QFileDialog.getSaveFileName(self, "Save as", start, self.filters)
+            chosen, _filter = QFileDialog.getSaveFileName(self, _("Save as"), start, self.filters)
         else:
-            chosen, _filter = QFileDialog.getOpenFileName(self, "Select file", start, self.filters)
+            chosen, _filter = QFileDialog.getOpenFileName(self, _("Select file"), start, self.filters)
         if chosen:
             self.edit.setText(os.path.normpath(chosen))
 
@@ -531,6 +760,77 @@ class PathPicker(QWidget):
 
     def set_path(self, value: str) -> None:
         self.edit.setText(value or "")
+
+
+class FileList(QWidget):
+    """Several files of the given suffixes: add, remove, or drop them in."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        suffixes: tuple[str, ...],
+        filters: str = "All files (*.*)",
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._suffixes = tuple(suffix.lower() for suffix in suffixes)
+        self.filters = filters
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.setMinimumHeight(96)
+
+        add = QPushButton(_("Add…"))
+        add.clicked.connect(self._browse)
+        remove = QPushButton(_("Remove"))
+        remove.clicked.connect(self._remove_selected)
+        buttons = QVBoxLayout()
+        buttons.setSpacing(6)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        buttons.addStretch(1)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.list, 1)
+        layout.addLayout(buttons)
+        self.setAcceptDrops(True)
+
+    def paths(self) -> list[str]:
+        return [self.list.item(row).text() for row in range(self.list.count())]
+
+    def add_paths(self, paths: Iterable[str]) -> None:
+        present = set(self.paths())
+        for path in paths:
+            path = os.path.normpath(path)
+            if path.lower().endswith(self._suffixes) and path not in present:
+                self.list.addItem(path)
+                present.add(path)
+        self.changed.emit()
+
+    def clear(self) -> None:
+        self.list.clear()
+        self.changed.emit()
+
+    def _remove_selected(self) -> None:
+        for item in self.list.selectedItems():
+            self.list.takeItem(self.list.row(item))
+        self.changed.emit()
+
+    def _browse(self) -> None:
+        start = os.path.dirname(self.paths()[-1]) if self.list.count() else os.getcwd()
+        chosen, _filter = QFileDialog.getOpenFileNames(self, _("Select files"), start, self.filters)
+        self.add_paths(chosen)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        self.add_paths(url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile())
+        event.acceptProposedAction()
 
 
 class Toggle(QCheckBox):

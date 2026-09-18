@@ -17,18 +17,25 @@ msgid ""
 msgstr "# Extrator de checkpoint ⚙️"
 
 msgid ""
+"# Extract a bundle\n"
+"Writes each model back out as `<name>/<name>.pth` and `<name>.index`, the layout Applio pairs by name. Copy those folders into Applio's `logs/`."
+msgstr ""
+"# Extrair um bundle\n"
+"Grava cada modelo de volta como `<nome>/<nome>.pth` e `<nome>.index`, o formato que o Applio pareia pelo nome. Copie essas pastas para o `logs/` do Applio."
+
+msgid ""
 "# Model Bundle Maker\n"
 "Combine one or more RVC `.pth` models into a compressed `{extension}` bundle.\n"
 "\n"
 "- Speaker names come from the `.pth` filenames.\n"
-"- Matching `.index` files are attached automatically.\n"
+"- Each `.index` goes to the model it is named after: the same name, else the model's name without `_<N>e_<N>s` -- `voz_10e_850s.pth` takes `voz.index`, or a lone `voz_spk0.index`.\n"
 "- Single Index binds one uploaded index to every model.\n"
 msgstr ""
 "# Criador de pacotes de modelo\n"
 "Combine um ou mais modelos RVC `.pth` em um pacote `{extension}` comprimido.\n"
 "\n"
 "- Os nomes dos locutores vêm dos nomes dos arquivos `.pth`.\n"
-"- Arquivos `.index` correspondentes são anexados automaticamente.\n"
+"- Cada `.index` vai para o modelo cujo nome ele segue: o mesmo nome, ou o nome do modelo sem `_<N>e_<N>s` -- `voz_10e_850s.pth` recebe `voz.index`, ou um `voz_spk0.index` quando houver só um.\n"
 "- Index único vincula um index enviado a todos os modelos.\n"
 
 msgid "## Download Model"
@@ -97,6 +104,9 @@ msgstr "4 · Treinar"
 msgid "5 · Index"
 msgstr "5 · Index"
 
+msgid "A .srvc under logs/, or type a path."
+msgstr "Um .srvc dentro de logs/, ou digite um caminho."
+
 msgid "A folder under logs/ that already has a config.json."
 msgstr "Uma pasta em logs/ que já possui um config.json."
 
@@ -106,8 +116,14 @@ msgstr "Aceita Hugging Face, Google Drive, Pixeldrain e links diretos."
 msgid "Actual size"
 msgstr "Tamanho real"
 
+msgid "Add at least one .pth file."
+msgstr "Adicione ao menos um arquivo .pth."
+
 msgid "Add silent examples so the model can reproduce silence."
 msgstr "Adiciona exemplos silenciosos para que o modelo consiga reproduzir silêncio."
+
+msgid "Add…"
+msgstr "Adicionar…"
 
 msgid "Adjusting the position more towards one side or the other will make the model more similar to the first or second."
 msgstr "Ajustar a posição mais para um lado ou para o outro deixa o modelo mais parecido com o primeiro ou com o segundo."
@@ -152,7 +168,7 @@ msgid "Applied on the next start. Takes effect immediately when launched with --
 msgstr "Aplicado na próxima inicialização. Tem efeito imediato quando iniciado com --language, que sobrepõe esta configuração."
 
 msgid "Applies to runs started after this is saved. FP16 and BF16 need a CUDA GPU."
-msgstr ""
+msgstr "Vale para os treinos iniciados depois de salvar. FP16 e BF16 precisam de uma GPU CUDA."
 
 msgid "Apply a soft autotune to your inferences, recommended for singing conversions."
 msgstr "Aplica um autotune suave às inferências; recomendado para conversões de canto."
@@ -235,6 +251,9 @@ msgstr "Batch"
 msgid "Batch Size"
 msgstr "Tamanho do batch"
 
+msgid "Batch folder"
+msgstr "Pasta em lote"
+
 msgid "Batch size"
 msgstr "Tamanho do batch"
 
@@ -260,6 +279,9 @@ msgstr ""
 "Desfoca a área de trabalho atrás da janela (Windows 11).\n"
 "Os cartões continuam opacos, então nada que você precise ler fica sobre o papel de parede."
 
+msgid "Both use SoXr. ffmpeg keeps more of the top octave; librosa uses a shorter filter with less pre-ringing on transients."
+msgstr "Ambos usam SoXr. O ffmpeg preserva mais da oitava superior; o librosa usa um filtro mais curto, com menos pre-ringing nos transientes."
+
 msgid "Browse"
 msgstr "Procurar"
 
@@ -274,6 +296,9 @@ msgstr "Construindo index…"
 
 msgid "Builds the retrieval index used at inference time."
 msgstr "Constrói o index de recuperação usado na inferência."
+
+msgid "Bundle"
+msgstr "Bundle"
 
 msgid "Bundle sub-model"
 msgstr "Submodelo do pacote"
@@ -362,6 +387,12 @@ msgstr "Apaga os pesos e logs anteriores antes de treinar."
 msgid "Click the field to pick one already in the custom pretraineds folder."
 msgstr "Clique no campo para escolher um que já esteja na pasta de pretrains customizados."
 
+msgid "Clips per step. Bigger is not better: VRAM is only the ceiling, and 4–8 suits most datasets."
+msgstr "Trechos por passo. Maior não é melhor: a VRAM é só o limite, e 4–8 serve para a maioria dos datasets."
+
+msgid "Combines .pth models, and their indexes, into one compressed .srvc file."
+msgstr "Junta modelos .pth, e seus indexes, num único arquivo .srvc comprimido."
+
 msgid "Comma-separated for multi-GPU."
 msgstr "Separados por vírgula para múltiplas GPUs."
 
@@ -376,6 +407,9 @@ msgstr "Compilar decodificador do vocoder"
 
 msgid "Compression level"
 msgstr "Nível de compressão"
+
+msgid "Config rebuilt."
+msgstr "Config regerada."
 
 msgid "Continuity"
 msgstr "Continuidade"
@@ -425,11 +459,17 @@ msgstr "Não foi possível salvar a cópia: {error}"
 msgid "Could not save the log: {error}"
 msgstr "Não foi possível salvar o log: {error}"
 
+msgid "Create a bundle"
+msgstr "Criar um bundle"
+
 msgid "Create model bundle"
 msgstr "Criar pacote de modelo"
 
 msgid "Creates logs/<name>/. Reuse a name to continue a run."
 msgstr "Cria logs/<nome>/. Reutilize um nome para continuar uma execução."
+
+msgid "Creating model bundle…"
+msgstr "Criando o bundle…"
 
 msgid "Custom Pretrained"
 msgstr "Pré-treinado personalizado"
@@ -527,6 +567,12 @@ msgstr "Solte um arquivo .pth e um .index para copiá-los para a pasta de modelo
 msgid "Drop a .pth or .srvc here"
 msgstr "Solte um .pth ou .srvc aqui"
 
+msgid "Drop a file here or browse…"
+msgstr "Solte um arquivo aqui ou procure…"
+
+msgid "Drop an audio file here"
+msgstr "Solte um arquivo de áudio aqui"
+
 msgid "Drop an audio file here or browse…"
 msgstr "Solte um arquivo de áudio aqui ou procure…"
 
@@ -544,6 +590,9 @@ msgstr "Modelo embedder"
 
 msgid "Embedders and pitch models"
 msgstr "Embedders e modelos de pitch"
+
+msgid "Empty extracts to logs/<bundle>_extracted."
+msgstr "Vazio extrai para logs/<bundle>_extracted."
 
 msgid "Empty saves to logs using the first model name."
 msgstr "Vazio salva em logs usando o nome do primeiro modelo."
@@ -638,8 +687,17 @@ msgstr "Extrair características"
 msgid "Extract Small Model"
 msgstr "Extrair modelo compacto"
 
+msgid "Extract a bundle"
+msgstr "Extrair um bundle"
+
+msgid "Extract bundle"
+msgstr "Extrair bundle"
+
 msgid "Extracting features…"
 msgstr "Extraindo características…"
+
+msgid "Extracting model bundle…"
+msgstr "Extraindo o bundle…"
 
 msgid "Extraction"
 msgstr "Extração"
@@ -660,13 +718,13 @@ msgid "F0-guided model"
 msgstr "Modelo guiado por F0"
 
 msgid "FP16 uses a GradScaler; BF16 needs none and keeps precision-sensitive paths in FP32."
-msgstr ""
+msgstr "O FP16 usa um GradScaler; o BF16 dispensa e mantém em FP32 as partes sensíveis à precisão."
 
 msgid "FP16: less VRAM and faster steps, with a GradScaler. BF16 has no native kernels on this GPU."
-msgstr ""
+msgstr "FP16: menos VRAM e passos mais rápidos, com um GradScaler. O BF16 não tem kernels nativos nesta GPU."
 
 msgid "FP16: less VRAM and faster steps, with a GradScaler. BF16: no scaler; precision-sensitive paths stay in FP32."
-msgstr ""
+msgstr "FP16: menos VRAM e passos mais rápidos, com um GradScaler. BF16: sem scaler; as partes sensíveis à precisão ficam em FP32."
 
 msgid "Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."
 msgstr "Silencia a saída onde a entrada está mais baixa que isto, em dBFS. Silêncio não tem nível para o codificador de conteúdo, então o modelo o preenche com chiado. -120 desliga o gate."
@@ -908,6 +966,9 @@ msgstr "Método de index para datasets grandes."
 msgid "Index one speaker only"
 msgstr "Indexar apenas um speaker"
 
+msgid "Indexes (optional)"
+msgstr "Indexes (opcional)"
+
 msgid "Inference"
 msgstr "Inferência"
 
@@ -985,9 +1046,6 @@ msgstr "Idioma definido como {name}."
 
 msgid "Language set to {name}. Restart the interface to apply it."
 msgstr "Idioma definido como {name}. Reinicie a interface para aplicá-lo."
-
-msgid "Language: {name}"
-msgstr "Idioma: {name}"
 
 msgid "Larger batches need more VRAM. Reduce the value if training runs out of memory."
 msgstr "Batches maiores exigem mais VRAM. Reduza o valor se o treinamento ficar sem memória."
@@ -1079,6 +1137,9 @@ msgstr "Modelo usado para as características do locutor."
 msgid "Model used to extract speaker-independent content features."
 msgstr "Modelo usado para extrair características de conteúdo independentes do locutor."
 
+msgid "Models"
+msgstr "Modelos"
+
 msgid "Move existing checkpoints aside"
 msgstr "Mover os checkpoints existentes para o lado"
 
@@ -1108,6 +1169,9 @@ msgstr "Vizinhos"
 
 msgid "Next"
 msgstr "Próximo"
+
+msgid "No audio loaded"
+msgstr "Nenhum áudio carregado"
 
 msgid "No preview image for this epoch."
 msgstr "Sem imagem de preview para esta época."
@@ -1211,8 +1275,14 @@ msgstr "Duração da sobreposição"
 msgid "Overtrain detector"
 msgstr "Detector de overtraining"
 
+msgid "Overwrite existing files"
+msgstr "Sobrescrever arquivos existentes"
+
 msgid "PTH file to export."
 msgstr "Arquivo .pth a exportar."
+
+msgid "Paired by name: voz_10e_850s.pth takes voz_10e_850s.index, else voz.index, else a lone voz_spk<N>.index."
+msgstr "Pareado pelo nome: voz_10e_850s.pth recebe voz_10e_850s.index, senão voz.index, senão um voz_spk<N>.index quando houver só um."
 
 msgid "Path for infer outputs"
 msgstr "Caminho das saídas de inferência"
@@ -1263,7 +1333,7 @@ msgid "Pitch shift in semitones. 12 = one octave up."
 msgstr "Deslocamento de pitch em semitons. 12 = uma oitava acima."
 
 msgid "Precision"
-msgstr ""
+msgstr "Precisão"
 
 msgid "Prepare a dataset and train a voice, one step at a time."
 msgstr "Prepare um dataset e treine uma voz, uma etapa por vez."
@@ -1310,6 +1380,9 @@ msgstr "Configurações de pré-treinado personalizado"
 msgid "Pretrained model downloaded successfully!"
 msgstr "Modelo pré-treinado baixado com sucesso!"
 
+msgid "Preview unavailable ({error})"
+msgstr "Prévia indisponível ({error})"
+
 msgid "Previews"
 msgstr "Previews"
 
@@ -1340,9 +1413,6 @@ msgstr "Correção de registro agudo do RMVPE"
 msgid "RMVPE is the recommended default. CREPE is an alternative for clean audio."
 msgstr "RMVPE é o padrão recomendado. CREPE é uma alternativa para áudio limpo."
 
-msgid "Raise until VRAM is nearly full, then stop."
-msgstr "Aumente até a VRAM ficar quase cheia e pare."
-
 msgid "Ratio"
 msgstr "Proporção"
 
@@ -1360,6 +1430,9 @@ msgstr "Lendo checkpoint…"
 
 msgid "Reading history…"
 msgstr "Lendo histórico…"
+
+msgid "Reading waveform…"
+msgstr "Lendo forma de onda…"
 
 msgid "Reads the metadata stored in a checkpoint."
 msgstr "Lê os metadados armazenados em um checkpoint."
@@ -1393,6 +1466,9 @@ msgstr "Atualizar modelos, indexes e áudios"
 
 msgid "Refresh the list to use the uploaded pretrained file."
 msgstr "Atualize a lista para usar o arquivo pré-treinado enviado."
+
+msgid "Remove"
+msgstr "Remover"
 
 msgid "Remove DC offset and low-frequency noise."
 msgstr "Remove o offset DC e o ruído de baixa frequência."
@@ -1437,13 +1513,13 @@ msgid "Run preprocessing"
 msgstr "Executar pré-processamento"
 
 msgid "Runs started from now on train in FP32 with TF32 tensor cores."
-msgstr ""
+msgstr "Os treinos iniciados a partir de agora usam FP32 com tensor cores TF32."
 
 msgid "Runs started from now on use BF16 autocast without a GradScaler; precision-sensitive paths stay in FP32."
-msgstr ""
+msgstr "Os treinos iniciados a partir de agora usam autocast BF16 sem GradScaler; as partes sensíveis à precisão ficam em FP32."
 
 msgid "Runs started from now on use FP16 autocast with a GradScaler."
-msgstr ""
+msgstr "Os treinos iniciados a partir de agora usam autocast FP16 com GradScaler."
 
 msgid "Sample Rate of the model (sr)"
 msgstr "Taxa de amostragem do modelo (sr)"
@@ -1465,6 +1541,9 @@ msgstr "Salvar uma cópia como"
 
 msgid "Save a copy…"
 msgstr "Salvar uma cópia…"
+
+msgid "Save as"
+msgstr "Salvar como"
 
 msgid "Save every N epochs"
 msgstr "Salvar a cada N epochs"
@@ -1532,8 +1611,17 @@ msgstr "Selecione um experimento primeiro."
 msgid "Select an experiment to see what its config was written for."
 msgstr "Selecione um experimento para ver para que o config dele foi escrito."
 
+msgid "Select file"
+msgstr "Selecionar arquivo"
+
 msgid "Select file to import"
 msgstr "Selecionar arquivo a importar"
+
+msgid "Select files"
+msgstr "Selecionar arquivos"
+
+msgid "Select folder"
+msgstr "Selecionar pasta"
 
 msgid "Select one that corresponds to your training."
 msgstr "Selecione uma que corresponda ao seu treinamento."
@@ -1586,6 +1674,9 @@ msgstr "Desloca os formantes vocais quando necessário."
 msgid "Show in folder"
 msgstr "Mostrar na pasta"
 
+msgid "Show the list"
+msgstr "Mostrar a lista"
+
 msgid "Show the unsmoothed trace behind each line."
 msgstr "Mostra o traço sem suavização atrás de cada linha."
 
@@ -1606,6 +1697,9 @@ msgstr "Similaridade"
 
 msgid "Simple cuts on a fixed grid; Automatic detects silence by level, New Automatic by neural VAD."
 msgstr "Simple corta em uma grade fixa; Automatic detecta o silêncio por nível, New Automatic por VAD neural."
+
+msgid "Single file"
+msgstr "Arquivo único"
 
 msgid "Single index"
 msgstr "Index único"
@@ -1657,6 +1751,9 @@ msgstr "ID do locutor para modelos multi-locutor."
 
 msgid "Speaker id inside a multi-speaker model."
 msgstr "ID do locutor dentro de um modelo multi-locutor."
+
+msgid "Speaker names come from the .pth file names."
+msgstr "Os nomes dos locutores vêm dos nomes dos arquivos .pth."
 
 msgid "Speaker to index"
 msgstr "Speaker a indexar"
@@ -1815,6 +1912,9 @@ msgstr "A arquitetura para a qual o config regerado será escrito."
 msgid "The archive is unpacked into logs/."
 msgstr "O arquivo é descompactado em logs/."
 
+msgid "The arrow lists audios converted before and the ones in assets/audios."
+msgstr "A seta lista os áudios já convertidos e os que estão em assets/audios."
+
 msgid "The audio you want converted."
 msgstr "O áudio que você quer converter."
 
@@ -1891,7 +1991,7 @@ msgid "This GPU has no FP16 tensor cores: autocast still halves activation memor
 msgstr "Esta GPU não tem tensor cores para FP16: o autocast ainda reduz pela metade a memória das ativações, mas pode não deixar os passos mais rápidos."
 
 msgid "This GPU has no native BF16 support, so it would be emulated and slow."
-msgstr ""
+msgstr "Esta GPU não tem suporte nativo a BF16, então ele seria emulado e ficaria lento."
 
 msgid "This run has not written validation previews yet. They appear every few hundred steps once training starts."
 msgstr "Este treino ainda não gravou previews de validação. Eles aparecem a cada algumas centenas de steps depois que o treino começa."
@@ -1927,7 +2027,7 @@ msgid "Training is running; the new language applies at the next start."
 msgstr "O treinamento está em andamento; o novo idioma será aplicado na próxima inicialização."
 
 msgid "Training precision"
-msgstr ""
+msgstr "Precisão do treino"
 
 msgid "Training status."
 msgstr "Status do treinamento."
@@ -2073,6 +2173,9 @@ msgstr "Qual voz dentro do pacote .srvc usar."
 msgid "Window"
 msgstr "Janela"
 
+msgid "Writes each model back out as <name>/<name>.pth and .index, the layout Applio pairs by name."
+msgstr "Grava cada modelo de volta como <nome>/<nome>.pth e .index, o formato que o Applio pareia pelo nome."
+
 msgid "Written to logs/ under this name."
 msgstr "Gravado em logs/ com este nome."
 
@@ -2114,9 +2217,6 @@ msgstr "https://…"
 
 msgid "l2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally."
 msgstr "l2 é o que o RVC original constrói. O cosseno compara apenas a direção, então uma tomada baixa e uma alta do mesmo som combinam igualmente."
-
-msgid "Both use SoXr. ffmpeg keeps more of the top octave; librosa uses a shorter filter with less pre-ringing on transients."
-msgstr "Ambos usam SoXr. O ffmpeg preserva mais da oitava superior; o librosa usa um filtro mais curto, com menos pre-ringing nos transientes."
 
 msgid "max-autotune spends longer compiling for a faster steady state."
 msgstr "max-autotune passa mais tempo compilando para chegar a um regime estável mais rápido."

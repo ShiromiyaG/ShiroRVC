@@ -206,6 +206,11 @@ def list_models() -> list[str]:
     return sorted(found, key=sort_key)
 
 
+def list_bundles() -> list[str]:
+    """Model bundles (``.srvc``) under ``logs/``, repo-relative."""
+    return [path for path in list_models() if path.lower().endswith(".srvc")]
+
+
 def list_indexes() -> list[str]:
     """Faiss indexes under ``logs/``, repo-relative."""
     found = []
@@ -230,13 +235,16 @@ def guess_index_for(model_path: str) -> str:
 
 
 def list_audios() -> list[str]:
-    """Audio files sitting directly in ``assets/audios``."""
+    """Inputs sitting directly in ``assets/audios``, where the Gradio tab keeps
+    every upload.  Conversion results are left out, as the Gradio list does."""
     if not paths.AUDIO_DIR.is_dir():
         return []
     return sorted(
         paths.relative(p)
         for p in paths.AUDIO_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+        if p.is_file()
+        and p.suffix.lower() in AUDIO_EXTENSIONS
+        and OUTPUT_SUFFIX not in p.stem
     )
 
 

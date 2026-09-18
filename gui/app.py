@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, __version__, theme
 from .services import engine, paths, prefs
 from . import native
-from .widgets import dock, effects, icons, scrollguard
+from .widgets import audio, dock, effects, forms, icons, scrollguard
 from .widgets.dock import FloatingDock
 from .widgets.navlist import NavList
 from .widgets.console import LogConsole
@@ -138,6 +138,7 @@ class Sidebar(effects.ChromePanel):
         self.language_button = QPushButton()
         self.language_button.setObjectName("Ghost")
         self.language_button.setCursor(Qt.PointingHandCursor)
+        self.language_button.setIconSize(QSize(16, 16))
         self.language_button.setToolTip(
             _(
                 "Interface language. Remembered between sessions and applied "
@@ -174,6 +175,7 @@ class Sidebar(effects.ChromePanel):
             self.list.item(row).setIcon(
                 icons.icon(glyph, tokens["text_faint"], tokens["accent"])
             )
+        self.language_button.setIcon(icons.icon("globe", tokens["text_dim"], size=16))
         going_light = mode == "dark"
         self.theme_button.setText(_("Light theme") if going_light else _("Dark theme"))
         self.theme_button.setIcon(
@@ -187,9 +189,9 @@ class Sidebar(effects.ChromePanel):
         self.backdrop_button.setText(_("Backdrop: {name}").format(name=name))
 
     def update_language_label(self) -> None:
-        self.language_button.setText(
-            _("Language: {name}").format(name=i18n.language_name(i18n.current_language()))
-        )
+        # The name alone: the globe says what it is, and the longer
+        # "Language: …" label did not fit the sidebar.
+        self.language_button.setText(i18n.language_name(i18n.current_language()))
 
 
 class MainWindow(QMainWindow):
@@ -500,6 +502,7 @@ class MainWindow(QMainWindow):
         self.status.apply_theme(tokens)
         for page in self.pages:
             page.apply_theme(tokens)
+        forms.restyle_popups(self, tokens)
 
     def _elevate_cards(self) -> None:
         """Attach or drop card shadows, according to the theme.
@@ -764,6 +767,7 @@ def run() -> int:
 
     # Before any window exists, so no control is ever briefly wheel-editable.
     scrollguard.install(application)
+    audio.quiet_media_logs()
 
     paths.ensure_dirs()
 

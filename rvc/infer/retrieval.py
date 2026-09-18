@@ -25,8 +25,8 @@ RVC model was tuned against:
     candidates chosen for the neighbouring source frames.  Frame-independent
     search is free to jump between unrelated parts of the dataset twenty times a
     second, and that jitter smears exactly the fine articulation the retrieval
-    exists to sharpen.  Needs the sidecar's provenance, so it is inactive for
-    indexes built elsewhere.
+    exists to sharpen.  Needs the provenance this fork stores with the index
+    (see ``rvc.lib.index_meta``), so it is inactive for indexes built elsewhere.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class RetrievalConfig:
 
 
 class IndexRetriever:
-    """Holds an index, its sidecar, and the device-side copies of both."""
+    """Holds an index, its metadata, and the device-side copies of both."""
 
     def __init__(self, index, meta=None, device="cpu"):
         self.index = index
@@ -340,7 +340,7 @@ class IndexRetriever:
         if self.meta.is_cosine:
             # The index stores directions.  Rescaling to the query's own norm
             # keeps the source's energy envelope intact and takes only the
-            # articulation from the dataset -- and it means a lost sidecar can
+            # articulation from the dataset -- and it means lost metadata can
             # never hand the generator a unit vector where a feature belongs.
             retrieved = torch.nn.functional.normalize(retrieved, dim=-1) * query.norm(
                 dim=-1, keepdim=True
@@ -351,7 +351,7 @@ class IndexRetriever:
 
 
 def load_retriever(index_path, device="cpu"):
-    """Read an index and its sidecar, or return ``None`` if there is nothing to read."""
+    """Read an index and its metadata, or return ``None`` if there is nothing to read."""
     if not index_path or not os.path.exists(index_path):
         return None
     try:

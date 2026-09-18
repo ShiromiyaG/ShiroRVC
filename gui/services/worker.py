@@ -130,7 +130,12 @@ def cmd_blend(args):
 
 
 def cmd_download(args):
-    return {"message": _core().run_download_script(**args)}
+    # The pipeline rather than core's wrapper: that one returns a failure as a
+    # message, which would reach the window as a success.
+    from rvc.lib.extras.model_download import model_download_pipeline
+
+    folder = model_download_pipeline(args["model_link"])
+    return {"message": f"Model downloaded to {os.path.relpath(folder)}."}
 
 
 def cmd_prerequisites(args):
@@ -145,18 +150,67 @@ def cmd_analyze(args):
 def cmd_speakers(args):
     """Speaker ids stored in a checkpoint.
 
-    Reads through the same helper the Gradio tab uses so bundles and plain
-    ``.pth`` files behave identically.
+    The same ``rvc.lib`` helper the Gradio tab calls, so bundles and plain
+    ``.pth`` files behave identically -- without importing that tab, which
+    would bring Gradio and its folder scans into the worker.
     """
-    from tabs.inference.inference import get_speakers_id
+    from rvc.lib.model_bundle import speaker_ids
 
-    return {"speakers": list(get_speakers_id(args.get("model"), args.get("sub_model")))}
+    model = args.get("model")
+    if not model or not os.path.isfile(model):
+        return {"speakers": [0]}
+    try:
+        return {"speakers": speaker_ids(model, args.get("sub_model"))}
+    except Exception as error:  # noqa: BLE001 - as the Gradio tab: fall back to one speaker
+        note(f"Could not read the model's speaker IDs: {error}")
+        return {"speakers": [0]}
 
 
 def cmd_bundle_models(args):
-    from tabs.inference.inference import get_bundle_model_names
+    from rvc.lib.model_bundle import bundle_model_names, is_model_bundle
 
-    return {"names": list(get_bundle_model_names(args.get("model")))}
+    model = args.get("model")
+    if not model or not is_model_bundle(model) or not os.path.isfile(model):
+        return {"names": []}
+    try:
+        return {"names": bundle_model_names(model)}
+    except Exception as error:  # noqa: BLE001 - as the Gradio tab: no sub-models to offer
+        note(f"Could not inspect the model bundle: {error}")
+        return {"names": []}
+
+
+def cmd_bundle_create(args):
+    from pathlib import Path
+
+    from rvc.lib import model_bundle
+
+    pth_paths = [Path(path) for path in args.get("pth_paths") or []]
+    output = model_bundle.resolve_bundle_path(
+        args.get("output_path"), args["logs_dir"], pth_paths
+    )
+    details = model_bundle.create_model_bundle(
+        pth_paths,
+        args.get("index_paths") or [],
+        output,
+        bool(args.get("single_index")),
+        int(args.get("compression", 3)),
+    )
+    return {"message": f"Bundle saved to {output}", "output": str(output), "details": details}
+
+
+def cmd_bundle_extract(args):
+    from pathlib import Path
+
+    from rvc.lib import model_bundle
+
+    bundle = Path(args["bundle"])
+    output = Path(args.get("output_dir") or Path(args["logs_dir"]) / f"{bundle.stem}_extracted")
+    reports = model_bundle.extract_model_bundle(bundle, output, bool(args.get("overwrite")))
+    return {
+        "message": f"Extracted to {output}",
+        "output": str(output),
+        "details": model_bundle.extraction_report(reports),
+    }
 
 
 def cmd_gpu_info(args):
@@ -196,6 +250,8 @@ HANDLERS = {
     "analyze": cmd_analyze,
     "speakers": cmd_speakers,
     "bundle_models": cmd_bundle_models,
+    "bundle_create": cmd_bundle_create,
+    "bundle_extract": cmd_bundle_extract,
     "gpu_info": cmd_gpu_info,
 }
 

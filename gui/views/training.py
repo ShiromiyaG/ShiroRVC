@@ -144,7 +144,7 @@ class TrainingPage(Page):
         return holder
 
     def _build_model_card(self) -> Card:
-        card = Card(_("1 · Model"), _("Names the run and decides the architecture."))
+        card = Card(_("1 · Model"), _("Names the run and decides the architecture."), icon="chip")
 
         self.model_name = SearchableCombo()
         self.model_name.refreshRequested.connect(self._refresh_models)
@@ -173,7 +173,7 @@ class TrainingPage(Page):
         return card
 
     def _build_preprocess_card(self) -> Card:
-        card = Card(_("2 · Preprocess"), _("Slice and normalise the dataset."))
+        card = Card(_("2 · Preprocess"), _("Slice and normalise the dataset."), icon="waveform")
 
         self.dataset = PathPicker(mode="dir", placeholder=_("Folder with your training audio"))
         card.add(Field(_("Dataset folder"), self.dataset, _("Every audio file below this folder is used.")))
@@ -242,7 +242,7 @@ class TrainingPage(Page):
         return card
 
     def _build_extract_card(self) -> Card:
-        card = Card(_("3 · Extract features"), _("Pitch curves and content embeddings."))
+        card = Card(_("3 · Extract features"), _("Pitch curves and content embeddings."), icon="search")
 
         self.extract_f0 = SearchableCombo(editable=False)
         self.extract_f0.refresh_button.hide()
@@ -296,7 +296,7 @@ class TrainingPage(Page):
         return card
 
     def _build_train_card(self) -> Card:
-        card = Card(_("4 · Train"), _("The long part."))
+        card = Card(_("4 · Train"), _("The long part."), icon="trend")
 
         self.total_epochs = SliderSpin(1, 10000, 1, decimals=0, value=500)
         self.batch_size = SliderSpin(1, 64, 1, decimals=0, value=8)
@@ -305,7 +305,10 @@ class TrainingPage(Page):
         row = QHBoxLayout()
         row.setSpacing(12)
         row.addWidget(Field(_("Total epochs"), self.total_epochs, ""))
-        row.addWidget(Field(_("Batch size"), self.batch_size, _("Raise until VRAM is nearly full, then stop.")))
+        row.addWidget(Field(_("Batch size"), self.batch_size, _(
+            "Clips per step. Bigger is not better: VRAM is only the ceiling, "
+            "and 4–8 suits most datasets."
+        )))
         row.addWidget(Field(_("Save every N epochs"), self.save_every, ""))
         card.body.addLayout(row)
 
@@ -435,7 +438,7 @@ class TrainingPage(Page):
         return card
 
     def _build_index_card(self) -> Card:
-        card = Card(_("5 · Index"), _("Builds the retrieval index used at inference time."))
+        card = Card(_("5 · Index"), _("Builds the retrieval index used at inference time."), icon="folder")
         self.index_algorithm = SearchableCombo(editable=False)
         self.index_algorithm.refresh_button.hide()
         self.index_algorithm.set_items(catalog.INDEX_ALGORITHMS)

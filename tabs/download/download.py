@@ -68,9 +68,9 @@ def fetch_pretrained_data():
             os.path.join(pretraineds_custom_path, json_url.split("/")[-1]), "r"
         ) as f:
             data = json.load(f)
-    except:
+    except (OSError, ValueError):
         try:
-            response = requests.get(json_url)
+            response = requests.get(json_url, timeout=15)
             response.raise_for_status()
             data = response.json()
             with open(
@@ -85,7 +85,7 @@ def fetch_pretrained_data():
                     separators=(",", ": "),
                     ensure_ascii=False,
                 )
-        except:
+        except (requests.RequestException, OSError, ValueError):
             data = {
                 "Titan": {
                     "32k": {"D": "null", "G": "null"},

@@ -65,8 +65,14 @@ QWidget {
 }
 
 #NavList::item:hover {
-    background: @accent_ghost@;
+    background: @hover_wash@;
     color: @text@;
+}
+
+/* The footer switches line up with the nav rows instead of centring. */
+#Sidebar QPushButton#Ghost {
+    text-align: left;
+    padding: 8px 10px;
 }
 
 #NavList::item:selected {
@@ -158,14 +164,20 @@ QPushButton#Chip:disabled {
     color: @text_faint@;
 }
 
+#CardIcon {
+    background: @accent_ghost@;
+    border: 1px solid @accent_soft@;
+    border-radius: 9px;
+}
+
 #CardTitle {
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 600;
     color: @text@;
 }
 
 #CardSubtitle {
-    font-size: 11px;
+    font-size: 12px;
     color: @text_faint@;
 }
 
@@ -203,6 +215,7 @@ QTreeWidget::branch {
 #FieldLabel {
     color: @text@;
     font-size: 12px;
+    font-weight: 500;
 }
 
 #FieldHint {
@@ -223,9 +236,16 @@ QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     border: 1px solid @border@;
     border-radius: 8px;
     padding: 6px 9px;
-    selection-background-color: @accent@;
-    selection-color: #ffffff;
-    min-height: 18px;
+    /* A wash rather than solid accent: a whole selected path read as a slab. */
+    selection-background-color: @accent_selection@;
+    selection-color: @text@;
+    min-height: 20px;
+}
+
+/* Capped as well: a spin box's own size hint came out taller than the fields
+ * beside it. */
+QSpinBox, QDoubleSpinBox {
+    max-height: 20px;
 }
 
 QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover,
@@ -274,14 +294,10 @@ QComboBox::down-arrow:on {
     image: @chevron_glyph_accent@;
 }
 
-QComboBox QAbstractItemView {
-    background: @surface@;
-    border: 1px solid @border_strong@;
-    border-radius: 8px;
-    padding: 4px;
-    outline: none;
-    selection-background-color: @accent_soft@;
-    selection-color: @text@;
+/* A list below the field rather than the menu-style popup, which ignores the
+ * ``::item`` rules.  The list's own look is in popup.qss. */
+QComboBox {
+    combobox-popup: 0;
 }
 
 QSpinBox::up-button, QDoubleSpinBox::up-button,
@@ -385,6 +401,34 @@ QPushButton#IconButton:hover {
     color: @text@;
 }
 
+/* Restated per ID: ``QPushButton:disabled`` loses to an ID selector, so these
+ * two kept their enabled colour while disabled. */
+QPushButton#Ghost:disabled, QPushButton#IconButton:disabled {
+    background: transparent;
+    color: @text_faint@;
+}
+
+QPushButton#IconButton:disabled {
+    border-color: @border@;
+}
+
+/* Fixed at 32 x 32 in code, so 16 is exactly round. */
+QPushButton#PlayButton {
+    background: @accent_soft@;
+    border: 1px solid transparent;
+    border-radius: 16px;
+    padding: 0;
+}
+
+QPushButton#PlayButton:hover {
+    border-color: @accent@;
+}
+
+QPushButton#PlayButton:disabled {
+    background: @surface_alt@;
+    border-color: @border@;
+}
+
 /* ---- checkboxes ---------------------------------------------------- */
 
 QCheckBox {
@@ -447,43 +491,40 @@ QRadioButton::indicator:checked {
 
 /* ---- sliders ------------------------------------------------------- */
 
-/* The track reads as a channel cut into the card rather than a bar laid on
- * top of it: same inset treatment as the input fields, so a slider and a text
- * field at the same size look like the same kind of control. */
-QSlider::groove:horizontal {
-    height: 6px;
-    border-radius: 4px;
-    background: @input@;
-    border: 1px solid @border@;
+/* Tall enough for the handle: at its natural height the widget clipped the
+ * handle's top row. */
+QSlider {
+    min-height: 20px;
 }
 
-/* Lit end, with a slight left-to-right lift so a long fill is not a flat
- * block of accent. */
+QSlider::groove:horizontal {
+    height: 4px;
+    border-radius: 2px;
+    background: @border_strong@;
+    border: none;
+}
+
 QSlider::sub-page:horizontal {
-    background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0,
-        stop: 0 @accent_pressed@, stop: 1 @accent@);
-    border: 1px solid @accent@;
-    border-radius: 4px;
+    background: @accent@;
+    border: none;
+    border-radius: 2px;
 }
 
 QSlider::add-page:horizontal {
     background: transparent;
-    border-radius: 4px;
+    border-radius: 2px;
 }
 
-/* A pale core inside an accent ring, which stays legible against both sides
- * of the track -- a solid accent dot disappears into the fill it sits at the
- * end of. */
-/* ``border-radius`` is measured against the *content* box, so it has to be
- * half of ``width`` -- the border is drawn outside that and rounds with it.
- * Setting it to half the outer size instead squares the handle off. */
+/* A pale core inside an accent ring, legible against both sides of the track.
+ * Qt takes the handle's height from the groove (4 + 2 * 6) and its width from
+ * ``width`` + border (12 + 2 * 2); both must be 16 for the radius to make a
+ * circle -- a radius above half either side squares it off. */
 QSlider::handle:horizontal {
     width: 12px;
-    height: 12px;
-    margin: -5px 0;
-    border-radius: 6px;
+    margin: -6px 0;
+    border-radius: 8px;
     background: @knob@;
-    border: 3px solid @accent@;
+    border: 2px solid @accent@;
 }
 
 QSlider::handle:horizontal:hover {
@@ -516,23 +557,26 @@ QTabWidget::pane {
     top: -1px;
 }
 
+/* Pills, drawn like the sidebar's selection so the two read as one system. */
 QTabBar::tab {
     background: transparent;
     color: @text_dim@;
-    padding: 8px 16px;
-    margin-right: 4px;
-    border: none;
-    border-bottom: 2px solid transparent;
+    padding: 7px 16px;
+    margin-right: 6px;
+    border: 1px solid transparent;
+    border-radius: 8px;
 }
 
 QTabBar::tab:hover {
     color: @text@;
+    background: @hover_wash@;
 }
 
 QTabBar::tab:selected {
     color: @text@;
     font-weight: 600;
-    border-bottom: 2px solid @accent@;
+    background: @accent_ghost@;
+    border-color: @accent_soft@;
 }
 
 /* ---- scrollbars ---------------------------------------------------- */

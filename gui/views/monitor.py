@@ -31,7 +31,7 @@ from ..services import runwatch
 from ..services.runwatch import ReadSignals
 from ..services.tbreader import RunReader
 from ..widgets.audio import AudioPlayer
-from ..widgets.forms import Card, ghost_button
+from ..widgets.forms import Card, ghost_button, polish_combo
 from ..widgets.gallery import PreviewGallery
 from ..widgets.metrics import MetricsPanel
 
@@ -89,6 +89,7 @@ class MonitorPage(Page):
         row.setSpacing(10)
 
         self.run_picker = QComboBox()
+        polish_combo(self.run_picker)
         self.run_picker.setMinimumWidth(280)
         self.run_picker.currentIndexChanged.connect(self._on_run_selected)
 
@@ -152,6 +153,7 @@ class MonitorPage(Page):
         row = QHBoxLayout()
         row.setSpacing(10)
         self.audio_picker = QComboBox()
+        polish_combo(self.audio_picker)
         self.audio_picker.setMinimumWidth(220)
         self.audio_picker.currentIndexChanged.connect(self._on_audio_epoch)
         row.addWidget(QLabel(_("Epoch")))
@@ -161,7 +163,7 @@ class MonitorPage(Page):
 
         # Generated above original: the question this screen answers is "what
         # does it sound like now", and the reference is what you compare to.
-        card = Card(_("Validation sample"))
+        card = Card(_("Validation sample"), icon="waveform")
         self.audio_generated = AudioPlayer(_("Generated"))
         self.audio_original = AudioPlayer(_("Original"))
         card.add(self.audio_generated, self.audio_original)

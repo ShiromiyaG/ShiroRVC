@@ -15,11 +15,10 @@ from core import (
 from rvc.lib.terminal import warning
 from rvc.lib.text import format_title
 from rvc.lib.model_bundle import (
-    get_bundle_models,
-    get_bundle_model_state,
+    bundle_model_names,
     is_model_bundle,
     is_model_file,
-    load_model_bundle,
+    speaker_ids,
     walk_models,
 )
 from tabs.settings.sections.restart import stop_infer
@@ -296,7 +295,7 @@ def match_index(model_file_value):
     try:
         files_in_dir = os.listdir(model_dir)
         index_files = [f for f in files_in_dir if f.endswith(".index")]
-    except:
+    except OSError:
         return ""
 
     if not index_files:
@@ -321,19 +320,7 @@ def get_speakers_id(model, sub_model_name=None):
     if not model or not os.path.exists(os.path.join(now_dir, model)):
         return [0]
     try:
-        if is_model_bundle(model):
-            model_data = load_model_bundle(os.path.join(now_dir, model))
-            model_state = get_bundle_model_state(model_data, sub_model_name)
-            speakers_id = model_state.get("speakers_id") if model_state else None
-        else:
-            import torch
-
-            model_data = torch.load(os.path.join(now_dir, model), map_location="cpu", weights_only=True)
-            speakers_id = model_data.get("speakers_id") if isinstance(model_data, dict) else None
-        if speakers_id:
-            return list(range(speakers_id))
-        else:
-            return [0]
+        return speaker_ids(os.path.join(now_dir, model), sub_model_name)
     except Exception as e:
         warning(f"Could not read the model's speaker IDs: {e}", tag="[INFER]")
         return [0]
@@ -343,8 +330,7 @@ def get_bundle_model_names(model):
     if not model or not is_model_bundle(model) or not os.path.exists(os.path.join(now_dir, model)):
         return []
     try:
-        model_data = load_model_bundle(os.path.join(now_dir, model))
-        return sorted(get_bundle_models(model_data).keys())
+        return bundle_model_names(os.path.join(now_dir, model))
     except Exception as e:
         warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []

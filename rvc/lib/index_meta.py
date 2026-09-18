@@ -1,16 +1,19 @@
-"""Sidecar metadata for FAISS retrieval indexes.
+"""Metadata for FAISS retrieval indexes, embedded after the index data.
 
-A ``.index`` file describes vectors and nothing else.  What this fork wants at
+A FAISS index describes vectors and nothing else.  What this fork wants at
 inference time and cannot express inside it is **where each vector came from**
 -- which utterance, which frame -- because the temporal-continuity bonus has to
 know whether two candidates are consecutive frames of the same recording.
 
-That lives in a sidecar next to the index, ``<name>.index.meta.npz``.  The
-separation is deliberate: an index produced by upstream RVC v2 simply has no
-sidecar, :func:`read` returns ``None``, and the caller falls back to
-:func:`legacy_meta`, which describes exactly what the bare file can support --
-L2 search over the stored vectors, no provenance.  Copying a ``.index`` around
-without its sidecar therefore degrades rather than breaks.
+That is appended to the ``.index`` file as a footer.  ``faiss.read_index``
+stops at the end of the index structure, so upstream RVC and Applio read the
+file as a plain index, and copying it carries the metadata along.  Indexes
+built before the footer have it in a sidecar, ``<name>.index.meta.npz``, which
+:func:`read` falls back to.  With neither -- an upstream index, or one re-saved
+by a tool that drops the footer -- :func:`read` returns ``None`` and the caller
+uses :func:`legacy_meta`, which describes exactly what the bare file supports:
+the metric the file says, no provenance.  Losing the metadata therefore
+degrades rather than breaks.
 
 Nothing here is *required* to interpret the vectors, which is the property that
 makes the degradation safe.  A cosine index stores unit vectors, and the
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 from dataclasses import dataclass, field
 from io import BytesIO
 
@@ -34,6 +38,10 @@ import numpy as np
 FORMAT_VERSION = 1
 
 SIDECAR_SUFFIX = ".meta.npz"
+
+#: The footer's last bytes: ``<payload><payload length, u64 LE><magic>``.
+FOOTER_MAGIC = b"RVCIMETA"
+_FOOTER = struct.Struct("<Q8s")
 
 #: Squared L2 over the stored vectors.  What upstream RVC has always used, and
 #: what every index built before this module speaks.
@@ -160,19 +168,57 @@ def _from_npz(data) -> IndexMeta | None:
     return meta
 
 
+def _footer(handle) -> tuple[int, int] | None:
+    """``(offset, length)`` of the embedded payload, or ``None`` if there is none."""
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    if size < _FOOTER.size:
+        return None
+    handle.seek(size - _FOOTER.size)
+    length, magic = _FOOTER.unpack(handle.read(_FOOTER.size))
+    if magic != FOOTER_MAGIC or length > size - _FOOTER.size:
+        return None
+    return size - _FOOTER.size - length, length
+
+
 def write(index_path: str | os.PathLike, meta: IndexMeta) -> str:
-    path = sidecar_path(index_path)
-    np.savez_compressed(path, **_payload(meta))
-    return path
+    """Embed ``meta`` at the end of the index file ``faiss.write_index`` wrote.
+
+    A footer already there is replaced, and a sidecar from an older build is
+    removed: it would describe a previous index, not this one.
+    """
+    payload = to_bytes(meta)
+    with open(index_path, "r+b") as handle:
+        footer = _footer(handle)
+        if footer is not None:
+            handle.truncate(footer[0])
+        handle.seek(0, os.SEEK_END)
+        handle.write(payload)
+        handle.write(_FOOTER.pack(len(payload), FOOTER_MAGIC))
+    stale = sidecar_path(index_path)
+    if os.path.exists(stale):
+        os.remove(stale)
+    return os.fspath(index_path)
 
 
 def read(index_path: str | os.PathLike) -> IndexMeta | None:
-    """Load the sidecar for ``index_path``, or ``None`` if there is not one.
+    """Load the metadata for ``index_path``: its footer, else a sidecar beside it.
 
-    A sidecar that exists but cannot be parsed is treated the same as a missing
-    one.  Retrieval still works without it, so a corrupt sidecar should cost the
-    user the improvements, not the inference.
+    Either one that cannot be parsed is treated as missing.  Retrieval still
+    works without them, so a corrupt one should cost the user the
+    improvements, not the inference.
     """
+    try:
+        with open(index_path, "rb") as handle:
+            footer = _footer(handle)
+            if footer is not None:
+                handle.seek(footer[0])
+                meta = from_bytes(handle.read(footer[1]))
+                if meta is not None:
+                    return meta
+    except OSError:
+        pass
+
     path = sidecar_path(index_path)
     if not os.path.exists(path):
         return None
@@ -183,8 +229,20 @@ def read(index_path: str | os.PathLike) -> IndexMeta | None:
         return None
 
 
+def from_index_bytes(data) -> IndexMeta | None:
+    """The footer of an index held in memory, as a model bundle carries it."""
+    buffer = np.asarray(data, dtype=np.uint8).reshape(-1)
+    if buffer.size < _FOOTER.size:
+        return None
+    length, magic = _FOOTER.unpack(buffer[-_FOOTER.size :].tobytes())
+    start = buffer.size - _FOOTER.size - length
+    if magic != FOOTER_MAGIC or start < 0:
+        return None
+    return from_bytes(buffer[start : start + length].tobytes())
+
+
 def to_bytes(meta: IndexMeta) -> bytes:
-    """Serialise for embedding in a model bundle, which has no file to sit next to."""
+    """Serialise, as the footer and model bundles both carry it."""
     buffer = BytesIO()
     np.savez_compressed(buffer, **_payload(meta))
     return buffer.getvalue()

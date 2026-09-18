@@ -1,0 +1,66 @@
+/* ShiroRVC -- dropdown and completer lists.
+ *
+ * Set on each popup window itself by ``forms`` rather than inherited from the
+ * main window's sheet: a completer's popup has no parent, so that sheet never
+ * reaches it.  Both kinds of list take this one sheet and so look the same.
+ * @token@ placeholders as in style.qss.
+ */
+
+QComboBoxPrivateContainer {
+    background: transparent;
+    border: none;
+}
+
+/* The window is translucent, so this rounded border is the popup's shape. */
+QAbstractItemView {
+    background: @surface@;
+    color: @text@;
+    font-size: 13px;
+    border: 1px solid @border_strong@;
+    border-radius: 10px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: @accent_soft@;
+    selection-color: @text@;
+}
+
+/* The right padding is room for the tick on the current value. */
+QAbstractItemView::item {
+    min-height: 30px;
+    padding: 0 32px 0 10px;
+    border-radius: 6px;
+    color: @text@;
+}
+
+QAbstractItemView::item:hover {
+    background: @hover_wash@;
+}
+
+QAbstractItemView::item:selected {
+    background: @accent_soft@;
+    color: @text@;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: @border_strong@;
+    border-radius: 4px;
+    min-height: 28px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: @accent@;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line,
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+    border: none;
+    height: 0;
+    width: 0;
+}

@@ -29,7 +29,7 @@ DARK = {
     "border_strong": "#3d3d4d",
     "text": "#e8e8ef",
     "text_dim": "#9a9aab",
-    "text_faint": "#6b6b7d",
+    "text_faint": "#7e7e92",
     "input": "#14141a",
     #: The pale core of a slider handle.  Not ``text``: that is near-black in
     #: the light theme, which turned the handle into a black dot on a violet
@@ -40,6 +40,8 @@ DARK = {
     "warning": "#fbbf24",
     "danger": "#f87171",
     "shadow": "rgba(0, 0, 0, 110)",
+    #: Neutral hover fill, so hovering a row never looks like selecting it.
+    "hover_wash": "rgba(255, 255, 255, 12)",
 }
 
 LIGHT = {
@@ -51,13 +53,14 @@ LIGHT = {
     "border_strong": "#c4c4d0",
     "text": "#1b1b22",
     "text_dim": "#5c5c6b",
-    "text_faint": "#8a8a99",
+    "text_faint": "#767685",
     "input": "#ffffff",
     "knob": "#ffffff",
     "success": "#16a34a",
     "warning": "#d97706",
     "danger": "#dc2626",
     "shadow": "rgba(0, 0, 0, 28)",
+    "hover_wash": "rgba(0, 0, 0, 12)",
 }
 
 
@@ -77,6 +80,7 @@ def tokens(mode: str = "dark", accent: str = "blue") -> dict[str, str]:
     # correct against both backgrounds without a second hand-picked colour.
     base["accent_soft"] = _alpha(colour, 38)
     base["accent_ghost"] = _alpha(colour, 20)
+    base["accent_selection"] = _alpha(colour, 90)
     base["mode"] = mode
     return base
 
@@ -108,6 +112,14 @@ def stylesheet(mode: str = "dark", accent: str = "blue") -> str:
     return source
 
 
+def popup_stylesheet(tokens: dict[str, str]) -> str:
+    """The sheet each dropdown and completer popup carries on itself."""
+    source = (paths.RESOURCE_DIR / "popup.qss").read_text(encoding="utf-8")
+    for key, value in tokens.items():
+        source = source.replace(f"@{key}@", str(value))
+    return source
+
+
 def _glyph_urls(values: dict[str, str], mode: str, accent: str) -> dict[str, str]:
     """Render the few glyphs QSS needs as images, and return their URLs.
 
@@ -131,7 +143,8 @@ def _glyph_urls(values: dict[str, str], mode: str, accent: str) -> dict[str, str
         directory = paths.STATE_DIR / "glyphs"
         directory.mkdir(parents=True, exist_ok=True)
         for token, (name, colour, width) in wanted.items():
-            target = directory / f"{token}-{mode}-{accent}.png"
+            # Keyed by colour, so a palette edit never reuses a stale glyph.
+            target = directory / f"{token}-{mode}-{colour.lstrip('#')}.png"
             if not target.exists():
                 pixmap = icons.pixmap(name, colour, 18, width)
                 if pixmap.isNull() or not pixmap.save(str(target)):
