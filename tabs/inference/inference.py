@@ -633,7 +633,7 @@ def inference_tab():
                 rms_mix_rate = gr.Slider(
                     minimum=0,
                     maximum=1,
-                    label=_("RMS Volume Envelope"),
+                    label=_("Volume Envelope"),
                     info=_("Mix the converted and input loudness envelopes."),
                     value=1,
                     interactive=True,

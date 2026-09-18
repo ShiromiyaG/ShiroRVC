@@ -1,0 +1,22 @@
+{
+    "export_format": "WAV",
+    "seed": 0,
+    "split_audio": false,
+    "autotune": false,
+    "autotune_strength": 1,
+    "clean_audio": false,
+    "clean_strength": 0.3,
+    "formant_shifting": false,
+    "formant_qfrency": 1,
+    "formant_timbre": 1,
+    "pitch": 0,
+    "index_rate": 0.8,
+    "index_k": 4,
+    "index_power": 2.5,
+    "index_continuity": 1.2,
+    "rms_mix_rate": 1,
+    "protect": 0.4,
+    "silence_gate_db": -60,
+    "f0_method": "rmvpe",
+    "embedder_model": "contentvec"
+}

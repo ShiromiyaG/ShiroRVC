@@ -1554,9 +1554,6 @@ msgstr "Arquivo .pth"
 msgid "Quefrency for formant shifting"
 msgstr "Quefrência do deslocamento de formantes"
 
-msgid "RMS Volume Envelope"
-msgstr "Envelope de volume RMS"
-
 msgid "RMVPE high-register correction"
 msgstr "Correção de registro agudo do RMVPE"
 

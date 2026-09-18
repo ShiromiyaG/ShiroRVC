@@ -6,7 +6,6 @@ import re
 import torch
 import torch.nn.functional as F
 import torchcrepe
-import librosa
 import numpy as np
 from scipy import signal
 from torch import Tensor
@@ -25,6 +24,9 @@ install_rich_print()
 
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE
 from rvc.lib.utils import extract_features
+# The dataset preprocessor's BS.1770 filters, so inference measures loudness
+# the way the training data was levelled.  numpy and scipy only.
+from rvc.train.preprocess.loudness import LOUDNESS_OFFSET, k_weighting
 from rvc.infer.retrieval import IndexRetriever, RetrievalConfig
 from rvc.lib.terminal import get_console
 
@@ -67,7 +69,7 @@ class AudioProcessor:
         threshold_db the gain fades to zero over knee_db; hold_ms keeps the gate
         open across short dips so a word does not lose its tail; release_ms
         closes it smoothly (an instant gain step would click). Nothing above the
-        knee is touched, unlike change_rms.
+        knee is touched, unlike match_loudness.
         """
         if threshold_db is None or not np.isfinite(threshold_db):
             return target_audio
@@ -116,42 +118,109 @@ class AudioProcessor:
         envelope = np.interp(positions, centres, smoothed).astype(target_audio.dtype)
         return target_audio * envelope
 
-    def change_rms(
+    @staticmethod
+    def short_term_loudness(
+        audio: np.ndarray, sample_rate: int, window_s: float, hop_s: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """K-weighted loudness per window, in LUFS, and each window's centre (s).
+
+        The windows sit at the same times whatever the rate -- ``hop_s`` and
+        ``window_s`` are whole samples at every rate the pipeline uses -- so
+        the input's and the output's measurements line up frame for frame.
+        """
+        audio = np.asarray(audio, dtype=np.float64)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=-1)
+        window = int(round(window_s * sample_rate))
+        hop = max(1, int(round(hop_s * sample_rate)))
+        if window <= 0 or audio.size < window:
+            return np.empty(0), np.empty(0)
+        shelf, high_pass = k_weighting(sample_rate)
+        weighted = signal.lfilter(*high_pass, signal.lfilter(*shelf, audio))
+        # A running sum rather than a strided view: one pass, no window copies.
+        energy = np.concatenate(([0.0], np.cumsum(weighted * weighted)))
+        starts = np.arange(0, weighted.size - window + 1, hop)
+        power = (energy[starts + window] - energy[starts]) / window
+        levels = LOUDNESS_OFFSET + 10.0 * np.log10(np.maximum(power, 1e-12))
+        return levels, (starts + window / 2.0) / sample_rate
+
+    @staticmethod
+    def match_loudness(
         source_audio: np.ndarray,
         source_rate: int,
         target_audio: np.ndarray,
         target_rate: int,
         rate: float,
-    ):
-        """Blend target_audio's RMS toward source_audio's, weighted by rate."""
-        rms1 = librosa.feature.rms(
-            y=source_audio,
-            frame_length=source_rate // 2 * 2,
-            hop_length=source_rate // 2,
-        )
-        rms2 = librosa.feature.rms(
-            y=target_audio,
-            frame_length=target_rate // 2 * 2,
-            hop_length=target_rate // 2,
-        )
+        window_s: float = 0.400,
+        hop_s: float = 0.050,
+        max_gain_db: float = 12.0,
+        silence_lufs: float = -60.0,
+        relative_gate_lu: float = -20.0,
+    ) -> np.ndarray:
+        """Pull the output's loudness contour toward the input's.
 
-        rms1 = F.interpolate(
-            torch.from_numpy(rms1).float().unsqueeze(0),
-            size=target_audio.shape[0],
-            mode="linear",
-        ).squeeze()
-        rms2 = F.interpolate(
-            torch.from_numpy(rms2).float().unsqueeze(0),
-            size=target_audio.shape[0],
-            mode="linear",
-        ).squeeze()
-        rms2 = torch.maximum(rms2, torch.zeros_like(rms2) + 1e-6)
+        The model renders level from content and pitch alone -- nothing tells
+        it how loud the input was -- so an input at an even level can come out
+        with whole phrases quieter than their neighbours.  This measures both
+        signals' short-term loudness and moves the output by the difference.
+        ``rate`` keeps the ``volume_envelope`` meaning it always had: the share
+        of the output's own contour that is kept, 1 leaving it alone and 0
+        following the input's entirely.
 
-        adjusted_audio = (
-            target_audio
-            * (torch.pow(rms1, 1 - rate) * torch.pow(rms2, rate - 1)).numpy()
+        What it replaced, ``change_rms``, did the same job in a way that hurt:
+
+        * **absolute level.**  It imposed the input's RMS, so the overall
+          loudness of the render moved with the recording's gain.  Only the
+          *contour* is matched here -- the median difference is taken out --
+          so the model keeps the level it renders at and only the uneven parts
+          move.
+        * **pauses.**  Its gain was ``rms_in / rms_out`` wherever it was
+          measured, and where the output is near silent that ratio runs away:
+          breaths and room tone came back boosted, as hiss.  Windows the input
+          itself calls quiet (BS.1770's gates: below ``silence_lufs``, or more
+          than ``relative_gate_lu`` under its gated loudness) are not measured
+          at all; the gain is carried across them from the phrases either side.
+        * **no ceiling.**  Nothing here moves more than ``max_gain_db``.
+        * **1 s windows, plain RMS.**  400 ms is BS.1770's momentary block, and
+          K-weighting is its model of loudness -- so a bass-heavy phrase and a
+          bright one compare the way they sound, not by their low end.
+        """
+        strength = 1.0 - float(np.clip(rate, 0.0, 1.0))
+        if strength <= 0.0 or target_audio.size == 0:
+            return target_audio
+
+        source_levels, centres = AudioProcessor.short_term_loudness(
+            source_audio, source_rate, window_s, hop_s
         )
-        return adjusted_audio
+        target_levels, _ = AudioProcessor.short_term_loudness(
+            target_audio, target_rate, window_s, hop_s
+        )
+        count = min(source_levels.size, target_levels.size)
+        if count == 0:
+            return target_audio
+        source_levels = source_levels[:count]
+        target_levels = target_levels[:count]
+        centres = centres[:count]
+
+        speech = source_levels > silence_lufs
+        if not speech.any():
+            return target_audio
+        gated = LOUDNESS_OFFSET + 10.0 * np.log10(
+            np.mean(10.0 ** ((source_levels[speech] - LOUDNESS_OFFSET) / 10.0))
+        )
+        speech &= source_levels > gated + relative_gate_lu
+        if not speech.any():
+            return target_audio
+
+        difference = source_levels - target_levels
+        difference -= np.median(difference[speech])
+        difference = np.clip(difference, -max_gain_db, max_gain_db)
+        # Measured where there is speech, carried across the rest.
+        gain_db = np.interp(centres, centres[speech], difference[speech]) * strength
+
+        positions = np.arange(target_audio.shape[0]) / float(target_rate)
+        envelope = 10.0 ** (np.interp(positions, centres, gain_db) / 20.0)
+        return target_audio * envelope.astype(target_audio.dtype)
 
 
 class Autotune:
@@ -632,7 +701,7 @@ class Pipeline:
 
 
         if volume_envelope != 1:
-            audio_opt = AudioProcessor.change_rms(
+            audio_opt = AudioProcessor.match_loudness(
                 audio, self.sample_rate, audio_opt, self.tgt_sr, volume_envelope
             )
 

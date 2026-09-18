@@ -4,7 +4,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ShiroRVC\n"
-"POT-Creation-Date: 2026-09-18 18:32+0000\n"
+"POT-Creation-Date: 2026-09-18 18:45+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -2206,10 +2206,6 @@ msgstr ""
 msgid "Quefrency for formant shifting"
 msgstr ""
 
-#: tabs/inference/inference.py:636
-msgid "RMS Volume Envelope"
-msgstr ""
-
 #: tabs/settings/sections/rmvpe_high_register.py:55
 msgid "RMVPE high-register correction"
 msgstr ""
@@ -3284,6 +3280,7 @@ msgstr ""
 msgid "Voice model used for inference."
 msgstr ""
 
+#: tabs/inference/inference.py:636
 #: tabs/inference/inference.py:862
 #: tabs/tts/tts.py:264
 msgid "Volume Envelope"
