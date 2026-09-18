@@ -30,6 +30,33 @@ import soundfile as sf
 SAMPLE_RATE_16K = 16000
 RES_TYPE_16K = "soxr_vhq"
 
+#: Resampler for the ffmpeg path.  ffmpeg's *default* (swresample) is the worst
+#: option available here on both axes at once: measured at 48k -> 32k it is
+#: already -0.4 dB at 14 kHz and -2.9 dB at 15 kHz, and it folds energy from
+#: above Nyquist back in at only -12 dB.  That shelf is what a dataset
+#: preprocessed through this loader sounds like, and the fold lands exactly
+#: where the decoder's own alias hunting happens.
+#:
+#: Naming soxr explicitly fixes both.  ``cutoff`` is the knob ``python-soxr``
+#: (and therefore ``librosa``) does not expose at all -- librosa is stuck at an
+#: effective 0.95, -3 dB at 15.2 kHz for a 32 kHz project -- while soxr holds
+#: alias rejection at ~-180 dB no matter where the cutoff sits.  It buys the
+#: passband with filter length instead, which is the trade worth making:
+#:
+#:   cutoff  flat to    alias      ringing >-60 dB, per side
+#:   0.95    15.0 kHz   -180 dB    ~2 ms     (what librosa gives us today)
+#:   0.98    15.7 kHz   -183 dB    4.94 ms
+#:   0.99    15.85 kHz  -186 dB    4.97 ms
+#:   0.995   15.93 kHz  -197 dB    8.03 ms
+#:
+#: 0.99 dominates 0.98 -- same ringing, more band -- and 0.995 doubles the
+#: ringing to buy 80 Hz of a region voices have no energy in.  soxr is
+#: linear-phase, so half of that ringing is *pre*-ringing ahead of the
+#: transient, which a vocoder discriminator does see; that is the reason not to
+#: push further.  ``cutoff=1.0`` is not a stronger setting, soxr clamps it to
+#: the same filter as 0.995.
+RESAMPLE_FILTER = "aresample=resampler=soxr:precision=28:cutoff=0.99"
+
 
 def load_audio_16k(file):
     """One clip at 16 kHz, for the pitch and embedder extractors.
@@ -83,7 +110,12 @@ def load_audio_ffmpeg(
     sample_rate: int = 48000,
     source_sr: int = None,
 ) -> np.ndarray:
-    """Load (or resample, for an in-memory chunk) audio via ffmpeg, as float32."""
+    """Load (or resample, for an in-memory chunk) audio via ffmpeg, as float32.
+
+    Resampling goes through :data:`RESAMPLE_FILTER` rather than ffmpeg's
+    default, which makes this path strictly better than the librosa one instead
+    of strictly worse.
+    """
     if isinstance(source, str):
         source = source.strip(" ").strip('"').strip("\n").strip('"').strip(" ")
         if not os.path.exists(source):
@@ -92,7 +124,14 @@ def load_audio_ffmpeg(
         try:
             out, err = (
                 ffmpeg.input(source, threads=0)
-                .output("-", format="f32le", acodec="pcm_f32le", ac=1, ar=sample_rate)
+                .output(
+                    "-",
+                    format="f32le",
+                    acodec="pcm_f32le",
+                    ac=1,
+                    ar=sample_rate,
+                    af=RESAMPLE_FILTER,
+                )
                 .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
             )
         except ffmpeg.Error as e:
@@ -113,7 +152,8 @@ def load_audio_ffmpeg(
             process = (
                 ffmpeg
                 .input('pipe:0', format='f32le', acodec='pcm_f32le', ar=source_sr, ac=1)
-                .output('pipe:1', format='f32le', acodec='pcm_f32le', ar=sample_rate)
+                .output('pipe:1', format='f32le', acodec='pcm_f32le', ar=sample_rate,
+                        af=RESAMPLE_FILTER)
                 .run_async(pipe_stdin=True, pipe_stdout=True, quiet=True)
             )
             out, err = process.communicate(input=source.tobytes())

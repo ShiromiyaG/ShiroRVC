@@ -2115,8 +2115,8 @@ msgstr "https://…"
 msgid "l2 is what upstream RVC builds. Cosine compares direction only, so a quiet and a loud take of the same sound match equally."
 msgstr "l2 é o que o RVC original constrói. O cosseno compara apenas a direção, então uma tomada baixa e uma alta do mesmo som combinam igualmente."
 
-msgid "librosa: high quality. ffmpeg: alternative resampler."
-msgstr "librosa: alta qualidade. ffmpeg: reamostrador alternativo."
+msgid "Both use SoXr. ffmpeg keeps more of the top octave; librosa uses a shorter filter with less pre-ringing on transients."
+msgstr "Ambos usam SoXr. O ffmpeg preserva mais da oitava superior; o librosa usa um filtro mais curto, com menos pre-ringing nos transientes."
 
 msgid "max-autotune spends longer compiling for a faster steady state."
 msgstr "max-autotune passa mais tempo compilando para chegar a um regime estável mais rápido."

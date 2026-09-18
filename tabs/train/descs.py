@@ -11,7 +11,7 @@ PREPROCESS_RMS_VALUE_INFO = N_(
 
 DATASET_FORMAT_INFO = N_("Output format for sliced audio. WAV is larger; FLAC is lossless.")
 
-RESAMPLER_INFO = N_("librosa: high quality. ffmpeg: alternative resampler.")
+RESAMPLER_INFO = N_("Both use SoXr. ffmpeg keeps more of the top octave; librosa uses a shorter filter with less pre-ringing on transients.")
 
 
 NORMALIZATION_INFO = N_("Choose the loudness normalization method.")

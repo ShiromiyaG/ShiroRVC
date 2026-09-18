@@ -55,7 +55,7 @@ def parse_args(argv=None):
     group.add_argument("--chunk-len", type=float, default=3.0)
     group.add_argument("--overlap-len", type=float, default=0.36)
     group.add_argument("--normalization", default="pre_peak_rvc", choices=("none", "post_peak", "pre_peak_rvc", "pre_loudness"))
-    group.add_argument("--loading-resampling", default="librosa", choices=("librosa", "ffmpeg"))
+    group.add_argument("--loading-resampling", default="ffmpeg", choices=("ffmpeg", "librosa"))
     group.add_argument("--rms-norm-db", type=float, default=-16.0)
 
     group = parser.add_argument_group("extract")

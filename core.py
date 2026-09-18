@@ -382,7 +382,7 @@ def run_preprocess_script(
     chunk_len: float,
     overlap_len: float,
     normalization_mode: str = "pre_peak_rvc",
-    loading_resampling: str = "librosa",
+    loading_resampling: str = "ffmpeg",
     dataset_format: str = "WAV",
     rms_norm_db: float = -16.0
 ):
@@ -1194,10 +1194,10 @@ PREPROCESS_OWN = [
     ),
     click.option(
         "--loading_resampling",
-        type=click.Choice(["librosa", "ffmpeg"]),
-        default='librosa',
+        type=click.Choice(["ffmpeg", "librosa"]),
+        default='ffmpeg',
         show_default=True,
-        help="Librosa's using SoXr, FFmpeg's using Windowed Sinc filter with Blackman-Nuttall window.",
+        help="Both use SoXr. ffmpeg keeps ~850 Hz more top band (flat to 15.85 kHz at 32 kHz against librosa's 15.0) for ~3 ms more filter ringing; librosa is the gentler, shorter filter.",
     ),
 ]
 

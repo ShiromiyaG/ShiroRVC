@@ -2949,7 +2949,7 @@ msgid "l2 is what upstream RVC builds. Cosine compares direction only, so a quie
 msgstr ""
 
 #: tabs/train/descs.py:14
-msgid "librosa: high quality. ffmpeg: alternative resampler."
+msgid "Both use SoXr. ffmpeg keeps more of the top octave; librosa uses a shorter filter with less pre-ringing on transients."
 msgstr ""
 
 #: gui/views/training.py:399

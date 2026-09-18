@@ -447,8 +447,8 @@ def train_tab():
                     loading_resampling = gr.Radio(
                         label=_("Resampling & Loading Handler"),
                         info=_(RESAMPLER_INFO),
-                        choices=["librosa", "ffmpeg"],
-                        value="librosa",
+                        choices=["ffmpeg", "librosa"],
+                        value="ffmpeg",
                         interactive=True,
                         key='loading_resampling'
                     )

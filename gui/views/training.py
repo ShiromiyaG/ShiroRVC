@@ -208,6 +208,7 @@ class TrainingPage(Page):
         self.resampling = SearchableCombo(editable=False)
         self.resampling.refresh_button.hide()
         self.resampling.set_items(catalog.LOADING_RESAMPLING)
+        self.resampling.set_text("ffmpeg")
 
         advanced.add_row(
             Field(_("Normalisation"), self.normalization, ""),

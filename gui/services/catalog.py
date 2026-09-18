@@ -61,7 +61,7 @@ CUT_PREPROCESS = ["Skip", "Simple", "Automatic", "New Automatic"]
 #: lands wherever the crest factor puts it, which for compressed material is
 #: well below the ceiling and is not a fault.
 NORMALIZATION_MODES = ["none", "post_peak", "pre_peak_rvc", "pre_loudness"]
-LOADING_RESAMPLING = ["librosa", "ffmpeg"]
+LOADING_RESAMPLING = ["ffmpeg", "librosa"]
 DATASET_FORMATS = ["WAV", "FLAC", "MP3", "OGG", "M4A"]
 
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".wma")

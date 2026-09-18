@@ -284,9 +284,9 @@ class PreProcess:
         audio_length = 0
         try:
             if loading_resampling == "librosa":
-                audio = load_audio(path, self.sr)  # SoXr resampler
+                audio = load_audio(path, self.sr)  # SoXr, cutoff fixed at ~0.95
             else:
-                audio = load_audio_ffmpeg(path, self.sr)  # windowed-sinc, Blackman-Nuttall
+                audio = load_audio_ffmpeg(path, self.sr)  # SoXr, cutoff 0.99
 
             audio_length = librosa.get_duration(y=audio, sr=self.sr)
 
