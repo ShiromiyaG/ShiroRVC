@@ -366,20 +366,24 @@ def eval_infer(net_g, reference):
 # last basis with the step it was estimated at.
 _prior_subspace_clips = None
 _prior_subspace_cache = None
+# Last basis any estimate produced, for a save whose own estimate found no room
+# on the device: the directions drift slowly, so a stale basis beats no key.
+_prior_subspace_last = None
 
 
 def prior_subspace_for(model_g, force: bool = False):
     """``prior_noise_subspace`` for the weights ``model_g`` holds now, or None.
 
     RefineGAN2 only; see ``rvc/train/prior_subspace.py``.  A failure costs the
-    checkpoint its key, never the save.
+    checkpoint its key, never the save; an estimate the device has no room for
+    falls back to the last basis estimated instead.
 
     The estimate is a pass per clip with a backward, and the directions move
     slowly, so a preview reuses one younger than ``prior_subspace_interval``
     steps.  ``force`` re-estimates whatever the age, which is what a checkpoint
     asks for: its basis has to belong to the weights it ships.
     """
-    global _prior_subspace_clips, _prior_subspace_cache
+    global _prior_subspace_clips, _prior_subspace_cache, _prior_subspace_last
     if vocoder != "refinegan2":
         return None
     interval = int(getattr(config.train, "prior_subspace_interval", 5000))
@@ -392,6 +396,10 @@ def prior_subspace_for(model_g, force: bool = False):
             _prior_subspace_clips = pick_clips(config.data.training_files)
         if not _prior_subspace_clips:
             return None
+        # The training step's cached blocks are reserved in shapes the estimate
+        # cannot reuse.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         basis, captured = estimate_prior_subspace(
             model_g,
             _prior_subspace_clips,
@@ -400,6 +408,22 @@ def prior_subspace_for(model_g, force: bool = False):
             max_frames=400,
             batch_size=int(getattr(config.train, "prior_subspace_batch", 4)),
         )
+        if basis is None:
+            if _prior_subspace_last is None:
+                warning(
+                    "No room on the device to estimate prior_noise_subspace; "
+                    "saving without it.",
+                    tag="[SAVE]",
+                )
+                return None
+            estimated_at, basis = _prior_subspace_last
+            info(
+                "No room on the device to estimate prior_noise_subspace; "
+                f"reusing the one from step {estimated_at}.",
+                tag="[SAVE]",
+            )
+            return basis
+        _prior_subspace_last = (global_step, basis)
         # Only the preview path caches: ``force`` estimates for weights that
         # are not the live ones -- the EMA average, or another checkpoint's --
         # and a preview must not inherit their basis.
