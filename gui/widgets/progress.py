@@ -82,6 +82,18 @@ def _clock(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def _rate_text(rate: float) -> str:
+    """Throughput in the unit that reads best at this speed.
+
+    Below 1 it/s the reciprocal is the number with meaning -- "0.3 it/s" takes
+    a moment to turn into "three seconds a batch", which is what someone
+    sizing a run actually wants to know.
+    """
+    if rate >= 1.0:
+        return f"{rate:.2f} it/s"
+    return f"{1.0 / rate:.1f} s/it"
+
+
 class TrainingProgress(QWidget):
     """Overall and per-epoch progress for a running trainer."""
 
@@ -294,7 +306,10 @@ class TrainingProgress(QWidget):
         ]
         if update["metrics"]:
             parts.append(update["metrics"])
-        remaining = self._remaining_seconds(update)
+        rate = self._rate()
+        if rate is not None:
+            parts.append(_rate_text(rate))
+        remaining = self._remaining_seconds(update, rate)
         if remaining is not None:
             parts.append(f"~{_clock(remaining)} left")
         self.detail.setText("   ·   ".join(parts))
@@ -309,7 +324,13 @@ class TrainingProgress(QWidget):
         """Batches completed since the run started, across epochs."""
         return (update["epoch"] - 1) * update["total_batches"] + update["batch"]
 
-    def _remaining_seconds(self, update: dict) -> float | None:
+    def _rate(self) -> float | None:
+        """Batches per second over the sample window, or ``None`` if too early.
+
+        The same number drives the throughput readout and the ETA, so they can
+        never disagree -- a card that says 2.0 it/s next to an ETA computed
+        from a different window is worse than showing neither.
+        """
         if len(self._samples) < _RATE_MINIMUM:
             return None
         (first_time, first_batch) = self._samples[0]
@@ -318,8 +339,13 @@ class TrainingProgress(QWidget):
         done = last_batch - first_batch
         if elapsed <= 0 or done <= 0:
             return None
-        rate = done / elapsed
+        return done / elapsed
+
+    def _remaining_seconds(self, update: dict, rate: float | None) -> float | None:
+        if not rate:
+            return None
         total = update["total_epochs"] * update["total_batches"]
+        last_batch = self._samples[-1][1]
         return max(0.0, (total - last_batch) / rate)
 
 

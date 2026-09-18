@@ -82,10 +82,19 @@ class PreviewImage(QWidget):
             self._label.setText(_("No preview image for this epoch."))
             return
 
+        # The cache key carries the file's identity, not just its name.  The
+        # trainer rewrites ``epoch_NNNN/mel/sample_00.png`` in place several
+        # times per epoch, so a path-only key would serve the first render of
+        # an epoch for the rest of that epoch and the preview would look frozen.
         key = str(path)
+        try:
+            stat = path.stat()
+            key = f"{key}|{stat.st_mtime_ns}|{stat.st_size}"
+        except OSError:
+            pass
         pixmap = self._cache.get(key)
         if pixmap is None:
-            pixmap = QPixmap(key)
+            pixmap = QPixmap(str(path))
             if pixmap.isNull():
                 self._pixmap = None
                 self._label.setText(_("Could not read {name}.").format(name=path.name))

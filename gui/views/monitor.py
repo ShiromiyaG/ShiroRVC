@@ -62,6 +62,7 @@ class MonitorPage(Page):
         self._reading = False
         self._pending_initial = False
         self._previews: list[media.EpochPreviews] = []
+        self._preview_fingerprint: tuple | None = None
         self._run_dir = ""
 
         self._read_signals = ReadSignals()
@@ -71,6 +72,7 @@ class MonitorPage(Page):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(self.POLL_INTERVAL_MS)
         self._poll_timer.timeout.connect(self._poll_metrics)
+        self._poll_timer.timeout.connect(self._poll_media)
 
         self.content.addLayout(self._build_run_row())
 
@@ -203,6 +205,7 @@ class MonitorPage(Page):
 
     def _attach(self, run_dir: str) -> None:
         self._run_dir = run_dir
+        self._preview_fingerprint = media.preview_fingerprint(run_dir)
         self._load_media(run_dir)
 
         if not run_dir or not os.path.isdir(run_dir):
@@ -284,7 +287,25 @@ class MonitorPage(Page):
 
     # -- media -------------------------------------------------------------
 
-    def _load_media(self, run_dir: str) -> None:
+    def _load_media(self, run_dir: str, keep_position: bool = False) -> None:
+        """Re-index the run's previews.
+
+        ``keep_position`` is what makes a refresh mid-run bearable: somebody
+        comparing epoch 12 against epoch 40 must not be yanked to the newest
+        every five seconds.  Someone sitting on the newest, on the other hand,
+        is watching it precisely because it moves, so that case follows along.
+        """
+        was_last = keep_position and self.gallery.index() >= len(self._previews) - 1
+        held_epoch = None
+        if keep_position and not was_last and 0 <= self.gallery.index() < len(self._previews):
+            held_epoch = self._previews[self.gallery.index()].epoch
+
+        audio_was_last = (
+            keep_position
+            and self.audio_picker.currentIndex() >= self.audio_picker.count() - 1
+        )
+        held_audio = None if audio_was_last else self.audio_picker.currentData()
+
         self._previews = media.list_previews(run_dir)
         self.gallery.set_count(len(self._previews))
 
@@ -314,12 +335,46 @@ class MonitorPage(Page):
                 count=len(self._previews), size=size
             )
         )
-        # Land on the newest, which is what someone opening this wants to see.
-        self.gallery.set_index(len(self._previews) - 1)
-        self._show_epoch(len(self._previews) - 1)
+        # Land on the newest, which is what someone opening this wants to see;
+        # on a refresh, honour whatever they were looking at instead.
+        target = len(self._previews) - 1
+        if held_epoch is not None:
+            target = next(
+                (i for i, e in enumerate(self._previews) if e.epoch == held_epoch),
+                target,
+            )
+        self.gallery.set_index(target)
+        # ``set_index`` is a no-op when the index has not moved, and on a
+        # refresh it usually has not -- but the file behind it was rewritten,
+        # so the reload has to be asked for explicitly.
+        self._show_epoch(target)
+
         if self.audio_picker.count():
-            self.audio_picker.setCurrentIndex(self.audio_picker.count() - 1)
-            self._on_audio_epoch(self.audio_picker.count() - 1)
+            audio_target = self.audio_picker.count() - 1
+            if held_audio is not None:
+                found = self.audio_picker.findData(held_audio)
+                if found >= 0:
+                    audio_target = found
+            blocked = self.audio_picker.blockSignals(True)
+            self.audio_picker.setCurrentIndex(audio_target)
+            self.audio_picker.blockSignals(blocked)
+            self._on_audio_epoch(audio_target)
+
+    def _poll_media(self) -> None:
+        """Pick up previews written since the last tick.
+
+        The trainer writes these several times per epoch, but until now they
+        were indexed once, in :meth:`_attach`, so the tab only moved when the
+        run was re-selected.  The fingerprint keeps the common case -- nothing
+        new -- down to one directory listing and a handful of stats.
+        """
+        if not self._run_dir:
+            return
+        fingerprint = media.preview_fingerprint(self._run_dir)
+        if fingerprint == self._preview_fingerprint:
+            return
+        self._preview_fingerprint = fingerprint
+        self._load_media(self._run_dir, keep_position=True)
 
     def _show_epoch(self, index: int) -> None:
         if not (0 <= index < len(self._previews)):

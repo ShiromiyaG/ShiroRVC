@@ -162,6 +162,55 @@ def list_previews(run_dir: str | os.PathLike[str] | None) -> list[EpochPreviews]
     return found
 
 
+def preview_fingerprint(run_dir: str | os.PathLike[str] | None) -> tuple | None:
+    """A cheap change token for a run's previews.
+
+    :func:`list_previews` walks every epoch directory, which is fine once but
+    not every few seconds on a pretrain with hundreds of them.  Only two things
+    can change while a run is being watched, and neither needs the full walk:
+
+    * a new ``epoch_NNNN`` directory appears, which moves the root's mtime;
+    * the newest epoch's files are rewritten.  The trainer writes previews
+      several times *per epoch* -- every 100 steps on a finetune, every 500 on
+      a pretrain -- into the same directory, overwriting in place.  An
+      overwrite updates the file's mtime but not any directory's, so the
+      newest epoch's files have to be stat'ed individually.
+
+    Everything older than the newest epoch is finished and never rewritten, so
+    it is not looked at.  The cost is one listing plus a stat per file of one
+    epoch, regardless of how long the run is.
+    """
+    root = preview_root(run_dir)
+    if root is None:
+        return None
+    try:
+        root_mtime = root.stat().st_mtime_ns
+        names = [
+            entry.name
+            for entry in root.iterdir()
+            if _EPOCH_DIR.match(entry.name) and entry.is_dir()
+        ]
+    except OSError:
+        return None
+    if not names:
+        return (root_mtime, 0, "", ())
+
+    newest = max(names, key=lambda name: int(_EPOCH_DIR.match(name).group(1)))
+    files: list[tuple[str, int, int]] = []
+    for sub in ("mel", "audio"):
+        try:
+            entries = sorted((root / newest / sub).iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            files.append((entry.name, stat.st_mtime_ns, stat.st_size))
+    return (root_mtime, len(names), newest, tuple(files))
+
+
 def latest_preview(run_dir: str | os.PathLike[str] | None) -> EpochPreviews | None:
     previews = list_previews(run_dir)
     return previews[-1] if previews else None

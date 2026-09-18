@@ -140,10 +140,11 @@ def test_estimate_is_withheld_until_there_is_enough_history(app):
         "total_batches": 8083, "step": 49080, "metrics": "",
     }
     widget._samples = [(1000.0 + i, 6 * 8083 + 3600 + i * 20) for i in range(10)]
-    assert widget._remaining_seconds(update) is None
+    assert widget._rate() is None
+    assert widget._remaining_seconds(update, widget._rate()) is None
 
     widget._samples = [(1000.0 + i, 6 * 8083 + 3600 + i * 20) for i in range(30)]
-    remaining = widget._remaining_seconds(update)
+    remaining = widget._remaining_seconds(update, widget._rate())
     # 20 batches/s over 500 epochs of 8083 batches, ~52k done.
     assert remaining is not None
     assert 150_000 < remaining < 260_000
@@ -158,7 +159,8 @@ def test_estimate_survives_a_stalled_sample(app):
         "total_batches": 100, "step": 5, "metrics": "",
     }
     widget._samples = [(1000.0 + i, 5) for i in range(30)]  # no progress at all
-    assert widget._remaining_seconds(update) is None
+    assert widget._rate() is None
+    assert widget._remaining_seconds(update, widget._rate()) is None
 
 
 @pytest.mark.parametrize(
