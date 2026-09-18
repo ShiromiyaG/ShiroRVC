@@ -204,7 +204,7 @@ def test_the_retired_modes_still_run_but_are_not_offered():
     ]
 
     offered = '"none", "post_peak", "pre_peak_rvc", "pre_loudness"'
-    assert offered in (ROOT / "core.py").read_text(encoding="utf-8")
+    assert offered in (ROOT / "rvc" / "cli_options.py").read_text(encoding="utf-8")
     assert offered in (ROOT / "tabs" / "train" / "train.py").read_text(encoding="utf-8")
 
     preprocess = (ROOT / "rvc" / "train" / "preprocess" / "preprocess.py").read_text(
@@ -620,7 +620,8 @@ def test_a_recording_scope_mode_is_the_default_everywhere():
 
     core = (ROOT / "core.py").read_text(encoding="utf-8")
     assert 'normalization_mode: str = "pre_peak_rvc"' in core
-    assert "default='pre_peak_rvc'" in core
+    cli = (ROOT / "rvc" / "cli_options.py").read_text(encoding="utf-8")
+    assert "default='pre_peak_rvc'" in cli
 
     gradio = (ROOT / "tabs" / "train" / "train.py").read_text(encoding="utf-8")
     assert 'value="pre_peak_rvc"' in gradio

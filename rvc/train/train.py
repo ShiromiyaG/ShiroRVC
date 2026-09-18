@@ -151,6 +151,7 @@ from rvc.train.prior_subspace import estimate_prior_subspace, pick_clips
 from rvc.lib.algorithm import commons
 from rvc.configs.vocoders import normalize_vocoder
 from rvc.train.run_spec import TrainRunSpec
+from rvc.train.previews import get_reference_sample
 
 # argv[1] is the run spec written by the launcher (not the same indexing as
 # ``core._find_trainer_processes``, which reads the OS command line and so
@@ -890,123 +891,6 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
     return net_g, net_d, optim_g, optim_d, epoch_str, global_step, ema, resumed_extra_d
 
 
-def get_reference_sample(train_loader, device, config):
-    reference_path = os.path.join("logs", "reference")
-    use_custom_ref = all([
-        os.path.isfile(os.path.join(reference_path, "ref_feats.npy")),
-        os.path.isfile(os.path.join(reference_path, "ref_f0c.npy")),
-        os.path.isfile(os.path.join(reference_path, "ref_f0f.npy")),
-    ])
-
-    # The reference is embedder-specific, and nothing about the filename says
-    # which embedder wrote it.  Handing 768-wide features to a 256-wide text
-    # encoder used to reach ``F.linear`` and die there -- "mat1 and mat2 shapes
-    # cannot be multiplied" -- a few thousand steps into a run, at the first
-    # preview rather than at startup.  Checked here instead, and the run
-    # continues on a reference taken from the dataset, which is right by
-    # construction.
-    if use_custom_ref:
-        expected_dim = int(getattr(config.model, "text_enc_hidden_dim", 768))
-        features = np.load(os.path.join(reference_path, "ref_feats.npy"))
-        if features.ndim != 2 or features.shape[1] != expected_dim:
-            found = "x".join(str(size) for size in features.shape)
-            warning(
-                f"logs/reference/ref_feats.npy is {found} but this model's text "
-                f"encoder takes {expected_dim}-wide features; it was made with a "
-                f"different embedder. Falling back to a reference from the "
-                f"dataset. To use your own, rebuild it with the embedder this "
-                f"model trains on: python tools/make_reference.py <audio> "
-                f"--embedder <name>",
-                tag="[REFERENCE]",
-            )
-            use_custom_ref = False
-
-    if use_custom_ref:
-        info("Using custom reference input from 'logs/reference/'.", tag="[REFERENCE]")
-        reference_audio = None
-        reference_source = reference_path
-
-        phone = torch.FloatTensor(np.repeat(features, 2, axis=0)).unsqueeze(0).to(device)
-        pitch = torch.LongTensor(np.load(os.path.join(reference_path, "ref_f0c.npy"))).unsqueeze(0).to(device)
-        pitchf = torch.FloatTensor(np.load(os.path.join(reference_path, "ref_f0f.npy"))).unsqueeze(0).to(device)
-
-        # Measure lengths
-        lengths = [phone.shape[1], pitch.shape[1], pitchf.shape[1]]
-        min_len = min(lengths)
-
-        # Trim to min length
-        phone = phone[:, :min_len, :]
-        pitch = pitch[:, :min_len]
-        pitchf = pitchf[:, :min_len]
-        phone_lengths = torch.LongTensor([phone.shape[1]]).to(device)
-        sid = torch.LongTensor([0]).to(device)
-
-        # Optional ground truth for the preview; without it the preview
-        # degrades to the generated waveform alone. Resampled on load, so it
-        # can be at any rate -- one f0 frame is one hop at every configured
-        # sample rate, both being 10 ms.
-        audio_path = os.path.join(reference_path, "ref_audio.wav")
-        if os.path.isfile(audio_path):
-            from rvc.lib.utils import load_audio
-
-            wave = load_audio(audio_path, config.data.sample_rate)
-            wanted = min_len * config.data.hop_length
-            if wave.shape[0] < wanted:
-                # Short is survivable -- the figure crops both mels to the
-                # frames they share -- but silently comparing less than the
-                # reference renders is not, so it is said out loud.
-                warning(
-                    "ref_audio.wav is "
-                    f"{wave.shape[0] / config.data.sample_rate:.2f}s, short of the "
-                    f"{wanted / config.data.sample_rate:.2f}s the features render; "
-                    "the preview will compare only the overlap.",
-                    tag="[REFERENCE]",
-                )
-            reference_audio = (
-                torch.FloatTensor(wave[:wanted]).view(1, 1, -1).to(device)
-            )
-        else:
-            warning(
-                "No ref_audio.wav; the preview will show the "
-                "generated audio without the mel comparison.",
-                tag="[REFERENCE]",
-            )
-
-    else:
-        info("No custom reference found; fetching from train_loader.", tag="[REFERENCE]")
-        batch = next(iter(train_loader))
-        # Unpack everything from the loader
-        phone, phone_lengths, pitch, pitchf, _, _, reference_audio, _, sid = batch
-
-        # Move only the first sample of the batch to device
-        phone = phone[0:1].to(device)
-        phone_lengths = phone_lengths[0:1].to(device)
-        pitch = pitch[0:1].to(device)
-        pitchf = pitchf[0:1].to(device)
-        reference_audio = reference_audio[0:1].to(device)
-        sid = sid[0:1].to(device)
-
-        batch_indices = []
-        for batch in train_loader.batch_sampler:
-            batch_indices = batch
-            break
-
-        if isinstance(train_loader.dataset, torch.utils.data.Subset):
-            file_paths = train_loader.dataset.dataset.get_file_paths(batch_indices)
-        else:
-            file_paths = train_loader.dataset.get_file_paths(batch_indices)
-
-        file_name = os.path.basename(file_paths[0])
-        info(f"Origin of the ref: {file_name}", tag="[REFERENCE]")
-        reference_source = file_name
-
-    return (
-        (phone, phone_lengths, pitch, pitchf, sid, config.train.seed),
-        reference_audio,
-        reference_source,
-    )
-
-
 def main():
     """
     Main function to start the training process.
@@ -1601,6 +1485,208 @@ def apply_linear_warmup(optim_g, optim_d, global_step, warmup_steps, rank):
         return
 
 
+def _log_reference_preview(
+    writer, config, epoch, global_step, generated, reference_audio, reference_source,
+    dpi=None, figsize=None,
+):
+    """Log one rendering of the reference sample: the mel comparison and both
+    recordings when there is a reference recording, the generated audio alone
+    when there is not."""
+    if reference_audio is not None:
+        eval_original_mel = wave_to_mel(
+            config,
+            reference_audio,
+            num_mels=None,
+        )
+        eval_generated_mel = wave_to_mel(
+            config,
+            generated,
+            num_mels=None,
+        )
+        log_validation_preview(
+            writer=writer,
+            experiment_dir=experiment_dir,
+            epoch=epoch,
+            sample_index=0,
+            global_step=global_step,
+            sample_rate=config.data.sample_rate,
+            predicted_mel=eval_generated_mel,
+            target_mel=eval_original_mel,
+            predicted_wave=generated,
+            target_wave=reference_audio,
+            source=reference_source,
+            # The time axis is frames * hop / sample_rate.  This
+            # used to fall back to the function's default of 256
+            # while every shipped config uses sample_rate/100
+            # (320 at 32 kHz), which labelled the axis 1.7x short.
+            hop_length=config.data.hop_length,
+            # Same story one axis over: the frequency ticks are only
+            # right if they are placed on the mel range the mels
+            # were actually binned with.
+            mel_fmin=config.data.mel_fmin,
+            mel_fmax=config.data.mel_fmax,
+            dpi=dpi,
+            figsize=figsize,
+        )
+    else:
+        log_tensorboard_media(
+            writer=writer,
+            namespace=TENSORBOARD_VALIDATION_FALLBACK_NAMESPACE,
+            global_step=global_step,
+            sample_rate=config.data.sample_rate,
+            audio={TENSORBOARD_VALIDATION_AUDIO_NAMES["generated"]: generated[0]},
+            text={TENSORBOARD_MEDIA_SOURCE_NAME: reference_source}
+            if reference_source
+            else None,
+        )
+
+
+def _render_epoch_preview(
+    net_g, ema, overtrain_monitor, optim_g, reference, reference_audio,
+    reference_source, config, writer, epoch, global_step,
+):
+    """Render the reference with the weights this run would hand over, log it,
+    and put the live weights back."""
+    # Preview whatever this run would actually hand over, so the audio
+    # you judge it by is the audio the exported model produces.
+    model_g = net_g.module if hasattr(net_g, "module") else net_g
+    preview_sd, preview_label, _preview_step = deliverable_weights(
+        overtrain_monitor, ema, model_g, use_holdout=False
+    )
+    live_sd_g = None
+    if preview_label != "live weights":
+        live_sd_g = {k: v.detach().clone() for k, v in model_g.state_dict().items()}
+        model_g.load_state_dict(preview_sd)
+        info(f"Epoch {epoch}: rendering from {preview_label}.", tag="[PREVIEW]")
+
+    # Inferencing on reference sample
+
+
+    # ``live_sd_g`` set means the preview swapped in EMA or holdout
+    # weights, which are already an evaluation point -- converting those
+    # to the schedule-free x iterate would apply the transform to
+    # weights its ``z`` state does not describe.
+    if live_sd_g is None:
+        with averaged_weights((optimizer_choice_g, optim_g)):
+            o = eval_preview(net_g, reference, reference_audio, config)
+    else:
+        o = eval_preview(net_g, reference, reference_audio, config)
+    # The config's dpi/figsize are not applied here, unlike the per-step preview.
+    _log_reference_preview(
+        writer, config, epoch, global_step, o, reference_audio, reference_source
+    )
+
+    # Restore live weights immediately ~ checkpoint saving stays raw
+    if live_sd_g is not None:
+        model_g.load_state_dict(live_sd_g)
+
+
+def _save_training_checkpoints(
+    net_g, net_d, optim_g, optim_d, ema, grad_scaler, config, epoch, global_step,
+    save_only_latest_net_models,
+):
+    """Write ``G_<step>.pth`` and ``D_<step>.pth``; returns the generator's prior
+    subspace, which the weight exports reuse."""
+    subspace_g = None
+    g_path = os.path.join(experiment_dir, f"G_{global_step}.pth")
+    d_path = os.path.join(experiment_dir, f"D_{global_step}.pth")
+
+    if save_only_latest_net_models:
+        old_files = glob.glob(os.path.join(experiment_dir, "G_*.pth")) + glob.glob(os.path.join(experiment_dir, "D_*.pth"))
+        for f in old_files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    # Both writes sit in one protected region: a stop between them would
+    # leave a generator without its matching discriminator.  The
+    # schedule-free switch wraps the whole region so the saved weights
+    # are the averaged iterate and the saved optimizer state records
+    # that it was written in that mode -- ``train_mode`` lives in
+    # ``param_groups``, so resuming restores the pairing.
+    with averaged_weights(
+        (optimizer_choice_g, optim_g), (optimizer_choice_d, optim_d)
+    ):
+        # Outside the protected region because it takes seconds; on
+        # the same weights the generator is saved with.
+        with ema.applied(net_g) if ema is not None else nullcontext():
+            subspace_g = prior_subspace_for(
+                net_g.module if hasattr(net_g, "module") else net_g,
+                force=True,
+            )
+        with uninterruptible_save("checkpoint write"):
+            # The generator is written as if there were no EMA: the
+            # average goes in ``model`` and no ``ema`` key is kept, so
+            # the checkpoint is a plain one for anything that reads it
+            # and is a pretrain as it stands, like
+            # ``tools/pretrain/clean_pretrain.py`` makes.  A resume therefore
+            # continues from the average, and the shadow restarts from
+            # it -- see the ``ema.load_state_dict`` fallback.
+            with ema.applied(net_g) if ema is not None else nullcontext():
+                save_checkpoint(
+                    net_g,
+                    optim_g,
+                    config.train.learning_rate_g,
+                    epoch,
+                    g_path,
+                    prior_noise_subspace=subspace_g,
+                )
+            save_checkpoint(
+                net_d,
+                optim_d,
+                config.train.learning_rate_d,
+                epoch,
+                d_path,
+                extra=_checkpoint_extra(grad_scaler),
+            )
+    return subspace_g
+
+
+def _export_weight_models(
+    model_add, net_g, optim_g, ema, overtrain_monitor, subspace_g, epoch,
+    global_step, config,
+):
+    """Export each ``(path, use_holdout)`` in ``model_add`` as an inference
+    ``.pth``, skipping paths that already exist."""
+    model_g = net_g.module if hasattr(net_g, "module") else net_g
+    for m, use_holdout in model_add:
+        if os.path.exists(m):
+            continue
+        # ``deliverable_weights`` can fall through to the live weights,
+        # and under a schedule-free optimizer those are the extrapolated
+        # iterate.  This is the exported .pth -- the file that gets used
+        # for inference -- so it is the last place that read may go
+        # unaveraged.
+        with averaged_weights((optimizer_choice_g, optim_g)):
+            ckpt, ckpt_label, ckpt_step = deliverable_weights(
+                overtrain_monitor, ema, model_g, use_holdout=use_holdout
+            )
+        success(
+            f"{os.path.basename(m)} <- {ckpt_label}", tag="[EXPORT]"
+        )
+        if use_holdout or subspace_g is None:
+            subspace = prior_subspace_for_state(model_g, ckpt)
+        else:
+            # EMA or live weights at this step: what G_*.pth was saved with.
+            subspace = subspace_g
+        with uninterruptible_save("weight model export"):
+            extract_model(
+                ckpt=ckpt,
+                sr=sample_rate,
+                name=model_name,
+                model_path=m,
+                epoch=epoch,
+                step=global_step,
+                hps=config,
+                vocoder=vocoder,
+                architecture=architecture,
+                weights_step=ckpt_step,
+                weights_source=ckpt_label,
+                prior_noise_subspace=subspace,
+            )
+
+
 def training_loop(
     rank,
     epoch,
@@ -1646,8 +1732,6 @@ def training_loop(
 
     if writers is not None:
         writer = writers[0]
-
-    live_sd_g = None
 
     net_g.train()
     net_d.train()
@@ -2663,53 +2747,11 @@ def training_loop(
                 else:
                     with averaged_weights((optimizer_choice_g, optim_g)):
                         o = eval_preview(net_g, reference, reference_audio, config)
-                if reference_audio is not None:
-                    eval_original_mel = wave_to_mel(
-                        config,
-                        reference_audio,
-                        num_mels=None,
-                    )
-                    eval_generated_mel = wave_to_mel(
-                        config,
-                        o,
-                        num_mels=None,
-                    )
-                    log_validation_preview(
-                        writer=writer,
-                        experiment_dir=experiment_dir,
-                        epoch=epoch,
-                        sample_index=0,
-                        global_step=global_step,
-                        sample_rate=config.data.sample_rate,
-                        predicted_mel=eval_generated_mel,
-                        target_mel=eval_original_mel,
-                        predicted_wave=o,
-                        target_wave=reference_audio,
-                        source=reference_source,
-                        # The time axis is frames * hop / sample_rate.  This
-                        # used to fall back to the function's default of 256
-                        # while every shipped config uses sample_rate/100
-                        # (320 at 32 kHz), which labelled the axis 1.7x short.
-                        hop_length=config.data.hop_length,
-                        # Same story one axis over: the frequency ticks are only
-                        # right if they are placed on the mel range the mels
-                        # were actually binned with.
-                        mel_fmin=config.data.mel_fmin,
-                        mel_fmax=config.data.mel_fmax,
-                        dpi=validation_preview_dpi,
-                        figsize=validation_preview_figsize,
-                    )
-                else:
-                    log_tensorboard_media(
-                        writer=writer,
-                        namespace=TENSORBOARD_VALIDATION_FALLBACK_NAMESPACE,
-                        global_step=global_step,
-                        sample_rate=config.data.sample_rate,
-                        audio={TENSORBOARD_VALIDATION_AUDIO_NAMES["generated"]: o[0]},
-                        text={TENSORBOARD_MEDIA_SOURCE_NAME: reference_source}
-                        if reference_source
-                        else None,
-                    )
+                _log_reference_preview(
+                    writer, config, epoch, global_step, o, reference_audio,
+                    reference_source, dpi=validation_preview_dpi,
+                    figsize=validation_preview_figsize,
+                )
                 flush_writer(writer, rank)
                 torch.cuda.empty_cache()
 
@@ -2783,75 +2825,10 @@ def training_loop(
         # At each epoch save point:
         if epoch % epoch_save_frequency == 0 or phase_limit_reached:
 
-            # Preview whatever this run would actually hand over, so the audio
-            # you judge it by is the audio the exported model produces.
-            model_g = net_g.module if hasattr(net_g, "module") else net_g
-            preview_sd, preview_label, _preview_step = deliverable_weights(
-                overtrain_monitor, ema, model_g, use_holdout=False
+            _render_epoch_preview(
+                net_g, ema, overtrain_monitor, optim_g, reference, reference_audio,
+                reference_source, config, writer, epoch, global_step,
             )
-            if preview_label != "live weights":
-                live_sd_g = {k: v.detach().clone() for k, v in model_g.state_dict().items()}
-                model_g.load_state_dict(preview_sd)
-                info(f"Epoch {epoch}: rendering from {preview_label}.", tag="[PREVIEW]")
-
-            # Inferencing on reference sample
-
-
-            # ``live_sd_g`` set means the preview swapped in EMA or holdout
-            # weights, which are already an evaluation point -- converting those
-            # to the schedule-free x iterate would apply the transform to
-            # weights its ``z`` state does not describe.
-            if live_sd_g is None:
-                with averaged_weights((optimizer_choice_g, optim_g)):
-                    o = eval_preview(net_g, reference, reference_audio, config)
-            else:
-                o = eval_preview(net_g, reference, reference_audio, config)
-            if reference_audio is not None:
-                eval_original_mel = wave_to_mel(
-                    config,
-                    reference_audio,
-                    num_mels=None,
-                )
-                eval_generated_mel = wave_to_mel(
-                    config,
-                    o,
-                    num_mels=None,
-                )
-                log_validation_preview(
-                    writer=writer,
-                    experiment_dir=experiment_dir,
-                    epoch=epoch,
-                    sample_index=0,
-                    global_step=global_step,
-                    sample_rate=config.data.sample_rate,
-                    predicted_mel=eval_generated_mel,
-                    target_mel=eval_original_mel,
-                    predicted_wave=o,
-                    target_wave=reference_audio,
-                    source=reference_source,
-                    # This branch was still on the function's fallbacks, so its
-                    # previews carried the hop-256 time axis the other call site
-                    # was already fixed for.
-                    hop_length=config.data.hop_length,
-                    mel_fmin=config.data.mel_fmin,
-                    mel_fmax=config.data.mel_fmax,
-                )
-            else:
-                log_tensorboard_media(
-                    writer=writer,
-                    namespace=TENSORBOARD_VALIDATION_FALLBACK_NAMESPACE,
-                    global_step=global_step,
-                    sample_rate=config.data.sample_rate,
-                    audio={TENSORBOARD_VALIDATION_AUDIO_NAMES["generated"]: o[0]},
-                    text={TENSORBOARD_MEDIA_SOURCE_NAME: reference_source}
-                    if reference_source
-                    else None,
-                )
-
-            # Restore live weights immediately ~ checkpoint saving stays raw
-            if live_sd_g is not None:
-                model_g.load_state_dict(live_sd_g)
-                live_sd_g = None
 
         flush_writer(writer, rank)
 
@@ -2867,59 +2844,10 @@ def training_loop(
 
         # Save weights every N epochs
         if epoch % epoch_save_frequency == 0 or phase_limit_reached:
-            g_path = os.path.join(experiment_dir, f"G_{global_step}.pth")
-            d_path = os.path.join(experiment_dir, f"D_{global_step}.pth")
-
-            if save_only_latest_net_models:
-                old_files = glob.glob(os.path.join(experiment_dir, "G_*.pth")) + glob.glob(os.path.join(experiment_dir, "D_*.pth"))
-                for f in old_files:
-                    try:
-                        os.remove(f)
-                    except OSError:
-                        pass
-
-            # Both writes sit in one protected region: a stop between them would
-            # leave a generator without its matching discriminator.  The
-            # schedule-free switch wraps the whole region so the saved weights
-            # are the averaged iterate and the saved optimizer state records
-            # that it was written in that mode -- ``train_mode`` lives in
-            # ``param_groups``, so resuming restores the pairing.
-            with averaged_weights(
-                (optimizer_choice_g, optim_g), (optimizer_choice_d, optim_d)
-            ):
-                # Outside the protected region because it takes seconds; on
-                # the same weights the generator is saved with.
-                with ema.applied(net_g) if ema is not None else nullcontext():
-                    subspace_g = prior_subspace_for(
-                        net_g.module if hasattr(net_g, "module") else net_g,
-                        force=True,
-                    )
-                with uninterruptible_save("checkpoint write"):
-                    # The generator is written as if there were no EMA: the
-                    # average goes in ``model`` and no ``ema`` key is kept, so
-                    # the checkpoint is a plain one for anything that reads it
-                    # and is a pretrain as it stands, like
-                    # ``tools/pretrain/clean_pretrain.py`` makes.  A resume therefore
-                    # continues from the average, and the shadow restarts from
-                    # it -- see the ``ema.load_state_dict`` fallback.
-                    with ema.applied(net_g) if ema is not None else nullcontext():
-                        save_checkpoint(
-                            net_g,
-                            optim_g,
-                            config.train.learning_rate_g,
-                            epoch,
-                            g_path,
-                            prior_noise_subspace=subspace_g,
-                        )
-                    save_checkpoint(
-                        net_d,
-                        optim_d,
-                        config.train.learning_rate_d,
-                        epoch,
-                        d_path,
-                        extra=_checkpoint_extra(grad_scaler),
-                    )
-
+            subspace_g = _save_training_checkpoints(
+                net_g, net_d, optim_g, optim_d, ema, grad_scaler, config, epoch,
+                global_step, save_only_latest_net_models,
+            )
 
             # Save small weight model
             if save_weight_models:
@@ -2967,42 +2895,10 @@ def training_loop(
             )
 
         if model_add:
-            model_g = net_g.module if hasattr(net_g, "module") else net_g
-            for m, use_holdout in model_add:
-                if os.path.exists(m):
-                    continue
-                # ``deliverable_weights`` can fall through to the live weights,
-                # and under a schedule-free optimizer those are the extrapolated
-                # iterate.  This is the exported .pth -- the file that gets used
-                # for inference -- so it is the last place that read may go
-                # unaveraged.
-                with averaged_weights((optimizer_choice_g, optim_g)):
-                    ckpt, ckpt_label, ckpt_step = deliverable_weights(
-                        overtrain_monitor, ema, model_g, use_holdout=use_holdout
-                    )
-                success(
-                    f"{os.path.basename(m)} <- {ckpt_label}", tag="[EXPORT]"
-                )
-                if use_holdout or subspace_g is None:
-                    subspace = prior_subspace_for_state(model_g, ckpt)
-                else:
-                    # EMA or live weights at this step: what G_*.pth was saved with.
-                    subspace = subspace_g
-                with uninterruptible_save("weight model export"):
-                    extract_model(
-                        ckpt=ckpt,
-                        sr=sample_rate,
-                        name=model_name,
-                        model_path=m,
-                        epoch=epoch,
-                        step=global_step,
-                        hps=config,
-                        vocoder=vocoder,
-                        architecture=architecture,
-                        weights_step=ckpt_step,
-                        weights_source=ckpt_label,
-                        prior_noise_subspace=subspace,
-                    )
+            _export_weight_models(
+                model_add, net_g, optim_g, ema, overtrain_monitor, subspace_g,
+                epoch, global_step, config,
+            )
 
         if stop_was_requested():
             finish_stop(writer if rank == 0 else None)

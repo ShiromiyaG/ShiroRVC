@@ -388,7 +388,7 @@ def test_the_trainer_guards_both_doors():
     import ast
 
     train = ast.parse((ROOT / "rvc" / "train" / "train.py").read_text())
-    utils = ast.parse((ROOT / "rvc" / "train" / "utils.py").read_text())
+    utils = ast.parse((ROOT / "rvc" / "train" / "checkpoints.py").read_text())
     called = [
         node
         for tree in (train, utils)

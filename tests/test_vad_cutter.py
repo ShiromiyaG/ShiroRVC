@@ -142,7 +142,7 @@ def test_the_option_is_offered_by_every_interface():
     source = (ROOT / "tabs" / "train" / "train.py").read_text(encoding="utf-8")
     assert '"Skip", "Simple", "Automatic", "New Automatic"' in source
 
-    cli = (ROOT / "core.py").read_text(encoding="utf-8")
+    cli = (ROOT / "rvc" / "cli_options.py").read_text(encoding="utf-8")
     assert 'click.Choice(["Skip", "Simple", "Automatic", "New Automatic"])' in cli
 
 
