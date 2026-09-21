@@ -133,6 +133,7 @@ def generator_gradient_metrics(net_g):
         "posterior": [],
         "prior": [],
         "decoder": [],
+        "output": [],
         "speaker": [],
         "other": [],
     }
@@ -145,6 +146,10 @@ def generator_gradient_metrics(net_g):
             group = "posterior"
         elif name.startswith("flow."):
             group = "prior"
+        # Kept out of "decoder": its gradient is ~90% of the generator's and
+        # would hide whatever the rest of the decoder does.
+        elif name.startswith("dec.conv_post."):
+            group = "output"
         elif name.startswith("dec."):
             group = "decoder"
         elif name.startswith("emb_g."):
