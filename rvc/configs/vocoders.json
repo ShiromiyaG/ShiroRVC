@@ -17,7 +17,7 @@
     },
     "hifi++": {
         "label": "HiFi-GAN++",
-        "enabled": false,
+        "enabled": true,
         "description": "The HiFi-GAN generator trained against RefineGAN v2's discriminator: multi-resolution spectrogram branches, UnivHD and SAN. Needs its own pretrain. 32 kHz only.",
         "architecture": "hifi++",
         "config_dir": "hifi++",

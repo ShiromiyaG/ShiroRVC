@@ -49,10 +49,8 @@ rvc/models/predictors/fcpe.pt
 rvc/models/predictors/fcpe_ddsp.pt
 rvc/models/predictors/rmvpe.pt
 rvc/models/fireredvad/
-rvc/models/embedders/spin_v1/pytorch_model.bin
 rvc/models/embedders/spin_v2/pytorch_model.bin
 rvc/models/embedders/contentvec/pytorch_model.bin
-rvc/models/embedders/spin_v1/config.json
 rvc/models/embedders/spin_v2/config.json
 # spin_wavlm_512 is downloaded as an 835 MB Lightning checkpoint and converted
 # on first use, so the whole directory is build output -- the encoder, its

@@ -20,10 +20,7 @@ from ..i18n import _
 # the backend validates anyway, so mirroring them costs nothing and keeps the
 # GUI's first paint free of backend imports.
 F0_METHODS = ["rmvpe", "crepe", "crepe-tiny", "fcpe"]
-EMBEDDER_MODELS = ["contentvec", "spin_v1", "spin_v2"]
-#: Training is the smaller set.  ``spin_v1`` was retired as a *training*
-#: choice; it stays above because a model already trained against it still has
-#: to run, and the embedder is read off the checkpoint at inference.
+EMBEDDER_MODELS = ["contentvec", "spin_v2"]
 TRAINING_EMBEDDER_MODELS = ["contentvec", "spin_v2"]
 EXPORT_FORMATS = ["WAV", "MP3", "FLAC", "OGG", "M4A"]
 INDEX_ALGORITHMS = ["Auto", "Faiss", "KMeans"]

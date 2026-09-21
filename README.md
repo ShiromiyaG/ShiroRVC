@@ -217,18 +217,12 @@ step.
 
 <table>
 <tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
-<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v1</code> · <code>spin_v2</code></td></tr>
+<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v2</code></td></tr>
 <tr><td><b>Optimizers</b></td><td>AdamW · Sched-Free AdamW · Muon · Lion</td></tr>
 <tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel</td></tr>
 <tr><td><b>LR schedulers</b></td><td>exponential decay per step or epoch · cosine annealing · none</td></tr>
 <tr><td><b>Export formats</b></td><td>WAV · MP3 · FLAC · OGG · M4A</td></tr>
 </table>
-
-`spin_v1` is inference-only: its features are 256-wide rather than 768, so a
-model trained against it needs its own pretrained and cannot start from a
-768-wide one. Training offers `contentvec` and `spin_v2`, which are both 768;
-models already trained against `spin_v1` still run, since the embedder is read
-off the checkpoint.
 
 Training writes live TensorBoard diagnostics for KL rate and per-dimension
 usage, per-module gradient norms, GAN balance and a held-out split that is the
@@ -239,8 +233,8 @@ only signal able to see overtraining.
 ## Credits
 
 - **[Applio](https://github.com/IAHispano/Applio)** - The base for this fork.
-- **[dr87 / spin-for-rvc](https://github.com/dr87/spin-for-rvc)** — the `spin_v1`
-  and `spin_v2` content embedders.
+- **[dr87 / spin-for-rvc](https://github.com/dr87/spin-for-rvc)** — the `spin_v2`
+  content embedder.
 - **[FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)** (Apache-2.0) — the
   neural voice-activity detector behind the **New Automatic** cutting mode.
 - [Retrieval-based Voice Conversion WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)

@@ -96,7 +96,6 @@ def load_embedder_model(embedder_model):
     embedder_root = os.path.join(now_dir, "rvc", "models", "embedders")
     embedding_list = {
         "contentvec": os.path.join(embedder_root, "contentvec"),
-        "spin_v1": os.path.join(embedder_root, "spin_v1"),
         "spin_v2": os.path.join(embedder_root, "spin_v2"),
     }
 
@@ -142,11 +141,9 @@ def load_embedder_model(embedder_model):
 
 
 #: Feature width of each embedder, which is what reaches the synthesizer as
-#: ``text_enc_hidden_dim``.  ``spin_v1`` is 256 wide, so a model trained
-#: against it is not weight-compatible with a 768-wide one.
+#: ``text_enc_hidden_dim``.
 EMBEDDER_FEATURE_DIMS = {
     "contentvec": 768,
-    "spin_v1": 256,
     "spin_v2": 768,
 }
 

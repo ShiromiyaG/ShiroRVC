@@ -202,7 +202,7 @@ def inference_options(overrides: dict | None = None) -> list:
         ),
         click.option(
             "--embedder_model",
-            type=click.Choice(["contentvec", "spin_v1", "spin_v2"]),
+            type=click.Choice(["contentvec", "spin_v2"]),
             default='contentvec',
             show_default=True,
             help="Choose the model used for generating speaker embeddings.",
@@ -442,9 +442,6 @@ EXTRACT_OWN = [
     ),
     click.option(
         "--embedder_model",
-        # No ``spin_v1``: it is not trainable any more.  Inference keeps it, so
-        # models already trained against it still run -- see
-        # ``TRAINING_EMBEDDER_MODELS`` in ``gui/services/catalog.py``.
         type=click.Choice(["contentvec", "spin_v2"]),
         default='contentvec',
         show_default=True,

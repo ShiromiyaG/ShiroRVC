@@ -4,10 +4,9 @@ The embedder reaches the synthesizer through exactly one weight.
 ``TextEncoder.__init__`` builds ``self.emb_phone = nn.Linear(embedding_dim,
 hidden_channels)`` and nothing else in the network is a function of
 ``embedding_dim`` -- not the transformer encoder above it, not the flow, not the
-posterior encoder, not the decoder, and not any discriminator.  So a model
-trained against ``spin_v1`` (256-wide) differs from a ``contentvec`` one
-(768-wide) by a single ``[192, 256]`` vs ``[192, 768]`` tensor out of the whole
-generator, and swapping embedders is a question of what to put in that tensor
+posterior encoder, not the decoder, and not any discriminator.  So models
+trained against two different embedders differ by a single ``[192, dim]``
+tensor out of the whole generator, and swapping embedders is a question of what to put in that tensor
 rather than a question of retraining.
 
 Putting a *random* tensor there works -- finetuning will eventually fit it --
@@ -25,9 +24,8 @@ is a ridge regression, computed here from accumulated normal equations in
 float64, which is a few minutes over hours of audio and needs no GPU memory
 beyond one clip.
 
-What this cannot do is invent information.  SPIN WavLM is 256-d, L2-normalised
-and trained to *discard* speaker identity; ContentVec is 768-d, unnormalised,
-and keeps some.  The fit recovers whatever the target embedder carries linearly
+What this cannot do is invent information.  SPIN is L2-normalised and trained
+to *discard* speaker identity; ContentVec is unnormalised and keeps some.  The fit recovers whatever the target embedder carries linearly
 of what the source carried, and the reported R^2 is the honest measure of how
 much that is.  Read it before trusting the output: a high R^2 means the
 finetune starts near where the pretrain left off, and a low one means this is a
@@ -74,7 +72,7 @@ Usage:
     python tools/convert_embedder.py \\
         --checkpoint logs/pretrains/pretrain_G.pth \\
         --output logs/pretrains/pretrain_contentvec_G.pth \\
-        --source-embedder spin_v1 \\
+        --source-embedder spin_v2 \\
         --target-embedder contentvec \\
         --audio-dir logs/pretrain/sliced_audios
 """

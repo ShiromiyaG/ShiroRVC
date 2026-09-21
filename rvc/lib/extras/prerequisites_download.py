@@ -63,7 +63,6 @@ models_list = [
 
 embedders_list = [
     ("embedders/contentvec/", ["pytorch_model.bin", "config.json"]),
-    ("embedders/spin_v1", ["pytorch_model.bin", "config.json"], f"{RESOURCE_BASE}/embedders/spin_v1"),
     ("embedders/spin_v2", ["pytorch_model.bin", "config.json"], f"{RESOURCE_BASE}/embedders/spin_v2"),
 ]
 
@@ -77,7 +76,6 @@ folder_mapping_list = {
     "pretrained_refinegan2/": "rvc/models/pretraineds/refinegan2/",
     "pretrained_hifi++/": "rvc/models/pretraineds/hifi-gan++/",
     "embedders/contentvec/": "rvc/models/embedders/contentvec/",
-    "embedders/spin_v1": "rvc/models/embedders/spin_v1/",
     "embedders/spin_v2": "rvc/models/embedders/spin_v2/",
     "predictors/": "rvc/models/predictors/",
     "fireredvad/VAD/": "rvc/models/fireredvad/VAD/",

@@ -298,7 +298,7 @@ def tts_tab():
             embedder_model = gr.Radio(
                 label=_("Embedder Model"),
                 info=_("Model used for learning speaker embedding."),
-                choices=["contentvec", "spin_v1", "spin_v2"],
+                choices=["contentvec", "spin_v2"],
                 value="contentvec",
                 interactive=True,
             )

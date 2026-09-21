@@ -21,7 +21,7 @@ import math
 import os
 
 F0_METHODS = ("crepe", "crepe-tiny", "rmvpe", "fcpe")
-EMBEDDER_MODELS = ("contentvec", "spin_v1", "spin_v2")
+EMBEDDER_MODELS = ("contentvec", "spin_v2")
 EXPORT_FORMATS = ("WAV", "MP3", "FLAC", "OGG", "M4A")
 
 #: Keys whose value is one of a fixed set.
