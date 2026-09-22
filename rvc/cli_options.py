@@ -286,7 +286,7 @@ STYLE_OPTIONS = [
         type=click.BOOL,
         default=True,
         show_default=True,
-        help="Keep each note centred where the source sings it.",
+        help="Keep each note centred where the source sings it, and quick passages on its slow pitch.",
     ),
     click.option(
         "--style_steps",

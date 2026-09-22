@@ -11,11 +11,12 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
+from scipy import signal
 
 from . import checkpoint
 from .clips import split_frames
 from .descriptors import DESCRIPTOR_NAMES, analyze, descriptor_vector, detect_notes, pool
-from .f0_repr import _runs, coarse_f0, decompose
+from .f0_repr import _runs, coarse_f0, decompose, interpolate_unvoiced
 from .flow import sample
 from .frontend import HOP, StyleFrontend
 from .units import units_to_frames
@@ -52,7 +53,8 @@ class StyleOptions:
     #: the gap between the model's and the whole source's, instead of on the
     #: model's everywhere.
     relative: bool = True
-    #: Shift each note so its stable part averages the source's pitch.
+    #: Keep the source's intonation: each note centred on the source's
+    #: pitch, phrases without a stable note on its slow contour.
     recenter: bool = True
     #: ``{descriptor_name: offset}`` in dataset standard deviations, added to
     #: the model's own descriptors (the dataset mean for a base).
@@ -93,11 +95,12 @@ def fill_unvoiced(residual, generated, vuv) -> np.ndarray:
     return out
 
 
-def recenter_notes(residual, src_res, f0, vuv, rcfg, dcfg) -> np.ndarray:
+def recenter_notes(residual, src_res, f0, vuv, rcfg, dcfg, slow_hz: float = 2.0) -> np.ndarray:
     """``residual`` shifted so the stable part of each source note averages
     the source's residual there.  Between notes of a phrase the shift is
     interpolated, so attacks and glides move with their notes instead of
-    stepping."""
+    stepping.  Phrases with no stable note follow the source below
+    ``slow_hz`` instead, keeping only the generated detail above it."""
     notes, runs, _ = detect_notes(f0, rcfg, dcfg)
     knots: dict = {}
     for note in notes:
@@ -106,10 +109,19 @@ def recenter_notes(residual, src_res, f0, vuv, rcfg, dcfg) -> np.ndarray:
             offset = float(np.mean((residual[note.start : note.end] - src_res[note.start : note.end])[m]))
             knots.setdefault(note.run, []).extend([(note.start, offset), (note.end - 1, offset)])
     out = np.asarray(residual, dtype=np.float32).copy()
-    for run, points in knots.items():
-        s, e = runs[run]
-        x, y = zip(*points)
-        out[s:e] -= np.where(vuv[s:e], np.interp(np.arange(s, e), x, y), 0.0).astype(np.float32)
+    sos = signal.butter(2, slow_hz, fs=rcfg.frame_rate, output="sos")
+    for run, (s, e) in enumerate(runs):
+        m = vuv[s:e]
+        if run in knots:
+            x, y = zip(*knots[run])
+            shift = np.interp(np.arange(s, e), x, y)
+        elif m.sum() >= 3:
+            diff = interpolate_unvoiced(out[s:e] - src_res[s:e], m)
+            # Too short for the filter to settle: its mean is all there is.
+            shift = signal.sosfiltfilt(sos, diff) if e - s >= 30 else np.full(e - s, diff[m].mean())
+        else:
+            continue
+        out[s:e] -= np.where(m, shift, 0.0).astype(np.float32)
     return out
 
 

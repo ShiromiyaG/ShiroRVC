@@ -411,7 +411,7 @@ def inference_tab():
                     )
                     style_recenter = gr.Checkbox(
                         label=_("Keep the source's intonation"),
-                        info=_("Each note stays centred where the source sings it."),
+                        info=_("Each note stays centred where the source sings it; quick passages follow its slow pitch."),
                         value=True,
                         interactive=True,
                     )
