@@ -1,0 +1,48 @@
+# Shared by extraction, pretrain, fine-tune and inference.  A style checkpoint
+# embeds the representation it was trained with, so editing this only affects
+# data extracted and models trained afterwards.
+
+representation:
+  frame_rate: 100.0          # RVC's pitch grid (16 kHz, hop 160)
+  coarse_rate_hz: 10.0
+  coarse_cutoff_hz: 3.0
+  quant_cents: 25.0
+  # Notes hold their pitch and the model generates attacks, glides and
+  # phrase ends; scoops reach ~900 cents, hence the wider clip.
+  coarse_mode: notes
+  residual_clip_cents: 1200.0
+
+# Empty uses the defaults in rvc/lib/style_flow/descriptors.py.
+descriptors: {}
+
+# RMVPE and the embedder run over long audio in windows of chunk_seconds (plus
+# context_seconds on each side); lower chunk_seconds if extraction runs out of VRAM.
+frontend:
+  chunk_seconds: 20.0
+  context_seconds: 1.0
+
+units:
+  clusters: 256
+  fit_max_frames: 500000
+  fit_frames_per_clip: 200
+  fit_iterations: 25
+  seed: 0
+
+clips:
+  min_seconds: 5.0
+  max_seconds: 15.0
+  min_voiced_fraction: 0.2
+  # Overlap tried first when stitching RVC slices back together (the
+  # Automatic modes' OVERLAP); any other overlap, such as "Simple" cutting's,
+  # is searched for.
+  slice_overlap_seconds: 0.3
+  stitch_min_correlation: 0.9
+
+# Architecture of a new base; a fine-tune takes it from its base checkpoint.
+model:
+  dim: 320
+  depth: 8
+  heads: 5
+  mlp_ratio: 4.0
+  conv_kernel: 7
+  qk_norm: true

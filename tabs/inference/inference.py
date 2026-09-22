@@ -10,6 +10,7 @@ from core import (
     run_infer_script,
     run_batch_infer_script,
     import_voice_converter,
+    list_style_models,
 )
 
 from rvc.lib.terminal import warning
@@ -294,6 +295,35 @@ def get_bundle_model_names(model):
         warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []
 
+#: Descriptor sliders: offsets in dataset standard deviations from the style
+#: model's own value.
+STYLE_SLIDERS = {
+    "vibrato_extent_cents": "Vibrato depth",
+    "vibrato_rate_hz": "Vibrato rate",
+    "vibrato_fraction": "Notes with vibrato",
+    "scoop_fraction": "Scoops",
+    "scoop_depth_cents": "Scoop depth",
+    "phrase_end_drop_cents": "Phrase-end drop",
+}
+
+
+def build_style(enabled, model, strength, rate, intensity, relative, recenter, steps, cfg, *offsets):
+    """The ``style`` argument of the infer scripts, or None when off."""
+    if not enabled or not model:
+        return None
+    return {
+        "model": model,
+        "strength": float(strength),
+        "rate": float(rate),
+        "intensity": float(intensity),
+        "relative": bool(relative),
+        "recenter": bool(recenter),
+        "steps": int(steps),
+        "cfg": float(cfg),
+        "descriptors": {name: float(v) for name, v in zip(STYLE_SLIDERS, offsets) if v},
+    }
+
+
 def inference_tab():
     with gr.Column():
         with gr.Row():
@@ -335,6 +365,104 @@ def inference_tab():
                 outputs=[model_file, index_file],
             )
 
+        with gr.Accordion(_("Style Model"), open=False):
+            with gr.Row(equal_height=True):
+                style_enabled = gr.Checkbox(
+                    label=_("Enable"),
+                    info=_("Sing with a style model's vibrato, scoops and phrase endings; the melody stays the source's."),
+                    value=False,
+                    interactive=True,
+                    scale=2,
+                )
+                style_model = gr.Dropdown(
+                    label=_("Style model"),
+                    info=_("<name>_style.pt for a singer, or a style base. Works with any voice model."),
+                    choices=list_style_models(),
+                    value=None,
+                    interactive=True,
+                    allow_custom_value=True,
+                    scale=5,
+                )
+                style_refresh = gr.Button(_("Refresh"), size="sm", scale=0, min_width=100)
+
+            with gr.Column(visible=False) as style_settings:
+                with gr.Row():
+                    style_strength = gr.Slider(
+                        0, 1, 1.0, step=0.05, label=_("Strength"),
+                        info=_("1 redraws the detail; lower keeps more of the source's."),
+                        interactive=True,
+                    )
+                    style_rate = gr.Slider(
+                        0, 2, 1.0, step=0.05, label=_("Amount"),
+                        info=_("0 keeps the source's smooth melody, 1 the generated style; above 1 exaggerates it."),
+                        interactive=True,
+                    )
+                    style_intensity = gr.Slider(
+                        0, 1.5, 1.0, step=0.05, label=_("Style intensity"),
+                        info=_("How far to move toward the singer's habits: 0 keeps the source's (or a neutral singer's, when not relative to the source), 1 the model's own."),
+                        interactive=True,
+                    )
+                with gr.Row():
+                    style_relative = gr.Checkbox(
+                        label=_("Relative to the source"),
+                        info=_("Each passage keeps the source's own habits, shifted toward the singer's, instead of the singer's everywhere."),
+                        value=True,
+                        interactive=True,
+                    )
+                    style_recenter = gr.Checkbox(
+                        label=_("Keep the source's intonation"),
+                        info=_("Each note stays centred where the source sings it."),
+                        value=True,
+                        interactive=True,
+                    )
+                with gr.Accordion(_("Style descriptors"), open=False):
+                    gr.Markdown(
+                        _("Offsets from the style model's own singing, in standard deviations; 0 keeps it as is.")
+                    )
+                    style_offsets = []
+                    labels = list(STYLE_SLIDERS.values())
+                    for i in range(0, len(labels), 2):
+                        with gr.Row():
+                            for label in labels[i : i + 2]:
+                                style_offsets.append(
+                                    gr.Slider(-3, 3, 0.0, step=0.1, label=_(label), interactive=True)
+                                )
+                    style_reset = gr.Button(_("Reset descriptors"), size="sm")
+                with gr.Accordion(_("Sampler"), open=False):
+                    with gr.Row():
+                        style_steps = gr.Slider(
+                            4, 128, 32, step=1, label=_("Steps"),
+                            info=_("More is slower; below ~16 quality drops."),
+                            interactive=True,
+                        )
+                        style_cfg = gr.Slider(
+                            1, 5, 2.0, step=0.1, label=_("CFG"),
+                            info=_("How strongly the descriptors are followed."),
+                            interactive=True,
+                        )
+
+            style_enabled.change(
+                fn=lambda on: gr.update(visible=bool(on)),
+                inputs=[style_enabled],
+                outputs=[style_settings],
+                show_progress="hidden",
+            )
+            style_refresh.click(
+                fn=lambda: gr.update(choices=list_style_models()),
+                inputs=[],
+                outputs=[style_model],
+            )
+            style_reset.click(
+                fn=lambda: [0.0] * len(style_offsets),
+                inputs=[],
+                outputs=style_offsets,
+                show_progress="hidden",
+            )
+        style_inputs = [
+            style_enabled, style_model, style_strength, style_rate, style_intensity, style_relative, style_recenter,
+            style_steps, style_cfg, *style_offsets,
+        ]
+
         def run_single_infer(
             pitch, filter_radius, index_rate, rms_mix_rate, protect,
             f0_method, audio, output_path, model_file, index_file,
@@ -345,6 +473,7 @@ def inference_tab():
             sid, seed, bundle_submodel,
             index_k, index_power, index_continuity,
             silence_gate_db,
+            *style_values,
         ):
             if not output_path or not output_path.strip():
                 output_path = output_path_fn(audio)
@@ -373,7 +502,12 @@ def inference_tab():
                 sid, seed, bundle_submodel,
                 index_k, index_power, index_continuity,
                 silence_gate_db,
+                style=build_style(*style_values),
             )
+
+        def run_batch_infer(*values):
+            n = len(style_inputs)
+            return run_batch_infer_script(*values[:-n], style=build_style(*values[-n:]))
 
         def on_model_change(model_path):
             bundle_models = get_bundle_model_names(model_path)
@@ -1167,11 +1301,12 @@ def inference_tab():
             index_power,
             index_continuity,
             silence_gate_db,
+            *style_inputs,
         ],
         outputs=[vc_output1, vc_output2],
     )
     convert_button_batch.click(
-        fn=run_batch_infer_script,
+        fn=run_batch_infer,
         inputs=[
             pitch_batch,
             filter_radius_batch,
@@ -1200,6 +1335,7 @@ def inference_tab():
             index_power_batch,
             index_continuity_batch,
             silence_gate_db_batch,
+            *style_inputs,
         ],
         outputs=[vc_output3],
     )

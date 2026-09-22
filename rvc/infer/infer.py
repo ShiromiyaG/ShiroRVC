@@ -150,6 +150,7 @@ class VoiceConverter:
         index_power: float = 2.0,
         index_continuity: float = 0.5,
         noise_scale: float = None,
+        style: dict = None,
         **kwargs,
     ):
         """silence_gate_db: input level (dBFS) under which output is faded out. The
@@ -161,6 +162,9 @@ class VoiceConverter:
         noise_scale: scale of the prior draw the model decodes. None uses the
         model's own default (0.3 for RefineGAN2, 0.66666 otherwise or when the
         checkpoint carries ``prior_noise_subspace``).
+
+        style: ``StyleOptions`` fields as a dict (``model`` set) to apply a
+        style model; None converts with plain RVC.
         """
         if not model_path:
             print_error("No model provided. Aborting conversion.", tag="[INFER]")
@@ -205,7 +209,7 @@ class VoiceConverter:
                 chunks, intervals = process_audio(audio, 16000)
                 info(f"Audio split into {len(chunks)} chunks.", tag="[INFER]")
             else:
-                chunks = [audio]
+                chunks, intervals = [audio], [(0, len(audio))]
 
             if seed != 0:
                 torch.manual_seed(seed)
@@ -218,6 +222,21 @@ class VoiceConverter:
                 torch.cuda.manual_seed_all(seed)
                 info(INFER_RANDOM_SEED_EXPOSED.format(seed=seed), tag="[INFER]")
 
+            style_options = None
+            if style and style.get("model"):
+                from rvc.lib.style_flow.infer import StyleOptions
+
+                style_options = StyleOptions.from_dict({"seed": seed, **style})
+                info(f"Style model: {os.path.basename(style_options.model)}", tag="[INFER]")
+
+            # Styled once over the whole input: per chunk, each would sample its
+            # own interpretation and the result would depend on the split.
+            style_contour = None
+            if style_options is not None and f0_autotune:
+                warning("Autotune and the style model are exclusive; style skipped.", tag="[INFER]")
+            elif style_options is not None and self.use_f0:
+                style_contour = self.vc.style_contour(audio, pitch, style_options)
+
             converted_chunks = []
             retrieval_config = RetrievalConfig.build(
                 k=index_k, power=index_power, continuity=index_continuity
@@ -229,7 +248,7 @@ class VoiceConverter:
                 "Converting",
                 disable=len(chunks) < 2,
             ) as (chunk_progress, chunk_task):
-                for c in chunks:
+                for c, (start, _) in zip(chunks, intervals):
                     audio_opt = self.vc.pipeline(
                         model=self.hubert_model,
                         net_g=self.net_g,
@@ -254,6 +273,7 @@ class VoiceConverter:
                         retrieval_config=retrieval_config,
                         do_normalize=self.hubert_do_normalize,
                         noise_scale=noise_scale,
+                        style_f0=None if style_contour is None else (*style_contour, round(start / 160)),
                     )
                     converted_chunks.append(audio_opt)
                     chunk_progress.advance(chunk_task)

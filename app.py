@@ -123,6 +123,7 @@ APP_LANGUAGE = i18n.install_resolved(
 # Import Tabs
 from tabs.inference.inference import inference_tab
 from tabs.train.train import train_tab
+from tabs.style.style import style_tab
 from tabs.utilities.utilities import utilities_tab
 from tabs.download.download import download_tab
 from tabs.tts.tts import tts_tab
@@ -188,6 +189,10 @@ with gr.Blocks(title=APP_TITLE) as interface:
             with gr.Tab(_("Training")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
                     train_tab()
+
+            with gr.Tab(_("Style")):
+                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
+                    style_tab()
 
             with gr.Tab(_("TTS")):
                 with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):

@@ -412,6 +412,7 @@ if __name__ == "__main__":
     else:
         data = {}
     data["embedder_model"] = embedder_model
+    data["f0_method"] = f0_method
     with open(file_path, "w") as f:
         json.dump(data, f, indent=4)
 

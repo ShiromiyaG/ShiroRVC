@@ -246,6 +246,70 @@ FORMANT_OPTIONS = [
     ),
 ]
 
+STYLE_OPTIONS = [
+    click.option(
+        "--style_model",
+        type=str,
+        default=None,
+        help="Style model (.pt) whose vibrato, scoops and phrase endings replace the source's fine pitch detail. Unset converts with plain RVC.",
+    ),
+    click.option(
+        "--style_strength",
+        type=click.FloatRange(0, 1),
+        default=1.0,
+        show_default=True,
+        help="1 generates the pitch detail from scratch; lower values stay closer to the source's own.",
+    ),
+    click.option(
+        "--style_rate",
+        type=click.FloatRange(0, 2),
+        default=1.0,
+        show_default=True,
+        help="0 keeps the source's smoothed melody, 1 the generated style, above 1 exaggerates it.",
+    ),
+    click.option(
+        "--style_intensity",
+        type=click.FloatRange(0, 3),
+        default=1.0,
+        show_default=True,
+        help="How far to move toward the style model's descriptors: 0 keeps the source's (the dataset mean without --style_relative), 1 the model's.",
+    ),
+    click.option(
+        "--style_relative",
+        type=click.BOOL,
+        default=True,
+        show_default=True,
+        help="Condition each passage on the source's own descriptors shifted toward the style model's, instead of on the model's everywhere.",
+    ),
+    click.option(
+        "--style_recenter",
+        type=click.BOOL,
+        default=True,
+        show_default=True,
+        help="Keep each note centred where the source sings it.",
+    ),
+    click.option(
+        "--style_steps",
+        type=click.IntRange(1, 256),
+        default=32,
+        show_default=True,
+        help="Sampler steps of the style model.",
+    ),
+    click.option(
+        "--style_cfg",
+        type=click.FloatRange(1, 10),
+        default=2.0,
+        show_default=True,
+        help="How strongly the style descriptors are followed.",
+    ),
+    click.option(
+        "--style_descriptors",
+        type=str,
+        default=None,
+        help='JSON offsets from the style model\'s own descriptors, in standard deviations, e.g. \'{"vibrato_extent_cents": 1.0}\'.',
+    ),
+]
+
 # ---- infer ----
 INFER_OWN = [
     click.option(
@@ -652,6 +716,84 @@ INDEX_OWN = [
         default="all",
         show_default=True,
         help="Build the index from one speaker's features instead of the whole dataset. 'all', or a speaker id. A per-speaker index is written as <model>_spk<id>.index alongside the full one.",
+    ),
+]
+
+# ---- style_extract ----
+STYLE_EXTRACT_OWN = [
+    click.option("--model_name", type=str, required=True, help="Name of the style run; data goes to logs/<model_name>/style_data."),
+    click.option(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Folder of whole audio files of any length; <id>_<name> subfolders are speakers. Unset reuses the preprocessed RVC experiment logs/<model_name>.",
+    ),
+    click.option(
+        "--embedder_model",
+        type=click.Choice(["contentvec", "spin_v2"]),
+        default="contentvec",
+        show_default=True,
+        help="Embedder of a new base (ignored with --base_path).",
+    ),
+    click.option(
+        "--base_path",
+        type=str,
+        default=None,
+        help="style_base.pt the data will fine-tune; its embedder, codebook and statistics are used.",
+    ),
+    click.option("--gpu", type=str, default="0", show_default=True, help="GPU id, or '-' for CPU."),
+    click.option(
+        "--recompute",
+        type=click.BOOL,
+        default=False,
+        show_default=True,
+        help="Ignore the RVC experiment's F0 and features and compute them again.",
+    ),
+]
+
+# ---- style_train ----
+STYLE_TRAIN_OWN = [
+    click.option("--model_name", type=str, required=True, help="Name of the preprocessed and extracted experiment."),
+    click.option(
+        "--base_path",
+        type=str,
+        default=None,
+        help="style_base.pt to fine-tune into <model_name>_style.pt. Unset pretrains a new base on the experiment.",
+    ),
+    click.option(
+        "--steps",
+        type=click.IntRange(0, None),
+        default=0,
+        show_default=True,
+        help="Training steps; 0 uses the config's (200000 for a base, 5000 for a fine-tune).",
+    ),
+    click.option(
+        "--precision",
+        type=click.Choice(["bf16", "fp16", "fp32"]),
+        default="bf16",
+        show_default=True,
+        help="Autocast dtype over FP32 weights; fp16 adds a GradScaler. TF32 is on.",
+    ),
+    click.option("--gpu", type=str, default="0", show_default=True, help="GPU id, or '-' for CPU."),
+    click.option(
+        "--speech_speakers",
+        type=str,
+        default=None,
+        help='Speech speaker ids of a pretrain, e.g. "0-4"; "" for none. Unset keeps pretrain.yaml\'s.',
+    ),
+    click.option(
+        "--batch_size",
+        type=click.IntRange(0, None),
+        default=0,
+        show_default=True,
+        help="Batch size; 0 uses the config's (32 for a base, 16 for a fine-tune).",
+    ),
+    click.option(
+        "--checkpointing",
+        type=click.BOOL,
+        default=False,
+        show_default=True,
+        help="Gradient checkpointing: less VRAM, slower steps.",
     ),
 ]
 

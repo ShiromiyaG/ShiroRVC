@@ -54,6 +54,9 @@ from rvc.cli_options import (
     MODEL_INFORMATION_OWN,
     PREPROCESS_OWN,
     PREREQUISITES_OWN,
+    STYLE_EXTRACT_OWN,
+    STYLE_OPTIONS,
+    STYLE_TRAIN_OWN,
     TRAIN_OWN,
     TTS_DEFAULTS,
     TTS_OWN,
@@ -167,6 +170,7 @@ def run_infer_script(
     silence_gate_db: float = -60.0,
     *,
     noise_scale: float = None,
+    style: dict = None,
 ):
     kwargs = {
         "audio_input_path": input_path,
@@ -200,6 +204,7 @@ def run_infer_script(
         "index_power": index_power,
         "index_continuity": index_continuity,
         "noise_scale": noise_scale,
+        "style": style,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(
@@ -244,6 +249,7 @@ def run_batch_infer_script(
     silence_gate_db: float = -60.0,
     *,
     noise_scale: float = None,
+    style: dict = None,
 ):
     kwargs = {
         "audio_input_paths": input_folder,
@@ -276,6 +282,7 @@ def run_batch_infer_script(
         "index_power": index_power,
         "index_continuity": index_continuity,
         "noise_scale": noise_scale,
+        "style": style,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(
@@ -757,6 +764,175 @@ def run_index_script(
     return f"Index file for {model_name} generated successfully."
 
 
+# Style model
+style_models_path = os.path.join(current_script_directory, "rvc", "models", "style")
+_style_process = None
+
+
+def list_style_models(kind: str = "all") -> list[str]:
+    """Style checkpoints: bases (``rvc/models/style/*.pt``, ``logs/*/style_base.pt``)
+    and fine-tuned singers (``logs/*/*_style.pt``).  ``kind`` is "base",
+    "singer" or "all"."""
+    import glob
+
+    bases = glob.glob(os.path.join(style_models_path, "*.pt")) + glob.glob(
+        os.path.join(logs_path, "*", "style_base.pt")
+    )
+    singers = glob.glob(os.path.join(logs_path, "*", "*_style.pt"))
+    chosen = {"base": bases, "singer": singers}.get(kind, bases + singers)
+    return sorted(os.path.relpath(p, current_script_directory) for p in chosen)
+
+
+def style_data_summary(model_name: str) -> str | None:
+    """One line on ``logs/<model_name>/style_data``, or None when missing."""
+    import json
+
+    manifest = os.path.join(logs_path, model_name, "style_data", "style_data.json")
+    if not os.path.exists(manifest):
+        return None
+    with open(manifest, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return (
+        f"{data.get('clips', 0)} clips, {data.get('hours', 0.0):.1f} h, "
+        f"{len(data.get('speaker_descriptors', {}))} speaker(s), embedder {data.get('embedder', '?')}."
+    )
+
+
+def _run_style_process(command) -> int:
+    """Run a style script, remembered so ``stop_style_script`` can stop it."""
+    global _style_process
+    _style_process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    try:
+        return _style_process.wait()
+    finally:
+        _style_process = None
+
+
+def stop_style_script():
+    """Interrupt the running style extraction or training; training saves a
+    checkpoint on the way out and resumes from it next time."""
+    process = _style_process
+    if process is None or process.poll() is not None:
+        return "No style job is running."
+    if os.name == "nt":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
+    return "Stopping the style job; training saves a checkpoint first."
+
+
+def _style_device(gpu) -> str:
+    return "cpu" if str(gpu).strip() in ("-", "") else f"cuda:{str(gpu).split('-')[0]}"
+
+
+def run_style_extract_script(
+    model_name: str,
+    dataset_path: str = None,
+    embedder_model: str = "contentvec",
+    base_path: str = None,
+    gpu: str = "0",
+    recompute: bool = False,
+):
+    """Build ``logs/<model_name>/style_data`` from a folder of whole audio
+    files (``dataset_path``; ``<id>_<name>`` subfolders are speakers) or, with
+    no path, from the RVC experiment ``logs/<model_name>``.  ``base_path``
+    ties it to a base for fine-tuning; otherwise ``embedder_model`` is used
+    for a new base."""
+    exp_dir = os.path.join(logs_path, model_name)
+    command = [
+        python,
+        os.path.join(current_script_directory, "tools", "style_flow", "extract.py"),
+        "--out", os.path.join(exp_dir, "style_data"),
+        "--device", _style_device(gpu),
+    ]
+    if dataset_path:
+        if not os.path.isdir(dataset_path):
+            return f"Dataset folder not found: {dataset_path}"
+        command += ["--audio-dir", dataset_path]
+    elif os.path.isdir(os.path.join(exp_dir, "sliced_audios")):
+        command += ["--experiment", exp_dir]
+        if recompute:
+            command.append("--recompute")
+    else:
+        return f"Pick a dataset folder; logs/{model_name} is not a preprocessed RVC experiment."
+    if base_path:
+        if not os.path.exists(base_path):
+            return f"Style base not found: {base_path}"
+        command += ["--reference", base_path, "--config",
+                    os.path.join(current_script_directory, "rvc", "configs", "style_flow", "finetune.yaml")]
+    else:
+        command += ["--embedder", embedder_model, "--config",
+                    os.path.join(current_script_directory, "rvc", "configs", "style_flow", "pretrain.yaml")]
+    code = _run_style_process(command)
+    if code != 0:
+        return f"Style extraction for {model_name} stopped ({describe_exit_code(code)}); rerun to resume."
+    return f"Style data for {model_name}: {style_data_summary(model_name)}"
+
+
+def run_style_train_script(
+    model_name: str,
+    base_path: str = None,
+    steps: int = 0,
+    precision: str = "bf16",
+    gpu: str = "0",
+    speech_speakers: str = None,
+    batch_size: int = 0,
+    checkpointing: bool = False,
+):
+    """Train a style model on ``logs/<model_name>``, extracting its style
+    dataset from the RVC experiment there when it has none yet.  With
+    ``base_path`` it fine-tunes LoRA adapters on that base into
+    ``<model_name>_style.pt``;
+    without it, it pretrains a new base, ``style_base.pt``.  ``steps`` and
+    ``batch_size`` 0 keep the config's; ``speech_speakers`` ("0-4", "" for
+    none) only applies to a pretrain."""
+    exp_dir = os.path.join(logs_path, model_name)
+    if not os.path.isdir(exp_dir):
+        return f"Nothing to train on: extract style data for {model_name} first."
+    pretrain = not base_path
+    if not pretrain and not os.path.exists(base_path):
+        return f"Style base not found: {base_path}"
+    script = "pretrain.py" if pretrain else "finetune.py"
+    command = [
+        python,
+        os.path.join(current_script_directory, "tools", "style_flow", script),
+        "--experiment", exp_dir,
+        "--precision", precision,
+        "--device", _style_device(gpu),
+    ]
+    if steps:
+        command += ["--steps", str(int(steps))]
+    if batch_size:
+        command += ["--batch-size", str(int(batch_size))]
+    if checkpointing:
+        command.append("--checkpointing")
+    if pretrain:
+        if speech_speakers is not None:
+            command += ["--speech-speakers", speech_speakers]
+    else:
+        command += ["--base", base_path]
+    code = _run_style_process(command)
+    if code != 0:
+        return (
+            f"Style training for {model_name} stopped ({describe_exit_code(code)}). "
+            "Rerun to resume; see the terminal if it failed."
+        )
+    output = "style_base.pt" if pretrain else f"{model_name}_style.pt"
+    return f"Style model saved to {os.path.join(exp_dir, output)}."
+
+
+def style_options(kwargs: dict) -> dict | None:
+    """Pops the CLI's ``style_*`` options out of ``kwargs`` into the ``style``
+    argument of the infer scripts."""
+    import json
+
+    values = {key: kwargs.pop(f"style_{key}", None) for key in ("model", "strength", "rate", "intensity", "relative", "recenter", "steps", "cfg", "descriptors")}
+    if not values["model"]:
+        return None
+    values["descriptors"] = json.loads(values["descriptors"]) if values["descriptors"] else {}
+    return {k: v for k, v in values.items() if v is not None}
+
+
 # Model information
 def run_model_information_script(pth_path: str):
     from rvc.train.process.model_information import model_information
@@ -845,17 +1021,19 @@ def cli():
 
 
 @cli.command("infer")
-@apply_options(INFER_OWN, inference_options(INFER_DEFAULTS), FORMANT_OPTIONS)
+@apply_options(INFER_OWN, inference_options(INFER_DEFAULTS), FORMANT_OPTIONS, STYLE_OPTIONS)
 def infer(**kwargs):
     """Run inference on a single audio file."""
-    run_infer_script(**kwargs)
+    style = style_options(kwargs)
+    run_infer_script(**kwargs, style=style)
 
 
 @cli.command("batch_infer")
-@apply_options(BATCH_INFER_OWN, inference_options(BATCH_INFER_DEFAULTS), FORMANT_OPTIONS)
+@apply_options(BATCH_INFER_OWN, inference_options(BATCH_INFER_DEFAULTS), FORMANT_OPTIONS, STYLE_OPTIONS)
 def batch_infer(**kwargs):
     """Run inference on every audio file in a folder."""
-    run_batch_infer_script(**kwargs)
+    style = style_options(kwargs)
+    run_batch_infer_script(**kwargs, style=style)
 
 
 @cli.command("tts")
@@ -894,6 +1072,20 @@ def train(**kwargs):
 def index(**kwargs):
     """Build the FAISS index for a trained model."""
     run_index_script(**kwargs)
+
+
+@cli.command("style_extract")
+@apply_options(STYLE_EXTRACT_OWN)
+def style_extract(**kwargs):
+    """Build a style dataset from an audio folder or an RVC experiment."""
+    print(run_style_extract_script(**kwargs))
+
+
+@cli.command("style_train")
+@apply_options(STYLE_TRAIN_OWN)
+def style_train(**kwargs):
+    """Pretrain a style base, or fine-tune one on a singer."""
+    print(run_style_train_script(**kwargs))
 
 
 @cli.command("model_information")

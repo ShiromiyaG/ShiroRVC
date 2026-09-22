@@ -1,0 +1,72 @@
+inherit: base.yaml
+
+# The fine-tune's threshold, so the base learns the same attacks and phrase
+# ends; at 0.03 weak tails read as drops.
+frontend:
+  voicing_threshold: 0.5
+
+data:
+  # Speaker ids that are speech (EARS) rather than singing, as "a-b" ranges
+  # or single ids.
+  speech_speakers: ["0-4"]
+  max_speech_fraction: 0.15
+  val_clips: 64
+  max_frames: 1500
+
+augment:
+  prob: 0.8
+  vibrato_extent: [0.5, 2.0]
+  vibrato_rate: [0.8, 1.25]
+  scoop_prob: 0.5
+  scoop_gain: [0.0, 2.5]
+  scoop_add_prob: 0.5
+  scoop_add_cents: [60.0, 600.0]
+  scoop_add_seconds: [0.05, 0.35]
+  drop_prob: 0.5
+  drop_gain: [0.0, 2.5]
+  drop_add_prob: 0.5
+  drop_add_cents: [40.0, 400.0]
+  drop_add_seconds: [0.1, 0.3]
+  coarse_shift_semitones: 3.0
+
+train:
+  batch_size: 32
+  steps: 200000
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  min_lr_ratio: 0.1
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  unit_dropout: 0.15
+  descriptor_dropout: 0.15
+  descriptor_dim_dropout: 0.1
+  t_logit_mean: 0.0
+  t_logit_std: 1.0
+  # bf16, fp16 (autocast + GradScaler over FP32 weights) or fp32.
+  precision: bf16
+  tf32: true
+  # Recompute block activations in backward: less VRAM, slower steps.
+  checkpointing: false
+  num_workers: 6
+  log_every: 100
+  val_every: 5000
+  keep_checkpoints: 3
+  seed: 0
+
+validation:
+  sample_clips: 16
+  steps: 32
+  cfg_scale: 2.0
+  cfg_drop: descriptors
+  # Each clip generated with its own descriptors.
+  condition: clip
+  plot_clips: 3
+  # Descriptor -> direction; a negative drop is a fall, so the fraction of
+  # falling phrase ends rises with it.
+  response_groups:
+    vibrato_extent: {vibrato_extent_cents: 1}
+    vibrato_rate: {vibrato_rate_hz: 1}
+    scoop: {scoop_fraction: 1}
+    phrase_end_drop: {phrase_end_drop_cents: -1, phrase_end_drop_fraction: 1}
+  response_offset: 1.5

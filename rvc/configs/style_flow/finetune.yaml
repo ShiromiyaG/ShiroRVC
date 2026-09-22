@@ -1,0 +1,75 @@
+inherit: base.yaml
+
+# Stricter than RMVPE's usual 0.03: a singer's set is often separated vocals,
+# whose weak attacks and tails (breath, fry, bleed) otherwise read as deep
+# scoops and phrase-end drops.  Saved in the model and used at inference.
+frontend:
+  voicing_threshold: 0.5
+
+data:
+  speech_speakers: []
+  max_speech_fraction: 0.0
+  val_clips: 8
+  max_frames: 1500
+
+# Milder than the pretrain: the point is the singer's own style, while the
+# recomputed descriptors keep the descriptor -> contour mapping honest.
+augment:
+  prob: 0.3
+  vibrato_extent: [0.7, 1.4]
+  vibrato_rate: [0.9, 1.1]
+  scoop_prob: 0.3
+  scoop_gain: [0.5, 1.5]
+  scoop_add_prob: 0.1
+  drop_prob: 0.3
+  drop_gain: [0.5, 1.5]
+  drop_add_prob: 0.1
+  coarse_shift_semitones: 3.0
+
+train:
+  batch_size: 16
+  steps: 5000
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  min_lr_ratio: 0.1
+  grad_clip: 1.0
+  ema_decay: 0.999
+  unit_dropout: 0.15
+  descriptor_dropout: 0.15
+  descriptor_dim_dropout: 0.1
+  t_logit_mean: 0.0
+  t_logit_std: 1.0
+  precision: bf16
+  tf32: true
+  # Recompute block activations in backward: less VRAM, slower steps.
+  checkpointing: false
+  num_workers: 4
+  log_every: 50
+  val_every: 500
+  keep_checkpoints: 2
+  seed: 0
+
+# A fine-tune always trains LoRA adapters: small singer sets overfit a full
+# fine-tune and lose the descriptor controls.
+lora:
+  enabled: true
+  rank: 16
+  alpha: 16
+  lr: 1.0e-4
+  targets: [qkv, proj, mlp, ada]
+  # Trained in full alongside the adapters.
+  train_extra: [desc_emb, desc_null]
+
+validation:
+  sample_clips: 8
+  steps: 32
+  cfg_scale: 2.0
+  cfg_drop: descriptors
+  # Generate with the singer's pooled descriptors, as inference does.
+  condition: style
+  plot_clips: 3
+  response_groups:
+    vibrato_extent: {vibrato_extent_cents: 1}
+    vibrato_rate: {vibrato_rate_hz: 1}
+  response_offset: 1.5

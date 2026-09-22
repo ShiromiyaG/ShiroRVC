@@ -386,17 +386,48 @@ class Pipeline:
             voiced = replace_hz[:n] > 0
             f0[offset : offset + n][voiced] = replace_hz_shifted[:n][voiced]
 
-        # Quantize f0 to 255 buckets for the coarse pitch embedding.
         f0bak = f0.copy()
+        return self.coarse_pitch(f0), f0bak
+
+    def coarse_pitch(self, f0):
+        """Quantize f0 to 255 buckets for the coarse pitch embedding."""
         f0_mel = 1127 * np.log(1 + f0 / 700)
         f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * 254 / (
             self.f0_mel_max - self.f0_mel_min
         ) + 1
         f0_mel[f0_mel <= 1] = 1
         f0_mel[f0_mel > 255] = 255
-        f0_coarse = np.rint(f0_mel).astype(int)
+        return np.rint(f0_mel).astype(int)
 
-        return f0_coarse, f0bak
+    def style_contour(self, audio, transpose, style):
+        """``(styled_hz, vuv)`` over the frames of the whole ``audio`` (16 kHz),
+        from one pass of the style model: split chunks then share one
+        generation instead of each sampling its own."""
+        from rvc.lib.style_flow.infer import get_engine
+
+        audio = signal.filtfilt(bh, ah, audio)
+        audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
+        styled, vuv = get_engine(style.model, self.device).contour(audio_pad.astype(np.float32), transpose, style)
+        pad, n = self.t_pad // self.window, len(audio) // self.window
+        return styled[pad : pad + n], vuv[pad : pad + n]
+
+    def apply_style(self, pitchf, style_f0, inp_f0):
+        """``pitchf`` with the style's F0 from ``style_f0`` =
+        ``(styled_hz, vuv, start)``, ``start`` being this chunk's first frame
+        in them; unchanged when the style cannot apply to this conversion."""
+        if inp_f0 is not None:
+            warning("An F0 file replaces the pitch; style skipped.", tag="[INFER]")
+            return pitchf
+        from rvc.lib.style_flow.infer import merge
+
+        styled, vuv, start = style_f0
+        # pitchf covers the chunk plus t_pad of reflected audio on each side.
+        idx = start - self.t_pad // self.window + np.arange(len(pitchf))
+        ok = (idx >= 0) & (idx < len(styled))
+        chunk_styled = np.zeros(len(pitchf), dtype=np.float32)
+        chunk_vuv = np.zeros(len(pitchf), dtype=bool)
+        chunk_styled[ok], chunk_vuv[ok] = styled[idx[ok]], vuv[idx[ok]]
+        return merge(pitchf, chunk_styled, chunk_vuv)
 
     def voice_conversion(
         self,
@@ -539,11 +570,14 @@ class Pipeline:
         do_normalize=False,
         silence_gate_db=-60.0,
         noise_scale=None,
+        style_f0=None,
     ):
         """silence_gate_db: input level below which the output is faded out
         (None or -inf disables it); see AudioProcessor.gate_to_source.
         noise_scale: prior draw handed to ``net_g.infer``; None uses the
         model's own ``prior_noise_scale``.
+        style_f0: ``(styled_hz, vuv, start)`` from ``style_contour`` over the
+        whole input, ``start`` this chunk's first frame; None for plain RVC.
         """
         if seed == 0:
             seed = random.randint(1, 2**32 - 1)
@@ -610,6 +644,9 @@ class Pipeline:
             )
             pitch = pitch[:p_len]
             pitchf = pitchf[:p_len]
+            if style_f0 is not None:
+                pitchf = self.apply_style(pitchf, style_f0, inp_f0)
+                pitch = self.coarse_pitch(pitchf.copy())
             if self.device == "mps":
                 pitchf = pitchf.astype(np.float32)
             pitch = torch.tensor(pitch, device=self.device).unsqueeze(0).long()
