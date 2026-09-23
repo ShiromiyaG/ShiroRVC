@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.adapters import HTTPAdapter
 
-from rvc.lib.terminal import info, progress_handle, progress_task
+from rvc.lib.terminal import progress_handle, progress_task
 
 RESOURCE_BASE = "https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/main"
 FIREREDVAD_BASE = "https://huggingface.co/FireRedTeam/FireRedVAD/resolve/main/VAD"
@@ -243,11 +243,8 @@ def prequisites_download_pipeline(
     entries = []
     if models:
         entries += models_list + embedders_list
-    if exe:
-        if os.name == "nt":
-            entries += executables_list
-        else:
-            info("No executables needed.", tag="[DOWNLOAD]")
+    if exe and os.name == "nt":
+        entries += executables_list
     if pretraineds_hifigan:
         entries += pretraineds_hifigan_list + vocoder_pretraineds_list()
     _download(entries, "Downloading all files")
