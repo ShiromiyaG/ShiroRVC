@@ -1,6 +1,7 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
-import requests 
+import requests
+from requests.adapters import HTTPAdapter
 
 from rvc.lib.terminal import info, progress_handle, progress_task
 
@@ -83,74 +84,107 @@ folder_mapping_list = {
 }
 
 
-def get_file_size_if_missing(file_list):
-    """
-    Calculate the total size of files to be downloaded only if they do not exist locally.
-    Supports optional third element (custom base URL) in the tuple.
+#: Files at least this big are fetched as ``SEGMENTS`` byte ranges at once:
+#: the CDN caps each connection well below what a cloud machine can take.
+SEGMENT_MIN = 32 * 1024 * 1024
+SEGMENTS = 8
+FILE_WORKERS = 8
+CHUNK = 1024 * 1024
 
-    The HEAD has to follow redirects.  Hugging Face answers ``resolve/main``
-    with a 302 to its CDN, and ``requests.head`` does not follow redirects by
-    default, so this read the *redirect's* content-length -- about 950 bytes per
-    file.  The progress bar was therefore sized at ~15 kB for a ~1.7 GB download
-    and hit 100% on the first chunk.
-    """
-    total_size = 0
+_session = requests.Session()
+_session.mount("https://", HTTPAdapter(pool_maxsize=FILE_WORKERS * SEGMENTS))
+
+
+def _missing(file_list):
+    """``(url, destination)`` of the files in ``file_list`` not on disk yet.
+    An entry's optional third element is its own base URL."""
     for entry in file_list:
-        if len(entry) == 2:
-            remote_folder, files = entry
-            base_url = url_base
-        else:
-            remote_folder, files, base_url = entry
-
+        remote_folder, files = entry[0], entry[1]
+        base_url = entry[2] if len(entry) > 2 else url_base
         local_folder = folder_mapping_list.get(remote_folder, "")
         for file in files:
             destination_path = os.path.join(local_folder, file)
             if not os.path.exists(destination_path):
                 if base_url == url_base:
-                    url = f"{base_url}/{remote_folder}{file}"
+                    yield f"{base_url}/{remote_folder}{file}", destination_path
                 else:
-                    url = f"{base_url}/{file}"
-                response = requests.head(url, allow_redirects=True, timeout=30)
-                total_size += int(response.headers.get("content-length", 0))
-    return total_size
+                    yield f"{base_url}/{file}", destination_path
 
 
+def _probe(url):
+    """Size of the file at ``url`` and whether its server takes byte ranges.
+    Follows redirects: Hugging Face answers with a 302 to its CDN, whose
+    content-length is the file's."""
+    response = _session.head(url, allow_redirects=True, timeout=30)
+    size = int(response.headers.get("content-length", 0))
+    ranges = response.ok and response.headers.get("accept-ranges") == "bytes"
+    return size, ranges
 
-def download_file(url, destination_path, global_bar):
+
+def _plan(file_list):
+    """``(url, destination, size, ranges)`` of each missing file, probed in
+    parallel."""
+    missing = list(_missing(file_list))
+    if not missing:
+        return []
+    with ThreadPoolExecutor(min(len(missing), 16)) as executor:
+        return [(*item, *probe) for item, probe in zip(missing, executor.map(_probe, [u for u, _ in missing]))]
+
+
+def _fetch(url, path, global_bar, start=None, end=None):
+    """Write ``url``, or its bytes ``start`` to ``end`` into the preallocated
+    ``path``, and check the length."""
+    headers = {} if start is None else {"Range": f"bytes={start}-{end}"}
+    response = _session.get(url, headers=headers, stream=True, timeout=30)
+    response.raise_for_status()
+    name = os.path.basename(path).removesuffix(".part")
+    if start is None:
+        expected = int(response.headers.get("content-length", 0))
+        mode = "wb"
+    else:
+        if response.status_code != 206:
+            raise IOError(f"{name}: the server ignored the byte range.")
+        expected = end - start + 1
+        mode = "r+b"
+    written = 0
+    with open(path, mode) as file:
+        if start is not None:
+            file.seek(start)
+        for data in response.iter_content(CHUNK):
+            file.write(data)
+            written += len(data)
+            global_bar.update(len(data))
+    if expected and written != expected:
+        raise IOError(f"{name}: expected {expected} bytes, got {written}.")
+
+
+def download_file(url, destination_path, global_bar, size=0, ranges=False):
+    """Download ``url`` to ``destination_path``, in byte ranges when it is big
+    and the server allows it.
+
+    The status is checked before anything is written and the body only renamed
+    into place once complete: a saved 404 body would otherwise pass as the file
+    on every later run and fail only at ``torch.load``.
     """
-    Download a file from the given URL to the specified destination path,
-    updating the global progress bar as data is downloaded.
-
-    The status code is checked before anything is written, and the body lands
-    in a temporary file that is only renamed into place once it is complete.
-    Without both of those this wrote whatever came back: a 404 from Hugging Face
-    carries the fifteen-byte body ``Entry not found``, which was duly saved as
-    ``f0G40k.pth``.  Every later run then saw the file existing and skipped it,
-    so six pretrained models stayed permanently broken and only failed much
-    later, at ``torch.load``, with an error about serialization formats that had
-    nothing to do with the real problem.
-    """
-
     dir_name = os.path.dirname(destination_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
 
-    response = requests.get(url, stream=True, timeout=30)
-    response.raise_for_status()
-    expected = int(response.headers.get("content-length", 0))
-
     temporary_path = f"{destination_path}.part"
-    written = 0
     try:
-        with open(temporary_path, "wb") as file:
-            for data in response.iter_content(1024):
-                file.write(data)
-                written += len(data)
-                global_bar.update(len(data))
-        if expected and written != expected:
-            raise IOError(
-                f"{os.path.basename(destination_path)}: expected {expected} bytes, got {written}."
-            )
+        if ranges and size >= SEGMENT_MIN:
+            with open(temporary_path, "wb") as file:
+                file.truncate(size)
+            step = -(-size // SEGMENTS)
+            with ThreadPoolExecutor(SEGMENTS) as executor:
+                futures = [
+                    executor.submit(_fetch, url, temporary_path, global_bar, start, min(start + step, size) - 1)
+                    for start in range(0, size, step)
+                ]
+                for future in futures:
+                    future.result()
+        else:
+            _fetch(url, temporary_path, global_bar)
         os.replace(temporary_path, destination_path)
     except BaseException:
         if os.path.exists(temporary_path):
@@ -158,32 +192,19 @@ def download_file(url, destination_path, global_bar):
         raise
 
 
-def download_mapping_files(file_mapping_list, global_bar):
-    """Download entries in parallel. Supports an optional third (custom base URL) tuple element."""
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for entry in file_mapping_list:
-            if len(entry) == 2:
-                remote_folder, file_list = entry
-                base_url = url_base
-            else:
-                remote_folder, file_list, base_url = entry
-
-            local_folder = folder_mapping_list.get(remote_folder, "")
-            for file in file_list:
-                destination_path = os.path.join(local_folder, file)
-                if not os.path.exists(destination_path):
-                    if base_url == url_base:
-                        url = f"{base_url}/{remote_folder}{file}"
-                    else:
-                        url = f"{base_url}/{file}"
-                    futures.append(
-                        executor.submit(
-                            download_file, url, destination_path, global_bar
-                        )
-                    )
-        for future in futures:
-            future.result()
+def _download(file_list, description):
+    """Download every missing file of ``file_list`` in one queue, biggest first,
+    under one progress bar."""
+    plan = sorted(_plan(file_list), key=lambda item: item[2], reverse=True)
+    total_size = sum(item[2] for item in plan)
+    if total_size <= 0:
+        return
+    with progress_task(total_size, description, download=True, leave=True) as (progress, task_id):
+        global_bar = progress_handle(progress, task_id)
+        with ThreadPoolExecutor(FILE_WORKERS) as executor:
+            futures = [executor.submit(download_file, *item[:2], global_bar, *item[2:]) for item in plan]
+            for future in futures:
+                future.result()
 
 
 def split_pretraineds(pretrained_list):
@@ -209,36 +230,9 @@ def split_pretraineds(pretrained_list):
 pretraineds_hifigan_list, _ = split_pretraineds(pretraineds_hifigan_list)
 
 
-def calculate_total_size(
-    pretraineds_hifigan,
-    models,
-    exe,
-):
-    total_size = 0
-
-    if models:
-        total_size += get_file_size_if_missing(models_list)
-        total_size += get_file_size_if_missing(embedders_list)
-
-    if exe and os.name == "nt":
-        total_size += get_file_size_if_missing(executables_list)
-
-    total_size += get_file_size_if_missing(pretraineds_hifigan)
-    return total_size
-
-
 def download_vocoder_pretraineds(vocoder, sample_rate):
     """Fetch one vocoder's missing G/D at ``sample_rate``."""
-    entries = vocoder_pretraineds_list(vocoder, sample_rate)
-    total_size = get_file_size_if_missing(entries)
-    if total_size > 0:
-        with progress_task(
-            total_size,
-            f"Downloading {vocoder} pretrained models",
-            download=True,
-            leave=True,
-        ) as (progress, task_id):
-            download_mapping_files(entries, progress_handle(progress, task_id))
+    _download(vocoder_pretraineds_list(vocoder, sample_rate), f"Downloading {vocoder} pretrained models")
 
 
 def prequisites_download_pipeline(
@@ -246,32 +240,14 @@ def prequisites_download_pipeline(
     models,
     exe,
 ):
-    pretraineds = (
-        pretraineds_hifigan_list + vocoder_pretraineds_list() if pretraineds_hifigan else []
-    )
-    total_size = calculate_total_size(
-        pretraineds,
-        models,
-        exe,
-    )
-
-    if total_size > 0:
-        with progress_task(
-            total_size,
-            "Downloading all files",
-            download=True,
-            leave=True,
-        ) as (progress, task_id):
-            global_bar = progress_handle(progress, task_id)
-            if models:
-                download_mapping_files(models_list, global_bar)
-                download_mapping_files(embedders_list, global_bar)
-            if exe:
-                if os.name == "nt":
-                    download_mapping_files(executables_list, global_bar)
-                else:
-                    info("No executables needed.", tag="[DOWNLOAD]")
-            if pretraineds_hifigan:
-                download_mapping_files(pretraineds, global_bar)
-    else:
-        pass
+    entries = []
+    if models:
+        entries += models_list + embedders_list
+    if exe:
+        if os.name == "nt":
+            entries += executables_list
+        else:
+            info("No executables needed.", tag="[DOWNLOAD]")
+    if pretraineds_hifigan:
+        entries += pretraineds_hifigan_list + vocoder_pretraineds_list()
+    _download(entries, "Downloading all files")
