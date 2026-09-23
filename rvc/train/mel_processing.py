@@ -143,6 +143,9 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
         #: is what the parity test constructs.
         self.output_scale = float(output_scale)
         self.log_base = torch.log(torch.tensor(10.0))
+        # The same FP32 value as a Python float: a compiled graph then holds
+        # no host tensor.
+        self._log_base = float(self.log_base)
         self.stft_params: list[tuple] = []
         self.hann_window: dict[int, torch.Tensor] = {}
         self.mel_banks: dict[int, torch.Tensor] = {}
@@ -151,34 +154,18 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
             (mel, win) for mel, win in zip(n_mels, window_lengths)
         ]
 
-    def mel_spectrogram(
-        self,
-        wav: torch.Tensor,
-        n_mels: int,
-        window_length: int,
-    ):
-        dtype_device = str(wav.dtype) + "_" + str(wav.device)
-        win_dtype_device = str(window_length) + "_" + dtype_device
-        mel_dtype_device = str(n_mels) + "_" + dtype_device
-        if win_dtype_device not in self.hann_window:
-            self.hann_window[win_dtype_device] = torch.hann_window(
+    def _window(self, wav: torch.Tensor, window_length: int) -> torch.Tensor:
+        key = str(window_length) + "_" + str(wav.dtype) + "_" + str(wav.device)
+        if key not in self.hann_window:
+            self.hann_window[key] = torch.hann_window(
                 window_length, device=wav.device, dtype=torch.float32
             )
+        return self.hann_window[key]
 
-        wav = wav.squeeze(1)
-
-        stft = torch.stft(
-            wav.float(),
-            n_fft=window_length,
-            hop_length=window_length//4,
-            window=self.hann_window[win_dtype_device],
-            return_complex=True,
-        )
-
-        magnitude = torch.sqrt(stft.real.pow(2) + stft.imag.pow(2) + 1e-6)
-
-        if mel_dtype_device not in self.mel_banks:
-            self.mel_banks[mel_dtype_device] = torch.from_numpy(
+    def _bank(self, wav: torch.Tensor, n_mels: int, window_length: int) -> torch.Tensor:
+        key = str(n_mels) + "_" + str(wav.dtype) + "_" + str(wav.device)
+        if key not in self.mel_banks:
+            self.mel_banks[key] = torch.from_numpy(
                 librosa_mel_fn(
                     sr=self.sample_rate,
                     n_mels=n_mels,
@@ -187,24 +174,86 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
                     fmax=None,
                 )
             ).to(device=wav.device, dtype=torch.float32)
+        return self.mel_banks[key]
 
-        mel_spectrogram = torch.matmul(
-            self.mel_banks[mel_dtype_device], magnitude
+    def _spectrum(self, wav: torch.Tensor, window_length: int) -> torch.Tensor:
+        """The STFT as ``view_as_real``, so what follows it never holds a
+        complex tensor -- which is what lets that part be compiled."""
+        stft = torch.stft(
+            wav.squeeze(1).float(),
+            n_fft=window_length,
+            hop_length=window_length // 4,
+            window=self._window(wav, window_length),
+            return_complex=True,
         )
-        return mel_spectrogram
+        return torch.view_as_real(stft)
+
+    @staticmethod
+    def _mel(spectrum: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
+        magnitude = torch.sqrt(spectrum[..., 0].pow(2) + spectrum[..., 1].pow(2) + 1e-6)
+        return torch.matmul(bank, magnitude)
+
+    def mel_spectrogram(
+        self,
+        wav: torch.Tensor,
+        n_mels: int,
+        window_length: int,
+    ):
+        return self._mel(
+            self._spectrum(wav, window_length), self._bank(wav, n_mels, window_length)
+        )
+
+    def _scale_loss(self, real_mels: torch.Tensor, fake_mels: torch.Tensor) -> torch.Tensor:
+        if self.safe_log:
+            real_logmels = torch.log1p(real_mels * self.log_scale)
+            fake_logmels = torch.log1p(fake_mels * self.log_scale)
+        else:
+            real_logmels = torch.log(real_mels.clamp(min=1e-5)) / self._log_base
+            fake_logmels = torch.log(fake_mels.clamp(min=1e-5)) / self._log_base
+        return self.loss_fn(real_logmels, fake_logmels)
+
+    def _distance(self, spectra) -> torch.Tensor:
+        """The loss from ``(real spectrum, fake spectrum, mel bank)`` per scale."""
+        loss = 0.0
+        for real_spectrum, fake_spectrum, bank in spectra:
+            loss += self._scale_loss(self._mel(real_spectrum, bank), self._mel(fake_spectrum, bank))
+        return loss * self.output_scale
+
+    def enable_compile(self, mode: str = "default") -> None:
+        """Compile everything after the STFTs.  The first call runs eager, to
+        fill the window, bank and band-weight caches the graph then reads as
+        constants; a failure falls back to eager for good."""
+        self._compiled_distance = torch.compile(self._distance, dynamic=False, mode=mode)
+        self._compile_state = "warmup"
 
     def forward(self, real: torch.Tensor, fake: torch.Tensor):
+        state = getattr(self, "_compile_state", None)
+        if state == "ready":
+            spectra = [
+                (self._spectrum(real, window), self._spectrum(fake, window), self._bank(real, n_mels, window))
+                for n_mels, window in self.stft_params
+            ]
+            try:
+                return self._compiled_distance(spectra)
+            except Exception as error:
+                import traceback
+
+                from rvc.lib.terminal import warning
+
+                self._compile_state = "failed"
+                warning(
+                    f"Compiling the multi-scale mel loss failed; it runs eager from here. {error}\n"
+                    f"{traceback.format_exc()}",
+                    tag="[TRAIN]",
+                )
+        elif state == "warmup":
+            self._compile_state = "ready"
+
         loss = 0.0
         for p in self.stft_params:
             real_mels = self.mel_spectrogram(real, *p)
             fake_mels = self.mel_spectrogram(fake, *p)
-            if self.safe_log:
-                real_logmels = torch.log1p(real_mels * self.log_scale)
-                fake_logmels = torch.log1p(fake_mels * self.log_scale)
-            else:
-                real_logmels = torch.log(real_mels.clamp(min=1e-5)) / self.log_base
-                fake_logmels = torch.log(fake_mels.clamp(min=1e-5)) / self.log_base
-            loss += self.loss_fn(real_logmels, fake_logmels)
+            loss += self._scale_loss(real_mels, fake_mels)
         return loss * self.output_scale
 
 

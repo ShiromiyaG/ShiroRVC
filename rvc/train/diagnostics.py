@@ -159,22 +159,22 @@ def generator_gradient_metrics(net_g):
         groups[group].append(parameter)
 
     metrics = {}
-    for group, parameters in groups.items():
-        if not parameters:
-            continue
-        parameter_norm = torch.sqrt(
-            sum(parameter.detach().float().square().sum() for parameter in parameters)
-        )
-        gradient_terms = [
-            parameter.grad.detach().float().square().sum()
-            for parameter in parameters
-            if parameter.grad is not None
-        ]
-        gradient_norm = (
-            torch.sqrt(sum(gradient_terms))
-            if gradient_terms
-            else parameter_norm.new_zeros(())
-        )
-        metrics[f"grad_norm_{group}"] = gradient_norm
-        metrics[f"grad_to_param_{group}"] = gradient_norm / parameter_norm.clamp_min(1e-8)
+    with torch.no_grad():
+        for group, parameters in groups.items():
+            if not parameters:
+                continue
+            parameter_norm = _total_norm(parameters)
+            gradients = [p.grad for p in parameters if p.grad is not None]
+            gradient_norm = (
+                _total_norm(gradients) if gradients else parameter_norm.new_zeros(())
+            )
+            metrics[f"grad_norm_{group}"] = gradient_norm
+            metrics[f"grad_to_param_{group}"] = gradient_norm / parameter_norm.clamp_min(1e-8)
     return metrics
+
+
+def _total_norm(tensors):
+    """L2 norm over all of ``tensors`` from one foreach norm, not three
+    kernels per tensor."""
+    norms = torch._foreach_norm(tensors)
+    return torch.linalg.vector_norm(torch.stack([n.float() for n in norms]))

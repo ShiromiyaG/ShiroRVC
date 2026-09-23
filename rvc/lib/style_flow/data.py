@@ -16,7 +16,10 @@ CODEBOOK = "codebook.npy"
 CLIP_DIR = "clips"
 
 
-def save_clip(path: str, *, f0, coarse, residual, vuv, units, descriptors, events: Events, speaker: int) -> None:
+def save_clip(path: str, *, f0, coarse, residual, vuv, units, descriptors, events: Events, speaker: int, loudness=None) -> None:
+    """``loudness`` is ``frontend.loudness_db`` of the clip; datasets from
+    before it have none."""
+    extra = {} if loudness is None else {"loudness": np.asarray(loudness, dtype=np.float32)}
     np.savez(
         path,
         f0=np.asarray(f0, dtype=np.float32),
@@ -27,6 +30,7 @@ def save_clip(path: str, *, f0, coarse, residual, vuv, units, descriptors, event
         descriptors=np.asarray(descriptors, dtype=np.float32),
         events=np.array(json.dumps(asdict(events))),
         speaker=np.int32(speaker),
+        **extra,
     )
 
 

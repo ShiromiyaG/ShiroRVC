@@ -55,6 +55,7 @@ def main():
     parser.add_argument("--no-tf32", action="store_true", help="Keep FP32 matmuls in full FP32.")
     parser.add_argument("--overfit", type=int, default=0, help="Train and validate on this many clips.")
     parser.add_argument("--checkpointing", action="store_true", help="Recompute block activations in backward to save VRAM.")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the training forward.")
     parser.add_argument("--recompute", action="store_true", help="Ignore the experiment's F0 and features.")
     parser.add_argument("--workers", type=int, default=4, help="Audio loading threads for extraction.")
     args = parser.parse_args()
@@ -66,6 +67,8 @@ def main():
         cfg["train"]["tf32"] = False
     if args.checkpointing:
         cfg["train"]["checkpointing"] = True
+    if args.compile:
+        cfg["train"]["compile"] = True
     for key, value in (("steps", args.steps), ("batch_size", args.batch_size), ("val_every", args.val_every)):
         if value is not None:
             cfg["train"][key] = value

@@ -26,6 +26,12 @@ class ModelConfig:
     n_units: int = 256
     n_descriptors: int = 16
     target_channels: int = 2
+    #: Per-frame input of a converter: the source residual it rewrites and a
+    #: presence channel.  0 is a generator, as checkpoints before it were.
+    source_channels: int = 0
+    #: 1 feeds the source's smoothed level (``f0_repr.loudness_input``), so
+    #: gestures can follow where the voice swells and fades.
+    loudness_channels: int = 0
     #: RMSNorm on queries and keys, against attention-logit blow-ups at high
     #: learning rates.  Off for checkpoints trained before it existed.
     qk_norm: bool = False
@@ -107,7 +113,7 @@ class StyleDiT(nn.Module):
         # Set by the trainer; not part of the checkpoint.
         self.grad_checkpointing = False
         dim = cfg.dim
-        self.in_proj = nn.Linear(cfg.target_channels + 1, dim)
+        self.in_proj = nn.Linear(cfg.target_channels + 1 + cfg.source_channels + cfg.loudness_channels, dim)
         # Index ``n_units`` is the dropped-units token.
         self.unit_emb = nn.Embedding(cfg.n_units + 1, dim)
         # Depthwise conv before attention: vibrato and scoops are local shapes.
@@ -124,15 +130,24 @@ class StyleDiT(nn.Module):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
 
-    def forward(self, x_t, t, units, coarse, desc, desc_mask, mask, drop_units=None, drop_desc=None):
+    def forward(self, x_t, t, units, coarse, desc, desc_mask, mask, drop_units=None, drop_desc=None, source=None, loudness=None):
         """``x_t`` (B, C, T), ``t`` (B,), ``units`` (B, T) long, ``coarse``
         (B, T), ``desc``/``desc_mask`` (B, D), ``mask`` (B, T) bool for valid
-        frames; ``drop_*`` (B,) bool replace that condition with its null.
+        frames; ``drop_*`` (B,) bool replace that condition with its null;
+        ``source`` (B, source_channels, T) for a converter, None for none;
+        ``loudness`` (B, T), required with ``loudness_channels``.
         Returns the velocity (B, C, T)."""
         B, _, T = x_t.shape
         if drop_units is not None:
             units = torch.where(drop_units[:, None], torch.full_like(units, self.cfg.n_units), units)
-        h = self.in_proj(torch.cat([x_t, coarse[:, None]], dim=1).transpose(1, 2)) + self.unit_emb(units)
+        inputs = [x_t, coarse[:, None]]
+        if self.cfg.source_channels:
+            if source is None:
+                source = x_t.new_zeros(B, self.cfg.source_channels, T)
+            inputs.append(source.to(x_t.dtype))
+        if self.cfg.loudness_channels:
+            inputs.append(loudness[:, None].to(x_t.dtype))
+        h = self.in_proj(torch.cat(inputs, dim=1).transpose(1, 2)) + self.unit_emb(units)
         h = h * mask[..., None]
         h = h + F.gelu(self.local(h.transpose(1, 2)).transpose(1, 2))
 

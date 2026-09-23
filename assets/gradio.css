@@ -317,6 +317,30 @@ footer {
     box-shadow: inset 3px 0 0 var(--primary-500);
 }
 
+/* An optional section among the main pickers: no card until it is used. */
+.gradio-container .block.rvc-quiet-accordion:has(> button.label-wrap) {
+    border-color: transparent !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+.gradio-container .block.rvc-quiet-accordion:has(> button.label-wrap):hover,
+.gradio-container .block.rvc-quiet-accordion:has(> button.label-wrap.open) {
+    border-color: var(--rvc-line) !important;
+}
+.gradio-container .block.rvc-quiet-accordion > button.label-wrap {
+    min-height: 32px !important;
+    padding: 6px 14px !important;
+    font-size: var(--text-sm) !important;
+    font-weight: 500 !important;
+    color: var(--body-text-color-subdued) !important;
+}
+.gradio-container .block.rvc-quiet-accordion > button.label-wrap:hover {
+    color: var(--primary-500) !important;
+}
+.gradio-container .block.rvc-quiet-accordion > button.label-wrap.open {
+    box-shadow: none;
+}
+
 /* --------------------------------------------------------------- inputs -- */
 
 .rvc-card input[type="text"]:not([role="combobox"]),

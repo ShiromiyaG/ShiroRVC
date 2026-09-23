@@ -244,7 +244,7 @@ def test_nothing_in_the_decoder_forces_a_cpu_kernel():
     step because Inductor emitted a *CPU* C++ kernel (needing MSVC on
     Windows), from three independent sources: ``self.upp`` being an
     ``np.int64`` (Dynamo wraps a traced numpy scalar as a CPU tensor),
-    ``SineGenerator.forward``'s cumsum lowering to a codegen path that raises,
+    ``SineGenerator``'s cumsum lowering to a codegen path that raises,
     and ``torchaudio.functional.resample`` rebuilding its sinc kernel from
     Python ints on every call. Compiling on CUDA is too slow and
     machine-dependent for a unit test, so what is pinned here is the three
@@ -253,7 +253,7 @@ def test_nothing_in_the_decoder_forces_a_cpu_kernel():
 
     generator = _generator()
     assert type(generator.upp) is int
-    assert getattr(R.SineGenerator.forward, "_torchdynamo_disable", False)
+    assert getattr(R.SineGenerator._phase, "_torchdynamo_disable", False)
     assert getattr(R.RefineGAN2Generator._decimate, "_torchdynamo_disable", False)
 
 

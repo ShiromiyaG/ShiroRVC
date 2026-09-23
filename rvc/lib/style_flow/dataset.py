@@ -6,9 +6,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from .augment import AugmentConfig, augment
+from .augment import AugmentConfig, _log_uniform, augment, reshape
 from .descriptors import DescriptorConfig
-from .f0_repr import Normalizer, ReprConfig
+from .f0_repr import Normalizer, ReprConfig, loudness_input
 
 
 def parse_speakers(spec) -> set[int]:
@@ -45,27 +45,41 @@ class StyleDataset(Dataset):
         max_frames: int = 1500,
         descriptor_dim_dropout: float = 0.0,
         random_crop: bool = True,
+        source_acfg: AugmentConfig | None = None,
+        source_dropout: float = 0.0,
+        seed: int | None = None,
+        loudness: bool = False,
     ):
+        """``source_acfg`` makes each item carry a ``source``: the target's
+        residual re-sung by it, for a converter to rewrite back; it is left
+        out (zeros) with probability ``source_dropout``.  ``seed`` makes each
+        item's draws fixed, as validation needs.  ``loudness`` adds the
+        clip's level input."""
         self.paths = list(paths)
         self.normalizer = normalizer
         self.rcfg, self.dcfg, self.acfg = rcfg, dcfg, acfg
         self.max_frames = max_frames
         self.descriptor_dim_dropout = descriptor_dim_dropout
         self.random_crop = random_crop
+        self.source_acfg, self.source_dropout, self.seed = source_acfg, source_dropout, seed
+        self.loudness = loudness
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(None if self.seed is None else self.seed + idx)
         with np.load(self.paths[idx], allow_pickle=False) as data:
             coarse, residual, vuv = data["coarse"], data["residual"], data["vuv"]
             units, desc = data["units"].astype(np.int64), data["descriptors"]
+            level = data["loudness"] if self.loudness else None
         if len(vuv) > self.max_frames:
             # Descriptors were measured on the whole clip; a crop only shifts them a little.
             s = int(rng.integers(0, len(vuv) - self.max_frames + 1)) if self.random_crop else 0
             e = s + self.max_frames
             coarse, residual, vuv, units = coarse[s:e], residual[s:e], vuv[s:e], units[s:e]
+            if level is not None:
+                level = level[s:e]
         if self.acfg is not None:
             coarse, residual, new_desc = augment(coarse, residual, vuv, self.rcfg, self.dcfg, self.acfg, rng)
             if new_desc is not None:
@@ -73,17 +87,30 @@ class StyleDataset(Dataset):
         present = np.isfinite(desc)
         if self.descriptor_dim_dropout > 0:
             present &= rng.random(present.shape) >= self.descriptor_dim_dropout
-        return {
+        item = {
             "target": self.normalizer.encode_target(residual, vuv),
             "coarse": self.normalizer.encode_coarse(coarse),
             "units": units,
             "desc": np.where(present, self.normalizer.encode_descriptors(desc), 0.0).astype(np.float32),
             "desc_mask": present.astype(np.float32),
         }
+        if level is not None:
+            scale = _log_uniform(rng, *self.acfg.loudness_scale) if self.acfg is not None else 1.0
+            item["loudness"] = loudness_input(level, vuv, self.rcfg, scale)
+        if self.source_acfg is not None:
+            if rng.random() < self.source_dropout:
+                item["source"] = np.zeros((2, len(vuv)), dtype=np.float32)
+            else:
+                src = reshape(coarse, residual, vuv, self.rcfg, self.dcfg, self.source_acfg, rng)
+                item["source"] = self.normalizer.encode_source(src, vuv)
+        return item
 
 
-def collate(items):
+def collate(items, pad_multiple: int = 1):
+    """``pad_multiple`` rounds the padded length up, so a compiled model sees
+    lengths its alignment guards always accept; the extra frames are masked."""
     T = max(item["units"].shape[0] for item in items)
+    T = -(-T // pad_multiple) * pad_multiple
     B = len(items)
     C = items[0]["target"].shape[0]
     out = {
@@ -100,6 +127,14 @@ def collate(items):
         out["coarse"][i, :n] = torch.from_numpy(item["coarse"])
         out["units"][i, :n] = torch.from_numpy(item["units"])
         out["mask"][i, :n] = True
+    if "loudness" in items[0]:
+        out["loudness"] = torch.zeros(B, T)
+        for i, item in enumerate(items):
+            out["loudness"][i, : item["units"].shape[0]] = torch.from_numpy(item["loudness"])
+    if "source" in items[0]:
+        out["source"] = torch.zeros(B, 2, T)
+        for i, item in enumerate(items):
+            out["source"][i, :, : item["units"].shape[0]] = torch.from_numpy(item["source"])
     return out
 
 

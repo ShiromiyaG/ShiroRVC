@@ -23,15 +23,62 @@ augment:
   scoop_add_cents: [60.0, 600.0]
   scoop_add_seconds: [0.05, 0.35]
   drop_prob: 0.5
-  drop_gain: [0.0, 2.5]
+  # Close to the data, whose falling ends have a median of -77 cents: at
+  # 2.5x and 400 cents the model fell ~3x deeper than the validation clips.
+  drop_gain: [0.0, 1.5]
   drop_add_prob: 0.5
-  drop_add_cents: [40.0, 400.0]
+  drop_add_cents: [40.0, 200.0]
   drop_add_seconds: [0.1, 0.3]
   coarse_shift_semitones: 3.0
+  # Mostly narrower: the sources at inference are usually mixed, compressed vocals.
+  loudness_scale: [0.5, 1.5]
+
+# The converter learns from each clip re-sung by these draws, rewriting it
+# back; broad, so any singer's residual at inference is one it has seen the like of.
+converter:
+  source_dropout: 0.25
+  degrade:
+    vibrato_extent: [0.1, 1.6]
+    vibrato_rate: [0.75, 1.3]
+    scoop_prob: 1.0
+    scoop_gain: [0.0, 2.0]
+    # Sources missing the target's scoops or drops, so the descriptors, not
+    # the source, decide how many there are.
+    scoop_flat_prob: 0.35
+    scoop_remove_prob: 0.3
+    scoop_add_prob: 0.5
+    drop_prob: 1.0
+    drop_gain: [0.0, 2.0]
+    drop_flat_prob: 0.35
+    drop_remove_prob: 0.3
+    drop_add_prob: 0.5
+    transition_prob: 0.8
+    transition_time: [0.5, 2.0]
+    overshoot_prob: 0.8
+    overshoot_gain: [0.0, 2.0]
+    overshoot_add_prob: 0.4
+
+# Multi-period discriminator on the vibrato band of the flow's one-step
+# estimate, conditioned on the descriptors, so vibrato comes out as deep and
+# regular as they ask rather than averaged.
+# Not exported; a fine-tune trains without it unless its config enables it.
+discriminator:
+  # Off: on the converter base it sat at chance, its vibrato already real,
+  # and cost ~15% of the step.
+  enabled: false
+  periods: [2, 3, 5, 7, 11]
+  lr: 2.0e-4
+  # The discriminator trains from the start; the model feels it from here
+  # (counted from the resume, when a checkpoint predates this discriminator).
+  start_step: 5000
+  # Estimates from earlier t are rightly an average of possible vibratos.
+  t_min: 0.5
+  adv_weight: 0.05
+  fm_weight: 0.1
 
 train:
-  batch_size: 32
-  steps: 200000
+  batch_size: 16
+  steps: 100000
   lr: 3.0e-4
   weight_decay: 0.01
   warmup_steps: 2000
@@ -48,6 +95,8 @@ train:
   tf32: true
   # Recompute block activations in backward: less VRAM, slower steps.
   checkpointing: false
+  # torch.compile the training forward; off with checkpointing.
+  compile: false
   num_workers: 6
   log_every: 100
   val_every: 5000
@@ -62,11 +111,11 @@ validation:
   # Each clip generated with its own descriptors.
   condition: clip
   plot_clips: 3
-  # Descriptor -> direction; a negative drop is a fall, so the fraction of
-  # falling phrase ends rises with it.
+  # Descriptor -> direction; a deeper fall is a more negative depth, and the
+  # fraction of falling phrase ends rises with it.
   response_groups:
     vibrato_extent: {vibrato_extent_cents: 1}
     vibrato_rate: {vibrato_rate_hz: 1}
     scoop: {scoop_fraction: 1}
-    phrase_end_drop: {phrase_end_drop_cents: -1, phrase_end_drop_fraction: 1}
+    phrase_end_drop: {phrase_end_drop_depth_cents: -1, phrase_end_drop_fraction: 1}
   response_offset: 1.5

@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field, fields
 import numpy as np
 from scipy import signal
 
-from .f0_repr import ReprConfig, _runs, bridge_gaps, hz_to_cents, interpolate_unvoiced, voiced_mask
+from .f0_repr import ReprConfig, _runs, bridge_gaps, butter_sos, hz_to_cents, interpolate_unvoiced, voiced_mask
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def smooth_cents(f0_hz: np.ndarray, cfg: ReprConfig) -> np.ndarray | None:
     if vuv.sum() < 4:
         return None
     cents = interpolate_unvoiced(hz_to_cents(f0_hz), vuv)
-    sos = signal.butter(4, cfg.coarse_cutoff_hz, fs=cfg.frame_rate, output="sos")
+    sos = butter_sos(4, cfg.coarse_cutoff_hz, cfg.frame_rate)
     padlen = min(len(cents) - 1, int(3 * cfg.frame_rate / cfg.coarse_cutoff_hz))
     return signal.sosfiltfilt(sos, cents, padtype="even", padlen=padlen)
 
@@ -146,7 +146,7 @@ def detect_notes(f0_hz: np.ndarray, cfg: ReprConfig, dcfg: DescriptorConfig):
 def _vibrato(dev: np.ndarray, fr: float, dcfg: DescriptorConfig):
     """``(rate_hz, extent_cents, onset_s)`` or ``None`` when the note has none."""
     dev = signal.detrend(dev)
-    sos = signal.butter(2, dcfg.vibrato_band_hz, btype="band", fs=fr, output="sos")
+    sos = butter_sos(2, dcfg.vibrato_band_hz, fr, "band")
     vib = _filt(dev, sos)
     total = float(np.mean(dev**2))
     if total <= 0:
@@ -192,7 +192,7 @@ def analyze(f0_hz: np.ndarray, cfg: ReprConfig, dcfg: DescriptorConfig, residual
     n_frames = len(f0_hz)
     # Deviations past what the residual can hold are pitch-tracking errors.
     max_dev = cfg.residual_clip_cents
-    jitter_sos = signal.butter(2, dcfg.jitter_highpass_hz, btype="high", fs=fr, output="sos")
+    jitter_sos = butter_sos(2, dcfg.jitter_highpass_hz, fr, "high")
 
     for i, note in enumerate(notes):
         dev = fine[note.start:note.end] - note.pitch
@@ -307,8 +307,12 @@ def transition_overshoot_cents(ev: Events) -> float:
     return _mean(ev.transition_overshoot)
 
 
-def phrase_end_drop_cents(ev: Events) -> float:
-    return _median(ev.phrase_end_drop)
+def phrase_end_drop_depth_cents(ev: Events, min_cents: float = DescriptorConfig.drop_min_cents) -> float:
+    """Median of the phrase ends that fall, as ``scoop_depth_cents`` is of the
+    attacks that scoop; how often they fall is ``phrase_end_drop_fraction``.
+    Over every end, rises and flat ones included, the median sat near 0 until
+    half of them fell, and so only echoed the fraction."""
+    return _median([d for d in ev.phrase_end_drop if d <= -min_cents])
 
 
 def phrase_end_drop_fraction(ev: Events, min_cents: float = DescriptorConfig.drop_min_cents) -> float:
@@ -342,7 +346,7 @@ DESCRIPTORS = {
     "fall_in_fraction": fall_in_fraction,
     "transition_time_s": transition_time_s,
     "transition_overshoot_cents": transition_overshoot_cents,
-    "phrase_end_drop_cents": phrase_end_drop_cents,
+    "phrase_end_drop_depth_cents": phrase_end_drop_depth_cents,
     "phrase_end_drop_fraction": phrase_end_drop_fraction,
     "jitter_cents": jitter_cents,
     "residual_rms_cents": residual_rms_cents,

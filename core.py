@@ -878,6 +878,7 @@ def run_style_train_script(
     speech_speakers: str = None,
     batch_size: int = 0,
     checkpointing: bool = False,
+    compile_model: bool = False,
 ):
     """Train a style model on ``logs/<model_name>``, extracting its style
     dataset from the RVC experiment there when it has none yet.  With
@@ -906,6 +907,8 @@ def run_style_train_script(
         command += ["--batch-size", str(int(batch_size))]
     if checkpointing:
         command.append("--checkpointing")
+    if compile_model:
+        command.append("--compile")
     if pretrain:
         if speech_speakers is not None:
             command += ["--speech-speakers", speech_speakers]
@@ -926,7 +929,11 @@ def style_options(kwargs: dict) -> dict | None:
     argument of the infer scripts."""
     import json
 
-    values = {key: kwargs.pop(f"style_{key}", None) for key in ("model", "strength", "rate", "intensity", "relative", "recenter", "steps", "cfg", "descriptors")}
+    keys = (
+        "model", "strength", "rate", "vibrato_gain", "scoop_gain", "drop_gain", "intensity", "relative", "recenter",
+        "steps", "cfg", "cfg_until", "descriptors",
+    )
+    values = {key: kwargs.pop(f"style_{key}", None) for key in keys}
     if not values["model"]:
         return None
     values["descriptors"] = json.loads(values["descriptors"]) if values["descriptors"] else {}

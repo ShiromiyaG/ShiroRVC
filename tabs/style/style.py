@@ -129,7 +129,7 @@ def style_tab():
             steps = gr.Slider(
                 0, 300000, 0, step=100,
                 label=_("Steps"),
-                info=_("0 uses the default: 200000 for a base, 5000 for a fine-tune."),
+                info=_("0 uses the default: 100000 for a base, 5000 for a fine-tune."),
                 interactive=True,
             )
             precision = gr.Radio(
@@ -143,12 +143,18 @@ def style_tab():
             batch_size = gr.Slider(
                 0, 128, 0, step=1,
                 label=_("Batch size"),
-                info=_("0 uses the default: 32 for a base, 16 for a fine-tune."),
+                info=_("0 uses the default: 16 for a base and for a fine-tune."),
                 interactive=True,
             )
             checkpointing = gr.Checkbox(
                 label=_("Gradient checkpointing"),
                 info=_("Less VRAM for slower steps; try it before lowering the batch size."),
+                value=False,
+                interactive=True,
+            )
+            compile_model = gr.Checkbox(
+                label=_("Compile model"),
+                info=_("torch.compile the training step: faster once the first steps have built the graph. Ignored with checkpointing."),
                 value=False,
                 interactive=True,
             )
@@ -191,6 +197,7 @@ def style_tab():
 
     def train(
         name, mode_value, base, steps_value, precision_value, gpu_value, speech_value, batch_value, checkpointing_value,
+        compile_value,
     ):
         if not name:
             return _("Give the run a name.")
@@ -205,6 +212,7 @@ def style_tab():
             speech_speakers=speech_value if mode_value == PRETRAIN else None,
             batch_size=batch_value,
             checkpointing=checkpointing_value,
+            compile_model=compile_value,
         )
 
     mode.change(fn=on_mode, inputs=[mode], outputs=[base_row, embedder_row, speech], show_progress="hidden")
@@ -232,7 +240,7 @@ def style_tab():
         show_progress="hidden",
     ).then(
         fn=train,
-        inputs=[model_name, mode, base_path, steps, precision, gpu, speech, batch_size, checkpointing],
+        inputs=[model_name, mode, base_path, steps, precision, gpu, speech, batch_size, checkpointing, compile_model],
         outputs=[output],
         show_progress="hidden",
     ).then(fn=lambda: gr.update(choices=list_runs()), inputs=[], outputs=[model_name])

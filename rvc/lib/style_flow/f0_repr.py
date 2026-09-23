@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+from functools import lru_cache
 
 import numpy as np
 from scipy import signal
@@ -11,6 +12,8 @@ from scipy import signal
 FRAME_RATE = 100.0
 #: Cents are measured from here so every audible F0 is positive.
 CENTS_REF_HZ = 10.0
+#: ``loudness_input`` of unvoiced frames: 40 dB under the clip's voiced median.
+LOUDNESS_FLOOR = -4.0
 
 
 @dataclass(frozen=True)
@@ -83,10 +86,26 @@ def interpolate_unvoiced(cents: np.ndarray, vuv: np.ndarray) -> np.ndarray:
     return np.interp(np.arange(len(cents)), idx, cents[idx].astype(np.float64))
 
 
+def butter_sos(order: int, cutoff, fs: float, btype: str = "low") -> np.ndarray:
+    """Butterworth second-order sections, from a cache: designing one costs
+    more than filtering a clip with it, and the training data path asks for the
+    same few filters dozens of times per clip.  A copy, because scipy's
+    ``sosfilt`` refuses a read-only array."""
+    cutoff = tuple(map(float, cutoff)) if np.ndim(cutoff) else float(cutoff)
+    return _butter_sos(int(order), cutoff, float(fs), btype).copy()
+
+
+@lru_cache(maxsize=None)
+def _butter_sos(order, cutoff, fs, btype):
+    sos = signal.butter(order, cutoff, btype=btype, fs=fs, output="sos")
+    sos.setflags(write=False)
+    return sos
+
+
 def _lowpass(x: np.ndarray, cutoff_hz: float, frame_rate: float) -> np.ndarray:
     if len(x) < 4:
         return np.full_like(x, x.mean())
-    sos = signal.butter(4, cutoff_hz, fs=frame_rate, output="sos")
+    sos = butter_sos(4, cutoff_hz, frame_rate)
     padlen = min(len(x) - 1, int(3 * frame_rate / cutoff_hz))
     return signal.sosfiltfilt(sos, x, padtype="even", padlen=padlen)
 
@@ -148,6 +167,23 @@ def _hold_notes(smooth: np.ndarray, fallback: np.ndarray, vuv: np.ndarray, cfg: 
     return out
 
 
+def loudness_input(level_db: np.ndarray, vuv: np.ndarray, cfg: ReprConfig, scale: float = 1.0) -> np.ndarray:
+    """Model input from a clip's level (``frontend.loudness_db``): tens of dB
+    from its voiced median, times ``scale``, with unvoiced frames at the floor.
+    Each voiced run is smoothed on its own below ``coarse_cutoff_hz``, so the
+    tremolo that comes with vibrato doesn't give the vibrato away."""
+    vuv = np.asarray(vuv, dtype=bool)
+    out = np.full(len(vuv), LOUDNESS_FLOOR, dtype=np.float32)
+    if not vuv.any():
+        return out
+    level = np.asarray(level_db, dtype=np.float64)
+    ref = float(np.median(level[vuv]))
+    for s, e in _runs(vuv):
+        rel = (_lowpass(level[s:e], cfg.coarse_cutoff_hz, cfg.frame_rate) - ref) / 10.0 * scale
+        out[s:e] = np.clip(rel, LOUDNESS_FLOOR, 2.0)
+    return out
+
+
 def coarse_f0(f0_hz: np.ndarray, cfg: ReprConfig) -> np.ndarray:
     """Coarse melody in Hz on every frame; zeros for an unvoiced clip."""
     cents = coarse_cents(f0_hz, cfg)
@@ -196,6 +232,12 @@ class Normalizer:
         res = (np.asarray(residual, dtype=np.float32) - self.residual_mean) / self.residual_std
         res = np.where(vuv, res, 0.0)
         return np.stack([res, np.where(vuv, 1.0, -1.0)]).astype(np.float32)
+
+    def encode_source(self, residual: np.ndarray, vuv: np.ndarray) -> np.ndarray:
+        """``(2, T)``: a residual for the model to rewrite, normalized like
+        the target's, and a channel of ones marking that one was given."""
+        res = self.encode_target(residual, vuv)[0]
+        return np.stack([res, np.ones_like(res)]).astype(np.float32)
 
     def decode_target(self, target: np.ndarray):
         """``(residual_cents, vuv)`` from a ``(2, T)`` target."""

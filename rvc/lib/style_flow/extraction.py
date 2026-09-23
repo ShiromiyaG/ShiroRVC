@@ -24,7 +24,7 @@ from .data import (
 )
 from .descriptors import DescriptorConfig, analyze, descriptor_vector
 from .f0_repr import Normalizer, ReprConfig, decompose
-from .frontend import HOP, VOICING_THRESHOLD, StyleFrontend, highpass
+from .frontend import HOP, VOICING_THRESHOLD, StyleFrontend, highpass, loudness_db
 from .units import UnitCodebook, units_to_frames
 
 DONE_FILE = "done_runs.txt"
@@ -212,16 +212,18 @@ def build_dataset(
 
     with open(done_path, "a", encoding="utf-8") as done_file:
         for run, stretches in track(prefetch(todo, workers), total=len(todo), description="Extracting style data"):
-            units = {}
+            units, levels = {}, {}
             for stretch, audio, k, (s, e), f0, coarse, residual, vuv in clips_of(stretches, analysis, rcfg, ccfg):
                 if id(stretch) not in units:
                     feats = analysis.features(stretch, audio)
                     units[id(stretch)] = units_to_frames(codebook.assign(feats), len(audio) // HOP)
+                    levels[id(stretch)] = loudness_db(audio, len(audio) // HOP)
                 events = analyze(f0, rcfg, dcfg, residual)
                 save_clip(
                     os.path.join(out, CLIP_DIR, f"{run.key}_{stretch.first}_{k}.npz"),
                     f0=f0, coarse=coarse, residual=residual, vuv=vuv, units=units[id(stretch)][s:e],
                     descriptors=descriptor_vector(events), events=events, speaker=run.speaker,
+                    loudness=levels[id(stretch)][s:e],
                 )
             done_file.write(run.key + "\n")
             done_file.flush()

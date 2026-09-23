@@ -31,11 +31,15 @@ def main():
     parser.add_argument("--transpose", type=float, default=0.0, help="Semitones.")
     parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--rate", type=float, default=1.0)
+    parser.add_argument("--vibrato-gain", type=float, default=1.0)
+    parser.add_argument("--scoop-gain", type=float, default=1.0)
+    parser.add_argument("--drop-gain", type=float, default=1.0)
     parser.add_argument("--intensity", type=float, default=1.0, help="0 keeps the source's descriptors (the dataset mean with --absolute), 1 the model's.")
     parser.add_argument("--absolute", action="store_true", help="Condition on the model's descriptors everywhere, not relative to the source.")
     parser.add_argument("--no-recenter", action="store_true", help="Don't centre each note on the source's pitch.")
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--cfg", type=float, default=2.0)
+    parser.add_argument("--cfg-until", type=float, default=0.8, help="Guidance only while t is below this; 1 guides every step.")
     parser.add_argument("--descriptors", default="{}", help='JSON offsets, e.g. \'{"vibrato_extent_cents": 1.0}\'.')
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
@@ -43,8 +47,9 @@ def main():
 
     options = StyleOptions(
         model=args.model, strength=args.strength, rate=args.rate, intensity=args.intensity,
+        vibrato_gain=args.vibrato_gain, scoop_gain=args.scoop_gain, drop_gain=args.drop_gain,
         relative=not args.absolute, recenter=not args.no_recenter, steps=args.steps, cfg=args.cfg,
-        descriptors=json.loads(args.descriptors), seed=args.seed,
+        cfg_until=args.cfg_until, descriptors=json.loads(args.descriptors), seed=args.seed,
     )
     engine = StyleEngine(args.model, args.device)
 

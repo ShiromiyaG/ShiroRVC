@@ -1,0 +1,8 @@
+inherit: finetune.yaml
+
+# Experiment against finetune.yaml: half the clips are trained without their
+# descriptors, so the adapters have to carry where and how the singer shapes
+# the contour, not only how much; the unconditional branch CFG contrasts
+# against then becomes the singer's own.
+train:
+  descriptor_dropout: 0.5

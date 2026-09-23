@@ -18,6 +18,16 @@ def highpass(audio: np.ndarray) -> np.ndarray:
     return signal.filtfilt(_bh, _ah, audio).astype(np.float32)
 
 
+def loudness_db(audio: np.ndarray, n_frames: int, window: int = 3 * HOP) -> np.ndarray:
+    """RMS level in dB of ``n_frames`` frames of 16 kHz ``audio``, each over
+    ``window`` samples centred where RMVPE puts its frame."""
+    half = window // 2
+    power = np.concatenate([np.zeros(half), np.asarray(audio, dtype=np.float64) ** 2, np.zeros(window)])
+    total = np.concatenate([[0.0], np.cumsum(power)])
+    starts = np.arange(n_frames) * HOP
+    return (10.0 * np.log10((total[starts + window] - total[starts]) / window + 1e-10)).astype(np.float32)
+
+
 #: RMVPE's usual salience threshold, and what every dataset and model
 #: without its own ``voicing_threshold`` was made with.
 VOICING_THRESHOLD = 0.03

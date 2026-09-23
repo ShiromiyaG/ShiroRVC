@@ -35,7 +35,7 @@ def _redo(job):
     events = analyze(clip["f0"], rcfg, dcfg, residual)
     save_clip(
         dst, f0=clip["f0"], coarse=coarse, residual=residual, vuv=vuv, units=clip["units"],
-        descriptors=descriptor_vector(events), events=events, speaker=clip["speaker"],
+        descriptors=descriptor_vector(events), events=events, speaker=clip["speaker"], loudness=clip.get("loudness"),
     )
 
 

@@ -268,6 +268,27 @@ STYLE_OPTIONS = [
         help="0 keeps the source's smoothed melody, 1 the generated style, above 1 exaggerates it.",
     ),
     click.option(
+        "--style_vibrato_gain",
+        type=click.FloatRange(0, 2),
+        default=1.0,
+        show_default=True,
+        help="Scales the generated vibrato around each note's pitch; 0 removes it.",
+    ),
+    click.option(
+        "--style_scoop_gain",
+        type=click.FloatRange(0, 2),
+        default=1.0,
+        show_default=True,
+        help="Scales how far attacks after silence start from their note; 0 flattens them.",
+    ),
+    click.option(
+        "--style_drop_gain",
+        type=click.FloatRange(0, 2),
+        default=1.0,
+        show_default=True,
+        help="Scales how far phrase ends fall or rise from their note; 0 flattens them.",
+    ),
+    click.option(
         "--style_intensity",
         type=click.FloatRange(0, 3),
         default=1.0,
@@ -301,6 +322,13 @@ STYLE_OPTIONS = [
         default=2.0,
         show_default=True,
         help="How strongly the style descriptors are followed.",
+    ),
+    click.option(
+        "--style_cfg_until",
+        type=click.FloatRange(0, 1),
+        default=0.8,
+        show_default=True,
+        help="Guidance stops at this point of the sampling and the last steps, which only refine detail, run unguided; 1 guides every step.",
     ),
     click.option(
         "--style_descriptors",
@@ -765,7 +793,7 @@ STYLE_TRAIN_OWN = [
         type=click.IntRange(0, None),
         default=0,
         show_default=True,
-        help="Training steps; 0 uses the config's (200000 for a base, 5000 for a fine-tune).",
+        help="Training steps; 0 uses the config's (100000 for a base, 5000 for a fine-tune).",
     ),
     click.option(
         "--precision",
@@ -786,7 +814,7 @@ STYLE_TRAIN_OWN = [
         type=click.IntRange(0, None),
         default=0,
         show_default=True,
-        help="Batch size; 0 uses the config's (32 for a base, 16 for a fine-tune).",
+        help="Batch size; 0 uses the config's (16 for a base and for a fine-tune).",
     ),
     click.option(
         "--checkpointing",
@@ -794,6 +822,13 @@ STYLE_TRAIN_OWN = [
         default=False,
         show_default=True,
         help="Gradient checkpointing: less VRAM, slower steps.",
+    ),
+    click.option(
+        "--compile_model",
+        type=click.BOOL,
+        default=False,
+        show_default=True,
+        help="torch.compile the training forward: faster steps after a slower start. Ignored with checkpointing.",
     ),
 ]
 

@@ -46,3 +46,9 @@ model:
   mlp_ratio: 4.0
   conv_kernel: 7
   qk_norm: true
+  # 2 makes a converter, which rewrites the source's residual (see
+  # converter: in pretrain.yaml); 0 a generator, which invents one.
+  source_channels: 2
+  # 1 feeds the source's level, so drops land where the voice fades rather
+  # than on a loud held vowel; needs a dataset extracted with loudness.
+  loudness_channels: 1

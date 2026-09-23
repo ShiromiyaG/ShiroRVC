@@ -14,11 +14,12 @@ import torch
 from scipy import signal
 
 from . import checkpoint
+from .augment import _reshape_attacks, _reshape_drops, _reshape_vibrato
 from .clips import split_frames
-from .descriptors import DESCRIPTOR_NAMES, analyze, descriptor_vector, detect_notes, pool
-from .f0_repr import _runs, coarse_f0, decompose, interpolate_unvoiced
+from .descriptors import DESCRIPTOR_NAMES, _vibrato, analyze, descriptor_vector, detect_notes, pool
+from .f0_repr import _runs, butter_sos, coarse_f0, compose_f0, decompose, hz_to_cents, interpolate_unvoiced, loudness_input
 from .flow import sample
-from .frontend import HOP, StyleFrontend
+from .frontend import HOP, StyleFrontend, loudness_db
 from .units import units_to_frames
 
 #: Clips generated per batch; with CFG the model sees twice as many.
@@ -31,7 +32,7 @@ MAIN_DESCRIPTORS = (
     "vibrato_fraction",
     "scoop_fraction",
     "scoop_depth_cents",
-    "phrase_end_drop_cents",
+    "phrase_end_drop_depth_cents",
 )
 
 
@@ -45,6 +46,14 @@ class StyleOptions:
     rate: float = 1.0
     steps: int = 32
     cfg: float = 2.0
+    #: Guidance only while the sampler's t is below this; 1 guides every step.
+    cfg_until: float = 0.8
+    #: Gains on the generated vibrato (of the notes that have one), attacks
+    #: after silence and phrase ends, each around its note's pitch; unlike
+    #: ``rate`` they leave transitions and note centres alone.
+    vibrato_gain: float = 1.0
+    scoop_gain: float = 1.0
+    drop_gain: float = 1.0
     #: How far to move toward the model's descriptors, before ``descriptors``
     #: is added: 0 is the source's own (``relative``) or the dataset mean, 1
     #: the model's, above 1 past them.
@@ -95,21 +104,49 @@ def fill_unvoiced(residual, generated, vuv) -> np.ndarray:
     return out
 
 
+def scale_gestures(residual, coarse, vuv, rcfg, dcfg, vibrato=1.0, scoop=1.0, drop=1.0) -> np.ndarray:
+    """``residual`` with the vibrato of the notes that have one, the attacks
+    after silence and the phrase ends scaled by these gains, each around its
+    note's pitch, as the augmentation does."""
+    if vibrato == scoop == drop == 1.0:
+        return residual
+    res = np.asarray(residual, dtype=np.float64).copy()
+    f0 = compose_f0(coarse, res, vuv)
+    notes, runs, _ = detect_notes(f0, rcfg, dcfg)
+    fr = rcfg.frame_rate
+    if vibrato != 1.0:
+        # Notes without vibrato keep their wobble: scaling it would read as out of tune.
+        fine = interpolate_unvoiced(hz_to_cents(f0), vuv)
+        vib = [
+            n for n in notes
+            if n.end - n.start >= dcfg.vibrato_min_note_s * fr and _vibrato(fine[n.start : n.end] - n.pitch, fr, dcfg)
+        ]
+        _reshape_vibrato(res, vib, fr, dcfg, vibrato, 1.0)
+    if scoop != 1.0:
+        _reshape_attacks(res, notes, runs, fr, dcfg, scoop)
+    if drop != 1.0:
+        _reshape_drops(res, notes, runs, fr, dcfg, drop)
+    clip = rcfg.residual_clip_cents
+    return np.clip(res, -clip, clip).astype(np.float32)
+
+
 def recenter_notes(residual, src_res, f0, vuv, rcfg, dcfg, slow_hz: float = 2.0) -> np.ndarray:
-    """``residual`` shifted so the stable part of each source note averages
-    the source's residual there.  Between notes of a phrase the shift is
-    interpolated, so attacks and glides move with their notes instead of
-    stepping.  Phrases with no stable note follow the source below
-    ``slow_hz`` instead, keeping only the generated detail above it."""
+    """``residual`` shifted so the stable part of each source note has the
+    source's residual there as its median; a mean would let a scoop or drop
+    the model adds inside the note pull the whole note off pitch.  Between
+    notes of a phrase the shift is interpolated, so attacks and glides move
+    with their notes instead of stepping.  Phrases with no stable note follow
+    the source below ``slow_hz`` instead, keeping only the generated detail
+    above it."""
     notes, runs, _ = detect_notes(f0, rcfg, dcfg)
     knots: dict = {}
     for note in notes:
         m = vuv[note.start : note.end]
         if m.sum() >= 3:
-            offset = float(np.mean((residual[note.start : note.end] - src_res[note.start : note.end])[m]))
+            offset = float(np.median((residual[note.start : note.end] - src_res[note.start : note.end])[m]))
             knots.setdefault(note.run, []).extend([(note.start, offset), (note.end - 1, offset)])
     out = np.asarray(residual, dtype=np.float32).copy()
-    sos = signal.butter(2, slow_hz, fs=rcfg.frame_rate, output="sos")
+    sos = butter_sos(2, slow_hz, rcfg.frame_rate)
     for run, (s, e) in enumerate(runs):
         m = vuv[s:e]
         if run in knots:
@@ -200,6 +237,9 @@ class StyleEngine:
         if spans[-1][1] < n:
             spans.append((spans[-1][1], n))
         coarse_n, source = norm.encode_coarse(coarse), norm.encode_target(src_res, vuv)
+        # A converter rewrites the source's own residual instead of inventing one.
+        convert = norm.encode_source(src_res, vuv) if self.style.model.cfg.source_channels else None
+        level = loudness_db(audio, n) if self.style.model.cfg.loudness_channels else None
         dcfg = self.style.descriptor_config
         clip_events = [analyze(f0[s:e], rcfg, dcfg, src_res[s:e]) for s, e in spans] if options.relative else ()
         desc, desc_mask = self.conditioning(options, clip_events)
@@ -220,23 +260,37 @@ class StyleEngine:
                 "mask": torch.zeros(B, T, dtype=torch.bool),
                 "source": torch.zeros(B, 2, T),
             }
+            if convert is not None:
+                batch["convert"] = torch.zeros(B, 2, T)
+            if level is not None:
+                batch["loudness"] = torch.zeros(B, T)
             for i, (s, e) in enumerate(chunk):
                 batch["units"][i, : e - s] = torch.from_numpy(units[s:e].astype(np.int64))
                 batch["coarse"][i, : e - s] = torch.from_numpy(coarse_n[s:e])
                 batch["source"][i, :, : e - s] = torch.from_numpy(source[:, s:e])
                 batch["mask"][i, : e - s] = True
+                if convert is not None:
+                    batch["convert"][i, :, : e - s] = torch.from_numpy(convert[:, s:e])
+                if level is not None:
+                    # Relative to each clip's own level, as in training.
+                    batch["loudness"][i, : e - s] = torch.from_numpy(loudness_input(level[s:e], vuv[s:e], rcfg))
             batch = {k: v.to(self.device) for k, v in batch.items()}
             with self._autocast():
                 x = sample(
                     self.style.model, batch["units"], batch["coarse"],
                     desc[b : b + B], desc_mask[b : b + B], batch["mask"],
-                    steps=int(options.steps), cfg_scale=float(options.cfg),
+                    steps=int(options.steps), cfg_scale=float(options.cfg), cfg_until=float(options.cfg_until),
                     source=batch["source"], strength=float(options.strength), generator=generator,
+                    convert=batch.get("convert"), loudness=batch.get("loudness"),
                 )
             x = x.float().cpu().numpy()
             for i, (s, e) in enumerate(chunk):
                 residual[s:e], generated[s:e] = norm.decode_target(x[i, :, : e - s])
         residual = fill_unvoiced(residual, generated, vuv)
+        residual = scale_gestures(
+            residual, coarse, vuv, rcfg, dcfg,
+            float(options.vibrato_gain), float(options.scoop_gain), float(options.drop_gain),
+        )
         if options.recenter:
             residual = recenter_notes(residual, src_res, f0, vuv, rcfg, dcfg)
         return coarse, residual, vuv, plain

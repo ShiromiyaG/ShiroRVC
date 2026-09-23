@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import glob
 import json
 import math
@@ -19,6 +20,7 @@ from .augment import AugmentConfig
 from .data import CODEBOOK, clip_paths, pooled_descriptors, read_manifest
 from .dataset import MixedBatchSampler, StyleDataset, collate, parse_speakers, scan_clips
 from .descriptors import DESCRIPTOR_NAMES, DescriptorConfig, analyze, descriptor_vector, pool
+from .discriminator import VibratoDiscriminator, discriminator_loss, generator_loss
 from .evaluation import descriptor_distance, melody_error_cents
 from .f0_repr import Normalizer, ReprConfig, compose_f0
 from .flow import flow_loss, sample
@@ -99,6 +101,34 @@ def _to(batch, device):
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+#: Batch lengths are rounded up to this when compiling: one static graph per
+#: rounded length, nine between the 5 s and 15 s clips (512 to 1536).
+COMPILE_PAD = 128
+
+
+def _compiled(model):
+    """``model``'s forward behind ``torch.compile``, back to eager for good if
+    compiling fails.  Static graphs: marking the length dynamic still ended in
+    one graph per length, which ran past Dynamo's limit of 8."""
+    from rvc.lib.terminal import warning
+
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
+    compiled = torch.compile(model, dynamic=False)
+    failed = False
+
+    def forward(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            try:
+                return compiled(*args, **kwargs)
+            except Exception as error:
+                failed = True
+                warning(f"Compiling the style model failed; training eager from here. {error}", tag="[STYLE]")
+        return model(*args, **kwargs)
+
+    return forward
+
+
 def _latest_checkpoint(out_dir):
     found = sorted(glob.glob(os.path.join(out_dir, CHECKPOINT_DIR, "step_*.pt")))
     return found[-1] if found else None
@@ -108,9 +138,12 @@ class Validator:
     """Fixed-noise validation loss, sampled contours and the descriptor
     response test, on the same clips every time."""
 
-    def __init__(self, setup: Setup, paths, vcfg: dict, max_frames: int, device, style_descriptors=None):
+    def __init__(self, setup: Setup, paths, vcfg: dict, max_frames: int, device, style_descriptors=None, source_acfg=None,
+                 loudness=False):
         """With ``style_descriptors`` (raw values, ``None`` for unknown) every
-        clip is generated with those, as inference does with a singer's."""
+        clip is generated with those, as inference does with a singer's.  A
+        converter rewrites each clip re-sung by ``source_acfg``, the same draw
+        every time."""
         self.setup, self.vcfg, self.device = setup, vcfg, device
         self.style = None
         if style_descriptors is not None:
@@ -120,7 +153,10 @@ class Validator:
                 torch.from_numpy(np.where(present, setup.normalizer.encode_descriptors(raw), 0.0).astype(np.float32)),
                 torch.from_numpy(present.astype(np.float32)),
             )
-        ds = StyleDataset(paths, setup.normalizer, setup.rcfg, setup.dcfg, max_frames=max_frames, random_crop=False)
+        ds = StyleDataset(
+            paths, setup.normalizer, setup.rcfg, setup.dcfg, max_frames=max_frames, random_crop=False,
+            source_acfg=source_acfg, seed=1234, loudness=loudness,
+        )
         self.items = [ds[i] for i in range(len(ds))]
         self.raw = []
         for path in paths[: vcfg["sample_clips"]]:
@@ -139,7 +175,7 @@ class Validator:
             t = torch.rand(B, device=self.device, generator=gen)
             noise = torch.randn(batch["target"].shape, device=self.device, generator=gen)
             with _autocast(dtype):
-                _, per_sample, _ = flow_loss(model, batch, t=t, noise=noise)
+                _, per_sample, _, _, _ = flow_loss(model, batch, t=t, noise=noise)
             total += per_sample.sum().item()
             n += B
         return total / max(n, 1)
@@ -153,7 +189,8 @@ class Validator:
                 batch["desc"] if desc is None else desc,
                 batch["desc_mask"] if desc_mask is None else desc_mask,
                 batch["mask"], steps=self.vcfg["steps"], cfg_scale=self.vcfg["cfg_scale"],
-                cfg_drop=self.vcfg.get("cfg_drop", "descriptors"), generator=gen,
+                cfg_drop=self.vcfg.get("cfg_drop", "descriptors"), generator=gen, convert=batch.get("source"),
+                loudness=batch.get("loudness"),
             )
         out = []
         for i, raw in enumerate(self.raw):
@@ -264,6 +301,13 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
         })
 
     paths = clip_paths(data_dir)
+    loudness = bool(mcfg.loudness_channels)
+    if loudness:
+        with np.load(paths[0], allow_pickle=False) as data:
+            if "loudness" not in data.files:
+                raise ValueError(
+                    f"{data_dir} has no loudness, which this model takes; extract it again into a new folder."
+                )
     lengths, speakers = scan_clips(paths)
     speech = parse_speakers(dcfg_data.get("speech_speakers"))
     max_frames = int(dcfg_data.get("max_frames", 1500))
@@ -277,9 +321,13 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
         val_idx = train_idx[: int(dcfg_data.get("val_clips", 64))]
 
     acfg = None if overfit else AugmentConfig.from_dict(cfg.get("augment"))
+    ccfg = cfg.get("converter") or {}
+    source_acfg = AugmentConfig.from_dict(ccfg.get("degrade")) if mcfg.source_channels else None
     dataset = StyleDataset(
         paths, setup.normalizer, setup.rcfg, setup.dcfg, acfg, max_frames,
         0.0 if overfit else float(tcfg.get("descriptor_dim_dropout", 0.0)),
+        source_acfg=source_acfg, source_dropout=0.0 if overfit else float(ccfg.get("source_dropout", 0.1)),
+        loudness=loudness,
     )
     singing = [i for i in train_idx if speakers[i] not in speech]
     speech_idx = [i for i in train_idx if speakers[i] in speech]
@@ -289,8 +337,10 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
         pool=1 if overfit else 50, seed=int(tcfg.get("seed", 0)),
     )
     workers = int(tcfg.get("num_workers", 4))
+    use_compile = bool(tcfg.get("compile", False)) and str(device).startswith("cuda")
     loader = DataLoader(
-        dataset, batch_sampler=sampler, collate_fn=collate, num_workers=workers,
+        dataset, batch_sampler=sampler, collate_fn=functools.partial(collate, pad_multiple=COMPILE_PAD if use_compile else 1),
+        num_workers=workers,
         pin_memory=True, persistent_workers=workers > 0, prefetch_factor=4 if workers > 0 else None,
     )
 
@@ -303,6 +353,14 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
     if use_lora:
         apply_lora(model, int(lcfg["rank"]), float(lcfg["alpha"]), lcfg["targets"], lcfg.get("train_extra", ()))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
+    # Training forward only: validation samples the EMA, eagerly.
+    train_model = model
+    if use_compile:
+        if model.grad_checkpointing:
+            warning("Compiling is off with gradient checkpointing.", tag="[STYLE]")
+        else:
+            info("Compiling the style model; the first steps take longer.", tag="[STYLE]")
+            train_model = _compiled(model)
     trainable = [p for p in model.parameters() if p.requires_grad]
     ema_trainable = [pe for pe, p in zip(ema.parameters(), model.parameters()) if p.requires_grad]
     groups = [{"params": trainable, "lr": float(tcfg["lr"])}]
@@ -325,6 +383,19 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
         optimizer, _lr_lambda(int(tcfg.get("warmup_steps", 0)), total_steps, float(tcfg.get("min_lr_ratio", 0.1)))
     )
 
+    gcfg = cfg.get("discriminator") or {}
+    disc = opt_d = None
+    if gcfg.get("enabled", False) and not overfit:
+        disc = VibratoDiscriminator(
+            setup.dcfg.vibrato_band_hz, setup.rcfg.frame_rate, tuple(gcfg.get("periods", (2, 3, 5, 7, 11))),
+            cond_dim=2 * mcfg.n_descriptors,
+        ).to(device)
+        opt_d = torch.optim.AdamW(
+            disc.parameters(), lr=float(gcfg.get("lr", 2e-4)), betas=(0.8, 0.99), fused=str(device).startswith("cuda")
+        )
+    adv_start, t_min = int(gcfg.get("start_step", 0)), float(gcfg.get("t_min", 0.5))
+    adv_weight, fm_weight = float(gcfg.get("adv_weight", 0.05)), float(gcfg.get("fm_weight", 0.1))
+
     step = 0
     resume = _latest_checkpoint(out_dir)
     if resume:
@@ -336,6 +407,16 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
         if "scaler" in state:
             scaler.load_state_dict(state["scaler"])
         step = int(state["step"])
+        if disc is not None:
+            loaded = disc.load_state_dict(state["disc"], strict=False) if "disc" in state else None
+            if loaded is not None and not loaded.missing_keys and not loaded.unexpected_keys:
+                opt_d.load_state_dict(state["opt_d"])
+            else:
+                # Added or changed since this checkpoint: what matches is kept,
+                # the rest starts at its init, and the discriminator gets its
+                # head start again before the model feels it.
+                adv_start = step + adv_start
+                warning(f"The discriminator is new to this checkpoint; the model feels it from step {adv_start}.", tag="[STYLE]")
         info(f"Resumed from {resume} at step {step}.", tag="[STYLE]")
         sampler.seed += step
 
@@ -346,6 +427,7 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
     else:
         clips, batch_note = f"{len(singing)} clips for training", f"batch {batch_size}"
     info(
+        f"{'Converter' if mcfg.source_channels else 'Generator'}{' with loudness' if loudness else ''}, "
         f"{params / 1e6:.1f}M parameters ({sum(p.numel() for p in trainable) / 1e6:.2f}M trained), {precision}"
         f"{' + TF32' if torch.backends.cuda.matmul.allow_tf32 else ''}; {clips}, "
         f"{len(val_idx)} for validation; {batch_note}.",
@@ -356,6 +438,7 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
     validator = Validator(
         setup, [paths[i] for i in val_idx], vcfg, max_frames, device,
         style_descriptors if vcfg.get("condition", "clip") == "style" else None,
+        source_acfg=source_acfg, loudness=loudness,
     )
     writer = SummaryWriter(out_dir)
     ema_decay = float(tcfg.get("ema_decay", 0.999))
@@ -367,11 +450,11 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
 
     def save():
         path = os.path.join(out_dir, CHECKPOINT_DIR, f"step_{step:08d}.pt")
-        torch.save(
-            {"model": model.state_dict(), "ema": ema.state_dict(), "optimizer": optimizer.state_dict(),
-             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "step": step, "config": cfg},
-            path,
-        )
+        state = {"model": model.state_dict(), "ema": ema.state_dict(), "optimizer": optimizer.state_dict(),
+                 "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "step": step, "config": cfg}
+        if disc is not None:
+            state.update(disc=disc.state_dict(), opt_d=opt_d.state_dict())
+        torch.save(state, path)
         for old in sorted(glob.glob(os.path.join(out_dir, CHECKPOINT_DIR, "step_*.pt")))[:-keep]:
             os.remove(old)
         checkpoint.export(
@@ -411,6 +494,8 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
     # Accumulated on the device and read once per log_every: a per-step
     # .item() stalls the CPU until the GPU catches up.
     loss_sum = torch.zeros((), device=device)
+    # Discriminator, adversarial and feature-matching losses, and their count.
+    gan_sum, gan_n = torch.zeros(3, device=device), torch.zeros((), device=device)
     bin_sum, bin_n = torch.zeros(4, device=device), torch.zeros(4, device=device)
     window, tic = 0, time.time()
     # Rich draws nothing when stdout is piped, so the step lines stay there.
@@ -422,11 +507,35 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
                     break
                 batch = _to(batch, device)
                 with _autocast(amp_dtype):
-                    loss, per_sample, t = flow_loss(
-                        model, batch, unit_dropout=unit_dropout, descriptor_dropout=desc_dropout, t_mean=t_mean, t_std=t_std
+                    loss, per_sample, t, estimate, drop_desc = flow_loss(
+                        train_model, batch, unit_dropout=unit_dropout, descriptor_dropout=desc_dropout, t_mean=t_mean, t_std=t_std
                     )
+                # train/loss stays the flow loss alone.
+                total = loss
+                if disc is not None:
+                    # Estimates from early t are rightly an average; only later ones should
+                    # sound real.  Nor is a sample drawn without descriptors held to them.
+                    weight = ((t >= t_min) & ~drop_desc).float()
+                    voiced = (batch["target"][:, 1] > 0) & batch["mask"]
+                    cond = torch.cat([batch["desc"] * batch["desc_mask"], batch["desc_mask"]], dim=-1)
+                    real, fake = batch["target"][:, 0], estimate[:, 0]
+                    with _autocast(amp_dtype):
+                        loss_d = discriminator_loss(disc(real, voiced, cond), disc(fake.detach(), voiced, cond), weight)
+                    opt_d.zero_grad(set_to_none=True)
+                    scaler.scale(loss_d).backward()
+                    scaler.step(opt_d)
+                    adv = fm = torch.zeros((), device=device)
+                    if step >= adv_start:
+                        with _autocast(amp_dtype):
+                            with torch.no_grad():
+                                real_out = disc(real, voiced, cond)
+                            adv, fm = generator_loss(real_out, disc(fake, voiced, cond), weight)
+                        total = loss + adv_weight * adv + fm_weight * fm
+                    with torch.no_grad():
+                        gan_sum += torch.stack([loss_d.detach(), adv.detach(), fm.detach()]).float()
+                        gan_n += 1
                 optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
+                scaler.scale(total).backward()
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
                 scaler.step(optimizer)
@@ -452,9 +561,16 @@ def train(cfg: dict, data_dir: str, out_dir: str, *, device="cuda:0", init=None,
                         if count:
                             writer.add_scalar(f"train/loss_t{i / 4:.2f}-{(i + 1) / 4:.2f}", total / count, step)
                     metrics = f"loss={mean_loss:.4f}"
+                    if disc is not None and gan_n.item():
+                        d_loss, adv_loss, fm_loss = (gan_sum / gan_n).tolist()
+                        writer.add_scalar("train/disc_loss", d_loss, step)
+                        if step > adv_start:
+                            writer.add_scalar("train/adv_loss", adv_loss, step)
+                            writer.add_scalar("train/fm_loss", fm_loss, step)
+                        metrics += f", disc={d_loss:.3f}"
                     if not live:
                         info(f"step {step}/{total_steps}: {metrics}, {window / elapsed:.1f} steps/s", tag="[STYLE]")
-                    for acc in (loss_sum, bin_sum, bin_n):
+                    for acc in (loss_sum, bin_sum, bin_n, gan_sum, gan_n):
                         acc.zero_()
                     window, tic = 0, time.time()
                 bar.update(task_id, advance=1, metrics=metrics)

@@ -29,6 +29,11 @@ The coarse melody is a step contour (`representation.coarse_mode: notes` in
 are generated rather than copied from the source. A dataset extracted with
 another representation can be re-split without re-extracting:
 `python tools/style_flow/redecompose.py --data <old style_data> --out <new>`.
+When a descriptor's definition changes, a base's dataset is re-described in
+place from its stored events: `python tools/style_flow/redescribe.py --data <style_data>`.
+A base with `model.loudness_channels: 1` also reads the level of the audio,
+which only extraction measures: a dataset from before it has to be extracted
+again, into a new folder, for the pretrain and for every fine-tune.
 
 Writes `logs/style_base_contentvec/style_base.pt`; copy it to
 `rvc/models/style/` to distribute it. `tools/style_flow/pretrain.py` has the
@@ -51,10 +56,12 @@ The fine-tune trains LoRA adapters; `--precision bf16|fp16|fp32`. Without
 ## 3. Inference
 
 Inference tab, "Style Model": pick any style model (independent of the voice
-model), then strength, F0 style rate, steps, CFG and descriptor offsets.
-Autotune and F0 files disable the style for that conversion. From the CLI,
-`infer`/`batch_infer` take `--style_model`, `--style_strength`, `--style_rate`,
-`--style_steps`, `--style_cfg` and `--style_descriptors '{"vibrato_extent_cents": 1}'`.
+model), then strength, F0 style rate, vibrato/scoop/phrase-end gains, steps,
+CFG and descriptor offsets. Autotune and F0 files disable the style for that
+conversion. From the CLI, `infer`/`batch_infer` take `--style_model`,
+`--style_strength`, `--style_rate`, `--style_vibrato_gain`, `--style_scoop_gain`,
+`--style_drop_gain`, `--style_steps`, `--style_cfg`, `--style_cfg_until` and
+`--style_descriptors '{"vibrato_extent_cents": 1}'`.
 
 Contours only, for evaluation:
 

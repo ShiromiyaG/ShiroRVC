@@ -1206,6 +1206,10 @@ def run(
     enable_vocoder_compile(
         net_g, device, rank, enabled=compile_vocoder, mode=torch_compile_mode
     )
+    # The mel loss rides on the generator's switch: it is the rest of the
+    # generator step's fixed-shape work.
+    if compile_vocoder and device.type == "cuda" and hasattr(fn_spectral_loss, "enable_compile"):
+        fn_spectral_loss.enable_compile()
     enable_frontend_compile(net_g, config, device, rank)
     enable_discriminator_compile(net_d, config, device, rank)
 

@@ -303,11 +303,14 @@ STYLE_SLIDERS = {
     "vibrato_fraction": "Notes with vibrato",
     "scoop_fraction": "Scoops",
     "scoop_depth_cents": "Scoop depth",
-    "phrase_end_drop_cents": "Phrase-end drop",
+    "phrase_end_drop_depth_cents": "Phrase-end drop depth",
 }
 
 
-def build_style(enabled, model, strength, rate, intensity, relative, recenter, steps, cfg, *offsets):
+def build_style(
+    enabled, model, strength, rate, intensity, vibrato_gain, scoop_gain, drop_gain, relative, recenter, steps, cfg,
+    cfg_until, *offsets,
+):
     """The ``style`` argument of the infer scripts, or None when off."""
     if not enabled or not model:
         return None
@@ -316,10 +319,14 @@ def build_style(enabled, model, strength, rate, intensity, relative, recenter, s
         "strength": float(strength),
         "rate": float(rate),
         "intensity": float(intensity),
+        "vibrato_gain": float(vibrato_gain),
+        "scoop_gain": float(scoop_gain),
+        "drop_gain": float(drop_gain),
         "relative": bool(relative),
         "recenter": bool(recenter),
         "steps": int(steps),
         "cfg": float(cfg),
+        "cfg_until": float(cfg_until),
         "descriptors": {name: float(v) for name, v in zip(STYLE_SLIDERS, offsets) if v},
     }
 
@@ -365,7 +372,7 @@ def inference_tab():
                 outputs=[model_file, index_file],
             )
 
-        with gr.Accordion(_("Style Model"), open=False):
+        with gr.Accordion(_("Style Model"), open=False, elem_classes=["rvc-quiet-accordion"]):
             with gr.Row(equal_height=True):
                 style_enabled = gr.Checkbox(
                     label=_("Enable"),
@@ -400,6 +407,22 @@ def inference_tab():
                     style_intensity = gr.Slider(
                         0, 1.5, 1.0, step=0.05, label=_("Style intensity"),
                         info=_("How far to move toward the singer's habits: 0 keeps the source's (or a neutral singer's, when not relative to the source), 1 the model's own."),
+                        interactive=True,
+                    )
+                with gr.Row():
+                    style_vibrato_gain = gr.Slider(
+                        0, 2, 1.0, step=0.05, label=_("Vibrato gain"),
+                        info=_("Scales the generated vibrato; each note keeps its pitch."),
+                        interactive=True,
+                    )
+                    style_scoop_gain = gr.Slider(
+                        0, 2, 1.0, step=0.05, label=_("Scoop gain"),
+                        info=_("Scales how far attacks after silence start from their note; 0 flattens them."),
+                        interactive=True,
+                    )
+                    style_drop_gain = gr.Slider(
+                        0, 2, 1.0, step=0.05, label=_("Phrase-end gain"),
+                        info=_("Scales how far phrase ends fall or rise from their note; 0 flattens them."),
                         interactive=True,
                     )
                 with gr.Row():
@@ -440,6 +463,11 @@ def inference_tab():
                             info=_("How strongly the descriptors are followed."),
                             interactive=True,
                         )
+                        style_cfg_until = gr.Slider(
+                            0, 1, 0.8, step=0.05, label=_("CFG until"),
+                            info=_("Guidance stops here; the last steps only refine detail and run unguided. 1 guides every step."),
+                            interactive=True,
+                        )
 
             style_enabled.change(
                 fn=lambda on: gr.update(visible=bool(on)),
@@ -459,8 +487,9 @@ def inference_tab():
                 show_progress="hidden",
             )
         style_inputs = [
-            style_enabled, style_model, style_strength, style_rate, style_intensity, style_relative, style_recenter,
-            style_steps, style_cfg, *style_offsets,
+            style_enabled, style_model, style_strength, style_rate, style_intensity,
+            style_vibrato_gain, style_scoop_gain, style_drop_gain, style_relative, style_recenter,
+            style_steps, style_cfg, style_cfg_until, *style_offsets,
         ]
 
         def run_single_infer(
