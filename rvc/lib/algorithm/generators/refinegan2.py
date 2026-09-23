@@ -513,8 +513,17 @@ class SineGenerator(nn.Module):
             (nyquist - f0_buf).div_(nyquist * self.NYQUIST_TAPER).clamp_(0.0, 1.0)
         )
 
-    def _f02sine(self, f0):
-        """f0: (batchsize, length, 1).  Returns (batchsize, length, dim) sines."""
+    # Inductor cannot compile the cumsum over the sample axis: it lowers it to
+    # a ``SplitScan`` whose codegen raises ``TypeError: list indices must be
+    # integers or slices, not NoneType`` -- reproduced on torch 2.10 + cu130,
+    # RTX 5060 -- and a failure inside the compiled region takes the *whole*
+    # decoder down with it.  Only the phase stays out: it is one channel,
+    # while everything after it is a chain over (batch, length, dim) that the
+    # graph fuses.
+    @torch.compiler.disable
+    def _phase(self, f0):
+        """The fundamental's phase in cycles, (batch, length, 1), and each
+        partial's random initial phase, (batch, dim)."""
         # rad_values is F0 in rad mod 1 (the integer cycle count doesn't affect phase)
         rad_values = (f0 / self.sampling_rate) % 1
 
@@ -526,7 +535,11 @@ class SineGenerator(nn.Module):
         tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
         cumsum_shift = torch.zeros_like(rad_values)
         cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-        phase = torch.cumsum(rad_values + cumsum_shift, dim=1)
+        return torch.cumsum(rad_values + cumsum_shift, dim=1), rand_ini
+
+    def _f02sine(self, f0):
+        """f0: (batchsize, length, 1).  Returns (batchsize, length, dim) sines."""
+        phase, rand_ini = self._phase(f0)
 
         # Partial j's phase is j times the fundamental's (mod 1), so the two
         # cumsums run on one channel instead of ``dim``.
@@ -537,16 +550,6 @@ class SineGenerator(nn.Module):
 
         return phase.mul_(2).mul_(np.pi).sin_()
 
-    # Inductor cannot compile this body.  ``_f02sine`` is a cumsum over the
-    # sample axis, and Inductor lowers it to a ``SplitScan`` whose codegen
-    # raises ``TypeError: list indices must be integers or slices, not
-    # NoneType`` -- reproduced on torch 2.10 + cu130, RTX 5060.  A failure
-    # inside the compiled region takes the *whole* decoder down with it, so
-    # ``enable_decoder_compile`` fell back to eager for every step.
-    #
-    # Everything up to ``merge`` runs under ``no_grad`` and is a pure function
-    # of f0, so keeping it out of the graph costs no fusion.
-    @torch.compiler.disable
     def forward(self, f0, gain=None):
         """f0: (batch, length, 1).  gain: (batch, length, gain_channels) or None."""
         with torch.no_grad():
