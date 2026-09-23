@@ -176,15 +176,6 @@ msgstr "Ajustar a posição mais para um lado ou para o outro deixa o modelo mai
 msgid "Advanced Settings"
 msgstr "Configurações avançadas"
 
-msgid "Advanced Settings for inference"
-msgstr "Configurações avançadas de inferência"
-
-msgid "Advanced Settings for the preprocessing step"
-msgstr "Configurações avançadas da etapa de pré-processamento"
-
-msgid "Advanced Settings for training"
-msgstr "Configurações avançadas de treinamento"
-
 msgid "Advanced settings"
 msgstr "Configurações avançadas"
 
@@ -236,9 +227,6 @@ msgstr "Vale para os treinos iniciados depois de salvar. FP16 e BF16 precisam de
 msgid "Apply a soft autotune to your inferences, recommended for singing conversions."
 msgstr "Aplica um autotune suave às inferências; recomendado para conversões de canto."
 
-msgid "Apply autotune for singing."
-msgstr "Aplica autotune para canto."
-
 msgid "Apply autotune."
 msgstr "Aplica autotune."
 
@@ -257,9 +245,6 @@ msgstr "Áudio"
 msgid "Audio Analyzer"
 msgstr "Analisador de áudio"
 
-msgid "Audio added. Run preprocessing when ready."
-msgstr "Áudio adicionado. Rode o pré-processamento quando quiser."
-
 msgid "Audio analyzer"
 msgstr "Analisador de áudio"
 
@@ -271,6 +256,9 @@ msgstr "Corte de áudio"
 
 msgid "Audio file"
 msgstr "Arquivo de áudio"
+
+msgid "Audio processing"
+msgstr "Processamento de áudio"
 
 msgid "Audio splitting"
 msgstr "Divisão de áudio"
@@ -360,9 +348,6 @@ msgstr "Procurar"
 msgid "Browse presets for formant shifting"
 msgstr "Procurar predefinições de deslocamento de formantes"
 
-msgid "Browse presets for formanting"
-msgstr "Procurar predefinições de formantes"
-
 msgid "Building index…"
 msgstr "Construindo index…"
 
@@ -395,9 +380,6 @@ msgstr "CUDA não está disponível para o backend; tudo vai rodar na CPU."
 
 msgid "Check precision"
 msgstr "Verificar precisão"
-
-msgid "Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped."
-msgstr "Verificando os pré-requisitos com guia de pitch... Os arquivos faltantes serão baixados. Se você já os tiver, esta etapa será pulada."
 
 msgid "Checkpoint (.pth) or bundle (.srvc) under logs/."
 msgstr "Checkpoint (.pth) ou pacote (.srvc) dentro de logs/."
@@ -452,9 +434,6 @@ msgstr "Intensidade da limpeza"
 
 msgid "Clear"
 msgstr "Limpar"
-
-msgid "Clear '_output' audio files ( infer outputs ) from 'assets/audios' "
-msgstr "Apaga os áudios '_output' ( saídas de inferência ) de 'assets/audios' "
 
 msgid "Clear Outputs"
 msgstr "Limpar saídas"
@@ -591,9 +570,6 @@ msgstr "Pasta do dataset"
 msgid "Dataset format"
 msgstr "Formato do dataset"
 
-msgid "Default: 1.0."
-msgstr "Padrão: 1,0."
-
 msgid "Denoise the output. Recommended for speech, not for singing."
 msgstr "Remove ruído da saída. Recomendado para fala, não para canto."
 
@@ -692,9 +668,6 @@ msgstr "Encerra a execução quando a qualidade no conjunto reservado para de me
 
 msgid "Enter a preset name first."
 msgstr "Digite um nome para a predefinição primeiro."
-
-msgid "Enter a valid dataset name."
-msgstr "Digite um nome de dataset válido."
 
 msgid "Enter input path"
 msgstr "Digite o caminho de entrada"
@@ -897,8 +870,8 @@ msgstr "Acompanhar"
 msgid "Follow ✓"
 msgstr "Acompanhar ✓"
 
-msgid "Formant Quefrency."
-msgstr "Quefrência do formante."
+msgid "Formant Quefrency"
+msgstr "Quefrência do formante"
 
 msgid "Formant Shifting"
 msgstr "Deslocamento de formantes"
@@ -921,6 +894,9 @@ msgstr "Timbre do formante"
 msgid "Formant timbre. Default: 1.0."
 msgstr "Timbre do formante. Padrão: 1,0."
 
+msgid "Formants"
+msgstr "Formantes"
+
 msgid "Frames averaged per match. Fewer keeps the training voice's idiosyncratic articulation; more averages toward its mean voice."
 msgstr "Frames somados por correspondência. Menos preserva a articulação idiossincrática da voz de treinamento; mais aproxima da sua voz média."
 
@@ -938,9 +914,6 @@ msgstr "GPU"
 
 msgid "GPU ID"
 msgstr "ID da GPU"
-
-msgid "GPU ID override / Multi-gpu-training configuration"
-msgstr "Sobrepor ID da GPU / configuração de treinamento multi-GPU"
 
 msgid "GPU IDs for extraction, separated by '-'."
 msgstr "IDs de GPU para a extração, separados por '-'."
@@ -1083,6 +1056,9 @@ msgstr "Indexar apenas um speaker"
 msgid "Index retrieval"
 msgstr "Busca no índice"
 
+msgid "Index status."
+msgstr "Status do índice."
+
 msgid "Indexes (optional)"
 msgstr "Indexes (opcional)"
 
@@ -1136,9 +1112,6 @@ msgstr "Informe o link do modelo"
 
 msgid "Introduce the model pth path"
 msgstr "Informe o caminho do .pth do modelo"
-
-msgid "Invalid audio file."
-msgstr "Arquivo de áudio inválido."
 
 msgid "Invalid pretrained file."
 msgstr "Arquivo pré-treinado inválido."
@@ -1194,9 +1167,6 @@ msgstr "Escala logarítmica. Vale a pena ativar para as perdas: os primeiros 2% 
 msgid "Loudness Normalization"
 msgstr "Normalização de volume"
 
-msgid "Median filtering for pitch smoothing."
-msgstr "Filtragem por mediana para suavizar o pitch."
-
 msgid "Metrics"
 msgstr "Métricas"
 
@@ -1227,9 +1197,6 @@ msgstr "Nome do modelo"
 msgid "Model Processing"
 msgstr "Processamento de modelos"
 
-msgid "Model Settings"
-msgstr "Configurações do modelo"
-
 msgid "Model blender"
 msgstr "Misturador de modelos"
 
@@ -1241,9 +1208,6 @@ msgstr "Informações do modelo"
 
 msgid "Model information"
 msgstr "Informações do modelo"
-
-msgid "Model information."
-msgstr "Informações do modelo."
 
 msgid "Model name"
 msgstr "Nome do modelo"
@@ -1461,9 +1425,6 @@ msgstr "Curvas de pitch e embeddings de conteúdo."
 msgid "Pitch extraction algorithm"
 msgstr "Algoritmo de extração de pitch"
 
-msgid "Pitch shift in semitones."
-msgstr "Deslocamento de pitch em semitons."
-
 msgid "Pitch shift in semitones. 12 = one octave up."
 msgstr "Deslocamento de pitch em semitons. 12 = uma oitava acima."
 
@@ -1494,9 +1455,6 @@ msgstr "Status do pré-processamento."
 msgid "Prerequisites"
 msgstr "Pré-requisitos"
 
-msgid "Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing."
-msgstr "Verificação de pré-requisitos concluída. Os arquivos faltantes foram baixados e você já pode começar o pré-processamento."
-
 msgid "Preset"
 msgstr "Predefinição"
 
@@ -1524,8 +1482,8 @@ msgstr "Predefinições de assets/formant_shift."
 msgid "Pretrained"
 msgstr "Pré-treinado"
 
-msgid "Pretrained Custom Settings"
-msgstr "Configurações de pré-treinado personalizado"
+msgid "Pretrained file added."
+msgstr "Arquivo pré-treinado adicionado."
 
 msgid "Pretrained model downloaded successfully!"
 msgstr "Modelo pré-treinado baixado com sucesso!"
@@ -1550,9 +1508,6 @@ msgstr "Protege as consoantes surdas. Valores mais altos reduzem a influência d
 
 msgid "Pth file"
 msgstr "Arquivo .pth"
-
-msgid "Quefrency for formant shifting"
-msgstr "Quefrência do deslocamento de formantes"
 
 msgid "RMVPE high-register correction"
 msgstr "Correção de registro agudo do RMVPE"
@@ -1605,17 +1560,8 @@ msgstr "Decoder RefineGAN guiado por uma fonte de excitação multi-harmônica, 
 msgid "Refresh"
 msgstr "Atualizar"
 
-msgid "Refresh Custom Pretraineds"
-msgstr "Atualizar pré-treinados personalizados"
-
-msgid "Refresh Presets"
-msgstr "Atualizar predefinições"
-
 msgid "Refresh models, indexes and audios"
 msgstr "Atualizar modelos, indexes e áudios"
-
-msgid "Refresh the list to use the uploaded pretrained file."
-msgstr "Atualize a lista para usar o arquivo pré-treinado enviado."
 
 msgid "Remove"
 msgstr "Remover"
@@ -1758,9 +1704,6 @@ msgstr "Buscar métricas…"
 msgid "Second model"
 msgstr "Segundo modelo"
 
-msgid "See Model Information"
-msgstr "Ver informações do modelo"
-
 msgid "Seed"
 msgstr "Seed"
 
@@ -1893,9 +1836,6 @@ msgstr "Fatiamento"
 msgid "Slow first epoch, faster afterwards."
 msgstr "Primeiro epoch lento, mais rápido depois."
 
-msgid "Smooth the extracted pitch curve. Default: 0.006."
-msgstr "Suaviza a curva de pitch extraída. Padrão: 0,006."
-
 msgid "Smoothing"
 msgstr "Suavização"
 
@@ -1916,9 +1856,6 @@ msgstr "Locutor"
 
 msgid "Speaker ID"
 msgstr "ID do locutor"
-
-msgid "Speaker ID for conversion."
-msgstr "ID do locutor para a conversão."
 
 msgid "Speaker ID for multi-speaker models."
 msgstr "ID do locutor para modelos multi-locutor."
@@ -1950,9 +1887,6 @@ msgstr "Dividir áudio"
 
 msgid "Split input at silence regions."
 msgstr "Divide a entrada nas regiões de silêncio."
-
-msgid "Split input into chunks."
-msgstr "Divide a entrada em blocos."
 
 msgid "Split long audio"
 msgstr "Dividir áudios longos"
@@ -2188,9 +2122,6 @@ msgstr "Este treino ainda não gravou previews de validação. Eles aparecem a c
 msgid "This section contains some extra utilities. You might find some of 'em helpful."
 msgstr "Esta seção contém alguns utilitários extras. Talvez você ache alguns deles úteis."
 
-msgid "Timbre for formant shifting"
-msgstr "Timbre do deslocamento de formantes"
-
 msgid "Torch compile mode"
 msgstr "Modo de compilação do Torch"
 
@@ -2287,9 +2218,6 @@ msgstr "Usar os meus próprios arquivos pré-treinados"
 msgid "Use pretrained weights for fine-tuning."
 msgstr "Usa pesos pré-treinados para fazer fine-tuning."
 
-msgid "Used by the Generate Index button below, after training."
-msgstr "Usado pelo botão Gerar Índice abaixo, depois do treino."
-
 msgid "Used by the loudness and RMS modes; ignored by the peak ones."
 msgstr "Usado pelos modos de loudness e RMS; ignorado pelos de pico."
 
@@ -2349,9 +2277,6 @@ msgstr "Epochs de warmup"
 
 msgid "Warmup phase for training"
 msgstr "Fase de warmup do treinamento"
-
-msgid "Warmup settings"
-msgstr "Configurações de warmup"
 
 msgid "What should the voice say?"
 msgstr "O que a voz deve dizer?"

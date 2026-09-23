@@ -181,13 +181,13 @@ def test_no_component_key_was_lost_or_duplicated():
 def test_the_sections_appear_in_a_deliberate_order():
     headers = " | ".join(_section_order())
     for expected in ("Starting point", "Optimisation", "Checkpoints and quality",
-                     "Performance", "Hardware", "Index"):
+                     "Performance", "Hardware"):
         assert expected in headers, f"the {expected!r} section is gone"
 
     order = [
         next(index for index, text in enumerate(_section_order()) if name in text)
         for name in ("Starting point", "Optimisation", "Checkpoints and quality",
-                     "Performance", "Hardware", "Index")
+                     "Performance", "Hardware")
     ]
     assert order == sorted(order), f"sections are out of order: {_section_order()}"
 

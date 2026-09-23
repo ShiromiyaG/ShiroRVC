@@ -177,7 +177,9 @@ footer {
 
 /* The tab strip reads as a segmented control rather than loose text. */
 #rvc-main-tabs > .tab-nav,
-#rvc-main-tabs > div:has(> button[role="tab"]) {
+#rvc-main-tabs > div:has(> button[role="tab"]),
+.rvc-settings-tabs > .tab-nav,
+.rvc-settings-tabs > div:has(> button[role="tab"]) {
     gap: 2px !important;
     padding: 4px !important;
     border: 1px solid color-mix(in srgb, var(--border-color-primary) 70%, transparent) !important;
@@ -215,31 +217,22 @@ footer {
 
 /* -------------------------------------------------------- cards + layout -- */
 
+/* Sized to its label: scale=0 alone pins it to Gradio's 160px minimum, which
+   wraps longer translations onto two lines. */
+.gradio-container button.rvc-fit-button {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    padding-inline: 16px !important;
+    white-space: nowrap;
+}
+
 .rvc-card {
     border: 1px solid var(--rvc-line);
     border-radius: var(--rvc-radius-lg);
     padding: 20px;
     background: var(--background-fill-primary);
     box-shadow: var(--rvc-shadow-md), var(--rvc-hairline);
-}
-.rvc-form-card {
-    position: relative;
-    /* No overflow clipping here: dropdown listboxes are absolutely positioned
-       inside this column and would be cut off. The rail rounds its own corners
-       instead. */
-}
-/* Gradient accent rail instead of a flat 3px border. */
-.rvc-form-card::before {
-    content: "";
-    position: absolute;
-    inset: 0 0 auto 0;
-    height: 3px;
-    border-radius: var(--rvc-radius-lg) var(--rvc-radius-lg) 0 0;
-    pointer-events: none;
-    background: linear-gradient(90deg,
-        var(--primary-500),
-        color-mix(in srgb, var(--secondary-500) 80%, var(--primary-400)) 55%,
-        transparent);
 }
 .rvc-card > .gap {
     gap: 14px;

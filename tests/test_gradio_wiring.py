@@ -132,6 +132,6 @@ def test_the_silence_gate_is_last_everywhere():
             }:
                 continue
             last = inputs.elts[-1]
-            assert isinstance(last, ast.Name) and last.id.startswith(
-                "silence_gate_db"
-            ), f"{relative}:{fn.id} does not end with the silence gate"
+            assert "silence_gate_db" in ast.unparse(last), (
+                f"{relative}:{fn.id} does not end with the silence gate"
+            )

@@ -40,6 +40,8 @@ EXPORT_FORMATS = list(presets_lib.EXPORT_FORMATS)
 
 
 def update_sliders_formant(preset):
+    if not preset:
+        return gr.skip(), gr.skip()
     with open(
         os.path.join(FORMANTSHIFT_DIR, f"{preset}.json"), "r", encoding="utf-8"
     ) as json_file:
@@ -93,14 +95,8 @@ def refresh_presets():
     return gr.update(choices=presets_lib.list_presets(PRESETS_DIR))
 
 
-def change_choices(model):
-    return (
-        {"choices": catalog.list_models(), "__type__": "update"},
-        {"choices": catalog.list_indexes(), "__type__": "update"},
-        {"choices": catalog.list_audios(), "__type__": "update"},
-        {"__type__": "update"},
-        {"__type__": "update"},
-    )
+def refresh_formant():
+    return gr.update(choices=list_json_files(FORMANTSHIFT_DIR))
 
 
 def save_to_wav(record_button):
@@ -137,11 +133,6 @@ def delete_outputs():
         os.remove(path)
 
 
-def refresh_formant():
-    json_files = list_json_files(FORMANTSHIFT_DIR)
-    return gr.update(choices=json_files)
-
-
 def get_speakers_id(model, sub_model_name=None):
     if not model or not os.path.exists(os.path.join(ROOT, model)):
         return [0]
@@ -161,7 +152,343 @@ def get_bundle_model_names(model):
         warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []
 
-def inference_tab():
+#: Preset keys, in the order the preset controls are passed around.  What a
+#: preset leaves out, and why, is in ``rvc.lib.inference_presets``.
+PRESET_ORDER = (
+    "export_format", "seed", "split_audio", "autotune", "autotune_strength",
+    "clean_audio", "clean_strength", "formant_shifting", "formant_qfrency",
+    "formant_timbre", "pitch", "index_rate", "index_k", "index_power",
+    "index_continuity", "rms_mix_rate", "protect", "silence_gate_db",
+    "f0_method", "embedder_model",
+)
+
+
+def _conversion_settings(batch: bool) -> dict:
+    """Build the conversion controls shared by the single and batch tabs.
+
+    ``batch`` selects that tab's defaults and its extra F0-file input.
+    Returns the components by name; the preset and visibility events are wired
+    here, the conversion itself by the caller.
+    """
+    c = {}
+
+    # One group visible at a time, each laid out in two columns.
+    with gr.Tabs(elem_classes=["rvc-settings-tabs"]):
+        with gr.Tab(_("Pitch")):
+            with gr.Row():
+                c["pitch"] = gr.Slider(
+                    minimum=-24,
+                    maximum=24,
+                    step=1,
+                    label=_("Pitch"),
+                    info=_("Pitch shift in semitones. 12 = one octave up."),
+                    value=0,
+                    interactive=True,
+                )
+                c["f0_method"] = gr.Radio(
+                    label=_("Pitch extraction algorithm"),
+                    info=_("Pitch algorithm. RMVPE is the recommended default."),
+                    choices=F0_METHODS,
+                    value="rmvpe",
+                    interactive=True,
+                )
+            with gr.Row():
+                c["autotune"] = gr.Checkbox(
+                    label=_("Autotuning"),
+                    info=_("Apply autotune."),
+                    value=False,
+                    interactive=True,
+                )
+                c["autotune_strength"] = gr.Slider(
+                    minimum=0,
+                    maximum=1,
+                    label=_("Strength of autotuning"),
+                    info=_("Higher values snap pitch to the chromatic grid."),
+                    visible=False,
+                    value=1,
+                    interactive=True,
+                )
+            # Hidden in both tabs, each with the range and value it has always sent.
+            c["filter_radius"] = gr.Slider(
+                minimum=0,
+                maximum=7 if batch else 1,
+                step=1 if batch else 0.001,
+                value=3 if batch else 0.006,
+                label=_("Filter Radius"),
+                interactive=False,
+                visible=False,
+            )
+
+        with gr.Tab(_("Index")):
+            with gr.Row():
+                c["index_rate"] = gr.Slider(
+                    minimum=0,
+                    maximum=1,
+                    label=_("Search Feature Ratio"),
+                    info=_("Index influence. Lower values can reduce artifacts."),
+                    value=0.5,
+                    interactive=True,
+                )
+                c["index_k"] = gr.Slider(
+                    minimum=1,
+                    maximum=32,
+                    step=1,
+                    label=_("Index Neighbours"),
+                    info=(
+                        _("Frames averaged per match. Fewer keeps the training "
+                        "voice's idiosyncratic articulation; more averages "
+                        "toward its mean voice.")
+                    ),
+                    value=8,
+                    interactive=True,
+                )
+            with gr.Row():
+                c["index_power"] = gr.Slider(
+                    minimum=0,
+                    maximum=8,
+                    step=0.25,
+                    label=_("Index Sharpness"),
+                    info=(
+                        _("How strongly closer neighbours outweigh further ones. "
+                        "0 averages them equally; high values use the nearest alone.")
+                    ),
+                    value=2.0,
+                    interactive=True,
+                )
+                c["index_continuity"] = gr.Slider(
+                    minimum=0,
+                    maximum=4,
+                    step=0.1,
+                    label=_("Index Continuity"),
+                    info=(
+                        _("Favours matches that continue the previous frame's, so "
+                        "the retrieval stops jumping between unrelated parts of "
+                        "the dataset. Needs an index built by this fork.")
+                    ),
+                    value=0.5,
+                    interactive=True,
+                )
+
+        with gr.Tab(_("Voice")):
+            with gr.Row():
+                c["sid"] = gr.Dropdown(
+                    label=_("Speaker ID"),
+                    info=_("Speaker ID for multi-speaker models."),
+                    choices=[0],
+                    value=0,
+                    interactive=True,
+                )
+                c["embedder_model"] = gr.Radio(
+                    label=_("Embedder Model"),
+                    info=_("Model used for speaker features."),
+                    choices=EMBEDDER_MODELS,
+                    value="contentvec",
+                    interactive=True,
+                )
+            with gr.Row():
+                c["protect"] = gr.Slider(
+                    minimum=0,
+                    maximum=0.5,
+                    label=_("Protect Voiceless Consonants"),
+                    info=_("Protect voiceless consonants. Higher values reduce index influence."),
+                    value=0.3 if batch else 0.33,
+                    interactive=True,
+                )
+                c["rms_mix_rate"] = gr.Slider(
+                    minimum=0,
+                    maximum=1,
+                    label=_("Volume Envelope"),
+                    info=_("Mix the converted and input loudness envelopes."),
+                    value=1,
+                    interactive=True,
+                )
+
+        with gr.Tab(_("Audio processing")):
+            with gr.Row():
+                c["split_audio"] = gr.Checkbox(
+                    label=_("Audio splitting"),
+                    info=_("Split input at silence regions."),
+                    value=False,
+                    interactive=True,
+                )
+                c["clean_audio"] = gr.Checkbox(
+                    label=_("Audio cleanup"),
+                    info=_("Reduce detected noise in speech."),
+                    value=False,
+                    interactive=True,
+                )
+            with gr.Row():
+                c["silence_gate_db"] = gr.Slider(
+                    minimum=-120,
+                    maximum=0,
+                    step=1,
+                    label=_("Silence Gate"),
+                    info=_("Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."),
+                    value=-60,
+                    interactive=True,
+                )
+                c["clean_strength"] = gr.Slider(
+                    minimum=0,
+                    maximum=1,
+                    label=_("Strength of cleaning"),
+                    info=_("Higher values apply stronger cleanup."),
+                    visible=False,
+                    value=0.5 if batch else 0.3,
+                    interactive=True,
+                )
+
+        with gr.Tab(_("Formants")):
+            c["formant_shifting"] = gr.Checkbox(
+                label=_("Formant Shifting"),
+                info=_("Shift vocal formants when needed."),
+                value=False,
+                interactive=True,
+            )
+            with gr.Column(visible=False) as formant_settings:
+                c["formant_preset"] = gr.Dropdown(
+                    label=_("Browse presets for formant shifting"),
+                    info=_("Presets from assets/formant_shift."),
+                    choices=list_json_files(FORMANTSHIFT_DIR),
+                    interactive=True,
+                )
+                with gr.Row():
+                    c["formant_qfrency"] = gr.Slider(
+                        value=1.0,
+                        info=_("Formant quefrency. Default: 1.0."),
+                        label=_("Formant Quefrency"),
+                        minimum=0.0,
+                        maximum=16.0,
+                        step=0.1,
+                        interactive=True,
+                    )
+                    c["formant_timbre"] = gr.Slider(
+                        value=1.0,
+                        info=_("Formant timbre. Default: 1.0."),
+                        label=_("Formant Timbre"),
+                        minimum=0.0,
+                        maximum=16.0,
+                        step=0.1,
+                        interactive=True,
+                    )
+
+        with gr.Tab(_("Output")):
+            if not batch:
+                c["output_path"] = gr.Textbox(
+                    label=_("Path for infer outputs"),
+                    placeholder=os.path.join("assets", "audios", "filename_output.wav"),
+                    info=_("Optional output path. Empty uses assets/audios."),
+                    value="",
+                    interactive=True,
+                )
+            with gr.Row():
+                c["export_format"] = gr.Radio(
+                    label=_("Export Format"),
+                    info=_("Output audio format."),
+                    choices=EXPORT_FORMATS,
+                    value="WAV",
+                    interactive=True,
+                )
+                c["seed"] = gr.Number(
+                    label=_("Inference Seed"),
+                    info=_("Seed for reproducible output. Use 0 for random output."),
+                    value=0,
+                    interactive=True,
+                )
+            if batch:
+                c["f0_file"] = gr.File(label=_("Edited F0 curve"))
+            clear_outputs = gr.Button(_("Clear Outputs"))
+
+        with gr.Tab(_("Preset Settings")):
+            with gr.Row():
+                c["preset_dropdown"] = gr.Dropdown(
+                    label=_("Select Custom Preset"),
+                    choices=presets_lib.list_presets(PRESETS_DIR),
+                    interactive=True,
+                )
+                import_file = gr.File(
+                    label=_("Select file to import"),
+                    file_count="single",
+                    type="filepath",
+                    interactive=True,
+                )
+            with gr.Row(equal_height=True):
+                preset_name_input = gr.Textbox(
+                    label=_("Preset Name"),
+                    placeholder=_("Enter preset name"),
+                )
+                export_button = gr.Button(_("Export Preset"))
+
+    for checkbox, target in (
+        (c["autotune"], c["autotune_strength"]),
+        (c["clean_audio"], c["clean_strength"]),
+        (c["formant_shifting"], formant_settings),
+    ):
+        checkbox.change(
+            fn=lambda enabled: gr.update(visible=bool(enabled)),
+            inputs=[checkbox],
+            outputs=[target],
+            show_progress="hidden",
+        )
+    c["formant_preset"].change(
+        fn=update_sliders_formant,
+        inputs=[c["formant_preset"]],
+        outputs=[c["formant_qfrency"], c["formant_timbre"]],
+        show_progress="hidden",
+    )
+    clear_outputs.click(fn=delete_outputs, inputs=[], outputs=[])
+
+    preset_controls = [c[key] for key in PRESET_ORDER]
+
+    def apply_preset(preset):
+        if not preset:
+            return [gr.skip()] * len(preset_controls)
+        try:
+            values = presets_lib.read_preset(PRESETS_DIR, preset)
+        except (OSError, ValueError) as error:
+            gr.Warning(_("Could not read that preset file: {}").format(error))
+            return [gr.skip()] * len(preset_controls)
+        # The checkboxes' own ``.change`` events then show or hide their
+        # strength and formant controls.
+        return [
+            gr.update(value=values[key]) if key in values else gr.skip()
+            for key in PRESET_ORDER
+        ]
+
+    def save_preset(preset_name, *values):
+        name = (preset_name or "").strip()
+        if not name:
+            gr.Warning(_("Enter a preset name first."))
+            return gr.skip()
+        if not presets_lib.is_valid_name(name):
+            gr.Warning(_('A preset name cannot contain \\ / : * ? " < > |'))
+            return gr.skip()
+        presets_lib.write_preset(PRESETS_DIR, name, dict(zip(PRESET_ORDER, values)))
+        gr.Info(_("Preset saved: {}").format(name))
+        # Only the list is refreshed: selecting the new preset would load it
+        # straight back over the form.
+        return gr.update(choices=presets_lib.list_presets(PRESETS_DIR))
+
+    c["preset_dropdown"].change(
+        apply_preset,
+        inputs=c["preset_dropdown"],
+        outputs=preset_controls,
+        show_progress="hidden",
+    )
+    import_file.change(
+        import_presets_button,
+        inputs=import_file,
+        outputs=[c["preset_dropdown"]],
+    )
+    export_button.click(
+        save_preset,
+        inputs=[preset_name_input, *preset_controls],
+        outputs=c["preset_dropdown"],
+    )
+    return c
+
+
+def inference_tab(tab=None):
+    """Build the tab; with ``tab`` given, its lists are refreshed on selection."""
     with gr.Column():
         with gr.Row():
             model_file = gr.Dropdown(
@@ -192,893 +519,272 @@ def inference_tab():
             unload_button = gr.Button(_("Unload the voice model"))
             refresh_button = gr.Button(_("Refresh models, indexes and audios"))
 
-            def _unload_and_cleanup():
-                import_voice_converter().cleanup_model()
-                return {"value": "", "__type__": "update"}, {"value": "", "__type__": "update"}
-
-            unload_button.click(
-                fn=_unload_and_cleanup,
-                inputs=[],
-                outputs=[model_file, index_file],
-            )
-
-        def run_single_infer(
-            pitch, filter_radius, index_rate, rms_mix_rate, protect,
-            f0_method, audio, output_path, model_file, index_file,
-            split_audio, autotune, autotune_strength,
-            clean_audio, clean_strength, export_format,
-            embedder_model,
-            formant_shifting, formant_qfrency, formant_timbre,
-            sid, seed, bundle_submodel,
-            index_k, index_power, index_continuity,
-            silence_gate_db,
-        ):
-            if not output_path or not output_path.strip():
-                output_path = catalog.default_output_path(audio)
-            else:
-                if os.path.isdir(output_path):
-                    default_name = os.path.splitext(os.path.basename(catalog.default_output_path(audio)))[0]
-                    output_path = os.path.join(output_path, default_name + f".{export_format.lower()}")
-
-                _, ext = os.path.splitext(output_path)
-                valid_formats = {"wav", "mp3", "flac", "ogg", "m4a"}
-                if ext and ext.lower().lstrip(".") in valid_formats:
-                    export_format = ext.lower().lstrip(".").upper()
-
-                    output_path = output_path[: -len(ext)] + ".wav"
-                elif not ext:
-                    output_path += ".wav"
-
-            return run_infer_script(
-                pitch, filter_radius, index_rate, rms_mix_rate, protect,
-                f0_method, audio, output_path, model_file, index_file,
-                split_audio, autotune, autotune_strength,
-                clean_audio, clean_strength, export_format,
-                None,
-                embedder_model,
-                formant_shifting, formant_qfrency, formant_timbre,
-                sid, seed, bundle_submodel,
-                index_k, index_power, index_continuity,
-                silence_gate_db,
-            )
-
-        def on_model_change(model_path):
-            bundle_models = get_bundle_model_names(model_path)
-
-            if bundle_models:
-                return (
-                    gr.update(visible=False, value=""),
-                    gr.update(choices=[0], value=0, visible=True),
-                    gr.update(visible=True, choices=bundle_models, value=bundle_models[0])
-                )
-            else:
-                speakers = get_speakers_id(model_path)
-                speaker_val = speakers[0] if speakers else 0
-                is_bundle = is_model_bundle(model_path)
-
-                return (
-                    gr.update(
-                        choices=catalog.list_indexes(),
-                        value=catalog.guess_index_for(model_path),
-                        interactive=not is_bundle,
-                        visible=True,
-                    ),
-                    gr.update(visible=True, choices=speakers, value=speaker_val),
-                    gr.update(visible=False, choices=[], value=None)
-                )
-
-        def on_submodel_change(model_path, sub_model_name):
-            if not model_path or not sub_model_name:
-                return gr.update(choices=[0], value=0)
-            
-            speakers = get_speakers_id(model_path, sub_model_name)
-            speaker_val = speakers[0] if speakers else 0
-            return gr.update(choices=speakers, value=speaker_val)
-
-            
-        def sync_speaker_id(model_path, repurposed_index_value):
-            if model_path and is_model_bundle(model_path):
-                return gr.update(value=repurposed_index_value)
-            return gr.update()
-
     with gr.Tab(_("Single input infer")):
         with gr.Column():
             upload_audio = gr.Audio(
                 label=_("Upload Audio"), type="filepath", editable=False
             )
-            with gr.Row():
-                audio_paths = catalog.list_audios()
-                audio = gr.Dropdown(
-                    label=_("Select Audio Input"),
-                    info=_("Audio to convert."),
-                    choices=audio_paths,
-                    value=audio_paths[0] if audio_paths else "",
-                    interactive=True,
-                    allow_custom_value=True,
-                )
+            audio_paths = catalog.list_audios()
+            audio = gr.Dropdown(
+                label=_("Select Audio Input"),
+                info=_("Audio to convert."),
+                choices=audio_paths,
+                value=audio_paths[0] if audio_paths else "",
+                interactive=True,
+                allow_custom_value=True,
+            )
 
-        with gr.Accordion(_("Advanced Settings for inference"), open=False):
-            with gr.Column():
-                clear_outputs_infer = gr.Button(_("Clear '_output' audio files ( infer outputs ) from 'assets/audios' "))
-                output_path = gr.Textbox(
-                    label=_("Path for infer outputs"),
-                    placeholder=os.path.join("assets", "audios", "filename_output.wav"),
-                    info=_("Optional output path. Empty uses assets/audios."),
-                    value="",
-                    interactive=True,
-                )
-                export_format = gr.Radio(
-                    label=_("Export Format"),
-                    info=_("Output audio format."),
-                    choices=EXPORT_FORMATS,
-                    value="WAV",
-                    interactive=True,
-                )
-                seed = gr.Number(
-                    label=_("Inference Seed"),
-                    info=_("Seed for reproducible output. Use 0 for random output."),
-                    value=0,
-                    interactive=True,
-                )
-                sid = gr.Dropdown(
-                    label=_("Speaker ID"),
-                    info=_("Speaker ID for multi-speaker models."),
-                    choices=[0],
-                    value=0,
-                    interactive=True,
-                )
-                split_audio = gr.Checkbox(
-                    label=_("Audio splitting"),
-                    info=_("Split input at silence regions."),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                autotune = gr.Checkbox(
-                    label=_("Autotuning"),
-                    info=_("Apply autotune."),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                autotune_strength = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Strength of autotuning"),
-                    info=_("Higher values snap pitch to the chromatic grid."),
-                    visible=False,
-                    value=1,
-                    interactive=True,
-                )
-                clean_audio = gr.Checkbox(
-                    label=_("Audio cleanup"),
-                    info=_("Reduce detected noise in speech."),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                clean_strength = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Strength of cleaning"),
-                    info=_("Higher values apply stronger cleanup."),
-                    visible=False,
-                    value=0.3,
-                    interactive=True,
-                )
-                formant_shifting = gr.Checkbox(
-                    label=_("Formant Shifting"),
-                    info=_("Shift vocal formants when needed."),
-                    value=False,
-                    visible=True,
-                    interactive=True,
-                )
-                with gr.Row(visible=False) as formant_row:
-                    formant_preset = gr.Dropdown(
-                        label=_("Browse presets for formant shifting"),
-                        info=_("Presets from assets/formant_shift."),
-                        choices=list_json_files(FORMANTSHIFT_DIR),
-                        visible=False,
-                        interactive=True,
-                    )
-                    formant_refresh_button = gr.Button(
-                        value="Refresh",
-                        visible=False,
-                    )
-                formant_qfrency = gr.Slider(
-                    value=1.0,
-                    info=_("Formant quefrency. Default: 1.0."),
-                    label=_("Formant Quefrency."),
-                    minimum=0.0,
-                    maximum=16.0,
-                    step=0.1,
-                    visible=False,
-                    interactive=True,
-                )
-                formant_timbre = gr.Slider(
-                    value=1.0,
-                    info=_("Formant timbre. Default: 1.0."),
-                    label=_("Formant Timbre"),
-                    minimum=0.0,
-                    maximum=16.0,
-                    step=0.1,
-                    visible=False,
-                    interactive=True,
-                )
-                with gr.Accordion(_("Preset Settings"), open=False):
-                    with gr.Row():
-                        preset_dropdown = gr.Dropdown(
-                            label=_("Select Custom Preset"),
-                            choices=presets_lib.list_presets(PRESETS_DIR),
-                            interactive=True,
-                        )
-                        presets_refresh_button = gr.Button(_("Refresh Presets"))
-                    import_file = gr.File(
-                        label=_("Select file to import"),
-                        file_count="single",
-                        type="filepath",
-                        interactive=True,
-                    )
-                    import_file.change(
-                        import_presets_button,
-                        inputs=import_file,
-                        outputs=[preset_dropdown],
-                    )
-                    presets_refresh_button.click(
-                        refresh_presets, outputs=preset_dropdown
-                    )
-                    with gr.Row():
-                        preset_name_input = gr.Textbox(
-                            label=_("Preset Name"),
-                            placeholder=_("Enter preset name"),
-                        )
-                        export_button = gr.Button(_("Export Preset"))
-                pitch = gr.Slider(
-                    minimum=-24,
-                    maximum=24,
-                    step=1,
-                    label=_("Pitch"),
-                    info=_("Pitch shift in semitones. 12 = one octave up."),
-                    value=0,
-                    interactive=True,
-                )
-                filter_radius = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Filter Radius"),
-                    info=_("Smooth the extracted pitch curve. Default: 0.006."),
-                    value=0.006,
-                    step=0.001,
-                    interactive=False,
-                    visible=False,
-                )
-                index_rate = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Search Feature Ratio"),
-                    info=_("Index influence. Lower values can reduce artifacts."),
-                    value=0.5,
-                    interactive=True,
-                )
-                index_k = gr.Slider(
-                    minimum=1,
-                    maximum=32,
-                    step=1,
-                    label=_("Index Neighbours"),
-                    info=(
-                        _("Frames averaged per match. Fewer keeps the training "
-                        "voice's idiosyncratic articulation; more averages "
-                        "toward its mean voice.")
-                    ),
-                    value=8,
-                    interactive=True,
-                )
-                index_power = gr.Slider(
-                    minimum=0,
-                    maximum=8,
-                    step=0.25,
-                    label=_("Index Sharpness"),
-                    info=(
-                        _("How strongly closer neighbours outweigh further ones. "
-                        "0 averages them equally; high values use the nearest alone.")
-                    ),
-                    value=2.0,
-                    interactive=True,
-                )
-                index_continuity = gr.Slider(
-                    minimum=0,
-                    maximum=4,
-                    step=0.1,
-                    label=_("Index Continuity"),
-                    info=(
-                        _("Favours matches that continue the previous frame's, so "
-                        "the retrieval stops jumping between unrelated parts of "
-                        "the dataset. Needs an index built by this fork.")
-                    ),
-                    value=0.5,
-                    interactive=True,
-                )
-                rms_mix_rate = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Volume Envelope"),
-                    info=_("Mix the converted and input loudness envelopes."),
-                    value=1,
-                    interactive=True,
-                )
-                protect = gr.Slider(
-                    minimum=0,
-                    maximum=0.5,
-                    label=_("Protect Voiceless Consonants"),
-                    info=_("Protect voiceless consonants. Higher values reduce index influence."),
-                    value=0.33,
-                    interactive=True,
-                )
-                silence_gate_db = gr.Slider(
-                    minimum=-120,
-                    maximum=0,
-                    step=1,
-                    label=_("Silence Gate"),
-                    info=_("Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."),
-                    value=-60,
-                    interactive=True,
-                )
-                f0_method = gr.Radio(
-                    label=_("Pitch extraction algorithm"),
-                    info=_("Pitch algorithm. RMVPE is the recommended default."),
-                    choices=F0_METHODS,
-                    value="rmvpe",
-                    interactive=True,
-                )
-                embedder_model = gr.Radio(
-                    label=_("Embedder Model"),
-                    info=_("Model used for speaker features."),
-                    choices=EMBEDDER_MODELS,
-                    value="contentvec",
-                    interactive=True,
-                )
+        single = _conversion_settings(batch=False)
 
-        convert_button1 = gr.Button(_("Convert"))
+        convert_button1 = gr.Button(_("Convert"), variant="primary")
 
         with gr.Row():
             vc_output1 = gr.Textbox(
                 label=_("Output Information"),
                 info=_("Inference status."),
             )
-            vc_output2 = gr.Audio("Export Audio")
+            vc_output2 = gr.Audio(label=_("Export Audio"))
 
     with gr.Tab(_("Batch")):
         with gr.Row():
-            with gr.Column():
-                input_folder_batch = gr.Textbox(
-                    label=_("Input Folder"),
-                    info=_("Folder containing input audio."),
-                    placeholder=_("Enter input path"),
-                    value=str(AUDIO_DIR),
-                    interactive=True,
-                )
-                output_folder_batch = gr.Textbox(
-                    label=_("Output Folder"),
-                    info=_("Folder for converted audio."),
-                    placeholder=_("Enter output path"),
-                    value=str(AUDIO_DIR),
-                    interactive=True,
-                )
-        with gr.Accordion(_("Advanced Settings"), open=False):
-            with gr.Column():
-                clear_outputs_batch = gr.Button(_("Clear Outputs"))
-                export_format_batch = gr.Radio(
-                    label=_("Export Format"),
-                    info=_("Output audio format."),
-                    choices=EXPORT_FORMATS,
-                    value="WAV",
-                    interactive=True,
-                )
-                sid_batch = gr.Dropdown(
-                    label=_("Speaker ID"),
-                    info=_("Speaker ID for conversion."),
-                    choices=[0],
-                    value=0,
-                    interactive=True,
-                )
-                split_audio_batch = gr.Checkbox(
-                    label=_("Split Audio"),
-                    info=_("Split input into chunks."),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                autotune_batch = gr.Checkbox(
-                    label=_("Autotune"),
-                    info=_("Apply autotune for singing."),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                autotune_strength_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Autotune Strength"),
-                    info=_("Higher values snap pitch to the chromatic grid."),
-                    visible=False,
-                    value=1,
-                    interactive=True,
-                )
-                clean_audio_batch = gr.Checkbox(
-                    label=_("Clean Audio"),
-                    info=_("Reduce detected noise in speech."),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                clean_strength_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Clean Strength"),
-                    info=_("Higher values apply stronger cleanup."),
-                    visible=False,
-                    value=0.5,
-                    interactive=True,
-                )
-                formant_shifting_batch = gr.Checkbox(
-                    label=_("Formant Shifting"),
-                    info=_("Shift vocal formants when needed."),
-                    value=False,
-                    visible=True,
-                    interactive=True,
-                )
-                with gr.Row(visible=False) as formant_row_batch:
-                    formant_preset_batch = gr.Dropdown(
-                        label=_("Browse presets for formanting"),
-                        info=_("Presets from assets/formant_shift."),
-                        choices=list_json_files(FORMANTSHIFT_DIR),
-                        visible=False,
-                        interactive=True,
-                    )
-                    formant_refresh_button_batch = gr.Button(
-                        value="Refresh",
-                        visible=False,
-                    )
-                formant_qfrency_batch = gr.Slider(
-                    value=1.0,
-                    info=_("Default: 1.0."),
-                    label=_("Quefrency for formant shifting"),
-                    minimum=0.0,
-                    maximum=16.0,
-                    step=0.1,
-                    visible=False,
-                    interactive=True,
-                )
-                formant_timbre_batch = gr.Slider(
-                    value=1.0,
-                    info=_("Default: 1.0."),
-                    label=_("Timbre for formant shifting"),
-                    minimum=0.0,
-                    maximum=16.0,
-                    step=0.1,
-                    visible=False,
-                    interactive=True,
-                )
-                pitch_batch = gr.Slider(
-                    minimum=-24,
-                    maximum=24,
-                    step=1,
-                    label=_("Pitch"),
-                    info=_("Pitch shift in semitones."),
-                    value=0,
-                    interactive=True,
-                )
-                filter_radius_batch = gr.Slider(
-                    minimum=0,
-                    maximum=7,
-                    label=_("Filter Radius"),
-                    info=_("Median filtering for pitch smoothing."),
-                    value=3,
-                    step=1,
-                    interactive=False,
-                    visible=False,
-                )
-                index_rate_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Search Feature Ratio"),
-                    info=_("Index influence. Lower values can reduce artifacts."),
-                    value=0.5,
-                    interactive=True,
-                )
-                index_k_batch = gr.Slider(
-                    minimum=1,
-                    maximum=32,
-                    step=1,
-                    label=_("Index Neighbours"),
-                    info=(
-                        _("Frames averaged per match. Fewer keeps the training "
-                        "voice's idiosyncratic articulation; more averages "
-                        "toward its mean voice.")
-                    ),
-                    value=8,
-                    interactive=True,
-                )
-                index_power_batch = gr.Slider(
-                    minimum=0,
-                    maximum=8,
-                    step=0.25,
-                    label=_("Index Sharpness"),
-                    info=(
-                        _("How strongly closer neighbours outweigh further ones. "
-                        "0 averages them equally; high values use the nearest alone.")
-                    ),
-                    value=2.0,
-                    interactive=True,
-                )
-                index_continuity_batch = gr.Slider(
-                    minimum=0,
-                    maximum=4,
-                    step=0.1,
-                    label=_("Index Continuity"),
-                    info=(
-                        _("Favours matches that continue the previous frame's, so "
-                        "the retrieval stops jumping between unrelated parts of "
-                        "the dataset. Needs an index built by this fork.")
-                    ),
-                    value=0.5,
-                    interactive=True,
-                )
-                rms_mix_rate_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Volume Envelope"),
-                    info=_("Mix the converted and input loudness envelopes."),
-                    value=1,
-                    interactive=True,
-                )
-                protect_batch = gr.Slider(
-                    minimum=0,
-                    maximum=0.5,
-                    label=_("Protect Voiceless Consonants"),
-                    info=_("Protect voiceless consonants. Higher values reduce index influence."),
-                    value=0.3,
-                    interactive=True,
-                )
-                silence_gate_db_batch = gr.Slider(
-                    minimum=-120,
-                    maximum=0,
-                    step=1,
-                    label=_("Silence Gate"),
-                    info=_("Fade the output out where the input is quieter than this, in dBFS. Silence has no level for the content encoder, so the model fills it with hiss. -120 turns the gate off."),
-                    value=-60,
-                    interactive=True,
-                )
-                f0_method_batch = gr.Radio(
-                    label=_("Pitch extraction algorithm"),
-                    info=_("Pitch algorithm. RMVPE is the recommended default."),
-                    choices=F0_METHODS,
-                    value="rmvpe",
-                    interactive=True,
-                )
-                embedder_model_batch = gr.Radio(
-                    label=_("Embedder Model"),
-                    info=_("Model used for speaker features."),
-                    choices=EMBEDDER_MODELS,
-                    value="contentvec",
-                    interactive=True,
-                )
-                f0_file_batch = gr.File(
-                    label=_("Edited F0 curve"),
-                    visible=True,
-                )
+            input_folder_batch = gr.Textbox(
+                label=_("Input Folder"),
+                info=_("Folder containing input audio."),
+                placeholder=_("Enter input path"),
+                value=str(AUDIO_DIR),
+                interactive=True,
+            )
+            output_folder_batch = gr.Textbox(
+                label=_("Output Folder"),
+                info=_("Folder for converted audio."),
+                placeholder=_("Enter output path"),
+                value=str(AUDIO_DIR),
+                interactive=True,
+            )
 
-        convert_button_batch = gr.Button(_("Convert"))
-        stop_button = gr.Button(_("Stop convert"), visible=False)
-        stop_button.click(fn=stop_infer, inputs=[], outputs=[])
+        batch = _conversion_settings(batch=True)
 
         with gr.Row():
-            vc_output3 = gr.Textbox(
-                label=_("Output Information"),
+            convert_button_batch = gr.Button(_("Convert"), variant="primary")
+            stop_button = gr.Button(_("Stop convert"), visible=False)
+
+        vc_output3 = gr.Textbox(
+            label=_("Output Information"),
             info=_("Batch status."),
-            )
+        )
 
-    def toggle_visible(checkbox):
-        return {"visible": checkbox, "__type__": "update"}
-
-    def enable_stop_convert_button():
-        return {"visible": False, "__type__": "update"}, {
-            "visible": True,
-            "__type__": "update",
-        }
-
-    def disable_stop_convert_button():
-        return {"visible": True, "__type__": "update"}, {
-            "visible": False,
-            "__type__": "update",
-        }
-
-    def toggle_visible_formant_shifting(checkbox):
-        if checkbox:
-            return (
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-            )
+    def run_single_infer(
+        pitch, filter_radius, index_rate, rms_mix_rate, protect,
+        f0_method, audio, output_path, model_file, index_file,
+        split_audio, autotune, autotune_strength,
+        clean_audio, clean_strength, export_format,
+        embedder_model,
+        formant_shifting, formant_qfrency, formant_timbre,
+        sid, seed, bundle_submodel,
+        index_k, index_power, index_continuity,
+        silence_gate_db,
+    ):
+        if not output_path or not output_path.strip():
+            output_path = catalog.default_output_path(audio)
         else:
-            return (
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-            )
+            if os.path.isdir(output_path):
+                default_name = os.path.splitext(os.path.basename(catalog.default_output_path(audio)))[0]
+                output_path = os.path.join(output_path, default_name + f".{export_format.lower()}")
 
-    # Every key of ``rvc.lib.inference_presets.PRESET_KEYS`` -> (single-input
-    # control, batch control).  Saved from the single-input tab, where the
-    # preset controls are, and loaded into both.  The seed has no batch twin;
-    # the batch run reads the single tab's.  What a preset leaves out, and why,
-    # is in that module.
-    preset_controls = {
-        "export_format": (export_format, export_format_batch),
-        "seed": (seed, None),
-        "split_audio": (split_audio, split_audio_batch),
-        "autotune": (autotune, autotune_batch),
-        "autotune_strength": (autotune_strength, autotune_strength_batch),
-        "clean_audio": (clean_audio, clean_audio_batch),
-        "clean_strength": (clean_strength, clean_strength_batch),
-        "formant_shifting": (formant_shifting, formant_shifting_batch),
-        "formant_qfrency": (formant_qfrency, formant_qfrency_batch),
-        "formant_timbre": (formant_timbre, formant_timbre_batch),
-        "pitch": (pitch, pitch_batch),
-        "index_rate": (index_rate, index_rate_batch),
-        "index_k": (index_k, index_k_batch),
-        "index_power": (index_power, index_power_batch),
-        "index_continuity": (index_continuity, index_continuity_batch),
-        "rms_mix_rate": (rms_mix_rate, rms_mix_rate_batch),
-        "protect": (protect, protect_batch),
-        "silence_gate_db": (silence_gate_db, silence_gate_db_batch),
-        "f0_method": (f0_method, f0_method_batch),
-        "embedder_model": (embedder_model, embedder_model_batch),
-    }
-    preset_sources = [single for single, _batch in preset_controls.values()]
-    preset_targets = [
-        control
-        for pair in preset_controls.values()
-        for control in pair
-        if control is not None
+            _, ext = os.path.splitext(output_path)
+            valid_formats = {"wav", "mp3", "flac", "ogg", "m4a"}
+            if ext and ext.lower().lstrip(".") in valid_formats:
+                export_format = ext.lower().lstrip(".").upper()
+
+                output_path = output_path[: -len(ext)] + ".wav"
+            elif not ext:
+                output_path += ".wav"
+
+        return run_infer_script(
+            pitch, filter_radius, index_rate, rms_mix_rate, protect,
+            f0_method, audio, output_path, model_file, index_file,
+            split_audio, autotune, autotune_strength,
+            clean_audio, clean_strength, export_format,
+            None,
+            embedder_model,
+            formant_shifting, formant_qfrency, formant_timbre,
+            sid, seed, bundle_submodel,
+            index_k, index_power, index_continuity,
+            silence_gate_db,
+        )
+
+    def on_model_change(model_path):
+        bundle_models = get_bundle_model_names(model_path)
+
+        if bundle_models:
+            sid_update = gr.update(choices=[0], value=0)
+            return (
+                gr.update(visible=False, value=""),
+                sid_update,
+                sid_update,
+                gr.update(visible=True, choices=bundle_models, value=bundle_models[0])
+            )
+        speakers = get_speakers_id(model_path)
+        sid_update = gr.update(choices=speakers, value=speakers[0] if speakers else 0)
+        is_bundle = is_model_bundle(model_path)
+        return (
+            gr.update(
+                choices=catalog.list_indexes(),
+                value=catalog.guess_index_for(model_path),
+                interactive=not is_bundle,
+                visible=True,
+            ),
+            sid_update,
+            sid_update,
+            gr.update(visible=False, choices=[], value=None)
+        )
+
+    def on_submodel_change(model_path, sub_model_name):
+        if not model_path or not sub_model_name:
+            sid_update = gr.update(choices=[0], value=0)
+        else:
+            speakers = get_speakers_id(model_path, sub_model_name)
+            sid_update = gr.update(choices=speakers, value=speakers[0] if speakers else 0)
+        return sid_update, sid_update
+
+    def sync_speaker_id(model_path, repurposed_index_value):
+        if model_path and is_model_bundle(model_path):
+            return gr.update(value=repurposed_index_value), gr.update(value=repurposed_index_value)
+        return gr.update(), gr.update()
+
+    def refresh_lists():
+        return (
+            gr.update(choices=catalog.list_models()),
+            gr.update(choices=catalog.list_indexes()),
+            gr.update(choices=catalog.list_audios()),
+            refresh_formant(),
+            refresh_formant(),
+            refresh_presets(),
+            refresh_presets(),
+        )
+
+    def _unload_and_cleanup():
+        import_voice_converter().cleanup_model()
+        return gr.update(value=""), gr.update(value="")
+
+    sids = [single["sid"], batch["sid"]]
+    list_outputs = [
+        model_file, index_file, audio,
+        single["formant_preset"], batch["formant_preset"],
+        single["preset_dropdown"], batch["preset_dropdown"],
     ]
 
-    def apply_preset(preset):
-        if not preset:
-            return [gr.skip()] * len(preset_targets)
-        try:
-            values = presets_lib.read_preset(PRESETS_DIR, preset)
-        except (OSError, ValueError) as error:
-            gr.Warning(_("Could not read that preset file: {}").format(error))
-            return [gr.skip()] * len(preset_targets)
-        # In ``preset_targets`` order.  The checkboxes' own ``.change`` events
-        # then show or hide their strength and formant controls.
-        return [
-            gr.update(value=values[key]) if key in values else gr.skip()
-            for key, pair in preset_controls.items()
-            for control in pair
-            if control is not None
-        ]
-
-    def save_preset(preset_name, *values):
-        name = (preset_name or "").strip()
-        if not name:
-            gr.Warning(_("Enter a preset name first."))
-            return gr.skip()
-        if not presets_lib.is_valid_name(name):
-            gr.Warning(_('A preset name cannot contain \\ / : * ? " < > |'))
-            return gr.skip()
-        presets_lib.write_preset(
-            PRESETS_DIR, name, dict(zip(preset_controls, values))
+    unload_button.click(
+        fn=_unload_and_cleanup,
+        inputs=[],
+        outputs=[model_file, index_file],
+    )
+    refresh_button.click(fn=refresh_lists, inputs=[], outputs=list_outputs)
+    if tab is not None:
+        tab.select(
+            fn=refresh_lists, inputs=[], outputs=list_outputs, show_progress="hidden"
         )
-        gr.Info(_("Preset saved: {}").format(name))
-        # Only the list is refreshed.  Selecting the new preset would load it,
-        # and that would copy this tab's settings over the batch tab's.
-        return gr.update(choices=presets_lib.list_presets(PRESETS_DIR))
-
-    preset_dropdown.change(
-        apply_preset,
-        inputs=preset_dropdown,
-        outputs=preset_targets,
-        show_progress="hidden",
-    )
-    export_button.click(
-        save_preset,
-        inputs=[preset_name_input, *preset_sources],
-        outputs=preset_dropdown,
-    )
-
     model_file.change(
         fn=on_model_change,
         inputs=[model_file],
-        outputs=[index_file, sid, bundle_submodel],
+        outputs=[index_file, *sids, bundle_submodel],
         show_progress="hidden",
     )
     bundle_submodel.change(
         fn=on_submodel_change,
         inputs=[model_file, bundle_submodel],
-        outputs=[sid]
+        outputs=sids,
     )
     index_file.change(
         fn=sync_speaker_id,
         inputs=[model_file, index_file],
-        outputs=[sid],
+        outputs=sids,
     )
-    autotune.change(
-        fn=toggle_visible,
-        inputs=[autotune],
-        outputs=[autotune_strength],
-        show_progress="hidden",
-    )
-    clean_audio.change(
-        fn=toggle_visible,
-        inputs=[clean_audio],
-        outputs=[clean_strength],
-        show_progress="hidden",
-    )
-    formant_shifting.change(
-        fn=toggle_visible_formant_shifting,
-        inputs=[formant_shifting],
-        outputs=[
-            formant_row,
-            formant_preset,
-            formant_refresh_button,
-            formant_qfrency,
-            formant_timbre,
-        ],
-        show_progress="hidden",
-    )
-    formant_shifting_batch.change(
-        fn=toggle_visible_formant_shifting,
-        inputs=[formant_shifting_batch],
-        outputs=[
-            formant_row_batch,
-            formant_preset_batch,
-            formant_refresh_button_batch,
-            formant_qfrency_batch,
-            formant_timbre_batch,
-        ],
-        show_progress="hidden",
-    )
-    formant_refresh_button.click(
-        fn=refresh_formant,
-        inputs=[],
-        outputs=[formant_preset],
-        show_progress="hidden",
-    )
-    formant_preset.change(
-        fn=update_sliders_formant,
-        inputs=[formant_preset],
-        outputs=[
-            formant_qfrency,
-            formant_timbre,
-        ],
-        show_progress="hidden",
-    )
-    formant_preset_batch.change(
-        fn=update_sliders_formant,
-        inputs=[formant_preset_batch],
-        outputs=[
-            formant_qfrency_batch,
-            formant_timbre_batch,
-        ],
-        show_progress="hidden",
-    )
-    autotune_batch.change(
-        fn=toggle_visible,
-        inputs=[autotune_batch],
-        outputs=[autotune_strength_batch],
-        show_progress="hidden",
-    )
-    clean_audio_batch.change(
-        fn=toggle_visible,
-        inputs=[clean_audio_batch],
-        outputs=[clean_strength_batch],
-        show_progress="hidden",
-    )
-    refresh_button.click(
-        fn=change_choices,
-        inputs=[model_file],
-        outputs=[model_file, index_file, audio, sid, sid_batch],
-    )
-
     upload_audio.upload(
         fn=save_to_wav2,
         inputs=[upload_audio],
-        outputs=[audio, output_path],
+        outputs=[audio, single["output_path"]],
     )
     upload_audio.stop_recording(
         fn=save_to_wav,
         inputs=[upload_audio],
-        outputs=[audio, output_path],
-    )
-    clear_outputs_infer.click(
-        fn=delete_outputs,
-        inputs=[],
-        outputs=[],
-    )
-    clear_outputs_batch.click(
-        fn=delete_outputs,
-        inputs=[],
-        outputs=[],
+        outputs=[audio, single["output_path"]],
     )
     convert_button1.click(
         fn=run_single_infer,
         inputs=[
-            pitch,
-            filter_radius,
-            index_rate,
-            rms_mix_rate,
-            protect,
-            f0_method,
+            single["pitch"],
+            single["filter_radius"],
+            single["index_rate"],
+            single["rms_mix_rate"],
+            single["protect"],
+            single["f0_method"],
             audio,
-            output_path,
+            single["output_path"],
             model_file,
             index_file,
-            split_audio,
-            autotune,
-            autotune_strength,
-            clean_audio,
-            clean_strength,
-            export_format,
-            embedder_model,
-            formant_shifting,
-            formant_qfrency,
-            formant_timbre,
-            sid,
-            seed,
+            single["split_audio"],
+            single["autotune"],
+            single["autotune_strength"],
+            single["clean_audio"],
+            single["clean_strength"],
+            single["export_format"],
+            single["embedder_model"],
+            single["formant_shifting"],
+            single["formant_qfrency"],
+            single["formant_timbre"],
+            single["sid"],
+            single["seed"],
             bundle_submodel,
-            index_k,
-            index_power,
-            index_continuity,
-            silence_gate_db,
+            single["index_k"],
+            single["index_power"],
+            single["index_continuity"],
+            single["silence_gate_db"],
         ],
         outputs=[vc_output1, vc_output2],
     )
     convert_button_batch.click(
         fn=run_batch_infer_script,
         inputs=[
-            pitch_batch,
-            filter_radius_batch,
-            index_rate_batch,
-            rms_mix_rate_batch,
-            protect_batch,
-            f0_method_batch,
+            batch["pitch"],
+            batch["filter_radius"],
+            batch["index_rate"],
+            batch["rms_mix_rate"],
+            batch["protect"],
+            batch["f0_method"],
             input_folder_batch,
             output_folder_batch,
             model_file,
             index_file,
-            split_audio_batch,
-            autotune_batch,
-            autotune_strength_batch,
-            clean_audio_batch,
-            clean_strength_batch,
-            export_format_batch,
-            f0_file_batch,
-            embedder_model_batch,
-            formant_shifting_batch,
-            formant_qfrency_batch,
-            formant_timbre_batch,
-            sid_batch,
-            seed,
-            index_k_batch,
-            index_power_batch,
-            index_continuity_batch,
-            silence_gate_db_batch,
+            batch["split_audio"],
+            batch["autotune"],
+            batch["autotune_strength"],
+            batch["clean_audio"],
+            batch["clean_strength"],
+            batch["export_format"],
+            batch["f0_file"],
+            batch["embedder_model"],
+            batch["formant_shifting"],
+            batch["formant_qfrency"],
+            batch["formant_timbre"],
+            batch["sid"],
+            batch["seed"],
+            batch["index_k"],
+            batch["index_power"],
+            batch["index_continuity"],
+            batch["silence_gate_db"],
         ],
         outputs=[vc_output3],
     )
     convert_button_batch.click(
-        fn=enable_stop_convert_button,
+        fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
         inputs=[],
         outputs=[convert_button_batch, stop_button],
         show_progress="hidden",
     )
+    stop_button.click(fn=stop_infer, inputs=[], outputs=[])
     stop_button.click(
-        fn=disable_stop_convert_button,
+        fn=lambda: (gr.update(visible=True), gr.update(visible=False)),
         inputs=[],
         outputs=[convert_button_batch, stop_button],
         show_progress="hidden",

@@ -181,33 +181,28 @@ with gr.Blocks(title=APP_TITLE) as interface:
 
     with gr.Column(elem_classes=["rvc-workspace"]):
         with gr.Tabs(elem_id="rvc-main-tabs"):
-            with gr.Tab(_("Inference")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    inference_tab()
+            # The tabs that list files on disk refresh those lists when opened.
+            with gr.Tab(_("Inference")) as tab:
+                with gr.Column(elem_classes=["rvc-card"]):
+                    inference_tab(tab)
 
-            with gr.Tab(_("Training")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    train_tab()
+            with gr.Tab(_("Training")) as tab:
+                with gr.Column(elem_classes=["rvc-card"]):
+                    train_tab(tab)
 
-            with gr.Tab(_("TTS")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    tts_tab()
+            with gr.Tab(_("TTS")) as tab:
+                with gr.Column(elem_classes=["rvc-card"]):
+                    tts_tab(tab)
 
-            with gr.Tab(_("Voice Blender")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    voice_blender_tab()
-
-            with gr.Tab(_("Download")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    download_tab()
-
-            with gr.Tab(_("Utilities")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    utilities_tab()
-
-            with gr.Tab(_("Settings")):
-                with gr.Column(elem_classes=["rvc-card", "rvc-form-card"]):
-                    settings_tab()
+            for label, build in (
+                (_("Voice Blender"), voice_blender_tab),
+                (_("Download"), download_tab),
+                (_("Utilities"), utilities_tab),
+                (_("Settings"), settings_tab),
+            ):
+                with gr.Tab(label):
+                    with gr.Column(elem_classes=["rvc-card"]):
+                        build()
 
 
 def launch_gradio(port):

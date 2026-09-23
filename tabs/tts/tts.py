@@ -10,7 +10,6 @@ from rvc.lib.paths import AUDIO_DIR, ROOT
 
 from core import run_tts_script, import_voice_converter
 from tabs.inference.inference import (
-    change_choices,
     get_speakers_id,
     names,
     default_weight,
@@ -36,19 +35,15 @@ def process_input(file_path):
         return None, None
 
 
-def _refresh_choices(model):
-    """``change_choices`` trimmed to the three dropdowns this tab actually has.
-
-    It was written for the inference tab and returns five updates, the third of
-    which lists input audio files -- something TTS has no dropdown for.  Wiring
-    its five values onto four outputs put that audio list into the speaker-ID
-    dropdown and dropped the last update with a warning.
-    """
-    models, indexes, _audio, speaker_id, _speaker_id_batch = change_choices(model)
-    return models, indexes, speaker_id
+def _refresh_choices():
+    return (
+        gr.update(choices=catalog.list_models()),
+        gr.update(choices=catalog.list_indexes()),
+    )
 
 
-def tts_tab():
+def tts_tab(tab=None):
+    """Build the tab; with ``tab`` given, its lists are refreshed on selection."""
     with gr.Column():
         with gr.Row():
             model_file = gr.Dropdown(
@@ -328,9 +323,16 @@ def tts_tab():
     )
     refresh_button.click(
         fn=_refresh_choices,
-        inputs=[model_file],
-        outputs=[model_file, index_file, sid],
+        inputs=[],
+        outputs=[model_file, index_file],
     )
+    if tab is not None:
+        tab.select(
+            fn=_refresh_choices,
+            inputs=[],
+            outputs=[model_file, index_file],
+            show_progress="hidden",
+        )
     txt_file.upload(
         fn=process_input,
         inputs=[txt_file],

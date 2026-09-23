@@ -1,10 +1,4 @@
 import os
-import signal
-
-from rvc.lib.i18n import _
-
-process_pids = []
-
 import shutil
 import json
 from multiprocessing import cpu_count
@@ -34,7 +28,7 @@ from rvc.configs.vocoders import (
     get_vocoder_spec,
     normalize_vocoder,
 )
-from rvc.lib.text import format_title
+from rvc.lib.i18n import _
 from rvc.lib.terminal import (
     DEFAULT_CPU_THREADS,
     error as print_error,
@@ -78,27 +72,6 @@ os.makedirs(presets_path, exist_ok=True)
 os.makedirs(DATASET_DIR, exist_ok=True)
 
 
-def refresh_custom_pretraineds():
-    return (
-        {"choices": catalog.list_custom_pretraineds("G"), "__type__": "update"},
-        {"choices": catalog.list_custom_pretraineds("D"), "__type__": "update"},
-    )
-
-
-def refresh_datasets():
-    return {"choices": catalog.list_dataset_folders(), "__type__": "update"}
-
-
-def refresh_models():
-    return {"choices": catalog.list_training_models(), "__type__": "update"}
-
-
-def refresh_models_and_datasets():
-    return (
-        {"choices": catalog.list_training_models(), "__type__": "update"},
-        {"choices": catalog.list_dataset_folders(), "__type__": "update"},
-    )
-
 def get_presets_list():
     return [os.path.splitext(s)[0] for s in os.listdir(presets_path) if s.endswith('.json')]
 
@@ -111,40 +84,23 @@ def save_drop_model(dropbox):
         if os.path.exists(pretrained_path):
             os.remove(pretrained_path)
         shutil.copy(dropbox, pretrained_path)
-        gr.Info(_("Refresh the list to use the uploaded pretrained file."))
+        gr.Info(_("Pretrained file added."))
     return None
-
-def save_drop_dataset_audio(dropbox, dataset_name):
-    if not dataset_name:
-        gr.Info(_("Enter a valid dataset name."))
-        return None, None
-    else:
-        if not catalog.is_audio_file(dropbox):
-            gr.Info(_("Invalid audio file."))
-        else:
-            dataset_name = format_title(dataset_name)
-            audio_file = format_title(os.path.basename(dropbox))
-            dataset_path = os.path.join(DATASET_DIR, dataset_name)
-            if not os.path.exists(dataset_path):
-                os.makedirs(dataset_path)
-            destination_path = os.path.join(dataset_path, audio_file)
-            if os.path.exists(destination_path):
-                os.remove(destination_path)
-            shutil.copy(dropbox, destination_path)
-            gr.Info(
-                _("Audio added. Run preprocessing when ready.")
-            )
-            dataset_path = os.path.dirname(destination_path)
-            return None, catalog.relative(dataset_path)
 
 def get_pth_list():
     return catalog.list_models(bundles=False, training_checkpoints=True)
 
 
-def refresh_pth_and_index_list():
+def refresh_lists():
+    """New choices for every list in the tab, in ``train_tab``'s ``list_outputs`` order."""
     return (
-        {"choices": get_pth_list(), "__type__": "update"},
-        {"choices": catalog.list_indexes(), "__type__": "update"},
+        gr.update(choices=catalog.list_training_models()),
+        gr.update(choices=catalog.list_dataset_folders()),
+        gr.update(choices=catalog.list_custom_pretraineds("G")),
+        gr.update(choices=catalog.list_custom_pretraineds("D")),
+        gr.update(choices=get_presets_list()),
+        gr.update(choices=get_pth_list()),
+        gr.update(choices=catalog.list_indexes()),
     )
 
 def export_pth(pth_path):
@@ -290,10 +246,78 @@ def update_vocoder_settings(vocoder_id, current_sample_rate):
         "__type__": "update",
     }
 
-def train_tab():
-    with gr.Accordion(_("Training Presets"), open=False):
+def train_tab(tab=None):
+    """Build the tab; with ``tab`` given, its lists are refreshed on selection."""
+    with gr.Row(equal_height=True):
+        model_name = gr.Dropdown(
+            label=_("Model Name"),
+            info=_("Name of the new model."),
+            choices=catalog.list_training_models(),
+            value="example-model-name",
+            interactive=True,
+            allow_custom_value=True,
+            scale=4,
+            key='model_name'
+        )
+        refresh_button = gr.Button(_("Refresh"), scale=1)
+
+    with gr.Row():
+        with gr.Column():
+            sampling_rate = gr.Radio(
+                label=_("Sampling Rate"),
+                info=_("Target sample rate. Match it to the dataset when possible."),
+                choices=initial_sample_rate_choices,
+                value=initial_sample_rate,
+                interactive=True,
+                key='sampling_rate'
+            )
+        with gr.Column():
+            vocoder = gr.Radio(
+                label=_("Vocoder"),
+                info=_(VOCODER_INFO_RVC),
+                choices=get_vocoder_choices(),
+                value=initial_vocoder,
+                interactive=True,
+                visible=True,
+                key='vocoder'
+            )
+            vocoder_description = gr.Markdown(
+                value=vocoder_description_text(initial_vocoder),
+                elem_classes=["rvc-vocoder-description"],
+            )
+    with gr.Accordion(
+        _("CPU / GPU settings for ' f0 ' and ' features ' extraction."),
+        open=False,
+    ):
         with gr.Row():
-            refresh_presets_button = gr.Button(_("Refresh Presets"))
+            with gr.Column():
+                cpu_threads = gr.Slider(
+                    1,
+                    min(cpu_count(), 192),  # max 192 parallel processes
+                    DEFAULT_CPU_THREADS,
+                    step=1,
+                    label=_("CPU Threads"),
+                    info=_("CPU threads used during extraction."),
+                    interactive=True,
+                    key='cpu_threads'
+                )
+            with gr.Column():
+                extract_gpu = gr.Textbox(
+                    label=_("GPU ID"),
+                    info=_("GPU IDs for extraction, separated by '-'."),
+                    placeholder=_("0 to ∞ separated by -"),
+                    value=str(get_number_of_gpus()),
+                    interactive=True,
+                    key='extract_gpu'
+                )
+                gr.Textbox(
+                    label=_("GPU Information"),
+                    info=_("Detected GPU information."),
+                    value=get_gpu_info(),
+                    interactive=False,
+                )
+
+    with gr.Accordion(_("Training Presets"), open=False):
         with gr.Row():
             with gr.Column():
                 preset_dropdown = gr.Dropdown(
@@ -306,73 +330,7 @@ def train_tab():
                 save_preset_button = gr.Button(_("Save to preset"))
                 load_preset_button = gr.Button(_("Load from preset"))
 
-    with gr.Accordion(_("Model Settings")):
-        with gr.Row():
-            with gr.Column():
-                model_name = gr.Dropdown(
-                    label=_("Model Name"),
-                    info=_("Name of the new model."),
-                    choices=catalog.list_training_models(),
-                    value="example-model-name",
-                    interactive=True,
-                    allow_custom_value=True,
-                    key='model_name'
-                )
-            with gr.Column():
-                sampling_rate = gr.Radio(
-                    label=_("Sampling Rate"),
-                    info=_("Target sample rate. Match it to the dataset when possible."),
-                    choices=initial_sample_rate_choices,
-                    value=initial_sample_rate,
-                    interactive=True,
-                    key='sampling_rate'
-                )
-                vocoder = gr.Radio(
-                    label=_("Vocoder"),
-                    info=_(VOCODER_INFO_RVC),
-                    choices=get_vocoder_choices(),
-                    value=initial_vocoder,
-                    interactive=True,
-                    visible=True,
-                    key='vocoder'
-                )
-                vocoder_description = gr.Markdown(
-                    value=vocoder_description_text(initial_vocoder),
-                    elem_classes=["rvc-vocoder-description"],
-                )
-        with gr.Accordion(
-            _("CPU / GPU settings for ' f0 ' and ' features ' extraction."),
-            open=False,
-        ):
-            with gr.Row():
-                with gr.Column():
-                    cpu_threads = gr.Slider(
-                        1,
-                        min(cpu_count(), 192),  # max 192 parallel processes
-                        DEFAULT_CPU_THREADS,
-                        step=1,
-                        label=_("CPU Threads"),
-                        info=_("CPU threads used during extraction."),
-                        interactive=True,
-                        key='cpu_threads'
-                    )
-                with gr.Column():
-                    extract_gpu = gr.Textbox(
-                        label=_("GPU ID"),
-                        info=_("GPU IDs for extraction, separated by '-'."),
-                        placeholder=_("0 to ∞ separated by -"),
-                        value=str(get_number_of_gpus()),
-                        interactive=True,
-                        key='extract_gpu'
-                    )
-                    gr.Textbox(
-                        label=_("GPU Information"),
-                        info=_("Detected GPU information."),
-                        value=get_gpu_info(),
-                        interactive=False,
-                    )
-
-    with gr.Accordion(_("Preprocessing")):
+    with gr.Tab(f"1. {_('Preprocessing')}"):
         dataset_path = gr.Dropdown(
             label=_("Dataset Path"),
             info=_("Folder containing the training audio."),
@@ -381,112 +339,109 @@ def train_tab():
             interactive=True,
             key='dataset_path'
         )
-        refresh = gr.Button(_("Refresh"))
 
-        with gr.Accordion(_("Advanced Settings for the preprocessing step"), open=True):
-            gr.Markdown()
-            with gr.Row(elem_classes=["rvc-preprocess-options"]):
-                with gr.Column(min_width=0):
-                    dataset_format = gr.Radio(
-                        label=_("Dataset Format"),
-                        info=_(DATASET_FORMAT_INFO),
-                        choices=["WAV", "FLAC"],
-                        value="WAV",
-                        interactive=True,
-                        key='dataset_format'
-                    )
-                with gr.Column(min_width=0):
-                    loading_resampling = gr.Radio(
-                        label=_("Resampling & Loading Handler"),
-                        info=_(RESAMPLER_INFO),
-                        choices=["ffmpeg", "librosa"],
-                        value="ffmpeg",
-                        interactive=True,
-                        key='loading_resampling'
-                    )
-                with gr.Column(min_width=0):
-                    normalization_mode = gr.Radio(
-                        label=_("Loudness Normalization"),
-                        info=_(NORMALIZATION_INFO),
-                        choices=["none", "post_peak", "pre_peak_rvc", "pre_loudness"],
-                        value="pre_peak_rvc",
-                        interactive=True,
-                        visible=True,
-                        key='normalization_mode'
-                    )
-            with gr.Row():
-                rms_norm_db = gr.Slider(
-                    -24.0, -3.0, -16.0, step=1.0,
-                    label=_("Target Level (LUFS)"),
-                    info=_(PREPROCESS_RMS_VALUE_INFO),
+        with gr.Row(elem_classes=["rvc-preprocess-options"]):
+            with gr.Column(min_width=0):
+                dataset_format = gr.Radio(
+                    label=_("Dataset Format"),
+                    info=_(DATASET_FORMAT_INFO),
+                    choices=["WAV", "FLAC"],
+                    value="WAV",
                     interactive=True,
-                    visible=False,
-                    key='rms_norm_db'
+                    key='dataset_format'
                 )
-            # The radio gets a row to itself: sharing one with the sliders below
-            # left it a sliver of the width (they carry scale=46 and 57 against
-            # its default 1), so its four choices stacked into a column three
-            # rows tall and dragged the whole section down with them.
-            with gr.Row():
-                cut_preprocess = gr.Radio(
-                    label=_("Audio cutting"),
-                    info=_(AUDIO_FILE_SLICING_INFO),
-                    choices=["Skip", "Simple", "Automatic", "New Automatic"],
-                    value="New Automatic",
+            with gr.Column(min_width=0):
+                loading_resampling = gr.Radio(
+                    label=_("Resampling & Loading Handler"),
+                    info=_(RESAMPLER_INFO),
+                    choices=["ffmpeg", "librosa"],
+                    value="ffmpeg",
                     interactive=True,
-                    key='cut_preprocess'
+                    key='loading_resampling'
                 )
-            with gr.Row():
-                chunk_len = gr.Slider(
-                    0.5,
-                    30.0,
-                    3.0,
-                    step=0.1,
-                    label=_("Chunk length (sec)"),
-                    info=_("Chunk length for Simple cutting."),
-                    interactive=True,
-                    scale=46,
-                    key='chunk_len'
-                )
-                overlap_len = gr.Slider(
-                    0.0,
-                    0.42,
-                    0.36,
-                    step=0.01,
-                    label=_("Overlap length"),
-                    info=_("Overlap between Simple chunks, in seconds."),
-                    interactive=True,
-                    scale=57,
-                    key='overlap_len'
-                )
-            with gr.Column():
-                process_effects = gr.Checkbox(
-                    label=_("DC / high-pass filtering"),
-                    info=_("Remove DC offset and low-frequency noise."),
-                    value=True,
+            with gr.Column(min_width=0):
+                normalization_mode = gr.Radio(
+                    label=_("Loudness Normalization"),
+                    info=_(NORMALIZATION_INFO),
+                    choices=["none", "post_peak", "pre_peak_rvc", "pre_loudness"],
+                    value="pre_peak_rvc",
                     interactive=True,
                     visible=True,
-                    key='process_effects'
+                    key='normalization_mode'
                 )
-            with gr.Column():
-                noise_reduction = gr.Checkbox(
-                    label=_("Noise Reduction"),
-                    info=_("Apply spectral-gating noise reduction."),
-                    value=False,
-                    interactive=True,
-                    visible=True,
-                    key='noise_reduction'
-                )
-                clean_strength = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=_("Noise Reduction Strength"),
-                    info=_("Higher values apply stronger cleanup."),
-                    visible=False,
-                    value=0.5,
-                    interactive=True,
-                    key='clean_strength'
-                )
+        with gr.Row():
+            rms_norm_db = gr.Slider(
+                -24.0, -3.0, -16.0, step=1.0,
+                label=_("Target Level (LUFS)"),
+                info=_(PREPROCESS_RMS_VALUE_INFO),
+                interactive=True,
+                visible=False,
+                key='rms_norm_db'
+            )
+        # The radio gets a row to itself: sharing one with the sliders below
+        # left it a sliver of the width, so its four choices stacked into a
+        # column three rows tall.
+        with gr.Row():
+            cut_preprocess = gr.Radio(
+                label=_("Audio cutting"),
+                info=_(AUDIO_FILE_SLICING_INFO),
+                choices=["Skip", "Simple", "Automatic", "New Automatic"],
+                value="New Automatic",
+                interactive=True,
+                key='cut_preprocess'
+            )
+        with gr.Row():
+            chunk_len = gr.Slider(
+                0.5,
+                30.0,
+                3.0,
+                step=0.1,
+                label=_("Chunk length (sec)"),
+                info=_("Chunk length for Simple cutting."),
+                interactive=True,
+                scale=46,
+                key='chunk_len'
+            )
+            overlap_len = gr.Slider(
+                0.0,
+                0.42,
+                0.36,
+                step=0.01,
+                label=_("Overlap length"),
+                info=_("Overlap between Simple chunks, in seconds."),
+                interactive=True,
+                scale=57,
+                key='overlap_len'
+            )
+        with gr.Column():
+            process_effects = gr.Checkbox(
+                label=_("DC / high-pass filtering"),
+                info=_("Remove DC offset and low-frequency noise."),
+                value=True,
+                interactive=True,
+                visible=True,
+                key='process_effects'
+            )
+        with gr.Column():
+            noise_reduction = gr.Checkbox(
+                label=_("Noise Reduction"),
+                info=_("Apply spectral-gating noise reduction."),
+                value=False,
+                interactive=True,
+                visible=True,
+                key='noise_reduction'
+            )
+            clean_strength = gr.Slider(
+                minimum=0,
+                maximum=1,
+                label=_("Noise Reduction Strength"),
+                info=_("Higher values apply stronger cleanup."),
+                visible=False,
+                value=0.5,
+                interactive=True,
+                key='clean_strength'
+            )
+        preprocess_button = gr.Button(_("Preprocess Dataset"), variant="primary")
         preprocess_output_info = gr.Textbox(
             label=_("Output Information"),
             info=_("Preprocessing status."),
@@ -495,30 +450,7 @@ def train_tab():
             interactive=False,
         )
 
-        with gr.Row():
-            preprocess_button = gr.Button(_("Preprocess Dataset"))
-            preprocess_button.click(
-                fn=run_preprocess_script,
-                inputs=[
-                    model_name,
-                    dataset_path,
-                    sampling_rate,
-                    cpu_threads,
-                    cut_preprocess,
-                    process_effects,
-                    noise_reduction,
-                    clean_strength,
-                    chunk_len,
-                    overlap_len,
-                    normalization_mode,
-                    loading_resampling,
-                    dataset_format,
-                    rms_norm_db,
-                ],
-                outputs=[preprocess_output_info],
-            )
-
-    with gr.Accordion(_("Extraction")):
+    with gr.Tab(f"2. {_('Extraction')}"):
         with gr.Row():
             f0_method = gr.Radio(
                 label=_("Pitch extraction algorithm"),
@@ -563,6 +495,7 @@ def train_tab():
             interactive=True,
             key="feature_precision",
         )
+        extract_button = gr.Button(_("Extract Features"), variant="primary")
         extract_output_info = gr.Textbox(
             label=_("Output Information"),
             info=_("Extraction status."),
@@ -570,24 +503,8 @@ def train_tab():
             max_lines=8,
             interactive=False,
         )
-        extract_button = gr.Button(_("Extract Features"))
-        extract_button.click(
-            fn=run_extract_script,
-            inputs=[
-                model_name,
-                f0_method,
-                cpu_threads,
-                extract_gpu,
-                sampling_rate,
-                vocoder,
-                embedder_model,
-                include_mutes,
-                feature_precision,
-            ],
-            outputs=[extract_output_info],
-        )
 
-    with gr.Accordion(_("Training")):
+    with gr.Tab(f"3. {_('Training')}"):
         with gr.Row():
             batch_size = gr.Slider(
                 1,
@@ -619,248 +536,183 @@ def train_tab():
                 interactive=True,
                 key='total_epoch_count'
             )
-        with gr.Accordion(_("Advanced Settings for training"), open=False):
-            # Grouped by what the setting decides, not by widget type.
-            gr.Markdown(f"#### {_('Starting point')}")
+        # Grouped by what the setting decides, not by widget type.
+        gr.Markdown(f"#### {_('Starting point')}")
+        with gr.Row():
+            with gr.Column(min_width=0):
+                pretrained = gr.Checkbox(
+                    label=_("Pretrained"),
+                    info=_("Use pretrained weights for fine-tuning."),
+                    value=True,
+                    interactive=True,
+                    key='pretrained'
+                )
+            with gr.Column(min_width=0):
+                custom_pretrained = gr.Checkbox(
+                    label=_("Custom Pretrained"),
+                    info=_("Use custom generator and discriminator pretrained files."),
+                    value=False,
+                    interactive=True,
+                    key='custom_pretrained'
+                )
+            with gr.Column(min_width=0):
+                cleanup = gr.Checkbox(
+                    label=_("Fresh Training"),
+                    info=_("Clear previous weights and logs before training."),
+                    value=False,
+                    interactive=True,
+                    key='cleanup'
+                )
+        # A Column, not a Group: a hidden Group keeps its border as a stray line.
+        with gr.Column(visible=False) as pretrained_custom_settings:
             with gr.Row():
-                with gr.Column(min_width=0):
-                    pretrained = gr.Checkbox(
-                        label=_("Pretrained"),
-                        info=_("Use pretrained weights for fine-tuning."),
-                        value=True,
+                g_pretrained_path = gr.Dropdown(
+                    label=_("Custom Pretrained G"),
+                    info=_("Generator pretrained file."),
+                    choices=catalog.list_custom_pretraineds("G"),
+                    interactive=True,
+                    allow_custom_value=True,
+                    key='g_pretrained_path'
+                )
+                d_pretrained_path = gr.Dropdown(
+                    label=_("Custom Pretrained D"),
+                    info=_("Discriminator pretrained file."),
+                    choices=catalog.list_custom_pretraineds("D"),
+                    interactive=True,
+                    allow_custom_value=True,
+                    key='d_pretrained_path'
+                )
+            with gr.Row():
+                upload_pretrained = gr.UploadButton(
+                    _("Upload Pretrained Model"),
+                    file_types=[".pth"],
+                    type="filepath",
+                    size="sm",
+                    scale=0,
+                    elem_classes=["rvc-fit-button"],
+                )
+
+        gr.Markdown(f"#### {_('Optimisation')}")
+        with gr.Row():
+            with gr.Column(min_width=0):
+                use_warmup = gr.Checkbox(
+                    label=_("Warmup phase for training"),
+                    info=_("Use linear learning-rate warmup."),
+                    value=False,
+                    interactive=True,
+                    key='use_warmup'
+                )
+                with gr.Column(visible=False) as warmup_settings:
+                    warmup_duration = gr.Slider(
+                        1,
+                        100,
+                        5,
+                        step=1,
+                        label=_("Duration of the warmup phase"),
+                        info=_("Warmup duration, in epochs."),
                         interactive=True,
-                        key='pretrained'
-                    )
-                with gr.Column(min_width=0):
-                    custom_pretrained = gr.Checkbox(
-                        label=_("Custom Pretrained"),
-                        info=_("Use custom generator and discriminator pretrained files."),
-                        value=False,
-                        interactive=True,
-                        key='custom_pretrained'
-                    )
-                with gr.Column(min_width=0):
-                    cleanup = gr.Checkbox(
-                        label=_("Fresh Training"),
-                        info=_("Clear previous weights and logs before training."),
-                        value=False,
-                        interactive=True,
-                        key='cleanup'
-                    )
-            with gr.Column(visible=False) as pretrained_custom_settings:
-                with gr.Accordion(_("Pretrained Custom Settings")):
-                    upload_pretrained = gr.File(
-                        label=_("Upload Pretrained Model"),
-                        type="filepath",
-                        interactive=True,
-                    )
-                    refresh_custom_pretaineds_button = gr.Button(_("Refresh Custom Pretraineds"))
-                    g_pretrained_path = gr.Dropdown(
-                        label=_("Custom Pretrained G"),
-                        info=_("Generator pretrained file."),
-                        choices=catalog.list_custom_pretraineds("G"),
-                        interactive=True,
-                        allow_custom_value=True,
-                        key='g_pretrained_path'
-                    )
-                    d_pretrained_path = gr.Dropdown(
-                        label=_("Custom Pretrained D"),
-                        info=_("Discriminator pretrained file."),
-                        choices=catalog.list_custom_pretraineds("D"),
-                        interactive=True,
-                        allow_custom_value=True,
-                        key='d_pretrained_path'
+                        key='warmup_duration'
                     )
 
-            gr.Markdown(f"#### {_('Optimisation')}")
-            with gr.Row():
-                with gr.Column(min_width=0):
-                    use_warmup = gr.Checkbox(
-                        label=_("Warmup phase for training"),
-                        info=_("Use linear learning-rate warmup."),
-                        value=False,
-                        interactive=True,
-                        key='use_warmup'
-                    )
-                    with gr.Column(visible=False) as warmup_settings:
-                        with gr.Accordion(_("Warmup settings")):
-                            warmup_duration = gr.Slider(
-                                1,
-                                100,
-                                5,
-                                step=1,
-                                label=_("Duration of the warmup phase"),
-                                info=_("Warmup duration, in epochs."),
-                                interactive=True,
-                                key='warmup_duration'
-                            )
+        gr.Markdown(f"#### {_('Checkpoints and quality')}")
+        with gr.Row():
+            with gr.Column(min_width=0):
+                save_only_latest_net_models = gr.Checkbox(
+                    label=_("Save Only Latest G/D"),
+                    info=_("Keep only the latest generator and discriminator checkpoints."),
+                    value=True,
+                    interactive=True,
+                    key='save_only_latest_net_models'
+                )
+                save_weight_models = gr.Checkbox(
+                    label=_("Save weight models"),
+                    info=_("Save the compact voice model files."),
+                    value=True,
+                    interactive=True,
+                    key='save_weight_models'
+                )
+            with gr.Column(min_width=0):
+                overtrain_detector = gr.Checkbox(
+                    label=_(OVERTRAIN_DETECTOR_LABEL),
+                    info=_(OVERTRAIN_DETECTOR_INFO),
+                    value=False,
+                    interactive=True,
+                    key='overtrain_detector'
+                )
+                stop_on_overtrain = gr.Checkbox(
+                    label=_(STOP_ON_OVERTRAIN_LABEL),
+                    info=_(STOP_ON_OVERTRAIN_INFO),
+                    value=False,
+                    interactive=True,
+                    # Hidden with the detector off, which is the default.
+                    visible=False,
+                    key='stop_on_overtrain'
+                )
 
-            gr.Markdown(f"#### {_('Checkpoints and quality')}")
-            with gr.Row():
-                with gr.Column(min_width=0):
-                    save_only_latest_net_models = gr.Checkbox(
-                        label=_("Save Only Latest G/D"),
-                        info=_("Keep only the latest generator and discriminator checkpoints."),
-                        value=True,
-                        interactive=True,
-                        key='save_only_latest_net_models'
-                    )
-                    save_weight_models = gr.Checkbox(
-                        label=_("Save weight models"),
-                        info=_("Save the compact voice model files."),
-                        value=True,
-                        interactive=True,
-                        key='save_weight_models'
-                    )
-                with gr.Column(min_width=0):
-                    overtrain_detector = gr.Checkbox(
-                        label=_(OVERTRAIN_DETECTOR_LABEL),
-                        info=_(OVERTRAIN_DETECTOR_INFO),
-                        value=False,
-                        interactive=True,
-                        key='overtrain_detector'
-                    )
-                    stop_on_overtrain = gr.Checkbox(
-                        label=_(STOP_ON_OVERTRAIN_LABEL),
-                        info=_(STOP_ON_OVERTRAIN_INFO),
-                        value=False,
-                        interactive=True,
-                        # Hidden with the detector off, which is the default.
-                        visible=False,
-                        key='stop_on_overtrain'
-                    )
-                    # Meaningless without the detector that produces the signal.
-                    # ``interactive`` only greys a Gradio checkbox out, leaving
-                    # a dead control sitting there; hide it instead.
-                    overtrain_detector.change(
-                        fn=lambda enabled: gr.update(visible=enabled),
-                        inputs=[overtrain_detector],
-                        outputs=[stop_on_overtrain],
-                        # Without this the default "full" progress tracker paints
-                        # a spinner on the output component, and a component that
-                        # was hidden when the request started never receives the
-                        # completion status -- it unhides stuck on "processing".
-                        show_progress="hidden",
-                    )
+        gr.Markdown(f"#### {_('Performance')}")
+        with gr.Row():
+            with gr.Column(min_width=0):
+                use_checkpointing = gr.Checkbox(
+                    label=_("Checkpointing"),
+                    info=_("Reduce VRAM use at the cost of speed."),
+                    value=auto_enable_checkpointing,
+                    interactive=True,
+                    key='use_checkpointing'
+                )
+            with gr.Column(min_width=0):
+                compile_vocoder = gr.Checkbox(
+                    label=_(VOCODER_COMPILE_LABEL),
+                    info=_(VOCODER_COMPILE_INFO),
+                    value=False,
+                    interactive=True,
+                    key='compile_vocoder'
+                )
+                torch_compile_mode = gr.Radio(
+                    label=_(TORCH_COMPILE_MODE_LABEL),
+                    info=_(TORCH_COMPILE_MODE_INFO),
+                    choices=TORCH_COMPILE_MODE_CHOICES,
+                    value=TORCH_COMPILE_MODE_CHOICES[0],
+                    interactive=True,
+                    visible=False,
+                    key='torch_compile_mode'
+                )
 
-            gr.Markdown(f"#### {_('Performance')}")
-            with gr.Row():
-                with gr.Column(min_width=0):
-                    use_checkpointing = gr.Checkbox(
-                        label=_("Checkpointing"),
-                        info=_("Reduce VRAM use at the cost of speed."),
-                        value=auto_enable_checkpointing,
+        gr.Markdown(f"#### {_('Hardware')}")
+        with gr.Row():
+            with gr.Column(min_width=0):
+                multiple_gpu = gr.Checkbox(
+                    label=_("GPU Settings"),
+                    # Must stay a plain string: a trailing comma turning
+                    # this into a tuple breaks translation and Gradio's
+                    # info serialization.
+                    info=_("Choose which GPUs to train on, and enable "
+                           "multi-GPU training."),
+                    value=False,
+                    interactive=True,
+                    key='multiple_gpu'
+                )
+                with gr.Column(visible=False) as gpu_custom_settings:
+                    training_gpu = gr.Textbox(
+                        label=_("GPU Number"),
+                        info=_("GPU IDs for training, separated by '-'."),
+                        placeholder=_("0 to ∞ separated by -"),
+                        # Despite the name this returns the ID list
+                        # ("0", "0-1", ...), not a count, so it is
+                        # already the right shape for this field.
+                        value=str(get_number_of_gpus()),
                         interactive=True,
-                        key='use_checkpointing'
+                        key="training_gpu"
                     )
-                with gr.Column(min_width=0):
-                    compile_vocoder = gr.Checkbox(
-                        label=_(VOCODER_COMPILE_LABEL),
-                        info=_(VOCODER_COMPILE_INFO),
-                        value=False,
-                        interactive=True,
-                        key='compile_vocoder'
-                    )
-                    torch_compile_mode = gr.Radio(
-                        label=_(TORCH_COMPILE_MODE_LABEL),
-                        info=_(TORCH_COMPILE_MODE_INFO),
-                        choices=TORCH_COMPILE_MODE_CHOICES,
-                        value=TORCH_COMPILE_MODE_CHOICES[0],
-                        interactive=True,
-                        visible=False,
-                        key='torch_compile_mode'
+                    gr.Textbox(
+                        label=_("GPU Information"),
+                        info=_("Detected GPU information."),
+                        value=get_gpu_info(),
+                        interactive=False,
                     )
 
-            gr.Markdown(f"#### {_('Hardware')}")
-            with gr.Row():
-                with gr.Column(min_width=0):
-                    multiple_gpu = gr.Checkbox(
-                        label=_("GPU Settings"),
-                        # Must stay a plain string: a trailing comma turning
-                        # this into a tuple breaks translation and Gradio's
-                        # info serialization.
-                        info=_("Choose which GPUs to train on, and enable "
-                               "multi-GPU training."),
-                        value=False,
-                        interactive=True,
-                        key='multiple_gpu'
-                    )
-                    with gr.Column(visible=False) as gpu_custom_settings:
-                        with gr.Accordion(_("GPU ID override / Multi-gpu-training configuration")):
-                            training_gpu = gr.Textbox(
-                                label=_("GPU Number"),
-                                info=_("GPU IDs for training, separated by '-'."),
-                                placeholder=_("0 to ∞ separated by -"),
-                                # Despite the name this returns the ID list
-                                # ("0", "0-1", ...), not a count, so it is
-                                # already the right shape for this field.
-                                value=str(get_number_of_gpus()),
-                                interactive=True,
-                                key="training_gpu"
-                            )
-                            gr.Textbox(
-                                label=_("GPU Information"),
-                                info=_("Detected GPU information."),
-                                value=get_gpu_info(),
-                                interactive=False,
-                            )
-
-            # -- the retrieval index -----------------------------------------
-            # Last, and labelled, because these two are not training options at
-            # all: they are read by the "Generate Index" button further down.
-            gr.Markdown(f"#### {_('Index')}")
-            gr.Markdown(
-                f"<sub>{_('Used by the Generate Index button below, after training.')}</sub>"
-            )
-            with gr.Row():
-                with gr.Column(min_width=0):
-                    index_algorithm = gr.Radio(
-                        label=_("Index Algorithm"),
-                        info=_("Index method for large datasets."),
-                        choices=["Auto", "Faiss", "KMeans"],
-                        value="Auto",
-                        interactive=True,
-                        key='index_algorithm'
-                    )
-                with gr.Column(min_width=0):
-                    index_metric = gr.Radio(
-                        label=_("Index Similarity"),
-                        info=(
-                            _("How neighbours are ranked. L2 is what upstream RVC "
-                            "builds. Cosine compares direction only, so a quiet and "
-                            "a loud take of the same sound match equally well.")
-                        ),
-                        choices=["l2", "cosine"],
-                        value="l2",
-                        interactive=True,
-                        key="index_metric",
-                    )
-            with gr.Row():
-                with gr.Column(min_width=0):
-                    index_single_speaker = gr.Checkbox(
-                        label=_("Index one speaker only"),
-                        info=_(INDEX_SINGLE_SPEAKER_INFO),
-                        value=False,
-                        interactive=True,
-                        key="index_single_speaker",
-                    )
-                # The container carries the visibility, not the dropdown.
-                # Toggling a component's own ``visible`` alongside its
-                # ``choices`` did not take effect until the checkbox was
-                # cycled a second time; every other conditional control in
-                # this tab wraps its widgets and shows the wrapper, so this
-                # one does too.
-                with gr.Column(min_width=0, visible=False) as index_speaker_row:
-                    index_speaker = gr.Dropdown(
-                        label=_("Speaker to index"),
-                        info=_("Read from the extracted features. Refresh after extracting."),
-                        choices=[],
-                        value=None,
-                        interactive=True,
-                        allow_custom_value=True,
-                        key="index_speaker",
-                    )
-
+        with gr.Row():
+            train_button = gr.Button(_("Start Training"), variant="primary")
+            stop_train_button = gr.Button(_("Stop Training"), variant="stop")
         train_output_info = gr.Textbox(
             label=_("Output Information"),
             info=_("Training status."),
@@ -869,370 +721,408 @@ def train_tab():
             interactive=False,
         )
 
+    with gr.Tab(f"4. {_('Index')}"):
         with gr.Row():
-            train_button = gr.Button(_("Start Training"))
-            # Announce first so the box says something straight away, then run
-            # the blocking call with Gradio's spinner off: a run lasts hours,
-            # and an overlay counting seconds on an empty box reads as a hang.
-            train_button.click(
-                fn=lambda: (
-                    "Training started. Epoch, step and loss progress is shown "
-                    "in the terminal window."
-                ),
-                inputs=[],
-                outputs=[train_output_info],
-                show_progress="hidden",
-            ).then(
-                fn=start_train_from_ui,
-                inputs=[
-                    model_name,
-                    epoch_save_frequency,
-                    save_only_latest_net_models,
-                    save_weight_models,
-                    total_epoch_count,
-                    sampling_rate,
-                    batch_size,
-                    training_gpu,
-                    use_warmup,
-                    warmup_duration,
-                    pretrained,
-                    cleanup,
-                    index_algorithm,
-                    custom_pretrained,
-                    g_pretrained_path,
-                    d_pretrained_path,
-                    vocoder,
-                    use_checkpointing,
-                    compile_vocoder,
-                    torch_compile_mode,
-                    overtrain_detector,
-                    stop_on_overtrain,
-                ],
-                outputs=[train_output_info],
-                show_progress="hidden",
-            )
-
-            stop_train_button = gr.Button(_("Stop Training"), visible=True)
-            # Stopping can take a moment while a checkpoint write finishes, so
-            # the same announce-then-run treatment applies.
-            stop_train_button.click(
-                fn=lambda: "Stopping training - letting any checkpoint write finish first...",
-                inputs=[],
-                outputs=[train_output_info],
-                show_progress="hidden",
-            ).then(
-                fn=stop_train_script,
-                inputs=[],
-                outputs=[train_output_info],
-                show_progress="hidden",
-            )
-
-            def fill_index_speakers(name):
-                """The picker's contents, from the selected model's features.
-
-                Kept separate from showing it, and run whether or not the
-                checkbox is on: one update that both reveals a component and
-                repopulates it is what failed to apply on the first click.
-                """
-                speakers = [str(sid) for sid in list_experiment_speakers(name)] if name else []
-                return gr.update(
-                    choices=speakers,
-                    value=speakers[0] if speakers else None,
+            with gr.Column(min_width=0):
+                index_algorithm = gr.Radio(
+                    label=_("Index Algorithm"),
+                    info=_("Index method for large datasets."),
+                    choices=["Auto", "Faiss", "KMeans"],
+                    value="Auto",
+                    interactive=True,
+                    key='index_algorithm'
                 )
+            with gr.Column(min_width=0):
+                index_metric = gr.Radio(
+                    label=_("Index Similarity"),
+                    info=(
+                        _("How neighbours are ranked. L2 is what upstream RVC "
+                        "builds. Cosine compares direction only, so a quiet and "
+                        "a loud take of the same sound match equally well.")
+                    ),
+                    choices=["l2", "cosine"],
+                    value="l2",
+                    interactive=True,
+                    key="index_metric",
+                )
+        with gr.Row():
+            with gr.Column(min_width=0):
+                index_single_speaker = gr.Checkbox(
+                    label=_("Index one speaker only"),
+                    info=_(INDEX_SINGLE_SPEAKER_INFO),
+                    value=False,
+                    interactive=True,
+                    key="index_single_speaker",
+                )
+            # The container carries the visibility, not the dropdown: toggling
+            # the dropdown's own ``visible`` alongside its ``choices`` did not
+            # take effect until the checkbox was cycled a second time.
+            with gr.Column(min_width=0, visible=False) as index_speaker_row:
+                index_speaker = gr.Dropdown(
+                    label=_("Speaker to index"),
+                    info=_("Read from the extracted features. Refresh after extracting."),
+                    choices=[],
+                    value=None,
+                    interactive=True,
+                    allow_custom_value=True,
+                    key="index_speaker",
+                )
+        index_button = gr.Button(_("Generate Index"), variant="primary")
+        index_output_info = gr.Textbox(
+            label=_("Output Information"),
+            info=_("Index status."),
+            value="",
+            max_lines=8,
+            interactive=False,
+        )
 
-            def toggle_index_speaker(enabled):
-                return gr.update(visible=bool(enabled))
-
-            def generate_index(name, algorithm, metric, single, speaker):
-                if not single:
-                    return run_index_script(name, algorithm, metric, "all")
-                if speaker in (None, ""):
-                    return _("Pick a speaker, or turn off 'Index one speaker only'.")
-                return run_index_script(name, algorithm, metric, speaker)
-
-            index_single_speaker.change(
-                fn=toggle_index_speaker,
-                inputs=[index_single_speaker],
-                outputs=[index_speaker_row],
-            ).then(
-                # Refilled on reveal too, so a model whose features were
-                # extracted while this tab was open is not missing from a list
-                # built before they existed.
-                fn=fill_index_speakers,
-                inputs=[model_name],
-                outputs=[index_speaker],
-            )
-            # The list belongs to the selected model, so it has to follow it;
-            # otherwise switching models leaves the previous one's speakers in
-            # the dropdown and the build fails on an id that is not there.
-            model_name.change(
-                fn=fill_index_speakers,
-                inputs=[model_name],
-                outputs=[index_speaker],
-            )
-
-            index_button = gr.Button(_("Generate Index"))
-            index_button.click(
-                fn=generate_index,
-                inputs=[model_name, index_algorithm, index_metric,
-                        index_single_speaker, index_speaker],
-                outputs=[train_output_info],
-            )
-
-    with gr.Accordion(_("Export Model"), open=False):
+    with gr.Tab(f"5. {_('Export Model')}"):
         if not os.name == "nt":
             gr.Markdown(
                 _("Upload is available on Google Colab and saves exported files to your Google Drive.")
             )
         with gr.Row():
             with gr.Column():
+                pth_dropdown_export = gr.Dropdown(
+                    label=_("Pth file"),
+                    info=_("PTH file to export."),
+                    choices=get_pth_list(),
+                    value=None,
+                    interactive=True,
+                    allow_custom_value=True,
+                )
                 pth_file_export = gr.File(
                     label=_("Exported Pth file"),
                     type="filepath",
                     value=None,
                     interactive=False,
                 )
-                pth_dropdown_export = gr.Dropdown(
-                    label=_("Pth file"),
-                info=_("PTH file to export."),
-                    choices=get_pth_list(),
+            with gr.Column():
+                index_dropdown_export = gr.Dropdown(
+                    label=_("Index File"),
+                    info=_("Index file to export."),
+                    choices=catalog.list_indexes(),
                     value=None,
                     interactive=True,
                     allow_custom_value=True,
                 )
-            with gr.Column():
                 index_file_export = gr.File(
                     label=_("Exported Index File"),
                     type="filepath",
                     value=None,
                     interactive=False,
                 )
-                index_dropdown_export = gr.Dropdown(
-                    label=_("Index File"),
-                info=_("Index file to export."),
-                    choices=catalog.list_indexes(),
-                    value=None,
-                    interactive=True,
-                    allow_custom_value=True,
-                )
-        with gr.Row():
-            with gr.Column():
-                refresh_export = gr.Button(_("Refresh"))
-                if not os.name == "nt":
-                    upload_exported = gr.Button(_("Upload"))
-                    upload_exported.click(
-                        fn=upload_to_google_drive,
-                        inputs=[pth_dropdown_export, index_dropdown_export],
-                        outputs=[],
-                    )
-
-            def toggle_visible(checkbox):
-                return gr.update(visible=bool(checkbox))
-
-            def toggle_compile_mode(compile_enabled):
-                return gr.update(visible=bool(compile_enabled))
-
-            def download_prerequisites():
-                    gr.Info(
-                        _("Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped.")
-                    )
-                    run_prerequisites_script(
-                        pretraineds_hifigan=True,
-                        models=False,
-                        exe=False,
-                    )
-                    gr.Info(
-                        _("Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing.")
-                    )
-
-            def update_noise_reduce_slider_visibility(noise_reduction):
-                return gr.update(visible=bool(noise_reduction))
-
-            def toggle_rms_norm_slider(norm_mode):
-                return gr.update(
-                    visible=norm_mode in ("post_rms", "post_loudness", "pre_loudness")
-                )
-
-            saved_components.extend([
-                # Model settings
-                vocoder, sampling_rate, cpu_threads, extract_gpu,
-
-                # Preprocessing
-                dataset_path, dataset_format, loading_resampling,
-                normalization_mode, rms_norm_db, cut_preprocess, chunk_len, overlap_len,
-                process_effects, noise_reduction, clean_strength,
-
-                # Feature extract
-                f0_method, embedder_model, include_mutes, feature_precision,
-
-                # Training
-                batch_size, epoch_save_frequency, total_epoch_count,
-                save_only_latest_net_models, save_weight_models, pretrained,
-                cleanup, use_checkpointing, compile_vocoder, torch_compile_mode,
-                custom_pretrained, g_pretrained_path,
-                d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
-                warmup_duration,
-                index_algorithm, index_metric, index_single_speaker,
-                overtrain_detector, stop_on_overtrain
-            ])
-
-            def save_training_preset(inputs):
-                settings = {}
-                for component in saved_components:
-                    settings[component.key] = inputs[component]
-
-                preset_path = os.path.normpath(os.path.abspath(os.path.join(presets_path, inputs[preset_dropdown] + '.json')))
-
-                if not preset_path.startswith(presets_path):
-                    raise gr.Error(
-                        _("Invalid training preset name: {name}").format(
-                            name=inputs[preset_dropdown]
-                        ),
-                        duration=5,
-                    )
-
-                with open(preset_path, 'w', encoding='utf-8') as of:
-                    json.dump(settings, of, indent=4, ensure_ascii=False)
-
-            def load_training_preset(preset_name):
-                if preset_name not in get_presets_list():
-                    raise gr.Error(
-                        _("Preset does not exist: {name}").format(name=preset_name)
-                    )
-
-                preset_path = os.path.normpath(os.path.abspath(os.path.join(presets_path, preset_name + '.json')))
-
-                with open(preset_path, 'r', encoding='utf-8') as ifile:
-                    settings = json.loads(ifile.read())
-
-                return [
-                    (
-                        settings[component.key]
-                        if component.key in settings
-                        # Historical preset key, kept only so a preset saved
-                        # before the option was renamed still restores the
-                        # toggle.  Nothing writes it any more.
-                        else settings.get("compile_chouwagan", gr.skip())
-                        if component.key == "compile_vocoder"
-                        else gr.skip()
-                    )
-                    for component in saved_components
-                ]
-
-            refresh_presets_button.click(
-                fn=lambda: gr.Dropdown(choices=get_presets_list()), 
-                outputs=[preset_dropdown],
-                show_progress="hidden",
+        if not os.name == "nt":
+            upload_exported = gr.Button(_("Upload"))
+            upload_exported.click(
+                fn=upload_to_google_drive,
+                inputs=[pth_dropdown_export, index_dropdown_export],
+                outputs=[],
             )
 
-            save_preset_button.click(
-                fn=save_training_preset,
-                inputs=set(saved_components) | {preset_dropdown}
-            ).then(
-                fn=lambda: gr.Dropdown(choices=get_presets_list()), 
-                outputs=[preset_dropdown]
-            )
+    # -- events ----------------------------------------------------------------
 
-            load_preset_button.click(
-                fn=load_training_preset,
-                inputs=[preset_dropdown],
-                outputs=saved_components
-            ).then(  # update twice so components depending on "change" events get updated
-                fn=load_training_preset,
-                inputs=[preset_dropdown],
-                outputs=saved_components
-            )
+    def toggle_visible(checkbox):
+        return gr.update(visible=bool(checkbox))
 
-            noise_reduction.change(
-                fn=update_noise_reduce_slider_visibility,
-                inputs=noise_reduction,
-                outputs=clean_strength,
-            )
-            normalization_mode.change(
-                fn=toggle_rms_norm_slider,
-                inputs=normalization_mode,
-                outputs=rms_norm_db,
-            )
-            sampling_rate.change(
-                fn=lambda sr: {
-                    "48000": 0.36,
-                    "40000": 0.38,
-                    "32000": 0.40,
-                }.get(sr, 0.36),
-                inputs=[sampling_rate],
-                outputs=[overlap_len],
-            )
-            vocoder.change(
-                fn=update_vocoder_settings,
-                inputs=[vocoder, sampling_rate],
-                outputs=[sampling_rate],
-            )
-            vocoder.change(
-                fn=vocoder_description_text,
-                inputs=[vocoder],
-                outputs=[vocoder_description],
-                show_progress="hidden",
-            )
-            refresh.click(
-                fn=refresh_models_and_datasets,
-                inputs=[],
-                outputs=[model_name, dataset_path],
-            )
-            pretrained.change(
-                fn=lambda pretrained_val, custom_val: (
-                    gr.update(visible=bool(pretrained_val)),
-                    gr.update(visible=bool(pretrained_val and custom_val)),
+    def toggle_rms_norm_slider(norm_mode):
+        return gr.update(
+            visible=norm_mode in ("post_rms", "post_loudness", "pre_loudness")
+        )
+
+    def fill_index_speakers(name):
+        """The picker's contents, from the selected model's features.
+
+        Kept separate from showing it: one update that both reveals a
+        component and repopulates it is what failed to apply on the first click.
+        """
+        speakers = [str(sid) for sid in list_experiment_speakers(name)] if name else []
+        return gr.update(
+            choices=speakers,
+            value=speakers[0] if speakers else None,
+        )
+
+    def generate_index(name, algorithm, metric, single, speaker):
+        if not single:
+            return run_index_script(name, algorithm, metric, "all")
+        if speaker in (None, ""):
+            return _("Pick a speaker, or turn off 'Index one speaker only'.")
+        return run_index_script(name, algorithm, metric, speaker)
+
+    list_outputs = [
+        model_name, dataset_path, g_pretrained_path, d_pretrained_path,
+        preset_dropdown, pth_dropdown_export, index_dropdown_export,
+    ]
+    refresh_button.click(fn=refresh_lists, inputs=[], outputs=list_outputs)
+    if tab is not None:
+        tab.select(
+            fn=refresh_lists, inputs=[], outputs=list_outputs, show_progress="hidden"
+        )
+
+    preprocess_button.click(
+        fn=run_preprocess_script,
+        inputs=[
+            model_name,
+            dataset_path,
+            sampling_rate,
+            cpu_threads,
+            cut_preprocess,
+            process_effects,
+            noise_reduction,
+            clean_strength,
+            chunk_len,
+            overlap_len,
+            normalization_mode,
+            loading_resampling,
+            dataset_format,
+            rms_norm_db,
+        ],
+        outputs=[preprocess_output_info],
+    )
+    extract_button.click(
+        fn=run_extract_script,
+        inputs=[
+            model_name,
+            f0_method,
+            cpu_threads,
+            extract_gpu,
+            sampling_rate,
+            vocoder,
+            embedder_model,
+            include_mutes,
+            feature_precision,
+        ],
+        outputs=[extract_output_info],
+    )
+
+    # Announce first so the box says something straight away, then run the
+    # blocking call with Gradio's spinner off: a run lasts hours, and an
+    # overlay counting seconds on an empty box reads as a hang.
+    train_button.click(
+        fn=lambda: (
+            "Training started. Epoch, step and loss progress is shown "
+            "in the terminal window."
+        ),
+        inputs=[],
+        outputs=[train_output_info],
+        show_progress="hidden",
+    ).then(
+        fn=start_train_from_ui,
+        inputs=[
+            model_name,
+            epoch_save_frequency,
+            save_only_latest_net_models,
+            save_weight_models,
+            total_epoch_count,
+            sampling_rate,
+            batch_size,
+            training_gpu,
+            use_warmup,
+            warmup_duration,
+            pretrained,
+            cleanup,
+            index_algorithm,
+            custom_pretrained,
+            g_pretrained_path,
+            d_pretrained_path,
+            vocoder,
+            use_checkpointing,
+            compile_vocoder,
+            torch_compile_mode,
+            overtrain_detector,
+            stop_on_overtrain,
+        ],
+        outputs=[train_output_info],
+        show_progress="hidden",
+    )
+    # Stopping can take a moment while a checkpoint write finishes.
+    stop_train_button.click(
+        fn=lambda: "Stopping training - letting any checkpoint write finish first...",
+        inputs=[],
+        outputs=[train_output_info],
+        show_progress="hidden",
+    ).then(
+        fn=stop_train_script,
+        inputs=[],
+        outputs=[train_output_info],
+        show_progress="hidden",
+    )
+
+    index_single_speaker.change(
+        fn=toggle_visible,
+        inputs=[index_single_speaker],
+        outputs=[index_speaker_row],
+    ).then(
+        # Refilled on reveal too, so features extracted while this tab was
+        # open are not missing from a list built before they existed.
+        fn=fill_index_speakers,
+        inputs=[model_name],
+        outputs=[index_speaker],
+    )
+    # Switching models would otherwise leave the previous one's speakers in the
+    # dropdown, and the build fails on an id that is not there.
+    model_name.change(
+        fn=fill_index_speakers,
+        inputs=[model_name],
+        outputs=[index_speaker],
+    )
+    index_button.click(
+        fn=generate_index,
+        inputs=[model_name, index_algorithm, index_metric,
+                index_single_speaker, index_speaker],
+        outputs=[index_output_info],
+    )
+
+    saved_components.extend([
+        # Model settings
+        vocoder, sampling_rate, cpu_threads, extract_gpu,
+
+        # Preprocessing
+        dataset_path, dataset_format, loading_resampling,
+        normalization_mode, rms_norm_db, cut_preprocess, chunk_len, overlap_len,
+        process_effects, noise_reduction, clean_strength,
+
+        # Feature extract
+        f0_method, embedder_model, include_mutes, feature_precision,
+
+        # Training
+        batch_size, epoch_save_frequency, total_epoch_count,
+        save_only_latest_net_models, save_weight_models, pretrained,
+        cleanup, use_checkpointing, compile_vocoder, torch_compile_mode,
+        custom_pretrained, g_pretrained_path,
+        d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
+        warmup_duration,
+        index_algorithm, index_metric, index_single_speaker,
+        overtrain_detector, stop_on_overtrain
+    ])
+
+    def save_training_preset(inputs):
+        settings = {}
+        for component in saved_components:
+            settings[component.key] = inputs[component]
+
+        preset_path = os.path.normpath(os.path.abspath(os.path.join(presets_path, inputs[preset_dropdown] + '.json')))
+
+        if not preset_path.startswith(presets_path):
+            raise gr.Error(
+                _("Invalid training preset name: {name}").format(
+                    name=inputs[preset_dropdown]
                 ),
-                inputs=[pretrained, custom_pretrained],
-                outputs=[custom_pretrained, pretrained_custom_settings],
-                show_progress="hidden",
+                duration=5,
             )
-            custom_pretrained.change(
-                fn=toggle_visible,
-                inputs=[custom_pretrained],
-                outputs=[pretrained_custom_settings],
-                show_progress="hidden",
+
+        with open(preset_path, 'w', encoding='utf-8') as of:
+            json.dump(settings, of, indent=4, ensure_ascii=False)
+
+    def load_training_preset(preset_name):
+        if preset_name not in get_presets_list():
+            raise gr.Error(
+                _("Preset does not exist: {name}").format(name=preset_name)
             )
-            refresh_custom_pretaineds_button.click(
-                fn=refresh_custom_pretraineds,
-                inputs=[],
-                outputs=[g_pretrained_path, d_pretrained_path],
+
+        preset_path = os.path.normpath(os.path.abspath(os.path.join(presets_path, preset_name + '.json')))
+
+        with open(preset_path, 'r', encoding='utf-8') as ifile:
+            settings = json.loads(ifile.read())
+
+        return [
+            (
+                settings[component.key]
+                if component.key in settings
+                # Historical preset key, kept only so a preset saved
+                # before the option was renamed still restores the
+                # toggle.  Nothing writes it any more.
+                else settings.get("compile_chouwagan", gr.skip())
+                if component.key == "compile_vocoder"
+                else gr.skip()
             )
-            upload_pretrained.upload(
-                fn=save_drop_model,
-                inputs=[upload_pretrained],
-                outputs=[upload_pretrained],
-            )
-            use_warmup.change(
-                fn=toggle_visible,
-                inputs=[use_warmup],
-                outputs=[warmup_settings],
-                show_progress="hidden",
-            )
-            compile_vocoder.change(
-                fn=toggle_compile_mode,
-                inputs=[compile_vocoder],
-                outputs=[torch_compile_mode],
-                show_progress="hidden",
-            )
-            multiple_gpu.change(
-                fn=toggle_visible,
-                inputs=[multiple_gpu],
-                outputs=[gpu_custom_settings],
-                show_progress="hidden",
-            )
-            pth_dropdown_export.change(
-                fn=export_pth,
-                inputs=[pth_dropdown_export],
-                outputs=[pth_file_export],
-            )
-            index_dropdown_export.change(
-                fn=export_index,
-                inputs=[index_dropdown_export],
-                outputs=[index_file_export],
-            )
-            refresh_export.click(
-                fn=refresh_pth_and_index_list,
-                inputs=[],
-                outputs=[pth_dropdown_export, index_dropdown_export],
-            )
+            for component in saved_components
+        ]
+
+    save_preset_button.click(
+        fn=save_training_preset,
+        inputs=set(saved_components) | {preset_dropdown}
+    ).then(
+        fn=lambda: gr.Dropdown(choices=get_presets_list()),
+        outputs=[preset_dropdown]
+    )
+
+    load_preset_button.click(
+        fn=load_training_preset,
+        inputs=[preset_dropdown],
+        outputs=saved_components
+    ).then(  # update twice so components depending on "change" events get updated
+        fn=load_training_preset,
+        inputs=[preset_dropdown],
+        outputs=saved_components
+    )
+
+    # ``show_progress="hidden"`` on these: the default tracker paints a spinner
+    # on the output, and a component hidden when the request started never
+    # receives the completion status -- it unhides stuck on "processing".
+    for checkbox, target in (
+        (noise_reduction, clean_strength),
+        (custom_pretrained, pretrained_custom_settings),
+        (use_warmup, warmup_settings),
+        (compile_vocoder, torch_compile_mode),
+        (multiple_gpu, gpu_custom_settings),
+        # Meaningless without the detector that produces the signal.
+        (overtrain_detector, stop_on_overtrain),
+    ):
+        checkbox.change(
+            fn=toggle_visible,
+            inputs=[checkbox],
+            outputs=[target],
+            show_progress="hidden",
+        )
+    normalization_mode.change(
+        fn=toggle_rms_norm_slider,
+        inputs=normalization_mode,
+        outputs=rms_norm_db,
+    )
+    sampling_rate.change(
+        fn=lambda sr: {
+            "48000": 0.36,
+            "40000": 0.38,
+            "32000": 0.40,
+        }.get(sr, 0.36),
+        inputs=[sampling_rate],
+        outputs=[overlap_len],
+    )
+    vocoder.change(
+        fn=update_vocoder_settings,
+        inputs=[vocoder, sampling_rate],
+        outputs=[sampling_rate],
+    )
+    vocoder.change(
+        fn=vocoder_description_text,
+        inputs=[vocoder],
+        outputs=[vocoder_description],
+        show_progress="hidden",
+    )
+    pretrained.change(
+        fn=lambda pretrained_val, custom_val: (
+            gr.update(visible=bool(pretrained_val)),
+            gr.update(visible=bool(pretrained_val and custom_val)),
+        ),
+        inputs=[pretrained, custom_pretrained],
+        outputs=[custom_pretrained, pretrained_custom_settings],
+        show_progress="hidden",
+    )
+    upload_pretrained.upload(
+        fn=save_drop_model,
+        inputs=[upload_pretrained],
+        outputs=[],
+    ).then(
+        fn=refresh_lists, inputs=[], outputs=list_outputs, show_progress="hidden"
+    )
+    pth_dropdown_export.change(
+        fn=export_pth,
+        inputs=[pth_dropdown_export],
+        outputs=[pth_file_export],
+    )
+    index_dropdown_export.change(
+        fn=export_index,
+        inputs=[index_dropdown_export],
+        outputs=[index_file_export],
+    )
