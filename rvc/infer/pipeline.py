@@ -1,5 +1,4 @@
 import os
-import sys
 import random
 import gc
 import re
@@ -9,9 +8,6 @@ import torchcrepe
 import numpy as np
 from scipy import signal
 from torch import Tensor
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
 from rvc.lib.terminal import (
     error as print_error,

@@ -1,5 +1,3 @@
-import os
-import sys
 import json
 
 import gradio as gr
@@ -7,14 +5,10 @@ import gradio as gr
 from rvc.configs.config import Config, bf16_is_supported, get_training_precision
 
 from rvc.lib.i18n import _
+from rvc.lib.paths import CONFIG_PATH
 from rvc.lib.terminal import success
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
 config = Config()
-
-CONFIG_PATH = os.path.join(now_dir, "assets", "config.json")
 
 PRECISION_CHOICES = ["FP32", "FP16", "BF16"]
 

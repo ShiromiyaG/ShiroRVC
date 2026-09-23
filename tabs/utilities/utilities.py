@@ -1,12 +1,6 @@
 import gradio as gr
 
-import os
-import sys
-
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
 from tabs.utilities.processing import processing_tab
 from tabs.utilities.analyzer import analyzer_tab

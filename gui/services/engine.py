@@ -21,14 +21,14 @@ SENTINEL = "\x1e"
 
 #: How long :meth:`Engine.shutdown` waits for a worker that is stopping a
 #: training run.  The trainer defers a stop until any checkpoint write in
-#: flight is on disk, and ``core.TRAINING_STOP_GRACE_SECONDS`` (45 s) plus the
+#: flight is on disk, and ``rvc.lib.process.TRAINING_STOP_GRACE_SECONDS`` (45 s) plus the
 #: tree kill after it is what the worker may spend; mirrored, since gui/ may
 #: not import core.  Killing the worker sooner orphans the trainer on Windows.
 TRAINING_SHUTDOWN_MS = 60_000
 SHUTDOWN_MS = 3_000
 
 #: NTSTATUS values a crashed Windows process exits with.  Mirrors
-#: ``core.describe_exit_code``; gui/ may not import core.
+#: ``rvc.lib.process.describe_exit_code``; the GUI does not load the backend.
 _NTSTATUS = {
     0xC0000005: "access violation - a native crash, usually a driver or a CUDA kernel",
     0xC000001D: "illegal instruction",

@@ -32,9 +32,7 @@ from rvc.configs.vocoders import (
     normalize_vocoder,
 )
 from rvc.lib.i18n import _
-
-#: The application root, for the shipped configs and for paths in reports.
-ROOT = Path(__file__).resolve().parents[2]
+from rvc.lib.paths import ROOT
 
 #: Same exclusions the training tab applies: these are shared assets, not runs.
 EXCLUDED_FOLDERS = ("zips", "mute", "reference")

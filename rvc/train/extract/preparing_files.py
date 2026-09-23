@@ -2,6 +2,7 @@ import os
 import shutil
 from random import shuffle
 from rvc.configs.config import Config
+from rvc.lib.paths import LOGS_DIR, ROOT
 from rvc.lib.terminal import info, success, warning
 from rvc.train.extract.noise_mutes import generated_mutes
 import json
@@ -9,15 +10,10 @@ import librosa
 import soundfile as sf
 
 config = Config()
-current_directory = os.getcwd()
 
 #: Filelist paths are stored relative to this root so moving `logs/<model>/`
-#: to another drive/install/container doesn't break every entry. Derived from
-#: this file's location, not `os.getcwd()`, since the extractor runs as a
-#: subprocess and must not depend on the caller's cwd.
-APPLICATION_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+#: to another drive/install/container doesn't break every entry.
+APPLICATION_ROOT = str(ROOT)
 
 
 def relative_to_root(path: str) -> str:
@@ -206,7 +202,7 @@ def generate_filelist(
     else:
         mute_folder = "mute_spin_v2"
 
-    mute_base_path = os.path.join(current_directory, "logs", mute_folder)
+    mute_base_path = os.path.join(LOGS_DIR, mute_folder)
 
     sids = []
     

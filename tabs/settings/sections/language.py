@@ -1,16 +1,10 @@
 import json
-import os
-import sys
 
 import gradio as gr
 
 from rvc.lib import i18n
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
-CONFIG_PATH = os.path.join(now_dir, "assets", "config.json")
+from rvc.lib.paths import CONFIG_PATH
 
 
 def get_language() -> str | None:

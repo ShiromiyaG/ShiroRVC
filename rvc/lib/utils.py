@@ -15,6 +15,7 @@ from transformers import AutoFeatureExtractor
 import logging
 import warnings
 
+from rvc.lib.paths import MODELS_DIR
 from rvc.lib.text import format_title
 from rvc.lib.terminal import info, warning
 
@@ -33,10 +34,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("fairseq").setLevel(logging.ERROR)
 logging.getLogger("faiss.loader").setLevel(logging.ERROR)
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
-base_path = os.path.join(now_dir, "rvc", "models", "formant", "stftpitchshift")
+base_path = os.path.join(MODELS_DIR, "formant", "stftpitchshift")
 stft = base_path + ".exe" if sys.platform == "win32" else base_path
 
 
@@ -93,7 +91,7 @@ def load_embedder_model(embedder_model):
     logging.getLogger("transformers").setLevel(logging.ERROR)
     logging.getLogger("torch").setLevel(logging.ERROR)
 
-    embedder_root = os.path.join(now_dir, "rvc", "models", "embedders")
+    embedder_root = os.path.join(MODELS_DIR, "embedders")
     embedding_list = {
         "contentvec": os.path.join(embedder_root, "contentvec"),
         "spin_v2": os.path.join(embedder_root, "spin_v2"),

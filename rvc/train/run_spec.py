@@ -18,7 +18,7 @@ Two properties of the launcher constrain the design:
   re-executes this module's importer from scratch in every child.  The spec has
   to be re-readable from ``sys.argv``, which a file path is and an in-memory
   object is not.
-* ``core._find_trainer_processes`` identifies the trainer by the OS command
+* ``rvc.lib.process.find_trainer_processes`` identifies the trainer by the OS command
   line's ``cmdline[1]`` being the script path.  That listing includes the
   interpreter; ``sys.argv`` inside the process does not.  So the same path is
   ``cmdline[2]`` from outside and ``sys.argv[1]`` from inside.

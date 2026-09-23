@@ -71,7 +71,7 @@ def test_trainer_takes_the_spec_path_from_argv_1():
 
     Two different indexings meet here and are easy to confuse.  Inside the
     process ``sys.argv[0]`` is the script, so the spec is ``argv[1]``.  From the
-    outside, ``core._find_trainer_processes`` reads the OS command line, which
+    outside, ``rvc.lib.process.find_trainer_processes`` reads the OS command line, which
     *does* include the interpreter -- there the script is ``cmdline[1]`` and the
     spec ``cmdline[2]``.  Reading ``argv[2]`` here raises IndexError on every
     launch; reading ``cmdline[2]`` there would break the stop button.

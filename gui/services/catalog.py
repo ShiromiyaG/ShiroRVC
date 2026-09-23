@@ -8,8 +8,6 @@ checkpoint actually loaded goes through :mod:`gui.services.engine` instead.
 from __future__ import annotations
 
 import json
-import os
-import re
 import time
 from pathlib import Path
 
@@ -61,8 +59,6 @@ CUT_PREPROCESS = ["Skip", "Simple", "Automatic", "New Automatic"]
 NORMALIZATION_MODES = ["none", "post_peak", "pre_peak_rvc", "pre_loudness"]
 LOADING_RESAMPLING = ["ffmpeg", "librosa"]
 DATASET_FORMATS = ["WAV", "FLAC", "MP3", "OGG", "M4A"]
-
-AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".wma")
 
 #: Starting values, copied from the Gradio tabs so the two interfaces produce
 #: the same output for an untouched form.  They are genuinely different per
@@ -138,22 +134,26 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
     },
 }
 
-#: Suffix the Gradio tabs give a converted file, from ``output_path_fn``.
-OUTPUT_SUFFIX = "_output"
 TTS_RAW_NAME = "tts_output.wav"
 TTS_CONVERTED_NAME = "tts_rvc_output.wav"
 
 
-def default_output_path(input_path: str) -> str:
-    """Where a conversion lands, matching the Gradio tab exactly.
+def _shared():
+    """``rvc.lib.catalog``, imported on first use: a window that cannot find the
+    application should still open and say so."""
+    from rvc.lib import catalog
 
-    ``<input stem>_output.wav`` in ``assets/audios``.  Same rule as
-    ``tabs/inference/inference.py:output_path_fn`` -- a different name here
-    would mean the two interfaces quietly write to different files, and the
-    "clear _output files" button in the Gradio tab would miss these.
-    """
-    stem = Path(input_path).name.rsplit(".", 1)[0]
-    return str(paths.AUDIO_DIR / f"{stem}{OUTPUT_SUFFIX}.wav")
+    return catalog
+
+
+def __getattr__(name: str):
+    if name in ("AUDIO_EXTENSIONS", "OUTPUT_SUFFIX"):
+        return getattr(_shared(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def default_output_path(input_path: str) -> str:
+    return _shared().default_output_path(input_path, paths.AUDIO_DIR)
 
 
 def conversion_outputs(output_path: str, export_format: str) -> list[str]:
@@ -166,184 +166,41 @@ def conversion_outputs(output_path: str, export_format: str) -> list[str]:
     converted = output_path.replace(".wav", f".{export_format.lower()}")
     return [output_path] if converted == output_path else [output_path, converted]
 
-#: ``<name>_<epoch>e_<step>s.pth``, the name ``extract_model`` exports under --
-#: the pattern the Gradio tab's ``extract_model_and_epoch`` reads.  This used to
-#: look for ``_e<epoch>_s<step>``, which no file has ever been called, so every
-#: checkpoint tied and the list kept the filesystem's string order: ``_100e``
-#: ahead of ``_20e``.
-_EPOCH_RE = re.compile(r"_(\d+)e_(\d+)s", re.IGNORECASE)
-
-
-def _walk_models(root: Path):
-    """``os.walk`` with the training-artifact directories pruned.
-
-    Reuses the backend's own skip list rather than duplicating it: a single
-    trained model leaves hundreds of thousands of files under ``extracted/``
-    and ``f0/``, which is the difference between an instant refresh and a
-    multi-second freeze.
-    """
-    try:
-        from rvc.lib.model_bundle import walk_models
-
-        yield from walk_models(root)
-    except Exception:
-        # The backend is missing or unimportable -- degrade to a plain walk so
-        # the GUI still opens and can explain itself.
-        skip = {
-            "sliced_audios", "sliced_audios_16k", "extracted", "f0", "f0_voiced",
-            "eval", "validation_samples", "zips", "__pycache__", ".torchinductor",
-        }
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in skip]
-            yield dirpath, dirnames, filenames
-
-
-def sort_key(path: str) -> tuple:
-    """Order checkpoints by training progress, newest last.
-
-    Filenames carry ``_<epoch>e_<step>s``; sorting on that instead of
-    lexicographically is what stops ``_100e`` from landing before ``_20e``.
-    Names without it sort by name, ahead of the numbered ones in their folder.
-    """
-    name = Path(path).name
-    folder = Path(path).parent.name.lower()
-    match = _EPOCH_RE.search(name)
-    if match:
-        return (folder, int(match.group(1)), int(match.group(2)), name.lower())
-    return (folder, -1, -1, name.lower())
-
 
 def list_models() -> list[str]:
-    """Voice checkpoints and model bundles under ``logs/``, repo-relative."""
-    found = []
-    for dirpath, _dirnames, filenames in _walk_models(paths.LOGS_DIR):
-        for name in filenames:
-            # A prefix, as the Gradio tab tests it: training checkpoints are
-            # ``G_<step>.pth`` / ``D_<step>.pth``.  Testing for the substring
-            # hid any model whose name merely contains one, "SNOOP_DOG_..." say.
-            if name.lower().endswith((".pth", ".srvc")) and not name.startswith(("G_", "D_")):
-                found.append(paths.relative(Path(dirpath) / name))
-    return sorted(found, key=sort_key)
+    return _shared().list_models(paths.LOGS_DIR)
 
 
 def list_bundles() -> list[str]:
-    """Model bundles (``.srvc``) under ``logs/``, repo-relative."""
-    return [path for path in list_models() if path.lower().endswith(".srvc")]
+    return _shared().list_bundles(paths.LOGS_DIR)
 
 
 def list_indexes() -> list[str]:
-    """Faiss indexes under ``logs/``, repo-relative."""
-    found = []
-    for dirpath, _dirnames, filenames in _walk_models(paths.LOGS_DIR):
-        for name in filenames:
-            if name.lower().endswith(".index") and "trained" not in name:
-                found.append(paths.relative(Path(dirpath) / name))
-    return sorted(found)
+    return _shared().list_indexes(paths.LOGS_DIR)
 
 
 def guess_index_for(model_path: str) -> str:
-    """The index sitting next to a checkpoint, if there is exactly one.
-
-    Picking it automatically removes the single most common source of "why does
-    my output sound nothing like the model" -- a forgotten index dropdown.
-    """
-    if not model_path:
-        return ""
-    folder = (paths.ROOT / model_path).parent
-    candidates = [p for p in folder.glob("*.index") if "trained" not in p.name]
-    return paths.relative(candidates[0]) if len(candidates) == 1 else ""
+    return _shared().guess_index_for(model_path)
 
 
 def list_audios() -> list[str]:
-    """Inputs sitting directly in ``assets/audios``, where the Gradio tab keeps
-    every upload.  Conversion results are left out, as the Gradio list does."""
-    if not paths.AUDIO_DIR.is_dir():
-        return []
-    return sorted(
-        paths.relative(p)
-        for p in paths.AUDIO_DIR.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in AUDIO_EXTENSIONS
-        and OUTPUT_SUFFIX not in p.stem
-    )
+    return _shared().list_audios(paths.AUDIO_DIR)
 
 
 def list_training_models() -> list[str]:
-    """Model folders under ``logs/`` that look like a training run."""
-    if not paths.LOGS_DIR.is_dir():
-        return []
-    names = []
-    for entry in paths.LOGS_DIR.iterdir():
-        if entry.is_dir() and not entry.name.startswith((".", "mute", "reference")):
-            names.append(entry.name)
-    return sorted(names)
+    return _shared().list_training_models(paths.LOGS_DIR)
 
 
 def list_experiment_speakers(model_name: str) -> list[int]:
-    """Speaker ids with extracted features in ``logs/<model_name>/``.
-
-    Read from the feature filenames -- preprocessing names every slice
-    ``<sid>_<file>_<slice>`` -- rather than from the backend, which would pull
-    faiss and scikit-learn in just to fill a dropdown.  Mirrors
-    ``rvc.train.process.extract_index.available_speakers``; the test suite pins
-    the two together.
-    """
-    if not model_name:
-        return []
-    feature_dir = paths.LOGS_DIR / model_name / "extracted"
-    if not feature_dir.is_dir():
-        return []
-    found = set()
-    for entry in feature_dir.iterdir():
-        if entry.suffix != ".npy":
-            continue
-        head = entry.name.split("_", 1)[0]
-        try:
-            found.add(int(head))
-        except ValueError:
-            continue
-    return sorted(found)
+    return _shared().list_experiment_speakers(model_name, paths.LOGS_DIR)
 
 
 def list_custom_pretraineds(kind: str) -> list[str]:
-    """User-supplied pretrained weights, ``kind`` being ``"G"`` or ``"D"``.
-
-    Matches what the Gradio tab offers: every ``.pth`` under the custom
-    pretraineds folder whose filename starts with the generator or
-    discriminator letter.  Sorted so the list does not reshuffle between
-    refreshes.
-    """
-    root = paths.CUSTOM_PRETRAINED_DIR
-    if not root.is_dir():
-        return []
-    wanted = kind.upper()
-    found = [
-        path for path in root.rglob("*.pth")
-        if path.is_file() and path.name.upper().startswith(wanted)
-    ]
-    return sorted(paths.relative(path) for path in found)
+    return _shared().list_custom_pretraineds(kind, paths.CUSTOM_PRETRAINED_DIR)
 
 
 def list_dataset_folders() -> list[str]:
-    """Folders under ``assets/datasets`` that actually contain audio.
-
-    Offering every directory would suggest the empty ones a fresh install
-    creates, which is a suggestion that cannot lead anywhere.
-    """
-    root = paths.DATASET_DIR
-    if not root.is_dir():
-        return []
-    found = []
-    for candidate in root.iterdir():
-        if not candidate.is_dir():
-            continue
-        if any(
-            entry.suffix.lower() in AUDIO_EXTENSIONS
-            for entry in candidate.rglob("*")
-            if entry.is_file()
-        ):
-            found.append(paths.relative(candidate))
-    return sorted(found)
+    return _shared().list_dataset_folders(paths.DATASET_DIR)
 
 
 def vocoders() -> list[tuple[str, str]]:

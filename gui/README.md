@@ -51,7 +51,7 @@ Three things fall out of this, and all three are the reason for the design:
 | Path | Responsibility |
 | --- | --- |
 | `services/paths.py` | Where everything is, derived from this file's location |
-| `services/catalog.py` | Dropdown contents. Filesystem and JSON only, no torch |
+| `services/catalog.py` | Dropdown contents, via `rvc/lib/catalog.py` shared with Gradio. No torch |
 | `services/engine.py` | GUI-side client: owns the `QProcess`, routes replies |
 | `services/worker.py` | Backend-side: the only code that imports `core` |
 | `services/tbreader.py` | Incremental TFRecord/protobuf reader for the live chart |
@@ -63,9 +63,9 @@ Three things fall out of this, and all three are the reason for the design:
 | `views/` | One screen each; talks to the backend through `engine` |
 | `theme.py` + `resources/style.qss` | `@token@` substitution, dark and light |
 
-The version comes from the repository's `VERSION` file, read directly in
-`gui/__init__.py` — the same file `app.py` and the release workflow read, so
-the two interfaces cannot report different builds.
+The version comes from the `"version"` key of `assets/config.json`, read
+directly in `gui/__init__.py` — the same file `version.py` reads for `app.py`
+and the release workflow, so the two interfaces cannot report different builds.
 
 ## Notes
 
@@ -197,7 +197,7 @@ the two interfaces cannot report different builds.
   until the output comes out wrong.
 - Defaults come from `catalog.INFERENCE_DEFAULTS`, which mirrors the Gradio
   tabs *per context*: single-file, batch and TTS genuinely ship different
-  numbers upstream. Output filenames follow `output_path_fn` as well, so both
+  numbers upstream. Output filenames come from `rvc.lib.catalog`, so both
   interfaces write to the same place and the Gradio "clear `_output` files"
   button still finds them.
 - The theme is written the moment it is switched, not at shutdown. Dark is the

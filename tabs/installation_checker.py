@@ -1,8 +1,8 @@
 import sys
-import os
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
+from rvc.lib.paths import ROOT
+
+app_root = str(ROOT)
 
 
 class InstallationError(Exception):
@@ -15,17 +15,17 @@ def check_installation():
     # Windows only: these are the paths its launch scripts and tools choke on.
     if sys.platform != "win32":
         return
-    if "OneDrive" in now_dir:
+    if "OneDrive" in app_root:
         raise InstallationError(
-            "Installation Error: The current working directory is located in OneDrive. Please move Shiromiya RVC Fork to a different folder."
+            "Installation Error: The installation folder is located in OneDrive. Please move Shiromiya RVC Fork to a different folder."
         )
-    if " " in now_dir:
+    if " " in app_root:
         raise InstallationError(
-            "Installation Error: The current working directory contains spaces. Please move Shiromiya RVC Fork to a folder without spaces in its path."
+            "Installation Error: The installation folder contains spaces. Please move Shiromiya RVC Fork to a folder without spaces in its path."
         )
     try:
-        now_dir.encode("ascii")
+        app_root.encode("ascii")
     except UnicodeEncodeError:
         raise InstallationError(
-            "Installation Error: The current working directory contains non-ASCII characters. Please move Shiromiya RVC Fork to a folder with only ASCII characters in its path."
+            "Installation Error: The installation folder contains non-ASCII characters. Please move Shiromiya RVC Fork to a folder with only ASCII characters in its path."
         )

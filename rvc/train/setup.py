@@ -15,6 +15,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from rvc.configs.vocoders import get_discriminator_id, normalize_vocoder
+from rvc.lib.paths import LOGS_DIR
 from rvc.lib.terminal import info
 from rvc.train.messages import (
     DISCRIMINATOR_COMPILE_ENABLED,
@@ -37,7 +38,7 @@ def _inductor_cache_dir():
     function of the code and the GPU, not of the experiment, so every run
     should be warming the same cache.
     """
-    cache_dir = os.path.join(os.getcwd(), "logs", ".torchinductor")
+    cache_dir = os.path.join(LOGS_DIR, ".torchinductor")
     os.makedirs(cache_dir, exist_ok=True)
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
     return cache_dir

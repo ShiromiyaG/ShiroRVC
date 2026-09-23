@@ -1,7 +1,6 @@
 import os
 import re
 import shutil
-import sys
 import tempfile
 import zipfile
 from urllib.parse import unquote, urlparse
@@ -9,9 +8,7 @@ from urllib.parse import unquote, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
+from rvc.lib.paths import LOGS_DIR
 from rvc.lib.text import format_title
 from rvc.lib.terminal import (
     error as print_error,
@@ -23,7 +20,7 @@ from rvc.lib.terminal import (
 from rvc.lib.extras import gdown
 
 
-file_path = os.path.join(now_dir, "logs")
+file_path = str(LOGS_DIR)
 zips_path = os.path.join(file_path, "zips")
 os.makedirs(zips_path, exist_ok=True)
 

@@ -57,6 +57,7 @@ from rvc.train.previews import (  # noqa: F401
 from itertools import chain
 from mel_processing import mel_spectrogram_torch
 from rvc.train.process.extract_model import extract_model
+from rvc.lib.paths import ROOT
 from rvc.lib.terminal import (
     error as print_error,
     info,
@@ -148,12 +149,8 @@ def load_wav_to_torch(full_path):
     return torch.FloatTensor(data), sample_rate
 
 
-#: Application root, used to resolve the relative paths in a filelist.  Taken
-#: from this file's location so it holds regardless of the working directory
-#: the trainer was launched with.
-APPLICATION_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
+#: Application root, used to resolve the relative paths in a filelist.
+APPLICATION_ROOT = str(ROOT)
 
 
 def load_filepaths_and_text(filename, split="|", path_columns=(0, 1, 2, 3), root=None):
@@ -313,8 +310,8 @@ def small_model_naming(model_name, epoch, global_step):
     return f"{model_name}_{epoch}e_{global_step}s.pth"
 
 
-def old_session_cleanup(now_dir, model_name):
-    for root, dirs, files in os.walk(os.path.join(now_dir, "logs", model_name), topdown=False):
+def old_session_cleanup(app_root, model_name):
+    for root, dirs, files in os.walk(os.path.join(app_root, "logs", model_name), topdown=False):
         for name in files:
             file_path = os.path.join(root, name)
             file_name, file_extension = os.path.splitext(name)

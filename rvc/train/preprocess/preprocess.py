@@ -17,8 +17,10 @@ import soundfile as sf
 import io
 from fractions import Fraction
 
-now_directory = os.getcwd()
-sys.path.append(now_directory)
+# Run as a script, so the repository root is not on sys.path by itself.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if _ROOT not in sys.path:
+    sys.path.append(_ROOT)
 
 from rvc.lib.terminal import (
     DEFAULT_CPU_THREADS,

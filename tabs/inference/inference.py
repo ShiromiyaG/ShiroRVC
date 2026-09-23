@@ -1,6 +1,5 @@
-import os, sys
+import os
 import gradio as gr
-import regex as re
 import shutil
 import datetime
 import json
@@ -14,73 +13,24 @@ from core import (
 
 from rvc.lib.terminal import warning
 from rvc.lib.text import format_title
+from rvc.lib import catalog
 from rvc.lib.model_bundle import (
     bundle_model_names,
     is_model_bundle,
-    is_model_file,
     speaker_ids,
-    walk_models,
 )
+from rvc.lib.paths import AUDIO_DIR, FORMANT_DIR, INFERENCE_PRESET_DIR, ROOT
 from tabs.settings.sections.restart import stop_infer
 from rvc.lib import inference_presets as presets_lib
 from rvc.lib.i18n import _
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
+PRESETS_DIR = str(INFERENCE_PRESET_DIR)
+FORMANTSHIFT_DIR = str(FORMANT_DIR)
 
-model_root = os.path.join(now_dir, "logs")
-audio_root = os.path.join(now_dir, "assets", "audios")
-PRESETS_DIR = os.path.join(now_dir, "assets", "inference_presets")
-FORMANTSHIFT_DIR = os.path.join(now_dir, "assets", "formant_shift")
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
-os.makedirs(audio_root, exist_ok=True)
-
-model_root_relative = os.path.relpath(model_root, now_dir)
-audio_root_relative = os.path.relpath(audio_root, now_dir)
-
-sup_audioext = {
-    "wav",
-    "mp3",
-    "flac",
-    "ogg",
-    "opus",
-    "m4a",
-    "mp4",
-    "aac",
-    "alac",
-    "wma",
-    "aiff",
-    "webm",
-    "ac3",
-}
-
-names = [
-    os.path.join(root, file)
-    for root, _, files in walk_models(model_root_relative)
-    for file in files
-    if (
-        is_model_file(file)
-        and not (file.startswith("G_") or file.startswith("D_"))
-    )
-]
-
+names = catalog.list_models()
 default_weight = names[0] if names else None
-
-indexes_list = [
-    os.path.join(root, name)
-    for root, _, files in walk_models(model_root_relative)
-    for name in files
-    if name.endswith(".index") and "trained" not in name
-]
-
-audio_paths = [
-    os.path.join(root, name)
-    for root, _, files in os.walk(audio_root_relative, topdown=False)
-    for name in files
-    if name.endswith(tuple(sup_audioext))
-    and root == audio_root_relative
-    and "_output" not in name
-]
 
 # The preset validation checks choices against these same sets, so a preset
 # can never name one the controls below do not offer.
@@ -143,69 +93,14 @@ def refresh_presets():
     return gr.update(choices=presets_lib.list_presets(PRESETS_DIR))
 
 
-def output_path_fn(input_audio_path):
-    original_name_without_extension = os.path.basename(input_audio_path).rsplit(".", 1)[
-        0
-    ]
-    new_name = original_name_without_extension + "_output.wav"
-    output_path = os.path.join(audio_root, new_name)
-    return output_path
-
-
 def change_choices(model):
-    names = [
-        os.path.join(root, file)
-        for root, _, files in walk_models(model_root_relative)
-        for file in files
-        if (
-            is_model_file(file)
-            and not (file.startswith("G_") or file.startswith("D_"))
-        )
-    ]
-
-    indexes_list = [
-        os.path.join(root, name)
-        for root, _, files in walk_models(model_root_relative)
-        for name in files
-        if name.endswith(".index") and "trained" not in name
-    ]
-
-    audio_paths = [
-        os.path.join(root, name)
-        for root, _, files in os.walk(audio_root_relative, topdown=False)
-        for name in files
-        if name.endswith(tuple(sup_audioext))
-        and root == audio_root_relative
-        and "_output" not in name
-    ]
-
     return (
-        {"choices": sorted(names), "__type__": "update"},
-        {"choices": sorted(indexes_list), "__type__": "update"},
-        {"choices": sorted(audio_paths), "__type__": "update"},
+        {"choices": catalog.list_models(), "__type__": "update"},
+        {"choices": catalog.list_indexes(), "__type__": "update"},
+        {"choices": catalog.list_audios(), "__type__": "update"},
         {"__type__": "update"},
         {"__type__": "update"},
     )
-
-
-def get_indexes():
-    indexes_list = [
-        os.path.join(dirpath, filename)
-        for dirpath, _, filenames in walk_models(model_root_relative)
-        for filename in filenames
-        if filename.endswith(".index") and "trained" not in filename
-    ]
-
-    return indexes_list if indexes_list else ""
-
-
-def extract_model_and_epoch(path):
-    base_name = os.path.basename(path)
-    match = re.match(r"(.+?)_(\d+)e_", base_name)
-    if match:
-        model, epoch = match.groups()
-        return model, int(epoch)
-    return "", 0
 
 
 def save_to_wav(record_button):
@@ -216,58 +111,30 @@ def save_to_wav(record_button):
     else:
         path_to_file = record_button
         new_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".wav"
-        target_path = os.path.join(audio_root_relative, os.path.basename(new_name))
+        target_path = os.path.join(AUDIO_DIR, new_name)
 
-        os.makedirs(audio_root_relative, exist_ok=True)
+        os.makedirs(AUDIO_DIR, exist_ok=True)
         shutil.move(path_to_file, target_path)
-        return target_path, gr.update()
+        return catalog.relative(target_path), gr.update()
 
 
 def save_to_wav2(upload_audio):
     file_path = upload_audio
     formated_name = format_title(os.path.basename(file_path))
-    target_path = os.path.join(audio_root_relative, formated_name)
+    target_path = os.path.join(AUDIO_DIR, formated_name)
 
     if os.path.exists(target_path):
         os.remove(target_path)
 
-    os.makedirs(audio_root_relative, exist_ok=True)
+    os.makedirs(AUDIO_DIR, exist_ok=True)
     shutil.copy(file_path, target_path)
-    return target_path, gr.update()
+    return catalog.relative(target_path), gr.update()
 
 
 def delete_outputs():
     gr.Info(_("Inference outputs cleared!"))
-    for root, _, files in os.walk(audio_root_relative, topdown=False):
-        for name in files:
-            if name.endswith(tuple(sup_audioext)) and "_output" in name:
-                os.remove(os.path.join(root, name))
-
-def match_index(model_file_value):
-    if not model_file_value or is_model_bundle(model_file_value):
-        return ""
-
-    model_dir = os.path.dirname(model_file_value)
-    if not os.path.exists(model_dir):
-        return ""
-
-    try:
-        files_in_dir = os.listdir(model_dir)
-        index_files = [f for f in files_in_dir if f.endswith(".index")]
-    except OSError:
-        return ""
-
-    if not index_files:
-        return ""
-
-    model_name = os.path.basename(model_file_value)
-    model_base = os.path.splitext(model_name)[0]
-    core_name = model_base.split('_')[0]
-
-    for index_file in index_files:
-        if core_name.lower() in index_file.lower():
-            return os.path.join(model_dir, index_file)
-    return ""
+    for path in catalog.list_outputs():
+        os.remove(path)
 
 
 def refresh_formant():
@@ -276,20 +143,20 @@ def refresh_formant():
 
 
 def get_speakers_id(model, sub_model_name=None):
-    if not model or not os.path.exists(os.path.join(now_dir, model)):
+    if not model or not os.path.exists(os.path.join(ROOT, model)):
         return [0]
     try:
-        return speaker_ids(os.path.join(now_dir, model), sub_model_name)
+        return speaker_ids(os.path.join(ROOT, model), sub_model_name)
     except Exception as e:
         warning(f"Could not read the model's speaker IDs: {e}", tag="[INFER]")
         return [0]
 
 def get_bundle_model_names(model):
     """Return the speaker names stored in a multi-model bundle."""
-    if not model or not is_model_bundle(model) or not os.path.exists(os.path.join(now_dir, model)):
+    if not model or not is_model_bundle(model) or not os.path.exists(os.path.join(ROOT, model)):
         return []
     try:
-        return bundle_model_names(os.path.join(now_dir, model))
+        return bundle_model_names(os.path.join(ROOT, model))
     except Exception as e:
         warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []
@@ -300,7 +167,7 @@ def inference_tab():
             model_file = gr.Dropdown(
                 label=_("Voice Model"),
                 info=_("Voice model used for inference."),
-                choices=sorted(names, key=lambda x: extract_model_and_epoch(x)),
+                choices=names,
                 interactive=True,
                 value=default_weight,
                 allow_custom_value=True,
@@ -316,8 +183,8 @@ def inference_tab():
             index_file = gr.Dropdown(
                 label=_("Index File"),
                 info=_("Optional index file; unavailable for model bundles."),
-                choices=get_indexes(),
-                value=match_index(default_weight) if default_weight else "",
+                choices=catalog.list_indexes(),
+                value=catalog.guess_index_for(default_weight),
                 interactive=True,
                 allow_custom_value=True,
             )
@@ -347,10 +214,10 @@ def inference_tab():
             silence_gate_db,
         ):
             if not output_path or not output_path.strip():
-                output_path = output_path_fn(audio)
+                output_path = catalog.default_output_path(audio)
             else:
                 if os.path.isdir(output_path):
-                    default_name = os.path.splitext(os.path.basename(output_path_fn(audio)))[0]
+                    default_name = os.path.splitext(os.path.basename(catalog.default_output_path(audio)))[0]
                     output_path = os.path.join(output_path, default_name + f".{export_format.lower()}")
 
                 _, ext = os.path.splitext(output_path)
@@ -391,8 +258,8 @@ def inference_tab():
 
                 return (
                     gr.update(
-                        choices=get_indexes(),
-                        value=match_index(model_path) if not is_bundle else "",
+                        choices=catalog.list_indexes(),
+                        value=catalog.guess_index_for(model_path),
                         interactive=not is_bundle,
                         visible=True,
                     ),
@@ -420,10 +287,11 @@ def inference_tab():
                 label=_("Upload Audio"), type="filepath", editable=False
             )
             with gr.Row():
+                audio_paths = catalog.list_audios()
                 audio = gr.Dropdown(
                     label=_("Select Audio Input"),
                     info=_("Audio to convert."),
-                    choices=sorted(audio_paths),
+                    choices=audio_paths,
                     value=audio_paths[0] if audio_paths else "",
                     interactive=True,
                     allow_custom_value=True,
@@ -686,14 +554,14 @@ def inference_tab():
                     label=_("Input Folder"),
                     info=_("Folder containing input audio."),
                     placeholder=_("Enter input path"),
-                    value=os.path.join(now_dir, "assets", "audios"),
+                    value=str(AUDIO_DIR),
                     interactive=True,
                 )
                 output_folder_batch = gr.Textbox(
                     label=_("Output Folder"),
                     info=_("Folder for converted audio."),
                     placeholder=_("Enter output path"),
-                    value=os.path.join(now_dir, "assets", "audios"),
+                    value=str(AUDIO_DIR),
                     interactive=True,
                 )
         with gr.Accordion(_("Advanced Settings"), open=False):

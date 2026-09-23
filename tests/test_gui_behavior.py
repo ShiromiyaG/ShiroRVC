@@ -153,7 +153,7 @@ def test_defaults_match_the_gradio_tabs():
 
 
 def test_output_path_matches_the_gradio_naming():
-    """``output_path_fn`` in tabs/inference/inference.py builds this name."""
+    """``rvc.lib.catalog.default_output_path`` builds this name for both interfaces."""
     produced = catalog.default_output_path("/somewhere/My Song.flac")
     assert Path(produced).name == "My Song_output.wav"
     assert Path(produced).parent == catalog.paths.AUDIO_DIR

@@ -1,5 +1,4 @@
 import os
-import sys
 import json
 import shutil
 import requests
@@ -10,11 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from rvc.lib.i18n import _
 
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
 from core import run_download_script
+from rvc.lib.paths import LOGS_DIR
 from rvc.lib.text import format_title
 from rvc.lib.terminal import progress_handle, progress_task, success
 
@@ -43,7 +39,7 @@ def save_drop_model(dropbox):
             model_name = model_name.replace(rep, "")
         model_name = model_name.split(".index")[0]
 
-    model_path = os.path.join(now_dir, "logs", model_name)
+    model_path = os.path.join(LOGS_DIR, model_name)
     if not os.path.exists(model_path):
         os.makedirs(model_path)
     if os.path.exists(os.path.join(model_path, file_name)):

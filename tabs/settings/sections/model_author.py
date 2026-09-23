@@ -1,23 +1,19 @@
-import os
-import sys
 import json
 
 from rvc.lib.i18n import _
+from rvc.lib.paths import CONFIG_PATH
 from rvc.lib.terminal import success
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
 import gradio as gr
 
 
 def set_model_author(model_author: str):
-    with open(os.path.join(now_dir, "assets", "config.json"), "r") as f:
+    with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
 
     config["model_author"] = model_author
 
-    with open(os.path.join(now_dir, "assets", "config.json"), "w") as f:
+    with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=4)
 
     success(f"Model author set to {model_author}.", tag="[SETTINGS]")
@@ -25,7 +21,7 @@ def set_model_author(model_author: str):
 
 
 def get_model_author():
-    with open(os.path.join(now_dir, "assets", "config.json"), "r") as f:
+    with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
 
     return config["model_author"] if "model_author" in config else None

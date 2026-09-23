@@ -4,11 +4,10 @@ import sys
 import json
 
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
+from rvc.lib.paths import INFER_PID_PATH
 
 def stop_infer():
-    pid_file_path = os.path.join(now_dir, "assets", "infer_pid.txt")
+    pid_file_path = INFER_PID_PATH
     try:
         with open(pid_file_path, "r") as pid_file:
             pids = [int(pid) for pid in pid_file.readlines()]

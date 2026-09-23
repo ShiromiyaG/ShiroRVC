@@ -8,8 +8,10 @@ import sys
 from collections import deque
 from contextlib import nullcontext
 
-now_dir = os.getcwd()
-sys.path.append(os.path.join(now_dir))
+# Run as a script, so the repository root is not on sys.path by itself.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.append(_ROOT)
 
 pid_data = {"process_pids": []}
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
@@ -151,10 +153,11 @@ from rvc.train.prior_subspace import estimate_prior_subspace, pick_clips
 from rvc.lib.algorithm import commons
 from rvc.configs.vocoders import normalize_vocoder
 from rvc.train.run_spec import TrainRunSpec
+from rvc.lib.paths import LOGS_DIR, ROOT
 from rvc.train.previews import get_reference_sample
 
 # argv[1] is the run spec written by the launcher (not the same indexing as
-# ``core._find_trainer_processes``, which reads the OS command line and so
+# ``rvc.lib.process.find_trainer_processes``, which reads the OS command line and so
 # sees the interpreter at cmdline[0]).  DDP's ``spawn`` re-executes this
 # module in every child, so each rank re-reads the same file.
 spec = TrainRunSpec.load(sys.argv[1])
@@ -189,8 +192,7 @@ lr_horizon_per_stage = spec.lr_horizon_per_stage
 training_phase = spec.training_phase
 max_steps = 0
 
-current_dir = os.getcwd()
-experiment_dir = os.path.join(current_dir, "logs", model_name)
+experiment_dir = os.path.join(LOGS_DIR, model_name)
 config_save_path = os.path.join(experiment_dir, "config.json")
 dataset_path = os.path.join(experiment_dir, "sliced_audios")
 model_info_path = os.path.join(experiment_dir, "model_info.json")
@@ -966,7 +968,7 @@ def main():
             children[i].join()
 
     if cleanup:
-        old_session_cleanup(now_dir, model_name)
+        old_session_cleanup(str(ROOT), model_name)
     start()
 
 

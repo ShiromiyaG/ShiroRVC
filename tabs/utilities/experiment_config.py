@@ -5,7 +5,6 @@ The logic lives in ``rvc.configs.experiments``, shared with the Qt interface.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import gradio as gr
@@ -13,12 +12,11 @@ import gradio as gr
 from rvc.configs import experiments
 from rvc.configs.vocoders import get_vocoder_choices
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
+from rvc.lib.paths import LOGS_DIR
 
 
 def _logs_dir() -> Path:
-    return Path(now_dir) / "logs"
+    return LOGS_DIR
 
 
 def get_experiments_list() -> list[str]:

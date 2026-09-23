@@ -1,29 +1,24 @@
 import json
 import os
 import random
-import sys
 
 import gradio as gr
 
+from rvc.lib import catalog
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
+from rvc.lib.paths import AUDIO_DIR, ROOT
 
 from core import run_tts_script, import_voice_converter
 from tabs.inference.inference import (
     change_choices,
-    get_indexes,
     get_speakers_id,
-    match_index,
-    extract_model_and_epoch,
     names,
     default_weight,
 )
 
 
 with open(
-    os.path.join("rvc", "lib", "extras", "tts_voices.json"), "r", encoding="utf-8"
+    os.path.join(ROOT, "rvc", "lib", "extras", "tts_voices.json"), "r", encoding="utf-8"
 ) as file:
     tts_voices_data = json.load(file)
 
@@ -59,16 +54,16 @@ def tts_tab():
             model_file = gr.Dropdown(
                 label=_("Voice Model"),
             info=_("Voice model used for conversion."),
-                choices=sorted(names, key=lambda x: extract_model_and_epoch(x)),
+                choices=names,
                 interactive=True,
                 value=default_weight,
                 allow_custom_value=True,
             )
-            best_default_index_path = match_index(model_file.value)
+            best_default_index_path = catalog.guess_index_for(model_file.value)
             index_file = gr.Dropdown(
                 label=_("Index File"),
             info=_("Optional index file."),
-                choices=get_indexes(),
+                choices=catalog.list_indexes(),
                 value=best_default_index_path,
                 interactive=True,
                 allow_custom_value=True,
@@ -88,7 +83,7 @@ def tts_tab():
             )
 
             model_file.select(
-                fn=lambda model_file_value: match_index(model_file_value),
+                fn=catalog.guess_index_for,
                 inputs=[model_file],
                 outputs=[index_file],
             )
@@ -137,13 +132,13 @@ def tts_tab():
             output_tts_path = gr.Textbox(
                 label=_("Output Path for TTS Audio"),
                 placeholder=_("Enter output path"),
-                value=os.path.join(now_dir, "assets", "audios", "tts_output.wav"),
+                value=os.path.join(AUDIO_DIR, "tts_output.wav"),
                 interactive=True,
             )
             output_rvc_path = gr.Textbox(
                 label=_("Output Path for RVC Audio"),
                 placeholder=_("Enter output path"),
-                value=os.path.join(now_dir, "assets", "audios", "tts_rvc_output.wav"),
+                value=os.path.join(AUDIO_DIR, "tts_rvc_output.wav"),
                 interactive=True,
             )
             export_format = gr.Radio(

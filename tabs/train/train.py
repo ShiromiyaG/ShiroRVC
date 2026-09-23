@@ -6,7 +6,6 @@ from rvc.lib.i18n import _
 process_pids = []
 
 import shutil
-import sys
 import json
 from multiprocessing import cpu_count
 
@@ -41,95 +40,63 @@ from rvc.lib.terminal import (
     error as print_error,
     warning,
 )
-from rvc.lib.model_bundle import walk_models
-from tabs.train.descs import *
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
-supported_audio_ext = { "wav", "mp3", "flac", "ogg", "opus", "m4a", "mp4", "aac", "alac", "wma", "aiff", "webm", "ac3", }
+from rvc.lib import catalog
+from rvc.lib.paths import (
+    CUSTOM_PRETRAINED_DIR,
+    DATASET_DIR,
+    ROOT,
+    TRAINING_PRESET_DIR,
+)
+from tabs.train.descs import (
+    AUDIO_FILE_SLICING_INFO,
+    BATCH_SIZE_INFO,
+    DATASET_FORMAT_INFO,
+    INDEX_SINGLE_SPEAKER_INFO,
+    NORMALIZATION_INFO,
+    OVERTRAIN_DETECTOR_INFO,
+    OVERTRAIN_DETECTOR_LABEL,
+    PITCH_EXTRACTION_INFO,
+    PREPROCESS_RMS_VALUE_INFO,
+    RESAMPLER_INFO,
+    STOP_ON_OVERTRAIN_INFO,
+    STOP_ON_OVERTRAIN_LABEL,
+    TORCH_COMPILE_MODE_CHOICES,
+    TORCH_COMPILE_MODE_INFO,
+    TORCH_COMPILE_MODE_LABEL,
+    VOCODER_COMPILE_INFO,
+    VOCODER_COMPILE_LABEL,
+    VOCODER_INFO_RVC,
+)
 
 saved_components = []  # components whose state is saved/restored by presets
 
 
-pretraineds_custom_path = os.path.join(now_dir, "rvc", "models", "pretraineds", "custom")
-pretraineds_custom_path_relative = os.path.relpath(pretraineds_custom_path, now_dir)
-presets_path = os.path.join(now_dir, 'assets', 'training_presets')
-presets_path_relative = os.path.relpath(presets_path, now_dir)
+presets_path = str(TRAINING_PRESET_DIR)
 
-os.makedirs(pretraineds_custom_path_relative, exist_ok=True)
+os.makedirs(CUSTOM_PRETRAINED_DIR, exist_ok=True)
 os.makedirs(presets_path, exist_ok=True)
+os.makedirs(DATASET_DIR, exist_ok=True)
 
-
-def get_pretrained_list(suffix):
-    return [
-        os.path.join(dirpath, filename)
-        for dirpath, _, filenames in os.walk(pretraineds_custom_path_relative)
-        for filename in filenames
-        if filename.endswith(".pth") and suffix in filename
-    ]
-
-pretraineds_list_d = get_pretrained_list("D")
-pretraineds_list_g = get_pretrained_list("G")
 
 def refresh_custom_pretraineds():
     return (
-        {"choices": sorted(get_pretrained_list("G")), "__type__": "update"},
-        {"choices": sorted(get_pretrained_list("D")), "__type__": "update"},
+        {"choices": catalog.list_custom_pretraineds("G"), "__type__": "update"},
+        {"choices": catalog.list_custom_pretraineds("D"), "__type__": "update"},
     )
 
-datasets_path = os.path.join(now_dir, "assets", "datasets")
-
-if not os.path.exists(datasets_path):
-    os.makedirs(datasets_path)
-
-datasets_path_relative = os.path.relpath(datasets_path, now_dir)
-DATASET_METADATA_NAME = ".rvc_dataset.json"
-
-def get_datasets_list():
-    dataset_roots = set()
-    for dirpath, _, filenames in os.walk(datasets_path_relative):
-        if DATASET_METADATA_NAME in filenames:
-            dataset_roots.add(os.path.normcase(os.path.abspath(dirpath)))
-
-    datasets = []
-    for dirpath, _, filenames in os.walk(datasets_path_relative):
-        absolute_dir = os.path.normcase(os.path.abspath(dirpath))
-        nested_in_dataset = any(
-            absolute_dir != dataset_root
-            and os.path.commonpath([absolute_dir, dataset_root]) == dataset_root
-            for dataset_root in dataset_roots
-        )
-        if nested_in_dataset:
-            continue
-        has_audio = any(
-            filename.lower().endswith(tuple(supported_audio_ext))
-            for filename in filenames
-        )
-        if has_audio or DATASET_METADATA_NAME in filenames:
-            datasets.append(dirpath)
-    return sorted(set(datasets))
 
 def refresh_datasets():
-    return {"choices": sorted(get_datasets_list()), "__type__": "update"}
+    return {"choices": catalog.list_dataset_folders(), "__type__": "update"}
 
-models_path = os.path.join(now_dir, "logs")
-
-def get_models_list():
-    return [
-        os.path.basename(dirpath)
-        for dirpath in os.listdir(models_path)
-        if os.path.isdir(os.path.join(models_path, dirpath))
-        and all(excluded not in dirpath for excluded in ["zips", "mute", "reference"])
-    ]
 
 def refresh_models():
-    return {"choices": sorted(get_models_list()), "__type__": "update"}
+    return {"choices": catalog.list_training_models(), "__type__": "update"}
+
 
 def refresh_models_and_datasets():
     return (
-        {"choices": sorted(get_models_list()), "__type__": "update"},
-        {"choices": sorted(get_datasets_list()), "__type__": "update"},
+        {"choices": catalog.list_training_models(), "__type__": "update"},
+        {"choices": catalog.list_dataset_folders(), "__type__": "update"},
     )
 
 def get_presets_list():
@@ -140,7 +107,7 @@ def save_drop_model(dropbox):
         gr.Info(_("Invalid pretrained file."))
     else:
         file_name = os.path.basename(dropbox)
-        pretrained_path = os.path.join(pretraineds_custom_path_relative, file_name)
+        pretrained_path = os.path.join(CUSTOM_PRETRAINED_DIR, file_name)
         if os.path.exists(pretrained_path):
             os.remove(pretrained_path)
         shutil.copy(dropbox, pretrained_path)
@@ -152,13 +119,12 @@ def save_drop_dataset_audio(dropbox, dataset_name):
         gr.Info(_("Enter a valid dataset name."))
         return None, None
     else:
-        file_extension = os.path.splitext(dropbox)[1][1:].lower()
-        if file_extension not in supported_audio_ext:
+        if not catalog.is_audio_file(dropbox):
             gr.Info(_("Invalid audio file."))
         else:
             dataset_name = format_title(dataset_name)
             audio_file = format_title(os.path.basename(dropbox))
-            dataset_path = os.path.join(now_dir, "assets", "datasets", dataset_name)
+            dataset_path = os.path.join(DATASET_DIR, dataset_name)
             if not os.path.exists(dataset_path):
                 os.makedirs(dataset_path)
             destination_path = os.path.join(dataset_path, audio_file)
@@ -169,36 +135,22 @@ def save_drop_dataset_audio(dropbox, dataset_name):
                 _("Audio added. Run preprocessing when ready.")
             )
             dataset_path = os.path.dirname(destination_path)
-            relative_dataset_path = os.path.relpath(dataset_path, now_dir)
-
-            return None, relative_dataset_path
+            return None, catalog.relative(dataset_path)
 
 def get_pth_list():
-    return [
-        os.path.relpath(os.path.join(dirpath, filename), now_dir)
-        for dirpath, _, filenames in walk_models(models_path)
-        for filename in filenames
-        if filename.endswith(".pth")
-    ]
+    return catalog.list_models(bundles=False, training_checkpoints=True)
 
-def get_index_list():
-    return [
-        os.path.relpath(os.path.join(dirpath, filename), now_dir)
-        for dirpath, _, filenames in walk_models(models_path)
-        for filename in filenames
-        if filename.endswith(".index") and "trained" not in filename
-    ]
 
 def refresh_pth_and_index_list():
     return (
-        {"choices": sorted(get_pth_list()), "__type__": "update"},
-        {"choices": sorted(get_index_list()), "__type__": "update"},
+        {"choices": get_pth_list(), "__type__": "update"},
+        {"choices": catalog.list_indexes(), "__type__": "update"},
     )
 
 def export_pth(pth_path):
     allowed_paths = get_pth_list()
-    normalized_allowed_paths = [os.path.abspath(os.path.join(now_dir, p)) for p in allowed_paths]
-    normalized_pth_path = os.path.abspath(os.path.join(now_dir, pth_path))
+    normalized_allowed_paths = [os.path.abspath(os.path.join(ROOT, p)) for p in allowed_paths]
+    normalized_pth_path = os.path.abspath(os.path.join(ROOT, pth_path))
 
     if normalized_pth_path in normalized_allowed_paths:
         return pth_path
@@ -207,9 +159,9 @@ def export_pth(pth_path):
         return None
 
 def export_index(index_path):
-    allowed_paths = get_index_list()
-    normalized_allowed_paths = [os.path.abspath(os.path.join(now_dir, p)) for p in allowed_paths]
-    normalized_index_path = os.path.abspath(os.path.join(now_dir, index_path))
+    allowed_paths = catalog.list_indexes()
+    normalized_allowed_paths = [os.path.abspath(os.path.join(ROOT, p)) for p in allowed_paths]
+    normalized_index_path = os.path.abspath(os.path.join(ROOT, index_path))
 
     if normalized_index_path in normalized_allowed_paths:
         return index_path
@@ -360,7 +312,7 @@ def train_tab():
                 model_name = gr.Dropdown(
                     label=_("Model Name"),
                     info=_("Name of the new model."),
-                    choices=get_models_list(),
+                    choices=catalog.list_training_models(),
                     value="example-model-name",
                     interactive=True,
                     allow_custom_value=True,
@@ -424,7 +376,7 @@ def train_tab():
         dataset_path = gr.Dropdown(
             label=_("Dataset Path"),
             info=_("Folder containing the training audio."),
-            choices=get_datasets_list(),
+            choices=catalog.list_dataset_folders(),
             allow_custom_value=True,
             interactive=True,
             key='dataset_path'
@@ -706,7 +658,7 @@ def train_tab():
                     g_pretrained_path = gr.Dropdown(
                         label=_("Custom Pretrained G"),
                         info=_("Generator pretrained file."),
-                        choices=sorted(pretraineds_list_g),
+                        choices=catalog.list_custom_pretraineds("G"),
                         interactive=True,
                         allow_custom_value=True,
                         key='g_pretrained_path'
@@ -714,7 +666,7 @@ def train_tab():
                     d_pretrained_path = gr.Dropdown(
                         label=_("Custom Pretrained D"),
                         info=_("Discriminator pretrained file."),
-                        choices=sorted(pretraineds_list_d),
+                        choices=catalog.list_custom_pretraineds("D"),
                         interactive=True,
                         allow_custom_value=True,
                         key='d_pretrained_path'
@@ -1058,7 +1010,7 @@ def train_tab():
                 index_dropdown_export = gr.Dropdown(
                     label=_("Index File"),
                 info=_("Index file to export."),
-                    choices=get_index_list(),
+                    choices=catalog.list_indexes(),
                     value=None,
                     interactive=True,
                     allow_custom_value=True,

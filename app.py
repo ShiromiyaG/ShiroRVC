@@ -91,15 +91,13 @@ from version import (  # noqa: E402 - after the environment setup above
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Add current directory to sys.path
-now_dir = os.getcwd()
-sys.path.append(now_dir)
+from rvc.lib.paths import ASSETS_DIR, ROOT  # noqa: E402
 
-GRADIO_CSS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "assets",
-    "gradio.css",
-)
+# The dropdowns hold repo-relative paths, which the backend resolves against
+# the working directory.
+os.chdir(ROOT)
+
+GRADIO_CSS_PATH = str(ASSETS_DIR / "gradio.css")
 
 # Language, before anything builds a widget.
 #

@@ -2,7 +2,6 @@ import datetime
 import hashlib
 import json
 import os
-import sys
 from collections import OrderedDict
 
 import torch
@@ -13,10 +12,8 @@ from rvc.configs.vocoders import (
     normalize_vocoder,
 )
 from rvc.lib.algorithm.synthesizers import vocoder_config_from_model
+from rvc.lib.paths import CONFIG_PATH
 from rvc.lib.terminal import error as print_error, success
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
 
 def replace_keys_in_dict(d, old_key_part, new_key_part):
@@ -73,7 +70,7 @@ def extract_model(
 
         vocoder_architecture = vocoder_id
 
-        with open(os.path.join(now_dir, "assets", "config.json"), "r") as f:
+        with open(CONFIG_PATH, "r") as f:
             data = json.load(f)
             model_author = data.get("model_author", None)
 

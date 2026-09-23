@@ -1,5 +1,4 @@
 import os
-import sys
 import random
 import soxr
 import time
@@ -11,9 +10,6 @@ import numpy as np
 import soundfile as sf
 import noisereduce as nr
 import faiss
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
 from rvc.lib.terminal import (
     error as print_error,
@@ -34,6 +30,8 @@ from rvc.lib.extras.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.algorithm.commons import strip_parametrizations
 from rvc.lib import index_meta
+from rvc.lib.catalog import is_audio_file
+from rvc.lib.paths import INFER_PID_PATH
 from rvc.lib.model_bundle import (
     default_model_name,
     get_bundle_model_state,
@@ -304,32 +302,12 @@ class VoiceConverter:
     ):
         pid = os.getpid()
         try:
-            with open(
-                os.path.join(now_dir, "assets", "infer_pid.txt"), "w"
-            ) as pid_file:
+            with open(INFER_PID_PATH, "w") as pid_file:
                 pid_file.write(str(pid))
             start_time = time.time()
             info(f"Converting batch '{audio_input_paths}'", tag="[INFER]")
             audio_files = [
-                f
-                for f in os.listdir(audio_input_paths)
-                if f.lower().endswith(
-                    (
-                        "wav",
-                        "mp3",
-                        "flac",
-                        "ogg",
-                        "opus",
-                        "m4a",
-                        "mp4",
-                        "aac",
-                        "alac",
-                        "wma",
-                        "aiff",
-                        "webm",
-                        "ac3",
-                    )
-                )
+                f for f in os.listdir(audio_input_paths) if is_audio_file(f)
             ]
             info(f"{len(audio_files)} audio files queued.", tag="[INFER]")
             for a in audio_files:
@@ -356,8 +334,8 @@ class VoiceConverter:
                 details=traceback.format_exc(),
             )
         finally:
-            if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
-                os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
+            if os.path.exists(INFER_PID_PATH):
+                os.remove(INFER_PID_PATH)
 
     def get_vc(self, weight_root, sid, bundle_submodel=None):
         if sid == "" or sid == []:

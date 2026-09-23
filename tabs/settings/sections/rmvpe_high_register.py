@@ -1,15 +1,9 @@
 import json
-import os
-import sys
 
 import gradio as gr
 
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
-CONFIG_PATH = os.path.join(now_dir, "assets", "config.json")
+from rvc.lib.paths import CONFIG_PATH
 
 # Keep in sync with HIGH_REGISTER_DEFAULTS in rvc/lib/predictors/f0.py
 DEFAULTS = {"enabled": False, "mode": "true_pitch", "f0_ceil": 1250}

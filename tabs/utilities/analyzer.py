@@ -1,10 +1,6 @@
-import os, sys
 import gradio as gr
 
 from rvc.lib.i18n import _
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
 from core import run_audio_analyzer_script
 

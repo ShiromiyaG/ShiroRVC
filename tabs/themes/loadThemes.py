@@ -4,13 +4,11 @@ import importlib
 import gradio as gr
 import sys
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
+from rvc.lib.paths import CONFIG_PATH
 from rvc.lib.terminal import error as print_error, success, warning
 
 folder = os.path.dirname(os.path.abspath(__file__))
-config_file = os.path.join(now_dir, "assets", "config.json")
+config_file = str(CONFIG_PATH)
 
 sys.path.append(folder)
 

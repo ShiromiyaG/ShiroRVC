@@ -1,7 +1,13 @@
-import sys
 import asyncio
-import edge_tts
 import os
+import sys
+
+import edge_tts
+
+# Run as a script, so the repository root is not on sys.path by itself.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if _ROOT not in sys.path:
+    sys.path.append(_ROOT)
 
 from rvc.lib.terminal import install_rich_print
 
