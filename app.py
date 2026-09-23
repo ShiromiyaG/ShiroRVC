@@ -1,5 +1,7 @@
 import sys
 import os
+import io
+import contextlib
 import logging
 import asyncio
 import threading
@@ -217,25 +219,30 @@ def launch_gradio(port):
     the one line in a session that does not follow the ``glyph [TAG] message``
     shape used by preprocessing, extraction and training.  ``prevent_thread_lock``
     hands the URLs back so they can be printed in that shape instead; blocking
-    then happens explicitly below.
+    then happens explicitly below.  ``quiet`` does not cover the share banner,
+    so the launch's stdout is captured too; it keeps Gradio's reason when the
+    public link fails.
     """
 
-    _app, local_url, share_url = interface.launch(
-        favicon_path="assets/logo.png",
-        share="--share" in sys.argv,
-        inbrowser="--open" in sys.argv,
-        server_port=port,
-        theme=APP_THEME,
-        css_paths=GRADIO_CSS_PATH,
-        footer_links=[],
-        quiet=True,
-        prevent_thread_lock=True,
-    )
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        _app, local_url, share_url = interface.launch(
+            favicon_path="assets/logo.png",
+            share="--share" in sys.argv,
+            inbrowser="--open" in sys.argv,
+            server_port=port,
+            theme=APP_THEME,
+            css_paths=GRADIO_CSS_PATH,
+            footer_links=[],
+            quiet=True,
+            prevent_thread_lock=True,
+        )
     success(f"Interface ready at {local_url}", tag="[APP]")
     if share_url:
         success(f"Public link: {share_url}", tag="[APP]")
     elif "--share" in sys.argv:
-        warning("The public link could not be created.", tag="[APP]")
+        reason = " ".join(captured.getvalue().split())
+        warning(f"The public link could not be created. {reason}".strip(), tag="[APP]")
     info("Press Ctrl+C to stop.", tag="[APP]")
     interface.block_thread()
 
