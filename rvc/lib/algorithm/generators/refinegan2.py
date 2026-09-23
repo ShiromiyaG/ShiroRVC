@@ -255,8 +255,9 @@ class ResBlock(nn.Module):
             x = x.float()
         for c1, c2 in zip(self.convs1, self.convs2):
             xt = F.leaky_relu(x, self.leaky_relu_slope)
-            xt = c1(xt)
-            xt = F.leaky_relu(xt, self.leaky_relu_slope)
+            # In place on the conv's own output: autograd keeps one tensor, not
+            # two.  The residual add stays out of place (``fp32_residuals``).
+            xt = F.leaky_relu(c1(xt), self.leaky_relu_slope, inplace=True)
             xt = c2(xt)
             x = xt + x
 
@@ -282,16 +283,16 @@ class AdaIN(nn.Module):
         self.noise = adain_noise_mode(noise)
         if self.noise != "off":
             self.weight = nn.Parameter(torch.ones(channels) * 1e-4)
-        # safe to use in-place as it is used on a new x+gaussian tensor
         self.activation = nn.LeakyReLU(leaky_relu_slope)
 
     def forward(self, x: torch.Tensor):
         if self.noise == "off" or (self.noise == "train" and not self.training):
             return self.activation(x)
 
-        gaussian = torch.randn_like(x) * self.weight[None, :, None]
-
-        return self.activation(x + gaussian)
+        # In place only on this branch: ``x`` is shared by the parallel blocks,
+        # the noisy sum is a fresh tensor.
+        noisy = torch.addcmul(x, torch.randn_like(x), self.weight[:, None])
+        return F.leaky_relu(noisy, self.activation.negative_slope, inplace=True)
 
 
 class ParallelResBlock(nn.Module):
@@ -348,7 +349,12 @@ class ParallelResBlock(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.input_conv(x)
-        return torch.stack([block(x) for block in self.blocks], dim=0).mean(dim=0)
+        # Summed as they come: ``stack`` held every output plus a copy of all
+        # of them before ``mean`` read it back.
+        out = self.blocks[0](x)
+        for block in self.blocks[1:]:
+            out = out + block(x)
+        return out / len(self.blocks)
 
 
 class SineGenerator(nn.Module):
@@ -483,7 +489,11 @@ class SineGenerator(nn.Module):
         # Octave band of each partial (1 | 2-3 | 4-7 | ...), so ``source_gain``
         # can shape the tilt with a handful of channels at any harmonic count.
         band = torch.floor(torch.log2(orders)).long()
-        self.register_buffer("gain_band", band, persistent=False)
+        self.band_count = int(band.max()) + 1
+        #: (dim, band_count) one-hot: sums the partials into their bands.
+        self.register_buffer(
+            "band_matrix", F.one_hot(band, self.band_count).float(), persistent=False
+        )
         #: Noise gain channels: a first-order lowpass of the draw, the draw
         #: itself, and a first-order highpass of it, each with its own gain.
         #: One gain on white noise can only move the floor as a block, and what
@@ -492,7 +502,7 @@ class SineGenerator(nn.Module):
         #: slope the projection can choose per frame.
         self.noise_gain_channels = 3
         #: Gain channels ``forward`` takes: one per octave band, then the noise.
-        self.gain_channels = int(band.max()) + 1 + self.noise_gain_channels
+        self.gain_channels = self.band_count + self.noise_gain_channels
 
     def _f02uv(self, f0):
         uv = torch.ones_like(f0)
@@ -543,31 +553,24 @@ class SineGenerator(nn.Module):
 
         # Partial j's phase is j times the fundamental's (mod 1), so the two
         # cumsums run on one channel instead of ``dim``.
-        phase = phase * self.harmonic_order
+        phase = torch.addcmul(rand_ini.unsqueeze(1), phase, self.harmonic_order)
         # In place from here: at ``dim`` partials every temporary is a full
-        # (batch, length, dim) tensor.  Same op order as out of place.
-        phase.add_(rand_ini.unsqueeze(1))
-
-        return phase.mul_(2).mul_(np.pi).sin_()
+        # (batch, length, dim) tensor.
+        return phase.mul_(2 * np.pi).sin_()
 
     def forward(self, f0, gain=None):
         """f0: (batch, length, 1).  gain: (batch, length, gain_channels) or None."""
         with torch.no_grad():
-            f0_buf = f0 * self.harmonic_order
-
-            sine_waves = self._f02sine(f0).mul_(self.sine_amp)
-            # Both are identity at ``harmonic_num = 0``: ``harmonic_gain`` is
-            # ``[1.0]`` and no fundamental sits within 10% of Nyquist.  So a
-            # single-partial run computes what it always did, bit for bit.
-            sine_waves.mul_(self.harmonic_gain)
-            sine_waves.mul_(self._nyquist_fade(f0_buf))
+            # Only the phase and the fade vary per sample *and* per partial.
+            # Every other factor is applied after the sum over partials, where
+            # it costs one channel instead of ``dim``.
+            sine_waves = self._f02sine(f0)
+            sine_waves.mul_(self._nyquist_fade(f0 * self.harmonic_order))
 
             uv = self._f02uv(f0)
 
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
             noise = noise_amp * torch.randn_like(uv)
-
-            sine_waves.mul_(uv)
 
         # merge with grad
         if gain is not None:
@@ -580,10 +583,6 @@ class SineGenerator(nn.Module):
             # saturation, and saturating a harmonic sum at the output rate
             # folds.  The gain used to multiply after the Tanh, so the output
             # is no less bounded than it was.
-            # ``index_select`` rather than ``gain[..., band]``: advanced
-            # indexing backpropagates through a sort-based ``index_put_`` over
-            # every (sample, partial), ``index_select`` through ``index_add_``.
-            sine_waves = sine_waves * torch.index_select(gain, -1, self.gain_band)
             noise = (
                 lowpass * gain[..., -3:-2]
                 + noise * gain[..., -2:-1]
@@ -591,15 +590,28 @@ class SineGenerator(nn.Module):
             )
 
         if self.dim == 1:
+            # The fade is exactly one here and ``harmonic_gain`` is ``[1.0]``,
+            # so this is the single-partial body as it always was, bit for bit.
+            sine_waves.mul_(self.sine_amp).mul_(uv)
+            if gain is not None:
+                sine_waves = sine_waves * gain[..., :1]
             merged = self.merge[0](sine_waves + noise)
         else:
+            weight = self.merge[0].weight[0] * self.harmonic_gain * self.sine_amp
+            if gain is None:
+                sine = sine_waves @ weight[:, None]
+            else:
+                # The gain is constant within an octave band, so each band is
+                # summed first: no (batch, length, dim) gain tensor, and no
+                # scatter-add of every partial into its band in the backward.
+                bands = sine_waves @ (self.band_matrix * weight[:, None])
+                sine = (bands * gain[..., : self.band_count]).sum(-1, keepdim=True)
             # ``merge`` over ``dim`` iid draws of std ``s / sqrt(dim)`` is one
             # draw of std ``s * ||w|| / sqrt(dim)``, so a single channel stands
             # in for all of them and the merged level stays ``noise_std`` at
             # init (``w`` is ones) whatever the harmonic count.
-            weight = self.merge[0].weight
-            noise_scale = weight.norm() / self.dim**0.5
-            merged = self.merge[0](sine_waves) + noise * noise_scale
+            noise_scale = self.merge[0].weight.norm() / self.dim**0.5
+            merged = sine * uv + noise * noise_scale
 
         return merged if gain is not None else self.merge[1](merged)
 

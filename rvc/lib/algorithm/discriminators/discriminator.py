@@ -703,7 +703,9 @@ class DiscriminatorS(torch.nn.Module):
             if self.use_san
             else norm_f(torch.nn.Conv1d(1024, 1, 3, 1, padding=1))
         )
-        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
+        # In place on each conv's own output: autograd keeps one tensor per
+        # layer instead of two.
+        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE, inplace=True)
 
     def forward(self, x, san_training: bool = False):
         fmap = []
@@ -763,7 +765,9 @@ class DiscriminatorP(torch.nn.Module):
             if self.use_san
             else norm_f(torch.nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
         )
-        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
+        # In place on each conv's own output: autograd keeps one tensor per
+        # layer instead of two.
+        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE, inplace=True)
 
     def forward(self, x, san_training: bool = False):
         fmap = []
@@ -863,8 +867,8 @@ class FastDiscriminatorP(torch.nn.Module):
         )
         # ``LRELU_SLOPE`` and not KazeFlow's 0.1: this is a capacity swap, and
         # an activation that differs from the branch it replaces would make it
-        # two changes wearing one name.
-        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
+        # two changes wearing one name.  In place, as in ``DiscriminatorP``.
+        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE, inplace=True)
 
     def forward(self, x, san_training: bool = False):
         fmap = []
@@ -988,13 +992,15 @@ class DiscriminatorR(torch.nn.Module):
             # the whole branch in FP32 was 200.6 ms, +1.2 GiB.
             with torch.autocast(x.device.type, enabled=False):
                 x = self.spectrogram(x.float()).unsqueeze(1)
-                x = F.leaky_relu(self.convs[0](x), self.lrelu_slope)
+                x = F.leaky_relu(self.convs[0](x), self.lrelu_slope, inplace=True)
         else:
             x = self.spectrogram(x).unsqueeze(1)
-            x = F.leaky_relu(self.convs[0](x), self.lrelu_slope)
+            x = F.leaky_relu(self.convs[0](x), self.lrelu_slope, inplace=True)
         fmap.append(x)
+        # In place on each conv's own output: autograd keeps one tensor per
+        # layer instead of two.
         for layer in self.convs[1:]:
-            x = F.leaky_relu(layer(x), self.lrelu_slope)
+            x = F.leaky_relu(layer(x), self.lrelu_slope, inplace=True)
             fmap.append(x)
         return san_tail(self, x, fmap, san_training)
 
@@ -1102,7 +1108,8 @@ class MultiBandDiscriminatorR(torch.nn.Module):
         for (lo, hi), stack in zip(self.band_edges, self.bands):
             h = x[:, :, lo:hi]
             for index, layer in enumerate(stack):
-                h = F.leaky_relu(layer(h), self.lrelu_slope)
+                # In place on the conv's own output, as in ``DiscriminatorR``.
+                h = F.leaky_relu(layer(h), self.lrelu_slope, inplace=True)
                 layers[index].append(h)
         # One entry per layer, a tuple of its band maps: ``feature_loss`` takes
         # their joint mean, so the branch weighs what ``DiscriminatorR`` does

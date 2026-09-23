@@ -101,6 +101,7 @@ import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -680,12 +681,14 @@ def main() -> int:
             # Discriminator. ``combine_inputs`` runs real and fake as one
             # batch of 2B, which is the same numbers in half the launches.
             with autocast(device_type="cuda", enabled=use_amp, dtype=torch.float16):
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(
+                # Only the logits are kept: a feature map held past this
+                # backward pins the whole 2B activation it is a view of.
+                y_d_hat_r, y_d_hat_g = net_d(
                     y,
                     y_hat.detach(),
                     san_training=san_active,
                     combine_inputs=True,
-                )
+                )[:2]
                 loss_disc = discriminator_loss(
                     y_d_hat_r,
                     y_d_hat_g,
@@ -705,11 +708,24 @@ def main() -> int:
             # Generator.
             net_d.requires_grad_(False)
             with autocast(device_type="cuda", enabled=use_amp, dtype=torch.float16):
-                _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat, no_grad_real=True)
+                # Frozen weights read by two passes: each weight norm is built
+                # once.  Not under spectral norm, whose power iteration
+                # advances per build.
+                with (
+                    torch.nn.utils.parametrize.cached()
+                    if not getattr(net_d, "use_spectral_norm", False)
+                    else nullcontext()
+                ):
+                    _, y_d_hat_g, fmap_r, fmap_g = net_d(
+                        y, y_hat, no_grad_real=True
+                    )
                 loss_spectral = fn_spectral(y, y_hat) * c_mel
                 loss_fm = (
                     feature_loss(fmap_r, fmap_g, branch_weights=branch_weights) * 2.0
                 )
+                # Nothing else reads the maps; held, they would sit through
+                # this backward and into the next step.
+                del fmap_r, fmap_g
                 # Returns a bare tensor unless ``per_branch`` is set, unlike
                 # ``discriminator_loss``, which always returns a tuple.
                 # This forward never sets ``san_training``, so these are plain

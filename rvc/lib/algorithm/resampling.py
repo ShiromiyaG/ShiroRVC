@@ -153,28 +153,26 @@ class AntiAliasedUpsample1d(nn.Module):
         self.pad_left = self.pad * self.factor + (kernel_size - 1) // 2
 
         # Everything the polyphase forward needs about padding is a constant,
-        # so it is computed here rather than from ``x.shape[-1]``.  It was
-        # computed there, and under ``torch.compile`` that makes the pad widths
-        # symbolic and ``if left or right:`` a data-dependent branch -- the
-        # class of guard that fails as "vr must not be None for symbol ...".
-        # The length cancels out of the right-hand pad:
+        # so it is computed here rather than from ``x.shape[-1]``: under
+        # ``torch.compile`` that makes the pad widths symbolic, the class of
+        # guard that fails as "vr must not be None for symbol ...".
         #
-        #     right = max(0, max(shift) + L - (L + 2*pad + 1))
-        #           = max(0, max(shift) - 2*pad - 1)
+        # ``lowpass_kernel`` is ``2 * width * factor + 1`` taps, which puts
+        # ``pad_left`` on a multiple of ``factor``: every phase then starts on
+        # the same input sample, so the phases interleave with one reshape.
         taps = -(-kernel_size // self.factor)
         whole, offset = divmod(self.pad_left, self.factor)
-        shifts = tuple(
-            whole + (1 if phase + offset >= self.factor else 0)
-            for phase in range(self.factor)
-        )
+        if offset:
+            raise ValueError(
+                f"A {kernel_size}-tap kernel at x{self.factor} puts the phases "
+                f"on different input samples; the polyphase form needs them "
+                f"aligned."
+            )
         self.taps = taps
-        self.shifts = shifts
-        self.phase_offset = offset
-        self.extra_left = max(0, taps - 1 - min(shifts))
-        self.extra_right = max(0, max(shifts) - 2 * self.pad - 1)
-        self.starts = tuple(
-            self.extra_left + shift - taps + 1 for shift in shifts
-        )
+        # Replicate padding for exactly ``length`` outputs per phase: output
+        # ``n`` reads inputs ``n - left`` through ``n + right``.
+        left = self.pad - whole + taps - 1
+        self.phase_pad = (left, taps - 1 - left)
 
     def _polyphase(self, x: Tensor):
         """The kernel split into ``factor`` phases, cached per device/dtype.
@@ -186,9 +184,8 @@ class AntiAliasedUpsample1d(nn.Module):
         is not, so this is 5-14x faster for a bit-comparable result (relative
         error 4e-7 against the transposed form at every shape in the decoder).
 
-        With ``pad_left = a*F + b``, the tap index ``qF + p - nF + pad_left``
-        splits into phase ``(p + b) mod F`` and tap ``q - n + a`` (plus one
-        when ``p + b >= F``), which is where ``shifts`` comes from.
+        With ``pad_left = a*F``, the tap index ``qF + p - nF + pad_left``
+        splits into phase ``p`` and tap ``q - n + a``.
         """
 
         channels = int(x.shape[1])
@@ -198,8 +195,7 @@ class AntiAliasedUpsample1d(nn.Module):
             taps = self.taps
             weight = kernel.new_zeros(self.factor, 1, taps)
             for phase in range(self.factor):
-                index = (phase + self.phase_offset) % self.factor
-                part = kernel[index :: self.factor]
+                part = kernel[phase :: self.factor]
                 # ``w[taps-1-j] = phase[j]``, so a phase shorter than ``taps``
                 # -- which happens whenever ``K`` is not a multiple of
                 # ``factor`` -- is right-aligned.  Left-aligning it shifts that
@@ -262,23 +258,17 @@ class AntiAliasedUpsample1d(nn.Module):
         batch, channels, length = x.shape[0], x.shape[1], x.shape[-1]
         weight = self._polyphase(x)
 
-        # The replicate pad is the same one the transposed form uses: the extra
-        # input sample on the right is what makes the output reach
-        # ``length * factor``, and replicating is what keeps the filter from
-        # inventing an edge.  The widths are constants -- see ``extra_left``.
-        padded = F.pad(
-            x,
-            (self.pad + self.extra_left, self.pad + 1 + self.extra_right),
-            mode="replicate",
-        )
+        # Replicate, as the transposed form pads, which keeps the filter from
+        # inventing an edge.  Only as far as the taps read, so no phase output
+        # is computed and then cropped.
+        padded = F.pad(x, self.phase_pad, mode="replicate")
         phases = F.conv1d(padded, weight, groups=channels)
-        phases = phases.view(batch, channels, self.factor, -1)
-        out = x.new_empty(batch, channels, length * self.factor)
-        for phase, start in enumerate(self.starts):
-            out[..., phase :: self.factor] = phases[
-                :, :, phase, start : start + length
-            ]
-        return out
+        # One coalesced copy instead of ``factor`` strided ones.
+        return (
+            phases.view(batch, channels, self.factor, length)
+            .transpose(2, 3)
+            .reshape(batch, channels, length * self.factor)
+        )
 
 
 def filter_schedule(

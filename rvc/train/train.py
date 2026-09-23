@@ -1953,6 +1953,11 @@ def training_loop(
                 )
                 y_d_hat_r, y_d_hat_g = d_outputs[0], d_outputs[1]
                 y_d_hat_neg = d_outputs[4] if negative is not None else None
+                # Only the logits are read from here on.  Holding the feature
+                # maps would keep every branch's activations, real and fake,
+                # alive through the whole generator update once this backward
+                # has released them.
+                del d_outputs
 
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 disc_loss_parts = discriminator_loss(
@@ -2107,9 +2112,20 @@ def training_loop(
                 discriminator_model = (
                     net_d.module if hasattr(net_d, "module") else net_d
                 )
-                _, y_d_hat_g, fmap_r, fmap_g = discriminator_model(
-                    y, y_hat, no_grad_real=True
+                # Frozen weights read by two passes, real then fake: each weight
+                # norm is built once.  Not under spectral norm, whose power
+                # iteration advances per build, nor compiled, where the graph
+                # already fuses it.
+                weights_cached = (
+                    torch.nn.utils.parametrize.cached()
+                    if not getattr(discriminator_model, "use_spectral_norm", False)
+                    and not getattr(discriminator_model, "_compile_enabled", False)
+                    else nullcontext()
                 )
+                with weights_cached:
+                    _, y_d_hat_g, fmap_r, fmap_g = discriminator_model(
+                        y, y_hat, no_grad_real=True
+                    )
 
 
             # Compute generator losses:
@@ -2179,6 +2195,10 @@ def training_loop(
                     )
                     * 2.0
                 )
+                # Nothing else reads the maps.  The real ones were only a target
+                # and would otherwise sit through this backward; both would be
+                # carried into the next step's discriminator update.
+                del fmap_r, fmap_g
 
                 # Generator loss.  ``y_d_hat_g`` comes from the *generator*
                 # update's forward, which never sets ``san_training``, so these

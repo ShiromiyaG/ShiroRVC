@@ -251,16 +251,27 @@ class HiFiGANNSFGenerator(torch.nn.Module):
             ]
             x = torch.nn.functional.leaky_relu(x, self.lrelu_slope)
 
-            if self.training and self.checkpointing:
+            checkpointed = self.training and self.checkpointing
+            if checkpointed:
                 x = checkpoint(ups, x, use_reentrant=False)
-                x = x + noise_convs(har_source)
-                xs = sum([
-                    checkpoint(resblock, x, use_reentrant=False)
-                    for resblock in stage_resblocks])
             else:
                 x = ups(x)
-                x = x + noise_convs(har_source)
-                xs = sum([resblock(x) for resblock in stage_resblocks])
+            x = x + noise_convs(har_source)
+            # Every block opens with ``leaky_relu(x)`` on this same ``x``.  Not
+            # under checkpointing, where passing it in would keep it alive
+            # until backward.
+            activated = (
+                None if checkpointed
+                else torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+            )
+            xs = None
+            for resblock in stage_resblocks:
+                if checkpointed:
+                    y = checkpoint(resblock, x, use_reentrant=False)
+                else:
+                    y = resblock(x, activated=activated)
+                # Not ``sum()``: it starts from ``0 + first``, a whole extra pass.
+                xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 
         x = torch.nn.functional.leaky_relu(x)

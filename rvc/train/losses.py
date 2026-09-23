@@ -33,27 +33,30 @@ def feature_loss(fmap_r, fmap_g, normalize=False, branch_weights=None):
     it was told to discount.
     """
 
-    def distance(rl, gl):
-        # A tuple is one map split into bands: the mean over all its elements.
-        if isinstance(rl, tuple):
-            total = sum(
-                torch.sum(torch.abs(r.float() - g.float())) for r, g in zip(rl, gl)
-            )
-            return total / sum(r.numel() for r in rl)
-        return torch.mean(torch.abs(rl.float() - gl.float()))
+    def l1(r, g):
+        # ``g`` is promoted inside the subtraction rather than copied to FP32
+        # first, and the norm is ``sum |r - g|`` in one pass instead of two.
+        return torch.linalg.vector_norm(r.float() - g, ord=1)
 
     terms = []
     weights = []
     for index, (dr, dg) in enumerate(zip(fmap_r, fmap_g)):
         weight = _branch_weight(branch_weights, index)
         for rl, gl in zip(dr, dg):
-            terms.append(weight * distance(rl, gl))
+            # A tuple is one map split into bands: the mean over all its elements.
+            if isinstance(rl, tuple):
+                total = torch.stack([l1(r, g) for r, g in zip(rl, gl)]).sum()
+                count = sum(r.numel() for r in rl)
+            else:
+                total, count = l1(rl, gl), rl.numel()
+            terms.append(total * (weight / count))
             weights.append(weight)
     if not terms:
         first = fmap_r[0][0]
         device = (first[0] if isinstance(first, tuple) else first).device
         return torch.zeros((), device=device)
-    loss = sum(terms)
+    # One reduction, not a chain of scalar adds -- there is a term per map.
+    loss = torch.stack(terms).sum()
     if not normalize:
         return loss
     # The weighted analogue of dividing by the term count: with the default

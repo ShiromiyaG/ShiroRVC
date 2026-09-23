@@ -43,14 +43,26 @@ class ResBlock(torch.nn.Module):
             [create_conv1d_layer(channels, kernel_size, dilation) for dilation in dilations]
         )
 
-    def forward(self, x: torch.Tensor, x_mask: torch.Tensor = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor = None,
+        activated: torch.Tensor = None,
+    ):
+        """``activated`` is ``leaky_relu(x)`` when the caller already has it:
+        the parallel blocks of a stage all start from the same one."""
         for conv1, conv2 in zip(self.convs1, self.convs2):
             residual = x
-            x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+            if activated is None:
+                x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+            else:
+                x, activated = activated, None
             if x_mask is not None:
                 x = x * x_mask
             x = conv1(x)
-            x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+            # In place on the conv's own output: autograd saves one tensor
+            # here instead of two.
+            x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE, inplace=True)
             if x_mask is not None:
                 x = x * x_mask
             x = conv2(x) + residual

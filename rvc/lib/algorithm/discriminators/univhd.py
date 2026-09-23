@@ -217,10 +217,14 @@ class _HybridConvBlock(torch.nn.Module):
         self.project = norm_f(torch.nn.Conv2d(2 * channels, channels, (1, 1)))
 
     def forward(self, x):
-        separable = self.pointwise(F.leaky_relu(self.depthwise(x), LRELU_SLOPE))
+        # The activations run in place on tensors made just for them: autograd
+        # keeps one per site instead of two.
+        separable = self.pointwise(
+            F.leaky_relu(self.depthwise(x), LRELU_SLOPE, inplace=True)
+        )
         standard = self.standard(x)
         joined = torch.cat([separable, standard], dim=1)
-        return self.project(F.leaky_relu(joined, LRELU_SLOPE))
+        return self.project(F.leaky_relu(joined, LRELU_SLOPE, inplace=True))
 
 
 class _MultiScaleDilatedBlock(torch.nn.Module):
@@ -265,8 +269,11 @@ class _MultiScaleDilatedBlock(torch.nn.Module):
         )
 
     def forward(self, x):
-        scales = sum(conv(x) for conv in self.dilated)
-        return self.down(F.leaky_relu(scales, LRELU_SLOPE))
+        # Not ``sum()``: it starts from ``0 + first``, a whole extra pass.
+        scales = self.dilated[0](x)
+        for conv in self.dilated[1:]:
+            scales = scales + conv(x)
+        return self.down(F.leaky_relu(scales, LRELU_SLOPE, inplace=True))
 
 
 def _strided_size(size: int) -> int:
@@ -371,7 +378,7 @@ class UnivHDDiscriminator(torch.nn.Module):
         x = self.hcb(x)
         fmap.append(x)
         for block in self.mdc:
-            x = F.leaky_relu(block(x), LRELU_SLOPE)
+            x = F.leaky_relu(block(x), LRELU_SLOPE, inplace=True)
             # The paper takes the feature-matching loss from each MDC output,
             # which is what these three entries are.
             fmap.append(x)
