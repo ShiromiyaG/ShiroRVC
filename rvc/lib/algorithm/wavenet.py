@@ -83,7 +83,7 @@ class WaveNet(torch.nn.Module):
             res_skip_layer = torch.nn.utils.parametrizations.weight_norm(res_skip_layer, name="weight")
             self.res_skip_layers.append(res_skip_layer)
 
-        # Set by ``apply_precision_policy`` under BF16: the residual and skip
+        # Set by ``apply_precision_policy`` under AMP: the residual and skip
         # sums stay FP32 so small per-layer updates are not rounded away.
         self.fp32_residuals = False
 

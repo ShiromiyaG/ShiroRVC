@@ -255,8 +255,8 @@ preview_posterior_noise_scale = float(
 )
 
 # Default: FP32 + TF32, no autocast/scaler. ``fp16`` autocasts with a
-# GradScaler.  ``bf16`` needs no scaler, but its mantissa is shorter, so
-# ``apply_precision_policy`` keeps the paths where rounding accumulates in FP32.
+# GradScaler.  ``bf16`` needs no scaler.  Under either, ``apply_precision_policy``
+# keeps the paths where values accumulate in FP32.
 AMP_DTYPES = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
 if precision not in AMP_DTYPES:
     raise ValueError(

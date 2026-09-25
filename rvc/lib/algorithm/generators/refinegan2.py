@@ -246,7 +246,7 @@ class ResBlock(nn.Module):
         )
         self.convs2.apply(init_weights)
 
-        # Set by ``apply_precision_policy`` under BF16: an FP32 stream keeps an
+        # Set by ``apply_precision_policy`` under AMP: an FP32 stream keeps an
         # update smaller than BF16's rounding step from being lost in the sum.
         self.fp32_residuals = False
 
@@ -1031,7 +1031,7 @@ class RefineGAN2Generator(nn.Module):
 
         self.out_tanh = nn.Tanh()
 
-        # Set by ``apply_precision_policy`` under BF16: the excitation, the
+        # Set by ``apply_precision_policy`` under AMP: the excitation, the
         # upsampling filters and the output layer then run in FP32.
         self.fp32_residuals = False
 

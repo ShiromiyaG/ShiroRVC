@@ -173,12 +173,13 @@ def setup_models_for_training(net_g, net_d, device, device_id, n_gpus):
 
 
 def apply_precision_policy(net_g, amp_dtype):
-    """Under BF16 autocast, keep the generator's precision-critical paths in FP32.
+    """Under autocast, keep the generator's precision-critical paths in FP32.
 
-    Sets ``fp32_residuals`` on every module that declares it.  Must run before
-    the compile: Dynamo guards on the attribute.
+    BF16 needs it for mantissa, FP16 for range.  Sets ``fp32_residuals`` on
+    every module that declares it.  Must run before the compile: Dynamo guards
+    on the attribute.
     """
-    enabled = amp_dtype == torch.bfloat16
+    enabled = amp_dtype in (torch.bfloat16, torch.float16)
     model = net_g.module if hasattr(net_g, "module") else net_g
     for module in model.modules():
         if hasattr(module, "fp32_residuals"):
