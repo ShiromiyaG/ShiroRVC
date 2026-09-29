@@ -31,6 +31,16 @@ from rvc.train.messages import (
 from rvc.train.optimizers import _make_optimizer
 
 
+def loader_workers(requested: int) -> int:
+    """``requested`` DataLoader workers, capped at the CPUs this process may
+    use, the limit PyTorch warns past (Colab has 2)."""
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available = os.cpu_count() or 1
+    return max(0, min(int(requested), available))
+
+
 def _inductor_cache_dir():
     """One Inductor cache for the whole fork, under ``logs/``.
 

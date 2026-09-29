@@ -50,6 +50,7 @@ from rvc.rectified.previews import RectifiedPreviews
 from rvc.rectified.vocoder import load_vocoder
 from rvc.train.ema import WeightEMA
 from rvc.train.progress import EpochRecorder, emit_machine_progress
+from rvc.train.setup import loader_workers
 from rvc.train.stop import finish_stop, install_stop_handlers, uninterruptible_save
 
 TAG = "[FLOW]"
@@ -163,7 +164,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         raise ValueError(
             f"{len(dataset)} clips is fewer than one batch of {batch_size} on each of {ranks.world} GPU(s)."
         )
-    workers = min(int(settings.get("num_workers", 4)), os.cpu_count() or 1)
+    workers = loader_workers(settings.get("num_workers", 4))
     # Every batch padded to the crop length, one shape for the compiled backbone.
     collate = partial(collate_flow, frames=segment)
     sampler = ranks.sampler(dataset)

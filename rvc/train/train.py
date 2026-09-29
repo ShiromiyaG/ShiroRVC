@@ -89,6 +89,7 @@ from rvc.train.setup import (
     get_d_model,
     get_g_model,
     get_optimizers,
+    loader_workers,
     normalize_san_weights,
     setup_models_for_training,
 )
@@ -635,7 +636,7 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
     )
     train_loader = DataLoader(
         train_dataset,
-        num_workers=4,
+        num_workers=loader_workers(4),
         shuffle=False,
         pin_memory=True,
         collate_fn=collate_fn,

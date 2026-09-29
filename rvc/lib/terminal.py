@@ -399,10 +399,12 @@ def _progress_columns(*, download: bool = False, training: bool = False):
 _TASK_LINE_INTERVAL = 0.5
 
 
-def _reports_to_a_pipe() -> bool:
-    """Whether output goes somewhere Rich's live bar cannot draw."""
+def reports_to_a_pipe() -> bool:
+    """Whether Rich's live bar cannot draw, so progress needs printed lines.
+    Asks the console rather than stdout: on Colab stdout is a pipe, but the
+    console is forced to a terminal and draws the bar."""
     try:
-        return not sys.stdout.isatty()
+        return not get_console().is_terminal
     except (AttributeError, ValueError):
         return False
 
@@ -475,7 +477,7 @@ def create_progress(
 ) -> Progress:
     return _ReportingProgress(
         *_progress_columns(download=download, training=training),
-        report=not disable and not training and _reports_to_a_pipe(),
+        report=not disable and not training and reports_to_a_pipe(),
         console=get_console(),
         refresh_per_second=10,
         transient=not leave,

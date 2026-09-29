@@ -96,10 +96,10 @@ def test_the_trainer_still_emits_this_format():
         assert field in template, f"the trainer stopped emitting {field}"
 
 
-def test_only_prints_when_stdout_is_not_a_terminal():
-    """An interactive run must keep seeing only rich's bar."""
+def test_only_prints_when_rich_draws_no_bar():
+    """An interactive run, or Colab's forced terminal, must keep seeing only rich's bar."""
     source = (ROOT / "rvc" / "train" / "progress.py").read_text(encoding="utf-8")
-    assert re.search(r"sys\.stdout\.isatty\(\)", source), (
+    assert re.search(r"reports_to_a_pipe\(\)", source), (
         "the progress line would flood an interactive terminal"
     )
 

@@ -48,7 +48,12 @@ from rvc.train.losses import discriminator_loss, feature_loss, generator_loss, l
 from rvc.train.mel_processing import build_ms_mel_loss
 from rvc.train.progress import EpochRecorder, emit_machine_progress
 from rvc.train.schedules import prepare_schedulers
-from rvc.train.setup import apply_precision_policy, enable_discriminator_compile, normalize_san_weights
+from rvc.train.setup import (
+    apply_precision_policy,
+    enable_discriminator_compile,
+    loader_workers,
+    normalize_san_weights,
+)
 from rvc.train.stop import finish_stop, install_stop_handlers, uninterruptible_save
 
 TAG = "[VOCODER]"
@@ -116,7 +121,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         raise ValueError(
             f"{len(dataset)} clips is fewer than one batch of {batch_size} on each of {ranks.world} GPU(s)."
         )
-    workers = min(4, os.cpu_count() or 1)
+    workers = loader_workers(4)
     sampler = ranks.sampler(dataset)
     loader = DataLoader(
         dataset,

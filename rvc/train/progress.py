@@ -1,9 +1,10 @@
 """Progress reporting: per-epoch timing, and the line a GUI front-end parses."""
 
 import datetime
-import sys
 
 from time import time as ttime
+
+from rvc.lib.terminal import reports_to_a_pipe
 
 
 class EpochRecorder:
@@ -37,17 +38,12 @@ _last_machine_progress = 0.0
 def emit_machine_progress(
     epoch, total_epochs, batch, total_batches, step, metrics, rank
 ):
-    """Print one parseable progress line for a GUI front-end, when stdout isn't
-    a terminal (Rich's bar renders nothing there). Throttled by wall clock
-    rather than batch count, since batch rate varies widely by configuration.
+    """Print one parseable progress line for a GUI front-end, when Rich's bar
+    is not drawn. Throttled by wall clock rather than batch count, since batch
+    rate varies widely by configuration.
     """
     global _last_machine_progress
-    if rank != 0:
-        return
-    try:
-        if sys.stdout.isatty():
-            return
-    except (AttributeError, ValueError):
+    if rank != 0 or not reports_to_a_pipe():
         return
 
     now = ttime()
