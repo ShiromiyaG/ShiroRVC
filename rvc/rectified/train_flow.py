@@ -235,7 +235,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         ema.reseed(model)
         starting_point = f"fine-tune from {os.path.basename(spec['pretrained_flow'])}"
 
-    writer = SummaryWriter(out_dir) if main_rank else None
+    writer = SummaryWriter(os.path.join(out_dir, "eval")) if main_rank else None
     previews = RectifiedPreviews(out_dir, config, step, device) if main_rank else None
     reference = dataset.reference() if main_rank else None
     # A fine-tune is short, so it previews more often; experiments whose config

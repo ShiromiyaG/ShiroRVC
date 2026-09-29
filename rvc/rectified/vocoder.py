@@ -10,13 +10,14 @@ MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_f
 
 
 #: Upsampler filters for the 44.1 kHz layout's five stages, ``[4, 4, 4, 4, 2]``.
-#: RefineGAN2's four-stage defaults extended on their own reasoning: the first
+#: RefineGAN2's four-stage widths extended on their own reasoning: the first
 #: stage short, where a long kernel reaches furthest into the padded edge, the
-#: later ones long; the last repeats the one before it. The config's
+#: later ones long; the last repeats the one before it. Rolloffs as
+#: ``nsf_bigvgan.UPSAMPLE_ROLLOFF``, with no image above Nyquist. The config's
 #: ``filter_width``, ``rolloff`` and ``filter_beta`` override them, and another
 #: stage count keeps the generator's own (the older ``[5, 4, 4, 4]`` exports).
 FILTER_WIDTH = (12, 24, 32, 48, 48)
-ROLLOFF = (0.90, 0.95, 0.97, 0.97, 0.97)
+ROLLOFF = (0.84, 0.92, 0.94, 0.94, 0.94)
 FILTER_BETA = (6.0, 6.0, 6.0, 9.0, 9.0)
 
 
@@ -46,8 +47,12 @@ def build_vocoder(config: dict) -> NSFBigVGANGenerator:
         source_noise_std=model["source_noise_std"],
         source_harmonics=model["source_harmonics"],
         source_branch=model["source_branch"],
+        source_type=model.get("source_type", "sine"),
         source_random_start_phase=model.get("source_random_start_phase", True),
         output_gain=model["output_gain"],
+        stage_channels=model.get("stage_channels"),
+        prenet_blocks=model.get("prenet_blocks", 0),
+        deep_source_stages=model.get("deep_source_stages", 0),
         **filters,
     )
 

@@ -16,7 +16,6 @@ from rvc.lib.algorithm.commons import expand_f0, get_padding, init_weights
 from rvc.lib.algorithm.generators.refinegan2 import (
     DC_WINDOW_SECONDS,
     DEFAULT_UPSAMPLE_BETA,
-    DEFAULT_UPSAMPLE_ROLLOFF,
     DEFAULT_UPSAMPLE_WIDTH,
     SOURCE_GAIN_KERNEL,
     SineGenerator,
@@ -44,12 +43,46 @@ except ImportError:
 
 #: Decimation filter that brings the excitation down to each stage's rate.
 #: With hundreds of partials in the source, a strided conv would fold them.
-SOURCE_DECIMATION = dict(width=12, rolloff=0.88, filter_beta=6.0)
+#: Long enough that the stopband (~80 dB) starts just below the new Nyquist,
+#: since the PCPH source has full power up to the old one.
+SOURCE_DECIMATION = dict(width=24, rolloff=0.88, filter_beta=8.0)
 
 #: Channels of the rectified source branch at the output rate; doubled per
 #: stage on the way down, as RefineGAN2's ``start_channels``.
 SOURCE_BRANCH_CHANNELS = 16
 SOURCE_BRANCH_SLOPE = 0.1
+
+#: Round trip of the deep source's rectifiers. Three in series at the default
+#: width 16 put 21 kHz at -12.5 dB; width 32 keeps it at -2.9. Rolloff low
+#: enough that the stopband starts at Nyquist: at 1.0 the transition band
+#: straddles it, and with the PCPH source's energy there training diverged.
+DEEP_SOURCE_ACTIVATION = dict(filter_width=64, rolloff=0.97)
+
+#: Hidden width of a pre-net block, in multiples of its channels.
+PRENET_EXPANSION = 3
+
+#: RefineGAN2's upsampler widths and betas with each rolloff lowered until the
+#: stopband starts at the input's Nyquist, so no image lands just above it.
+UPSAMPLE_ROLLOFF = (0.84, 0.92, 0.94, 0.94)
+
+#: SnakeBeta's round trip, 65 taps as the fused kernel takes: the stopband
+#: starts at the stage's Nyquist, so nothing it makes folds into the band.
+SNAKE_ACTIVATION = dict(filter_width=16, rolloff=0.89, filter_beta=5.0)
+#: The output stage may fold into its top band while that stays above this.
+AUDIBLE_LIMIT = 20000.0
+#: Below 1: at 1.0 the PCPH source's energy at Nyquist made training diverge.
+MAX_OUTPUT_ROLLOFF = 0.99
+
+
+def output_design(sample_rate: int, filter_width: int = 16, filter_beta: float = 6.0) -> dict:
+    """A 2x round trip at the output rate whose folds stay above
+    ``AUDIBLE_LIMIT``, or fold nowhere when the rate leaves no room."""
+    attenuation = filter_beta / 0.1102 + 8.7
+    # Kaiser's transition width, as a fraction of Nyquist, halved.
+    half_band = (attenuation - 8.0) / (28.72 * filter_width)
+    audible = 2.0 - AUDIBLE_LIMIT / (sample_rate / 2.0) - half_band
+    rolloff = min(MAX_OUTPUT_ROLLOFF, max(1.0 - half_band, audible))
+    return dict(filter_width=filter_width, rolloff=round(rolloff, 3), filter_beta=filter_beta)
 
 
 class _SnakeBetaFunction(torch.autograd.Function):
@@ -110,11 +143,13 @@ class AntiAliasedSnakeBeta(AntiAliasedActivation):
     Triton.
     """
 
-    def __init__(self, channels: int):
-        super().__init__(SnakeBeta(channels))
+    def __init__(self, channels: int, design: dict = SNAKE_ACTIVATION):
+        super().__init__(SnakeBeta(channels), **design)
+        # The fused kernel's lowpass is fixed at 65 taps.
+        self.fusable = self.design[:2] == (2, 16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if FusedSnakeBeta is None or not x.is_cuda:
+        if FusedSnakeBeta is None or not x.is_cuda or not self.fusable:
             return super().forward(x)
         return FusedSnakeBeta.apply(x, *self._fused_args(x))
 
@@ -138,9 +173,10 @@ class AntiAliasedSnakeBeta(AntiAliasedActivation):
         )
 
 
-def snake_activation(channels: int, antialias: bool = True) -> nn.Module:
+def snake_activation(channels: int, antialias: bool = True,
+                     design: dict = SNAKE_ACTIVATION) -> nn.Module:
     if antialias:
-        return AntiAliasedSnakeBeta(channels)
+        return AntiAliasedSnakeBeta(channels, design)
     return StageRateActivation(SnakeBeta(channels))
 
 
@@ -172,16 +208,17 @@ class AMPBlock(nn.Module):
         dilation: Sequence[int],
         antialias: bool = True,
         pairs: bool = True,
+        design: dict = SNAKE_ACTIVATION,
     ):
         super().__init__()
         self.convs1 = nn.ModuleList([_conv(channels, kernel_size, d) for d in dilation])
         self.acts1 = nn.ModuleList(
-            [snake_activation(channels, antialias) for _ in dilation]
+            [snake_activation(channels, antialias, design) for _ in dilation]
         )
         if pairs:
             self.convs2 = nn.ModuleList([_conv(channels, kernel_size) for _ in dilation])
             self.acts2 = nn.ModuleList(
-                [snake_activation(channels, antialias) for _ in dilation]
+                [snake_activation(channels, antialias, design) for _ in dilation]
             )
 
         # Set by ``apply_precision_policy`` under AMP.
@@ -205,7 +242,7 @@ class AMPBlock(nn.Module):
             FusedResidualSnakeBeta is not None
             and x.is_cuda
             and x.dtype == torch.float32
-            and all(isinstance(act, AntiAliasedSnakeBeta) for act in self.acts1)
+            and all(isinstance(act, AntiAliasedSnakeBeta) and act.fusable for act in self.acts1)
         )
 
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
@@ -220,6 +257,112 @@ class AMPBlock(nn.Module):
             if hasattr(self, "convs2"):
                 y = self.convs2[index](self.acts2[index](y))
         return y + x
+
+
+class PrenetBlock(nn.Module):
+    """ConvNeXt block at the mel frame rate, where width is cheap."""
+
+    def __init__(self, channels: int, layer_scale: float):
+        super().__init__()
+        self.depthwise = nn.Conv1d(channels, channels, 7, padding=3, groups=channels)
+        self.norm = nn.LayerNorm(channels)
+        self.up = nn.Linear(channels, channels * PRENET_EXPANSION)
+        self.down = nn.Linear(channels * PRENET_EXPANSION, channels)
+        self.gamma = nn.Parameter(torch.full((channels,), float(layer_scale)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.depthwise(x).transpose(1, 2)
+        y = self.down(F.gelu(self.up(self.norm(y)))) * self.gamma
+        return x + y.transpose(1, 2)
+
+
+def source_conv(in_channels: int, channels: int, deep: bool) -> nn.Module:
+    """The conv that adds a stage's excitation; ``deep`` makes it three convs
+    with oversampled rectifiers between, to shape the excitation at that
+    stage's rate. At the stage rate the rectifiers would fold inharmonically."""
+    if not deep:
+        return nn.Conv1d(in_channels, channels, 7, 1, padding=3)
+    return nn.Sequential(
+        nn.Conv1d(in_channels, channels, 7, 1, padding=3),
+        AntiAliasedActivation(leaky_relu_slope=SOURCE_BRANCH_SLOPE, **DEEP_SOURCE_ACTIVATION),
+        nn.Conv1d(channels, channels, 7, 1, padding=3),
+        AntiAliasedActivation(leaky_relu_slope=SOURCE_BRANCH_SLOPE, **DEEP_SOURCE_ACTIVATION),
+        nn.Conv1d(channels, channels, 7, 1, padding=3),
+    )
+
+
+class PCPHSource(nn.Module):
+    """Pseudo-constant-power harmonic excitation, Wavehax's PCPH prior.
+
+    Every harmonic up to Nyquist, each at ``k`` times the fundamental's phase,
+    so they add up to one band-limited pulse per period; the sine source's
+    per-partial random phases leave the high band unpulsed. The amplitude
+    ``sine_amp * sqrt(2 / n)`` keeps the sum's power at ``sine_amp**2`` for
+    any f0. The harmonics below ``1 - NYQUIST_TAPER`` of Nyquist are summed in
+    closed form; the ones above fade out one by one, as ``SineGenerator``'s do,
+    so f0 crossing a harmonic boundary does not click. Noise as the sine
+    source's: ``noise_std`` in voiced samples, ``sine_amp / 3`` in unvoiced.
+    Owns no state-dict key.
+    """
+
+    NYQUIST_TAPER = SineGenerator.NYQUIST_TAPER
+
+    def __init__(self, samp_rate, sine_amp=0.1, noise_std=0.003, voiced_threshold=0,
+                 random_start_phase=False):
+        super().__init__()
+        self.sampling_rate = samp_rate
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.voiced_threshold = voiced_threshold
+        self.random_start_phase = bool(random_start_phase)
+
+    @torch.compiler.disable  # the sample-axis cumsum, as ``SineGenerator._phase``
+    def _phase(self, f0):
+        """The fundamental's phase in cycles, float64, (batch, length)."""
+        phase = torch.cumsum(f0.double() / self.sampling_rate, dim=-1)
+        if self.random_start_phase and self.training:
+            phase = phase + torch.rand(phase.shape[0], 1, device=phase.device, dtype=phase.dtype)
+        return phase % 1.0
+
+    @staticmethod
+    def _sine_sum(phase, count):
+        """``sum_{k=1..count} sin(2 pi k phase)`` by the Dirichlet identity.
+        The angles are reduced in float64: ``count`` reaches hundreds."""
+        half = phase * 0.5
+        numerator = torch.sin(2 * np.pi * ((count * half) % 1.0)).float() * torch.sin(
+            2 * np.pi * (((count + 1) * half) % 1.0)
+        ).float()
+        denominator = torch.sin(np.pi * phase).float()
+        safe = denominator.abs() > 1e-6
+        return torch.where(safe, numerator / torch.where(safe, denominator, 1.0), 0.0)
+
+    def forward(self, f0, gain=None):
+        """f0: (batch, length, 1) in Hz. Returns (batch, length, 1)."""
+        if gain is not None:
+            raise ValueError("PCPHSource takes no source gain.")
+        with torch.no_grad():
+            f0 = f0[..., 0]
+            uv = (f0 > self.voiced_threshold).float()
+            nyquist = self.sampling_rate / 2.0
+            taper = nyquist * self.NYQUIST_TAPER
+            safe_f0 = torch.where(uv > 0, f0, nyquist).double()
+            phase = self._phase(torch.where(uv > 0, f0, 0.0))
+
+            full = torch.floor((nyquist - taper) / safe_f0)
+            harmonics = self._sine_sum(phase, full)
+            power = full.float()
+            # Harmonics in the top band, faded by their own frequency.
+            voiced_f0 = f0[uv > 0]
+            fading = int(np.ceil(taper / voiced_f0.min().item())) + 1 if voiced_f0.numel() else 0
+            for offset in range(1, fading + 1):
+                order = full + offset
+                fade = ((nyquist - order * safe_f0) / taper).clamp(0.0, 1.0).float()
+                harmonics = harmonics + fade * torch.sin(2 * np.pi * ((order * phase) % 1.0)).float()
+                power = power + fade.square()
+
+            harmonics = harmonics * self.sine_amp * torch.sqrt(2.0 / power.clamp(min=1.0)) * uv
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            return (harmonics + noise_amp * torch.randn_like(uv)).unsqueeze(-1)
 
 
 class NSFBigVGANGenerator(nn.Module):
@@ -246,6 +389,11 @@ class NSFBigVGANGenerator(nn.Module):
             phases for the partials; see ``SineGenerator``.
         source_phase_jitter (float, optional): Per-call spread of the
             coherent phases, in cycles.
+        source_type (str, optional): ``sine``, the NSF sine source the
+            ``source_harmonics``/``source_tilt``/``source_phase`` options
+            shape, or ``pcph``, ``PCPHSource``: every harmonic to Nyquist,
+            phase-locked, at constant power. PCPH takes none of those options
+            nor ``source_gain``.
         source_branch (str, optional): ``linear`` adds the one-channel
             excitation to every stage through a conv. ``rectified`` runs it
             through a conv and an oversampled ``leaky_relu`` at the output
@@ -264,6 +412,12 @@ class NSFBigVGANGenerator(nn.Module):
             activations, per stage. The work is proportional to channels x
             rate, which doubles every stage, so the last stage is about half
             of it and the first two about a fifth.
+        stage_channels (sequence of int, optional): Width of each stage;
+            ``None`` halves ``upsample_initial_channel`` at every stage.
+        prenet_blocks (int, optional): ConvNeXt blocks after ``conv_pre``, at
+            the mel frame rate.
+        deep_source_stages (int, optional): How many of the last stages add
+            the excitation through three convs instead of one.
     """
 
     def __init__(
@@ -280,7 +434,7 @@ class NSFBigVGANGenerator(nn.Module):
         gin_channels: int = 256,
         checkpointing: bool = False,
         filter_width: "int | Sequence[int]" = DEFAULT_UPSAMPLE_WIDTH,
-        rolloff: "float | Sequence[float]" = DEFAULT_UPSAMPLE_ROLLOFF,
+        rolloff: "float | Sequence[float]" = UPSAMPLE_ROLLOFF,
         filter_beta: "float | Sequence[float]" = DEFAULT_UPSAMPLE_BETA,
         source_gain: bool = False,
         source_noise_std: float = 0.003,
@@ -289,8 +443,12 @@ class NSFBigVGANGenerator(nn.Module):
         source_phase: str = "random",
         source_phase_jitter: float = 0.0,
         source_branch: str = "linear",
+        source_type: str = "sine",
         source_random_start_phase: bool = False,
         output_gain: bool = False,
+        stage_channels: "Sequence[int] | None" = None,
+        prenet_blocks: int = 0,
+        deep_source_stages: int = 0,
     ):
         super().__init__()
         self.sample_rate = int(sample_rate)
@@ -301,6 +459,21 @@ class NSFBigVGANGenerator(nn.Module):
         self.num_kernels = len(resblock_kernel_sizes)
 
         count = len(self.upsample_rates)
+        if stage_channels is None:
+            stage_channels = [
+                int(upsample_initial_channel) // 2 ** (stage + 1) for stage in range(count)
+            ]
+        stage_channels = [int(value) for value in stage_channels]
+        if len(stage_channels) != count:
+            raise ValueError(
+                f"stage_channels has {len(stage_channels)} entries for {count} stages."
+            )
+        deep_source_stages = int(deep_source_stages)
+        if not 0 <= deep_source_stages <= count:
+            raise ValueError(
+                f"deep_source_stages must be between 0 and {count}, received {deep_source_stages}."
+            )
+        self.deep_source_from = count - deep_source_stages
         if str(resblock) not in ("1", "2"):
             raise ValueError(f"resblock must be '1' or '2', received {resblock!r}.")
         if isinstance(antialias, bool):
@@ -317,20 +490,36 @@ class NSFBigVGANGenerator(nn.Module):
         self.filter_beta = filter_schedule(filter_beta, count, "filter_beta", 0.0)
 
         # Read by the checkpoint guards in ``rvc/train/checkpoints.py``.
-        self.source_type = "sine"
+        self.source_type = str(source_type)
         self.source_harmonics = int(source_harmonics)
         self.source_tilt = float(source_tilt)
         self.source_phase = str(source_phase)
         self.source_phase_jitter = float(source_phase_jitter)
-        self.m_source = SineGenerator(
-            self.sample_rate,
-            harmonic_num=self.source_harmonics,
-            noise_std=float(source_noise_std),
-            harmonic_tilt=self.source_tilt,
-            harmonic_phase=self.source_phase,
-            phase_jitter=self.source_phase_jitter,
-            random_start_phase=source_random_start_phase,
-        )
+        if self.source_type == "pcph":
+            if source_gain or self.source_harmonics or self.source_phase != "random" \
+                    or self.source_phase_jitter:
+                raise ValueError(
+                    "source_type 'pcph' has every harmonic, phase-locked, at a fixed "
+                    "level; source_gain, source_harmonics, source_phase and "
+                    "source_phase_jitter are the sine source's."
+                )
+            self.m_source = PCPHSource(
+                self.sample_rate,
+                noise_std=float(source_noise_std),
+                random_start_phase=source_random_start_phase,
+            )
+        elif self.source_type == "sine":
+            self.m_source = SineGenerator(
+                self.sample_rate,
+                harmonic_num=self.source_harmonics,
+                noise_std=float(source_noise_std),
+                harmonic_tilt=self.source_tilt,
+                harmonic_phase=self.source_phase,
+                phase_jitter=self.source_phase_jitter,
+                random_start_phase=source_random_start_phase,
+            )
+        else:
+            raise ValueError(f"source_type must be 'sine' or 'pcph', not {source_type!r}.")
 
         # Output-rate excitation -> each earlier stage's rate, last stage first.
         self.source_downs = nn.ModuleList(
@@ -354,7 +543,8 @@ class NSFBigVGANGenerator(nn.Module):
                 nn.Conv1d(1, SOURCE_BRANCH_CHANNELS, 7, 1, padding=3)
             )
             self.source_act = AntiAliasedActivation(
-                leaky_relu_slope=SOURCE_BRANCH_SLOPE
+                leaky_relu_slope=SOURCE_BRANCH_SLOPE,
+                **output_design(self.sample_rate),
             )
             self.source_blocks = nn.ModuleList(
                 [
@@ -401,14 +591,22 @@ class NSFBigVGANGenerator(nn.Module):
         self.conv_pre = weight_norm(nn.Conv1d(num_mels, channels, 7, 1, padding=3))
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, channels, 1)
+        self.prenet = (
+            nn.Sequential(
+                *[PrenetBlock(channels, 1.0 / prenet_blocks) for _ in range(prenet_blocks)]
+            )
+            if prenet_blocks > 0
+            else None
+        )
 
+        output_snake = output_design(self.sample_rate)
         self.projections = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.source_convs = nn.ModuleList()
         self.resblocks = nn.ModuleList()
         for stage, rate in enumerate(self.upsample_rates):
-            new_channels = channels // 2
-            # Halving the channels before the upsampler keeps the conv at the
+            new_channels = stage_channels[stage]
+            # Narrowing the channels before the upsampler keeps the conv at the
             # input rate, where it costs 1/rate of the same conv after it.
             self.projections.append(
                 weight_norm(nn.Conv1d(channels, new_channels, 7, 1, padding=3))
@@ -422,7 +620,11 @@ class NSFBigVGANGenerator(nn.Module):
                 )
             )
             self.source_convs.append(
-                nn.Conv1d(source_channels[stage], new_channels, 7, 1, padding=3)
+                source_conv(
+                    source_channels[stage],
+                    new_channels,
+                    deep=stage >= count - deep_source_stages,
+                )
             )
             for kernel, dilation in zip(resblock_kernel_sizes, resblock_dilation_sizes):
                 self.resblocks.append(
@@ -432,12 +634,17 @@ class NSFBigVGANGenerator(nn.Module):
                         dilation,
                         antialias=antialias[stage],
                         pairs=str(resblock) == "1",
+                        design=output_snake if stage == count - 1 else SNAKE_ACTIVATION,
                     )
                 )
             channels = new_channels
         self.projections.apply(init_weights)
 
-        self.activation_post = snake_activation(channels, antialias[-1])
+        # No skip around these two, so their lowpass is the output's band: long
+        # filters, unfused, to keep it flat close to Nyquist.
+        final = output_design(self.sample_rate, filter_width=64, filter_beta=8.0)
+        self.activation_post = snake_activation(channels, antialias[-1], final)
+        self.output_act = AntiAliasedActivation(nn.Tanh(), **final)
         # Unit norm, not weight norm: a learned output gain took 99% of the
         # generator's gradient in the first pretrain, as it did in RefineGAN2.
         self.conv_post = nn.Conv1d(channels, 1, 7, 1, padding=3, bias=False)
@@ -492,6 +699,13 @@ class NSFBigVGANGenerator(nn.Module):
         with self._fp32_region(x):
             return self.ups[stage](self._fp32(x))
 
+    def _add_source(self, stage: int, source: torch.Tensor) -> torch.Tensor:
+        # A deep source filters in its rectifiers, and the filters stay in FP32.
+        if stage < self.deep_source_from:
+            return self.source_convs[stage](source)
+        with self._fp32_region(source):
+            return self.source_convs[stage](self._fp32(source))
+
     def forward(self, x: torch.Tensor, f0: torch.Tensor, g: torch.Tensor = None):
         if f0.dim() == 2:
             f0 = f0.unsqueeze(1)
@@ -500,6 +714,8 @@ class NSFBigVGANGenerator(nn.Module):
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
+        if self.prenet is not None:
+            x = self.prenet(x)
 
         checkpointed = self.training and self.checkpointing
         for stage in range(len(self.upsample_rates)):
@@ -507,7 +723,7 @@ class NSFBigVGANGenerator(nn.Module):
                 x = checkpoint(self._upsample, stage, x, use_reentrant=False)
             else:
                 x = self._upsample(stage, x)
-            x = x + self.source_convs[stage](sources[stage])
+            x = x + self._add_source(stage, sources[stage])
 
             blocks = self.resblocks[
                 stage * self.num_kernels : (stage + 1) * self.num_kernels
@@ -529,7 +745,8 @@ class NSFBigVGANGenerator(nn.Module):
             x = remove_dc(x, self.dc_window)
             # Not v2's clamp: with no gain on ``conv_post`` the output starts
             # past 1, and a saturated clamp passes no gradient to the trunk.
-            return torch.tanh(x)
+            # Oversampled, since its odd harmonics would fold at this rate.
+            return self.output_act(x)
 
     def remove_weight_norm(self) -> None:
         for module in list(self.modules()):

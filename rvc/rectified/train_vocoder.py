@@ -6,6 +6,7 @@ Usage: python rvc/rectified/train_vocoder.py <spec.json>
 import json
 import math
 import os
+import random
 import sys
 from collections import defaultdict, deque
 from contextlib import nullcontext
@@ -97,6 +98,11 @@ def train(ranks: Ranks, spec_path: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     device = ranks.device
+    seed = settings.get("seed")
+    if seed is not None:
+        # Offset per rank, as ``Ranks.setup`` does; rank 0 keeps the seed.
+        random.seed(int(seed) + ranks.rank)
+        torch.manual_seed(int(seed) + ranks.rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -225,7 +231,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     # R1's squared input gradient can underflow in FP16, so it runs in FP32 there.
     r1_dtype = amp_dtype if amp_dtype == torch.bfloat16 else None
 
-    writer = SummaryWriter(out_dir) if main_rank else None
+    writer = SummaryWriter(os.path.join(out_dir, "eval")) if main_rank else None
     previews = RectifiedPreviews(out_dir, config, step, device) if main_rank else None
     reference = dataset.reference() if main_rank else None
     total_epochs = int(spec["total_epochs"])
@@ -244,6 +250,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Epochs", f"{epoch} -> {total_epochs}, saving every {save_every}"),
                 ("Starting point", starting_point),
                 ("PRECISION", precision_label(amp_dtype)),
+                ("Seed", "random" if seed is None else int(seed)),
                 ("Device", (torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU")
                            + (f" x {ranks.world} GPUs" if ranks.world > 1 else "")),
                 ("Optimizer", f"AdamW, lr {settings['learning_rate']:g}, {lr_scheduler} {settings['lr_decay']}"

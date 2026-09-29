@@ -20,31 +20,40 @@
         "c_mel": 45.0,
         "c_fm": 2.0,
         "ema_decay": 0.999,
+        "seed": 1234,
         "compile_discriminator": false,
         "rolling_loss_steps": 50,
         "preview_interval": 500,
         "model": {
             "upsample_rates": [4, 4, 4, 4, 2],
             "upsample_initial_channel": 512,
+            "prenet_blocks": 0,
+            "deep_source_stages": 0,
             "resblock": "2",
             "resblock_kernel_sizes": [3, 7, 11],
             "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
             "antialias": [true, true, true, true, true],
             "source_harmonics": 0,
+            "source_type": "pcph",
             "source_noise_std": 0.001,
-            "source_branch": "rectified",
+            "source_branch": "linear",
             "source_random_start_phase": true,
             "output_gain": true
         },
         "discriminator": {
             "use_spectral_norm": false,
             "d_version": "v3",
+            "d_periods": [2, 7, 11, 13, 23],
             "d_use_univhd": true,
             "d_mrd_mel_cond": false,
             "d_mrd_mel_cond_warmup": 0,
             "d_use_san": true,
             "d_use_msd": false,
-            "d_use_fast_mpd": false
+            "d_use_fast_mpd": false,
+            "d_r1_gamma": 0,
+            "d_r1_interval": 16,
+            "d_r1_batch_fraction": 0.5,
+            "d_r1_segment": 8704
         }
     },
     "flow": {

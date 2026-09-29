@@ -241,14 +241,16 @@ class LYNXNet2Block(nn.Module):
     def forward(self, x, mask, embedding=None):
         """``x`` [B, T, C], ``mask`` [B, T, 1], ``embedding`` [B, 1, C]."""
         y = self.norm(x)
-        gate = 1.0
+        gate = None
         if self.modulation is not None:
             shift, scale, gate = self.modulation(F.silu(embedding)).chunk(3, dim=-1)
-            y = y * (1.0 + scale) + shift
-            gate = 1.0 + gate
+            # Not ``1 + scale``: in BF16 that rounds modulations under ~0.004 to nothing.
+            y = y + y * scale + shift
         y = self.depthwise((y * mask).transpose(1, 2)).transpose(1, 2)
         y = self.down(atan_glu(self.mid(atan_glu(self.up(y)))))
-        return (x + gate * y) * mask
+        if gate is not None:
+            y = y + gate * y
+        return (x + y) * mask
 
 
 class LYNXNet2Backbone(nn.Module):
@@ -280,7 +282,11 @@ class LYNXNet2Backbone(nn.Module):
     def forward(self, x, t, cond, mask, voice=None):
         time = self.time_mlp(timestep_embedding(t, self.channels))[:, None, :]
         frame_mask = mask.transpose(1, 2)
-        h = self.input(x.transpose(1, 2)) + self.input_cond(cond).transpose(1, 2) + time
+        # Full precision in, which also keeps the residual stream in FP32: at
+        # late t the leftover noise is smaller than BF16's step on x_t.
+        with torch.autocast(x.device.type, enabled=False):
+            h = self.input(x.transpose(1, 2).to(self.input.weight.dtype))
+        h = h + self.input_cond(cond).transpose(1, 2) + time
         h = h * frame_mask
         embedding = None
         if self.voice is not None:
