@@ -126,7 +126,10 @@ class HarmonicFilterBank(torch.nn.Module):
         bins_per_octave: int = 24,
         f_min: float = 80.0,
         half_harmonic: bool = True,
+        max_hz: float = None,
     ):
+        """``max_hz`` zeroes every filter centred above it; shapes are unchanged,
+        so a checkpoint loads either way."""
         super().__init__()
         self.sample_rate = int(sample_rate)
         self.n_fft = int(n_fft)
@@ -152,6 +155,10 @@ class HarmonicFilterBank(torch.nn.Module):
             torch.linspace(0.0, self.sample_rate / 2.0, self.n_fft // 2 + 1),
             persistent=False,
         )
+        self.max_hz = None if max_hz is None else float(max_hz)
+        placed = self.orders[:, None] * self.centers[None, :]
+        keep = placed <= (self.max_hz if self.max_hz is not None else float("inf"))
+        self.register_buffer("keep", keep.float(), persistent=False)
         # ``gamma >= 1`` via ``1 + softplus``, initialised so gamma ~= 1: the
         # constraint is the paper's, and it is one-sided on purpose.  gamma
         # divides the bandwidth, so the bank may sharpen away from the
@@ -177,7 +184,8 @@ class HarmonicFilterBank(torch.nn.Module):
         centers = self.orders[:, None] * self.centers[None, :]
         bandwidth = (ERB_SLOPE * centers + ERB_OFFSET) / self.gamma()
         distance = (self.bin_hz[None, None, :] - centers[..., None]).abs()
-        return torch.clamp(1.0 - 2.0 * distance / bandwidth[..., None], min=0.0)
+        triangles = torch.clamp(1.0 - 2.0 * distance / bandwidth[..., None], min=0.0)
+        return triangles * self.keep[..., None]
 
     def forward(self, magnitude):
         # [B, F, T] -> [B, H, K, T].  One matmul over F, which is why the bank
@@ -300,7 +308,11 @@ class UnivHDDiscriminator(torch.nn.Module):
         half_harmonic: bool = True,
         use_spectral_norm: bool = False,
         use_san: bool = False,
+        max_hz: float = None,
     ):
+        """``max_hz`` blinds the bank above that frequency: the generator's
+        adversarial pull there went against the mel loss, toward less level
+        and more frame-to-frame jitter."""
         super().__init__()
         norm_f = spectral_norm if use_spectral_norm else weight_norm
         self.n_fft = int(n_fft)
@@ -312,6 +324,7 @@ class UnivHDDiscriminator(torch.nn.Module):
             bins_per_octave=bins_per_octave,
             f_min=f_min,
             half_harmonic=half_harmonic,
+            max_hz=max_hz,
         )
         # A real analysis window, unlike ``DiscriminatorR``'s deliberate boxcar:
         # the bank's triangles are only as selective as the bins they read, and

@@ -2,6 +2,30 @@ import math
 import torch
 from typing import List, Optional
 
+#: How content features at 50 Hz reach the 100 Hz frame rate; see
+#: ``upsample_content``.  A model's config names one, ``nearest`` when absent.
+CONTENT_INTERPOLATIONS = ("nearest", "linear")
+
+
+def upsample_content(features: torch.Tensor, mode: str = "nearest") -> torch.Tensor:
+    """Content features ``[frames, channels]`` or ``[batch, frames, channels]``
+    at 50 Hz -> twice the frames.
+
+    ``nearest`` repeats each frame, a step every 20 ms that the direct path
+    renders as high-band jitter.  ``linear`` samples the same positions (a
+    quarter frame either side of each source frame) without the steps.
+    """
+    if mode not in CONTENT_INTERPOLATIONS:
+        raise ValueError(f"content_interpolation must be one of {CONTENT_INTERPOLATIONS}, not {mode!r}.")
+    batched = features.dim() == 3
+    x = (features if batched else features.unsqueeze(0)).transpose(1, 2)
+    if mode == "linear":
+        x = torch.nn.functional.interpolate(x, scale_factor=2, mode="linear", align_corners=False)
+    else:
+        x = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    x = x.transpose(1, 2)
+    return x if batched else x[0]
+
 def strip_parametrizations(module: torch.nn.Module):
     """
     Fold every parametrization (weight norm, spectral norm, ...) into the raw

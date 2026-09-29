@@ -2,13 +2,13 @@
 
 <img src="assets/logo-shirorvc.png" alt="ShiroRVC" width="570" />
 
-# **There still aren't any pretrains for RefineGAN v2.**
-
 **Turn one voice into another — speaking or singing.**
 
-Record yourself, convert it to a voice you have trained, and keep the melody,
-the timing and the emotion of the original performance. Runs on your own
-computer, or on a free cloud GPU.
+ShiroRVC is a voice conversion fork of [Applio](https://github.com/IAHispano/Applio)
+built around a **rectified-flow** voice model: it keeps the melody, timing and
+emotion of the original performance and renders the target voice as a 44.1 kHz
+mel spectrogram, which a separate neural vocoder turns into sound. The classic
+RVC pipeline is still here, side by side.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
@@ -21,17 +21,21 @@ computer, or on a free cloud GPU.
 
 ---
 
-## What you can do with it
+## Why rectified flow
 
-- **Convert a voice** — one file or a whole folder at once. Singing works as
-  well as speech, and you can nudge the pitch curve by hand if a note lands
-  wrong.
-- **Train your own voice** — feed it clean recordings of someone and get a model
-  you can use forever after.
-- **Type and hear it spoken** — text-to-speech routed through any voice you have.
-- **Blend two voices** — mix two models into a third one that sounds like both.
-- **Bring in voices from elsewhere** — paste a link, drop in files you already
-  have, or download ready-made starting points.
+Classic RVC decodes straight to a waveform from a VITS latent, so the voice
+model and the vocoder are one network trained on one dataset. The rectified
+pipeline splits them:
+
+- **A flow model** turns content, pitch, loudness, breathiness and speaker into
+  a mel spectrogram. It is small enough to fine-tune on a few minutes of one
+  voice.
+- **A vocoder** turns that mel into audio. It has no speaker input, so one good
+  vocoder renders every voice model. You do not retrain it per voice.
+
+The mel is OpenVPI SingingVocoders' — 44.1 kHz, hop 512, 128 bins from 40 Hz to
+16 kHz — so their NSF-HiFiGAN releases, `pc-nsf-hifigan` included, work as the
+vocoder out of the box.
 
 ## Getting started
 
@@ -75,7 +79,8 @@ requirements.
 > the project folder, and doing so leaves files your normal user cannot change
 > afterwards.
 
-### Installing into an existing Python environment
+<details>
+<summary><b>Installing into an existing Python environment</b></summary>
 
 Cloud GPU templates (RunPod, Vast.ai, Jupyter images) usually come with their
 own torch. Running `pip install -r requirements.txt` there replaces torch but
@@ -93,36 +98,83 @@ pip install -r requirements.txt
 These are CUDA 13 builds, so the machine needs NVIDIA driver 580 or newer
 (`nvidia-smi` shows the version).
 
+</details>
+
 ## Three ways to use it
 
 All three drive the same engine and share the same `logs/` folder, so a voice
 you train in one shows up immediately in the others.
 
-| | Start it with | Best for |
+| | Start it with | Rectified flow lives in |
 | --- | --- | --- |
-| **Desktop app** | `start-gui.bat` / `start-gui.sh` | Day-to-day use. Waveform editing, live training charts, a graphics-memory meter and a batch queue. If the engine crashes, the window stays up. |
-| **In your browser** | `start-gradio.bat` / `start-gradio.sh` | Reaching it from another machine, or over a tunnel. |
-| **Command line** | `python core.py --help` | Scripting and automation. The other two are built on top of these commands. |
+| **Desktop app** | `start-gui.bat` / `start-gui.sh` | The **Rectified flow** page (`Ctrl+1`), with its own Inference and Training tabs, a live progress card that follows you to other pages, and "save a copy" on the result. |
+| **In your browser** | `start-gradio.bat` / `start-gradio.sh` | The **Rectified** tab. |
+| **Command line** | `python core.py --help` | The `rectified_*` commands. |
+
+Both open on the rectified Inference tab. The classic pipeline sits next to it,
+under **Classic RVC**, with its own Inference and Training tabs.
 
 The desktop app lives entirely in [`gui/`](gui/README.md) and is optional —
 deleting that folder leaves the browser version and the command line working.
+The Colab notebook starts the browser version, **Rectified** tab included.
 
-## Training your own voice
+## Training a rectified-flow voice
 
-Put clean audio in a folder under `assets/datasets/`, then pick it in the
-Training tab.
+Put clean audio in a folder under `assets/datasets/`.
 
 - Keep the recordings consistent — same microphone, same room, same tone.
-- Cut the silence off the start and end, or let **New Automatic** cutting do it
-  for you — it detects voice with a neural VAD rather than a loudness threshold.
 - Twenty clean minutes beats two noisy hours. Quality matters far more than
   quantity.
+- **New Automatic** cutting finds the voice with a neural VAD rather than a
+  loudness threshold, so you don't have to trim silence by hand.
 
-Behind the scenes, preparation writes two copies of your audio: one at full
-quality for training and a smaller one used only to analyse pitch. The app
-offers to delete the smaller copies afterwards, which frees about a third of the
-space. Say yes unless you plan to redo the analysis with different settings —
-that step needs them back.
+Then run the steps in order. In the apps they are numbered; on the command line:
+
+```bash
+python core.py rectified_preprocess --model_name my-voice --dataset_path assets/datasets/my-voice
+python core.py rectified_extract    --model_name my-voice --gpu 0
+python core.py rectified_train_flow --model_name my-voice --gpu 0 \
+    --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec.pth \
+    --vocoder rvc/models/pretraineds/rectified/<vocoder>.pth
+python core.py index                --model_name my-voice   # optional
+```
+
+- **The starting point.** Fine-tuning from a pretrained flow is the normal way
+  to train a voice. A pretrain only fits the content features it was trained on,
+  so in the apps **Pretrained** picks the one for the embedder you extracted with:
+  `pretrain_flow_contentvec.pth` (downloaded on first launch) or
+  `pretrain_flow_spin_v2.pth`, in `rvc/models/pretraineds/rectified/`. A pretrain
+  of the other embedder is refused. Its speakers are replaced by your dataset's.
+  On a single-speaker fine-tune, the time and speaker conditioning stays frozen,
+  so speaker guidance keeps working. Without a pretrained flow, the model trains
+  from scratch, which needs far more data.
+- **The vocoder** you pick renders the audio previews in TensorBoard and is
+  stored in every export, so the inference screens select it for you.
+- **Several GPUs.** Pass them as `0-1` (or `0-1-2-3`), as in the RVC trainer.
+  Each GPU runs its own process under DDP, and **the batch size is per GPU**. A
+  single GPU runs the plain trainer, with no distributed overhead.
+- **Precision.** `fp32`, `fp16` or `bf16`. The desktop app picks a default from
+  your GPU.
+
+Exports land in `logs/<name>/flow/` as `<name>_flow_<epoch>e_<step>s.pth`.
+Training checkpoints (`F_<step>.pth`) sit beside them, so a run resumes where it
+stopped unless you ask for a fresh start. A flow checkpoint is close to 1 GB,
+so **Keep checkpoints** sets how many are written: the latest only, all of
+them, or none. With none, only the exports are saved, and a stopped or crashed
+run starts over instead of resuming.
+
+### Vocoder pretrain
+
+The vocoder is a pretrain, not something you train per voice: it has no speaker
+input, so one pretrain renders every voice model. Build one on a large
+multi-speaker dataset in the **Vocoder Pretrain** tab, or:
+
+```bash
+python core.py rectified_train_vocoder --model_name big-dataset --gpu 0-1 --batch_size 16
+```
+
+It trains NSF-BigVGAN against the same 44.1 kHz mel and writes
+`logs/<name>/vocoder/<name>_vocoder_<epoch>e_<step>s.pth`.
 
 ### Watching it learn
 
@@ -130,11 +182,109 @@ Drag a model folder onto `logs/run_tensorboard_in_model_folder.bat`, or on Linux
 pass it as an argument:
 
 ```bash
-./logs/run_tensorboard_in_model_folder.sh logs/my-model
+./logs/run_tensorboard_in_model_folder.sh logs/my-voice
 ```
 
 Charts open in your browser on port `25565`, reachable from other machines on
-your network.
+your network. A flow run logs its loss, the held-out loss at five flow times,
+gradient and conditioning norms, and audio previews of a reference clip. When
+the vocoder can render it, a preview also includes the reference's real mel
+through the vocoder alone, so you can tell flow errors from vocoder errors.
+
+## Converting with it
+
+Pick a flow model, a vocoder and optionally an index, then an input file:
+
+```bash
+python core.py rectified_infer --input_path in.wav --output_path out.wav \
+    --flow_path logs/my-voice/flow/my-voice_flow_100e_8400s.pth \
+    --vocoder_path rvc/models/pretraineds/rectified/<vocoder>.pth
+```
+
+Everything else has a working default. The controls worth knowing:
+
+| | |
+| --- | --- |
+| **Pitch** | Transpose in semitones, autotune, a median filter against jitter, octave-error folding, and a formant shift apart from the pitch. |
+| **Steps & sampler** | ODE steps from noise to mel (16 by default), Euler or Heun, and a uniform, sway or logit-normal step schedule. |
+| **Speaker guidance** | Classifier-free guidance toward the target voice, with rescale so strong guidance does not oversaturate, and a flow-time window it applies in. |
+| **Content guidance** | Pushes away from a blurred copy of the content for clearer articulation. |
+| **Index** | The same retrieval index as RVC, with neighbour count, sharpness and continuity. |
+| **Silence gate** | Fades the output where the input is silent, which the content encoder would otherwise fill with hiss. |
+
+Long files are converted in 30 s passes with overlapping content context, so
+they need no splitting.
+
+A flow can also come from a model bundle (`.srvc`, made in *Utilities → Model
+Bundles*), with its index inside. The bundle only names the flow's vocoder,
+without storing it. The vocoder is picked for you when a file of that name is
+in `rvc/models/pretraineds/rectified/` or `logs/`.
+
+## Under the hood
+
+<details>
+<summary><b>The rectified-flow voice model</b></summary>
+
+The design follows [OpenVPI DiffSinger](https://github.com/openvpi/DiffSinger)'s
+shallow diffusion, trained as a rectified flow.
+
+- **Conditioning.** ContentVec or SPIN v2 content through a 64-dim noisy
+  bottleneck, which keeps the source speaker out. Pitch as Fourier features,
+  plus a harmonic prior drawn from it on the mel grid. Frame loudness,
+  breathiness from aperiodicity, a 256-dim speaker embedding, and the key shift
+  and speed of the augmentation.
+- **Aux decoder.** A ConvNeXt stack (512 ch × 6) predicts the mel directly. The
+  flow only covers `t ≥ 0.4`, starting from that prediction mixed with noise,
+  so a few steps are enough.
+- **Backbone.** LYNXNet2: 6 depthwise-separable blocks at 1024 channels with a
+  31-tap kernel and ATanGLU. Time and speaker modulate every block (adaLN-Zero,
+  as in RIFT-SVC's DiT).
+- **Training.** Muon for the matrices and AdamW for the rest. Cosine decay to
+  0.1× after a 2k-step warmup, and weight EMA. Key shift of ±5 semitones and
+  time stretch of 0.5–2×, each on 43 % of clips. Speaker dropout for guidance,
+  and 32 held-out clips for the validation curves.
+
+</details>
+
+<details>
+<summary><b>The vocoders</b></summary>
+
+| | **NSF-BigVGAN** (trained here) | **OpenVPI NSF-HiFiGAN** |
+| --- | --- | --- |
+| Where it comes from | Vocoder Pretrain (`rectified_train_vocoder`) | [SingingVocoders](https://github.com/openvpi/SingingVocoders) releases, `pc-nsf-hifigan` included |
+| Generator | SnakeBeta, anti-aliased AMP blocks, `[4, 4, 4, 4, 2]` upsampling, rectified harmonic source | NSF-HiFiGAN, loaded as-is |
+| Discriminator | v3 + UnivHD with SAN | — |
+
+OpenVPI checkpoints (`.ckpt`) and exports load directly. Anything their weights
+do not say is read from a `config.json` beside the file, and the 44.1 kHz release
+defaults fill in the rest. `python rvc/rectified/openvpi.py <checkpoint> <out.pth>`
+converts one to a rectified vocoder export.
+
+</details>
+
+<details>
+<summary><b>The classic RVC pipeline</b></summary>
+
+The **Classic RVC** tabs and the commands (`preprocess`, `extract`, `train`, `infer`,
+`batch_infer`, `tts`, `index`, `model_blender`) work as in Applio, on the VITS
+skeleton (`enc_q` + flow + `c_kl`) with an NSF HiFi-GAN decoder at 32, 40 or
+48 kHz. On top of that:
+
+- Text to speech through any voice, and blending two models into a third.
+- A held-out split that detects overtraining and exports the last good weights.
+- Live TensorBoard diagnostics for KL rate, per-module gradient norms and GAN
+  balance.
+
+<table>
+<tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
+<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v2</code></td></tr>
+<tr><td><b>Optimizers</b></td><td>AdamW · Sched-Free AdamW · Muon · Lion</td></tr>
+<tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel</td></tr>
+<tr><td><b>LR schedulers</b></td><td>exponential decay per step or epoch · cosine annealing · none</td></tr>
+<tr><td><b>Export formats</b></td><td>WAV · MP3 · FLAC · OGG · M4A</td></tr>
+</table>
+
+</details>
 
 ## Language
 
@@ -180,59 +330,25 @@ catalog falls back to English silently rather than raising.
 
 </details>
 
-## Under the hood
-
-<details>
-<summary><b>The voice engines</b></summary>
-
-ShiroRVC ships two vocoders — the part that turns the model's internal
-representation back into sound. Both run on the same VITS skeleton
-(`enc_q` + flow + `c_kl`) and are handed the sliced latent `z`, not a mel.
-
-| | **HiFi-GAN** | **RefineGAN** |
-|---|---|---|
-| Sample rates | 32 / 40 / 48 kHz | 32 kHz |
-| Frontend | Original VITS (flow + posterior) | ← |
-| Generator | NSF HiFi-GAN | Pulse template refined through parallel ResBlocks |
-| Discriminator | MPD + MSD (`v2`) | `v4` + UnivHD |
-| Decoder size | 15.0 M | 13.2 M |
-| Discriminator size | 71.4 M | 39.1 M |
-
-**HiFi-GAN** is the well-tested option inherited from the original RVC, and the
-right choice if you want results that behave predictably.
-
-**RefineGAN** is [Applio](https://github.com/IAHispano/Applio)'s decoder, ported
-unchanged and configured for 32 kHz (`[5, 4, 4, 4]` upsampling against a
-320-sample hop). It works the other way around from HiFi-GAN's NSF:
-instead of upsampling a latent and adding a source, it builds a sine excitation
-at the full rate, downsamples it into a channel pyramid with Kaiser-windowed
-resampling, and refines the latent against that pyramid through parallel
-multi-kernel ResBlocks, concatenating the matching excitation scale at every
-step.
-
-</details>
-
-<details>
-<summary><b>What you can choose from</b></summary>
-
-<table>
-<tr><td><b>Pitch extraction</b></td><td><code>rmvpe</code> · <code>crepe</code> · <code>crepe-tiny</code> · <code>fcpe</code></td></tr>
-<tr><td><b>Content embedders</b></td><td><code>contentvec</code> · <code>spin_v2</code></td></tr>
-<tr><td><b>Optimizers</b></td><td>AdamW · Sched-Free AdamW · Muon · Lion</td></tr>
-<tr><td><b>Spectral losses</b></td><td>L1 mel · multi-scale mel</td></tr>
-<tr><td><b>LR schedulers</b></td><td>exponential decay per step or epoch · cosine annealing · none</td></tr>
-<tr><td><b>Export formats</b></td><td>WAV · MP3 · FLAC · OGG · M4A</td></tr>
-</table>
-
-Training writes live TensorBoard diagnostics for KL rate and per-dimension
-usage, per-module gradient norms, GAN balance and a held-out split that is the
-only signal able to see overtraining.
-
-</details>
-
 ## Credits
 
-- **[Applio](https://github.com/IAHispano/Applio)** - The base for this fork.
+- **[OpenVPI DiffSinger](https://github.com/openvpi/DiffSinger)** — the design
+  the rectified-flow voice model follows: shallow reflow from a ConvNeXt aux
+  decoder, the LYNXNet2 backbone with ATanGLU, key-shift and time-stretch
+  augmentation, smoothed variance curves and the Muon/AdamW split.
+- **[RIFT-SVC](https://github.com/Pur1zumu/RIFT-SVC)** — the rectified-flow
+  singing voice conversion the model draws on: adaLN time-and-speaker
+  modulation of every block, speaker and content guidance with rescale, and
+  freezing the conditioning on a one-speaker fine-tune so speaker guidance
+  survives it.
+- **[OpenVPI SingingVocoders](https://github.com/openvpi/SingingVocoders)** — the
+  44.1 kHz mel the rectified pipeline uses and the NSF-HiFiGAN generator ported
+  to render it, including the pc-nsf-hifigan release.
+- **[BigVGAN](https://github.com/NVIDIA/BigVGAN)** (NVIDIA) — SnakeBeta and the
+  anti-aliased AMP blocks behind the NSF-BigVGAN vocoder.
+- **[Muon](https://kellerjordan.github.io/posts/muon/)** (Keller Jordan) — the
+  Newton-Schulz orthogonalised optimizer.
+- **[Applio](https://github.com/IAHispano/Applio)** — the base for this fork.
 - **[dr87 / spin-for-rvc](https://github.com/dr87/spin-for-rvc)** — the `spin_v2`
   content embedder.
 - **[FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)** (Apache-2.0) — the

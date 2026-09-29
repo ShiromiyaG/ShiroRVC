@@ -38,7 +38,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from rvc.lib.algorithm.commons import strip_parametrizations  # noqa: E402
+from rvc.lib.algorithm.commons import strip_parametrizations, upsample_content  # noqa: E402
 from rvc.lib.algorithm.synthesizers import Synthesizer  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "tools" / "probes"))
@@ -63,9 +63,24 @@ def apply_checkpoint_layout(model_cfg: dict, layout: dict | None) -> dict:
         return model_cfg
     cfg = dict(model_cfg)
     cfg["upsample_rates"] = list(layout["upsample_rates"])
-    for key in ("source_gain", "source_harmonics", "source_tilt"):
+    # Absent in checkpoints written before the option existed, all random.
+    layout = {
+        "source_phase": "random",
+        "source_phase_jitter": 0.0,
+        "source_branch": "linear",
+        **layout,
+    }
+    for key in (
+        "source_gain",
+        "source_harmonics",
+        "source_tilt",
+        "source_phase",
+        "source_phase_jitter",
+        "source_branch",
+    ):
         if key in layout:
-            cfg[f"refinegan2_{key}"] = layout[key]
+            for prefix in ("refinegan2_", "nsf_bigvgan_"):
+                cfg[f"{prefix}{key}"] = layout[key]
     return cfg
 
 
@@ -106,8 +121,10 @@ def build(log_dir: Path, ckpt_path: Path, ema: bool, keep_posterior: bool = Fals
     return net_g, int(data["sample_rate"])
 
 
-def reference_inputs(ref_dir: Path, f0: float | None):
-    phone = np.repeat(np.load(ref_dir / "ref_feats.npy"), 2, axis=0)
+def reference_inputs(ref_dir: Path, f0: float | None, interpolation: str = "nearest"):
+    phone = upsample_content(
+        torch.from_numpy(np.load(ref_dir / "ref_feats.npy")).float(), interpolation
+    ).numpy()
     pitch = np.load(ref_dir / "ref_f0c.npy").astype(np.int64)
     pitchf = np.load(ref_dir / "ref_f0f.npy").astype(np.float32)
     n = min(len(phone), len(pitch), len(pitchf))
@@ -154,7 +171,9 @@ def main() -> None:
         else max(log_dir.glob("G_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
     )
     net_g, sr = build(log_dir, ckpt_path, args.ema)
-    phone, lengths, pitch, pitchf = reference_inputs(Path(args.ref_dir), args.f0)
+    phone, lengths, pitch, pitchf = reference_inputs(
+        Path(args.ref_dir), args.f0, net_g.content_interpolation
+    )
     sid = torch.tensor([args.sid])
 
     source = net_g.dec.m_source

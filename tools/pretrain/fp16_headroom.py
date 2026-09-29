@@ -199,7 +199,11 @@ def main() -> int:
         0.0, min(1.0, float(getattr(config.train, "san_direction_weight", 0.25)))
     )
 
-    dataset = TextAudioLoaderMultiNSFsid(config.data, n_mel_bins=config.model.inter_channels)
+    dataset = TextAudioLoaderMultiNSFsid(
+        config.data,
+        n_mel_bins=config.model.inter_channels,
+        content_interpolation=getattr(config.model, "content_interpolation", "nearest"),
+    )
     collate = TextAudioCollateMultiNSFsid(
         pad_multiple=int(getattr(config.data, "pad_multiple", 32)),
         hop_length=config.data.hop_length,

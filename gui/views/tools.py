@@ -513,7 +513,8 @@ class ToolsPage(Page):
 
         create = Card(
             _("Create a bundle"),
-            _("Combines .pth models, and their indexes, into one compressed .srvc file."),
+            _("Combines .pth models, and their indexes, into one compressed .srvc file. RVC models "
+              "and rectified-flow exports both go in; a flow's vocoder is referenced, not stored."),
             icon="download",
         )
         self.bundle_pths = FileList((".pth",), "Models (*.pth);;All files (*.*)")
@@ -547,7 +548,8 @@ class ToolsPage(Page):
 
         extract = Card(
             _("Extract a bundle"),
-            _("Writes each model back out as <name>/<name>.pth and .index, the layout Applio pairs by name."),
+            _("Writes each RVC model back out as <name>/<name>.pth and .index, the layout Applio pairs "
+              "by name, and each rectified flow as flow/<name>.pth."),
             icon="folder",
         )
         self.bundle_file = PathPicker(filters="Model bundles (*.srvc);;All files (*.*)")

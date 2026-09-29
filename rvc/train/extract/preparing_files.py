@@ -151,9 +151,10 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str,
 def generate_filelist(
     model_path: str, sample_rate: int, include_mutes: int = 5, embedder_model: str = "contentvec", vocoder_arch: str = "hifi"
 ):
-    from rvc.configs.vocoders import normalize_vocoder
+    from rvc.configs.vocoders import RECTIFIED_EXTRACTION, normalize_vocoder
 
-    vocoder_arch = normalize_vocoder(vocoder_arch)
+    if vocoder_arch != RECTIFIED_EXTRACTION:
+        vocoder_arch = normalize_vocoder(vocoder_arch)
     gt_wavs_dir = os.path.join(model_path, "sliced_audios")
     feature_dir = os.path.join(model_path, f"extracted")
 

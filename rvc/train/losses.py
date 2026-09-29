@@ -65,7 +65,7 @@ def feature_loss(fmap_r, fmap_g, normalize=False, branch_weights=None):
     return loss / total if total else loss
 
 
-def loud_crop(real, count, segment):
+def loud_crop(real, count, segment, cond=None, hop=1):
     """One random ``segment``-sample window of ``real``, then its ``count``
     loudest clips.
 
@@ -73,19 +73,30 @@ def loud_crop(real, count, segment):
     window costs proportionally less, and the loudest clips skip mutes, which
     cost the same and say nothing.  ``segment`` 0 keeps the whole clip.
     Neither choice touches the host.
+
+    With ``cond`` (frame-rate features, ``hop`` samples per frame) the window
+    snaps to whole frames, the same window and clips are taken from it, and
+    ``(real, cond)`` is returned.
     """
     real = real.detach()
     length = real.shape[-1]
+    if cond is not None:
+        segment = segment // hop * hop
     if 0 < segment < length:
-        start = int(torch.randint(0, length - segment + 1, ()))
+        start = int(torch.randint(0, (length - segment) // hop + 1, ())) * hop
         real = real[..., start : start + segment]
+        if cond is not None:
+            cond = cond[..., start // hop : (start + segment) // hop]
     if count < real.shape[0]:
         loudness = real.float().square().mean(dim=tuple(range(1, real.dim())))
-        real = real.index_select(0, loudness.topk(count).indices)
-    return real
+        indices = loudness.topk(count).indices
+        real = real.index_select(0, indices)
+        if cond is not None:
+            cond = cond.index_select(0, indices)
+    return real if cond is None else (real, cond.detach())
 
 
-def r1_penalty(discriminator, real, branch, dtype=None):
+def r1_penalty(discriminator, real, branch, dtype=None, cond=None):
     """R1 for one branch: batch mean of ``||d score / d real||^2``,
     differentiable in D's weights.
 
@@ -93,12 +104,12 @@ def r1_penalty(discriminator, real, branch, dtype=None):
     call keeps the double-backward graph, and the VRAM it peaks at, to that
     branch.  ``dtype`` is the autocast type to run under; pass ``bfloat16``
     only -- in FP16 the squared input gradient can underflow, so anything else
-    runs in FP32.
+    runs in FP32.  ``cond`` goes to a mel-conditioned branch.
     """
     real = real.float().requires_grad_(True)
     enabled = dtype == torch.bfloat16
     with torch.autocast(real.device.type, dtype=torch.bfloat16, enabled=enabled):
-        score = discriminator.real_score(real, branch)
+        score = discriminator.real_score(real, branch, cond=cond)
         (grad,) = torch.autograd.grad(score.sum(), real, create_graph=True)
     return grad.float().square().flatten(1).sum(1).mean()
 

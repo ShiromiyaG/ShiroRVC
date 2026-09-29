@@ -91,8 +91,9 @@ def model_bundle_tab():
         gr.Markdown(
             _(
                 "# Model Bundle Maker\n"
-                "Combine one or more RVC `.pth` models into a compressed "
-                "`{extension}` bundle.\n\n"
+                "Combine one or more RVC `.pth` models or rectified-flow exports "
+                "into a compressed `{extension}` bundle. A flow's vocoder is "
+                "referenced by name, not stored.\n\n"
                 "- Speaker names come from the `.pth` filenames.\n"
                 "- Each `.index` goes to the model it is named after: the same "
                 "name, else the model's name without `_<N>e_<N>s` -- "
@@ -153,9 +154,10 @@ def model_bundle_tab():
         gr.Markdown(
             _(
                 "# Extract a bundle\n"
-                "Writes each model back out as `<name>/<name>.pth` and "
+                "Writes each RVC model back out as `<name>/<name>.pth` and "
                 "`<name>.index`, the layout Applio pairs by name. Copy those "
-                "folders into Applio's `logs/`."
+                "folders into Applio's `logs/`. Rectified flows go to "
+                "`flow/<name>.pth`, where the Rectified tab finds them."
             )
         )
         with gr.Row():

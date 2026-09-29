@@ -207,7 +207,9 @@ class MPD_MSD_Combined(torch.nn.Module):
         univhd_f_min: float = 80.0,
         univhd_channels: int = 32,
         univhd_half_harmonic: bool = True,
+        univhd_max_hz: Optional[float] = None,
         univhd_weight: Optional[float] = None,
+        msd_weight: float = DEFAULT_BRANCH_WEIGHT,
         mrd_fp32_input: bool = True,
         mrd_multiband: Optional[bool] = None,
         mrd_channels: int = 32,
@@ -216,8 +218,13 @@ class MPD_MSD_Combined(torch.nn.Module):
         r1_interval: int = 16,
         r1_batch_fraction: float = 0.5,
         r1_segment: int = 6400,
+        mrd_mel_cond: Optional[dict] = None,
     ):
         """``version`` picks a preset; the overrides edit it branch by branch.
+
+        ``mrd_mel_cond`` conditions the multi-band spectrogram branches on the
+        generator's input mel (see ``MultiBandDiscriminatorR``); ``forward``
+        and ``real_score`` then take it as ``cond``.
 
         ``mrd_multiband`` and ``mpd_pre_emphasis`` default to what the version
         says (``MULTIBAND_MRD_VERSIONS``, ``MPD_PRE_EMPHASIS_BY_VERSION``);
@@ -326,6 +333,12 @@ class MPD_MSD_Combined(torch.nn.Module):
                 f"univhd_weight is a loss weight and cannot be negative; "
                 f"received {self.univhd_weight}."
             )
+        self.msd_weight = float(msd_weight)
+        if self.msd_weight < 0.0:
+            raise ValueError(
+                f"msd_weight is a loss weight and cannot be negative; "
+                f"received {self.msd_weight}."
+            )
         # ``train.py`` reads this to decide whether the losses take their SAN
         # form; it is an attribute rather than a lookup on the branches so a
         # discriminator that is *asked* for SAN and could not build it cannot
@@ -354,6 +367,15 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
             for p in self.periods
         ]
+        if mrd_mel_cond and not self.mrd_multiband:
+            raise ValueError("mrd_mel_cond needs the multi-band spectrogram branches (v4).")
+        self.mrd_mel_cond = dict(mrd_mel_cond) if mrd_mel_cond else None
+        #: Branch indices that take ``cond``.
+        self.cond_branches = (
+            frozenset(range(len(branches), len(branches) + len(self.resolutions)))
+            if self.mrd_mel_cond
+            else frozenset()
+        )
         if self.mrd_multiband:
             branches += [
                 MultiBandDiscriminatorR(
@@ -362,6 +384,7 @@ class MPD_MSD_Combined(torch.nn.Module):
                     frequency_strides=self.frequency_strides,
                     use_spectral_norm=use_spectral_norm,
                     use_san=self.use_san,
+                    mel_cond=self.mrd_mel_cond,
                 )
                 for r in self.resolutions
             ]
@@ -389,6 +412,7 @@ class MPD_MSD_Combined(torch.nn.Module):
                     f_min=float(univhd_f_min),
                     channels=int(univhd_channels),
                     half_harmonic=bool(univhd_half_harmonic),
+                    max_hz=univhd_max_hz,
                     use_spectral_norm=use_spectral_norm,
                     use_san=self.use_san,
                 )
@@ -428,12 +452,15 @@ class MPD_MSD_Combined(torch.nn.Module):
 
         The generator's adversarial term, the feature-matching term and the
         discriminator's own loss all take these.  See
-        ``UNIVHD_WEIGHT_BY_VERSION`` for the one branch that is not 1.0 and the
-        measurements behind it.
+        ``UNIVHD_WEIGHT_BY_VERSION`` for UnivHD's and the measurements behind
+        it; the scale branch takes ``msd_weight`` (``d_msd_weight``).
         """
 
         count = len(self.discriminators)
         weights = [DEFAULT_BRANCH_WEIGHT] * count
+        if self.use_msd:
+            # The scale branch is built first, as ``branch_labels`` records.
+            weights[0] = self.msd_weight
         if self.use_univhd:
             # UnivHD appends itself last -- see ``__init__`` -- which is also
             # what ``branch_labels`` records.
@@ -522,7 +549,15 @@ class MPD_MSD_Combined(torch.nn.Module):
             if label.startswith("resolution_") or label == "univhd"
         )
 
-    def real_score(self, x, index):
+    def _cond_kwargs(self, index, cond):
+        return {"cond": cond} if index in self.cond_branches else {}
+
+    def set_mel_cond_scale(self, scale: float) -> None:
+        """Scale of the conditioned branches' mel projection, 0 to 1."""
+        for index in self.cond_branches:
+            self.discriminators[index].mel_scale.fill_(float(scale))
+
+    def real_score(self, x, index, cond=None):
         """Per-sample R1 score of branch ``index``: its weighted mean logit.
 
         Calls the branch directly, so it stays eager under ``enable_compile``
@@ -530,7 +565,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         Under SAN it reads the function output, the one the generator is
         scored by.
         """
-        logits, _ = self.discriminators[index](x)
+        logits, _ = self.discriminators[index](x, **self._cond_kwargs(index, cond))
         return self.branch_weights[index] * logits.float().mean(dim=1)
 
     def forward(
@@ -542,6 +577,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         combine_inputs: bool = False,
         extra=None,
         extra_branches=(),
+        cond=None,
     ):
         """``no_grad_real`` runs the real branch under ``no_grad``.
 
@@ -587,7 +623,14 @@ class MPD_MSD_Combined(torch.nn.Module):
         ``extra_branches`` only; their logits come back as a fifth element, one
         per listed branch.  With ``combine_inputs`` it joins those branches'
         batch, so it adds no kernel launches.
+
+        ``cond`` is the generator's input mel, shared by ``y`` and ``y_hat``,
+        for the branches in ``cond_branches``.
         """
+        if self.cond_branches and cond is None:
+            raise ValueError("This discriminator is mel-conditioned; pass cond.")
+        if extra is not None and self.cond_branches.intersection(extra_branches):
+            raise ValueError("The extra batch has no mel for the conditioned branches.")
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
         extra_outputs = []
         checkpointing = self.training and self.use_checkpointing
@@ -600,18 +643,20 @@ class MPD_MSD_Combined(torch.nn.Module):
 
         if combined:
             paired = torch.cat((y, y_hat), dim=0)
+            paired_cond = None if cond is None else torch.cat((cond, cond), dim=0)
             for index, d in enumerate(self.discriminators):
                 with_extra = extra is not None and index in extra_branches
                 batch = torch.cat((paired, extra), dim=0) if with_extra else paired
                 sizes = (y.shape[0], y_hat.shape[0]) + (
                     (extra.shape[0],) if with_extra else ()
                 )
+                kwargs = self._cond_kwargs(index, paired_cond)
                 if checkpointing:
                     y_d, fmap = checkpoint(
-                        d, batch, san_training=san, use_reentrant=False
+                        d, batch, san_training=san, use_reentrant=False, **kwargs
                     )
                 else:
-                    y_d, fmap = d(batch, san_training=san)
+                    y_d, fmap = d(batch, san_training=san, **kwargs)
                 # Under SAN a branch returns ``[function, direction]`` rather
                 # than one tensor, and both halves have to be split.
                 if isinstance(y_d, (list, tuple)):
@@ -645,24 +690,27 @@ class MPD_MSD_Combined(torch.nn.Module):
                 return y_d_rs, y_d_gs, fmap_rs, fmap_gs, extra_outputs
             return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
-        for d in self.discriminators:
+        for index, d in enumerate(self.discriminators):
+            kwargs = self._cond_kwargs(index, cond)
             # The other two arms add no context manager at all, and not
             # ``enable_grad``: an outer ``no_grad`` (the validation path) must
             # stay in force.
             if no_grad_real:
                 with torch.no_grad():
-                    y_d_r, fmap_r = d(y, san_training=san)
+                    y_d_r, fmap_r = d(y, san_training=san, **kwargs)
             elif checkpointing:
-                y_d_r, fmap_r = checkpoint(d, y, san_training=san, use_reentrant=False)
+                y_d_r, fmap_r = checkpoint(
+                    d, y, san_training=san, use_reentrant=False, **kwargs
+                )
             else:
-                y_d_r, fmap_r = d(y, san_training=san)
+                y_d_r, fmap_r = d(y, san_training=san, **kwargs)
 
             if checkpointing:
                 y_d_g, fmap_g = checkpoint(
-                    d, y_hat, san_training=san, use_reentrant=False
+                    d, y_hat, san_training=san, use_reentrant=False, **kwargs
                 )
             else:
-                y_d_g, fmap_g = d(y_hat, san_training=san)
+                y_d_g, fmap_g = d(y_hat, san_training=san, **kwargs)
 
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
@@ -1005,6 +1053,30 @@ class DiscriminatorR(torch.nn.Module):
         return san_tail(self, x, fmap, san_training)
 
 
+def mel_to_linear_bins(n_bins, sample_rate, n_mels, fmin, fmax):
+    """(n_bins, n_mels) matrix interpolating a log mel between band centres
+    onto the linear STFT bins, held flat past the first and last centre."""
+    import librosa
+    import numpy as np
+
+    centres = librosa.mel_frequencies(n_mels + 2, fmin=fmin, fmax=fmax)[1:-1]
+    freqs = np.linspace(0.0, sample_rate / 2.0, n_bins)
+    eye = np.eye(n_mels)
+    matrix = np.stack([np.interp(freqs, centres, eye[j]) for j in range(n_mels)], axis=1)
+    return torch.from_numpy(matrix).float()
+
+
+def _keep_new_mel_embed(
+    module, state_dict, prefix, local_metadata, strict, missing_keys,
+    unexpected_keys, error_msgs,
+):
+    """Load hook: a branch saved without mel conditioning keeps its fresh
+    projection, whose small starting scale barely moves the loaded scores."""
+    for key, value in module.state_dict().items():
+        if key.startswith("mel_embed.") or key == "mel_proj_logit":
+            state_dict.setdefault(prefix + key, value)
+
+
 class MultiBandDiscriminatorR(torch.nn.Module):
     """Spectrogram branch on a compressed complex STFT, one conv stack per band.
 
@@ -1015,7 +1087,25 @@ class MultiBandDiscriminatorR(torch.nn.Module):
     frequency axis is split into ``BANDS`` (fractions of the bins), each with
     its own stack, as in DAC's MRD, so the low band cannot claim every filter.
     ``frequency_strides`` and the window rule are ``DiscriminatorR``'s.
+
+    ``mel_cond`` (``sample_rate``, ``n_mels``, ``fmin``, ``fmax``) conditions
+    the branch on the generator's input mel by projection: the mel, resampled
+    onto this branch's bins and frames, goes through a small stack with the
+    bands' geometry, and the result is a per-location direction, normalised
+    and scaled like SAN's ``conv_post``, whose inner product with the last
+    feature map is added to the logits.  Under SAN the function term reads it
+    detached and the direction term reads the features detached, so the
+    conditioning cannot inflate the logits past SAN's bound.  The scale starts
+    near zero, so the branch starts unconditional.  ``forward`` then needs
+    ``cond`` [batch, n_mels, frames].
     """
+
+    #: Width of the mel embedding stack.
+    MEL_EMBED_CHANNELS = 16
+    #: Projection scale = ``SCALE_MAX * sigmoid(mel_proj_logit)``: bounded like
+    #: SAN's, and a sigmoid rather than a clamp so it cannot stick at a bound.
+    MEL_PROJ_SCALE_MAX = 4.0
+    MEL_PROJ_LOGIT_INIT = -4.0
 
     BANDS = ((0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
     # Power floor: keeps log and the compression gain finite in silence,
@@ -1030,6 +1120,7 @@ class MultiBandDiscriminatorR(torch.nn.Module):
         use_san: bool = False,
         compression: float = 0.3,
         frequency_strides=(1, 1, 1),
+        mel_cond: Optional[dict] = None,
     ):
         super().__init__()
         self.resolution = resolution
@@ -1048,22 +1139,43 @@ class MultiBandDiscriminatorR(torch.nn.Module):
         self.band_edges = tuple(
             (int(round(lo * n_bins)), int(round(hi * n_bins))) for lo, hi in self.BANDS
         )
+        self.mel_cond = dict(mel_cond) if mel_cond else None
 
-        def band_stack():
-            return torch.nn.ModuleList(
-                [norm_f(torch.nn.Conv2d(3, channels, (3, 9), padding=(1, 4)))]
-                + [
-                    norm_f(
-                        torch.nn.Conv2d(
-                            channels, channels, (3, 9), stride=(s, 2), padding=(1, 4)
-                        )
-                    )
-                    for s in self.frequency_strides
-                ]
-                + [norm_f(torch.nn.Conv2d(channels, channels, (3, 3), padding=(1, 1)))]
+        def band_stack(in_channels, width, last):
+            # The layers the bands share, so a stack built with the same
+            # strides lands on the same grid as the band's last feature map.
+            return [norm_f(torch.nn.Conv2d(in_channels, width, (3, 9), padding=(1, 4)))] + [
+                norm_f(torch.nn.Conv2d(width, width, (3, 9), stride=(s, 2), padding=(1, 4)))
+                for s in self.frequency_strides
+            ] + [last]
+
+        self.bands = torch.nn.ModuleList(
+            torch.nn.ModuleList(
+                band_stack(
+                    3, channels,
+                    norm_f(torch.nn.Conv2d(channels, channels, (3, 3), padding=(1, 1))),
+                )
             )
-
-        self.bands = torch.nn.ModuleList(band_stack() for _ in self.BANDS)
+            for _ in self.BANDS
+        )
+        if self.mel_cond:
+            self.register_buffer(
+                "mel_to_bins",
+                mel_to_linear_bins(n_bins, **self.mel_cond),
+                persistent=False,
+            )
+            width = self.MEL_EMBED_CHANNELS
+            stacks = []
+            for _ in self.BANDS:
+                last = torch.nn.Conv2d(width, channels, (3, 3), padding=(1, 1))
+                stacks.append(torch.nn.ModuleList(band_stack(1, width, last)))
+            self.mel_embed = torch.nn.ModuleList(stacks)
+            self.mel_proj_logit = torch.nn.Parameter(
+                torch.tensor(self.MEL_PROJ_LOGIT_INIT)
+            )
+            # Scales the projection; ``set_mel_cond_scale`` can ramp it in.
+            self.register_buffer("mel_scale", torch.ones(()), persistent=False)
+            self.register_load_state_dict_pre_hook(_keep_new_mel_embed)
         self.use_san = bool(use_san)
         self.conv_post = (
             SANConv2d(channels, 1, (3, 3), padding=(1, 1))
@@ -1099,11 +1211,20 @@ class MultiBandDiscriminatorR(torch.nn.Module):
             (0.5 * torch.log(power), x.real * gain, x.imag * gain), dim=1
         )
 
-    def forward(self, x, san_training: bool = False):
+    def forward(self, x, san_training: bool = False, cond=None):
         # Only the STFT leaves autocast; after compression the input is in the
         # range the other branches see.
         with torch.autocast(x.device.type, enabled=False):
             x = self.spectrogram(x.float())
+            if self.mel_cond:
+                if cond is None:
+                    raise ValueError("This branch is mel-conditioned; pass cond.")
+                # Both framings centre frame t near (t + 0.5) * hop, so a
+                # linear resize lines them up to within a fraction of a frame.
+                cond = F.interpolate(
+                    cond.float(), size=x.shape[-1], mode="linear", align_corners=False
+                )
+                mel = (self.mel_to_bins @ cond).unsqueeze(1)
         layers = [[] for _ in self.bands[0]]
         for (lo, hi), stack in zip(self.band_edges, self.bands):
             h = x[:, :, lo:hi]
@@ -1115,4 +1236,32 @@ class MultiBandDiscriminatorR(torch.nn.Module):
         # their joint mean, so the branch weighs what ``DiscriminatorR`` does
         # without copying the activations into one tensor.
         fmap = [tuple(maps) for maps in layers]
-        return san_tail(self, torch.cat(layers[-1], dim=2), fmap, san_training)
+        features = torch.cat(layers[-1], dim=2)
+        projection = None
+        if self.mel_cond:
+            directions = []
+            for (lo, hi), stack in zip(self.band_edges, self.mel_embed):
+                e = mel[:, :, lo:hi]
+                for layer in stack[:-1]:
+                    e = F.leaky_relu(layer(e), self.lrelu_slope, inplace=True)
+                directions.append(stack[-1](e))
+            with torch.autocast(features.device.type, enabled=False):
+                h = features.float()
+                e = torch.cat(directions, dim=2).float()
+                # Unit norm over the channels at every location.
+                e = e / e.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                scale = (
+                    self.MEL_PROJ_SCALE_MAX
+                    * torch.sigmoid(self.mel_proj_logit.float())
+                    * self.mel_scale
+                )
+                if self.use_san and san_training:
+                    # SAN's split: the function term moves the scale and the
+                    # trunk, the direction term moves only the embedding.
+                    projection = (
+                        scale * (e.detach() * h).sum(1, keepdim=True),
+                        scale.detach() * (e * h.detach()).sum(1, keepdim=True),
+                    )
+                else:
+                    projection = scale * (e * h).sum(1, keepdim=True)
+        return san_tail(self, features, fmap, san_training, projection)

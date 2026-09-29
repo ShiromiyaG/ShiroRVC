@@ -123,6 +123,7 @@ APP_LANGUAGE = i18n.install_resolved(
 # Import Tabs
 from tabs.inference.inference import inference_tab
 from tabs.train.train import train_tab
+from tabs.rectified.rectified import rectified_tab
 from tabs.utilities.utilities import utilities_tab
 from tabs.download.download import download_tab
 from tabs.tts.tts import tts_tab
@@ -182,13 +183,17 @@ with gr.Blocks(title=APP_TITLE) as interface:
     with gr.Column(elem_classes=["rvc-workspace"]):
         with gr.Tabs(elem_id="rvc-main-tabs"):
             # The tabs that list files on disk refresh those lists when opened.
-            with gr.Tab(_("Inference")) as tab:
+            # Rectified is first, so the app opens on its Inference sub-tab.
+            with gr.Tab(_("Rectified")) as tab:
                 with gr.Column(elem_classes=["rvc-card"]):
-                    inference_tab(tab)
+                    rectified_tab(tab)
 
-            with gr.Tab(_("Training")) as tab:
+            with gr.Tab(_("Classic RVC")) as tab:
                 with gr.Column(elem_classes=["rvc-card"]):
-                    train_tab(tab)
+                    with gr.Tab(_("Inference")):
+                        inference_tab(tab)
+                    with gr.Tab(_("Training")):
+                        train_tab(tab)
 
             with gr.Tab(_("TTS")) as tab:
                 with gr.Column(elem_classes=["rvc-card"]):

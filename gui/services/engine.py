@@ -104,7 +104,10 @@ class Engine(QObject):
     @property
     def is_training(self) -> bool:
         """Whether a training job was sent and has not answered yet."""
-        return any(cmd == "train" for cmd, _result, _error in self._pending.values())
+        return any(
+            cmd in ("train", "rectified_train")
+            for cmd, _result, _error in self._pending.values()
+        )
 
     def start(self) -> None:
         if self._process is not None:

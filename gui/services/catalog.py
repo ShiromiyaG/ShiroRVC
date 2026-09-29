@@ -134,6 +134,14 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
     },
 }
 
+#: Mirror rvc.rectified.flow_model, which imports torch.
+RECTIFIED_SAMPLERS = ["euler", "heun"]
+RECTIFIED_SCHEDULES = ["uniform", "sway", "logit-normal"]
+RECTIFIED_RESCALE_MODES = ["global", "frame"]
+#: The rectified recipe ships one configuration; extraction's vocoder id for it.
+RECTIFIED_SAMPLE_RATE = 44100
+RECTIFIED_EXTRACTION = "rectified"
+
 TTS_RAW_NAME = "tts_output.wav"
 TTS_CONVERTED_NAME = "tts_rvc_output.wav"
 
@@ -201,6 +209,61 @@ def list_custom_pretraineds(kind: str) -> list[str]:
 
 def list_dataset_folders() -> list[str]:
     return _shared().list_dataset_folders(paths.DATASET_DIR)
+
+
+def _rectified_pretrained_exports(kind: str) -> list:
+    """``rvc.rectified.common._pretrained_exports``."""
+    folder = paths.RECTIFIED_PRETRAINED_DIR
+    return [*folder.glob(f"*_{kind}_*.pth"), *folder.glob(f"*_{kind}.pth")]
+
+
+def list_rectified_exports(kind: str) -> list[str]:
+    """``rvc.rectified.common.list_exports``, without its torch import."""
+    shared = _shared()
+    found = list(paths.LOGS_DIR.glob(f"*/{kind}/*_{kind}_*.pth"))
+    found += _rectified_pretrained_exports(kind)
+    if kind == "vocoder":
+        found += paths.RECTIFIED_PRETRAINED_DIR.glob("*.ckpt")
+    listed = sorted((shared.relative(path) for path in found), key=shared.sort_key)
+    if kind == "flow":
+        listed += shared.list_bundles(paths.LOGS_DIR, "rectified_flow")
+    return listed
+
+
+def list_rectified_pretrained(kind: str) -> list[str]:
+    """``rvc.rectified.common.list_pretrained``: ``vocoder_g``, ``vocoder_d`` or ``flow``."""
+    shared = _shared()
+    patterns = {
+        "vocoder_g": ["G_*.pth", "*_vocoder_*.pth", "*_vocoder.pth"],
+        "vocoder_d": ["D_*.pth"],
+        "flow": ["F_*.pth", "*_flow_*.pth", "*_flow.pth"],
+    }[kind]
+    folder = "flow" if kind == "flow" else "vocoder"
+    found = []
+    for pattern in patterns:
+        found += paths.LOGS_DIR.glob(f"*/{folder}/{pattern}")
+        if not pattern.endswith(("G_*.pth", "D_*.pth", "F_*.pth")):
+            found += paths.RECTIFIED_PRETRAINED_DIR.glob(pattern)
+    letter = {"vocoder_g": "G", "vocoder_d": "D", "flow": "F"}[kind]
+    return sorted(shared.relative(path) for path in found) + list_custom_pretraineds(letter)
+
+
+def default_flow_pretrain(model_name: str) -> tuple[str, str, str]:
+    """``(path or "", embedder, file name)`` of the default flow pretrain for
+    the embedder ``model_name`` was extracted with."""
+    shared = _shared()
+    embedder = shared.experiment_embedder(model_name, paths.LOGS_DIR)
+    name = shared.RECTIFIED_FLOW_PRETRAINS.get(embedder, "")
+    return shared.default_flow_pretrain(embedder, paths.RECTIFIED_PRETRAINED_DIR), embedder, name
+
+
+def default_rectified_pretrained(kind: str) -> str:
+    """``rvc.rectified.common.default_pretrained``, relative, or ``""``."""
+    shared = _shared()
+    found = [str(path) for path in _rectified_pretrained_exports(kind)]
+    if not found and kind == "vocoder":
+        found = [str(path) for path in paths.RECTIFIED_PRETRAINED_DIR.glob("*.ckpt")]
+    return shared.relative(max(found, key=shared.sort_key)) if found else ""
 
 
 def vocoders() -> list[tuple[str, str]]:

@@ -2,12 +2,15 @@
 TensorBoard and as loose files under the run's log directory."""
 
 import os
+from contextlib import contextmanager
 
 import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
+from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.terminal import info, warning
 
 import matplotlib
@@ -48,6 +51,51 @@ VALIDATION_PREVIEW_FIGSIZE = (24.0, 5.8)
 VALIDATION_PREVIEW_FREQUENCY_TICKS = (
     0.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
 )
+
+
+#: Previews kept for TensorBoard, which by default shows 10 images and 10
+#: clips per tag; anything older only made the event file bigger.
+TENSORBOARD_MEDIA_KEEP = 10
+
+
+class MediaLog:
+    """TensorBoard run for the validation media: one event file per preview,
+    pruned to the newest ``keep``.
+
+    Event files are append-only, so previews written beside the scalars kept
+    every one of them (~1 MB each) while TensorBoard displays only 10.
+    """
+
+    def __init__(self, log_dir, resume_step=0, keep=TENSORBOARD_MEDIA_KEEP):
+        self.log_dir = log_dir
+        self.keep = keep
+        os.makedirs(log_dir, exist_ok=True)
+        # Written by a previous run past the checkpoint this one resumes from.
+        for path, step in self._files():
+            if step > resume_step:
+                os.remove(path)
+
+    def _files(self):
+        """``(path, step)`` of every preview file, oldest step first."""
+        found = []
+        for name in os.listdir(self.log_dir):
+            stem, _, step = name.rpartition(".step")
+            if "tfevents" in stem and step.isdigit():
+                found.append((os.path.join(self.log_dir, name), int(step)))
+        return sorted(found, key=lambda item: item[1])
+
+    @contextmanager
+    def writer(self, global_step):
+        """A writer for one preview; the file is closed and pruned on exit."""
+        writer = SummaryWriter(
+            self.log_dir, filename_suffix=f".step{int(global_step)}"
+        )
+        try:
+            yield writer
+        finally:
+            writer.close()
+            for path, _ in self._files()[: -self.keep]:
+                os.remove(path)
 
 
 def limit_audio_peak(audio, max_peak=0.98):
@@ -474,7 +522,10 @@ def get_reference_sample(train_loader, device, config):
         reference_audio = None
         reference_source = reference_path
 
-        phone = torch.FloatTensor(np.repeat(features, 2, axis=0)).unsqueeze(0).to(device)
+        phone = upsample_content(
+            torch.FloatTensor(features),
+            getattr(config.model, "content_interpolation", "nearest"),
+        ).unsqueeze(0).to(device)
         pitch = torch.LongTensor(np.load(os.path.join(reference_path, "ref_f0c.npy"))).unsqueeze(0).to(device)
         pitchf = torch.FloatTensor(np.load(os.path.join(reference_path, "ref_f0f.npy"))).unsqueeze(0).to(device)
 

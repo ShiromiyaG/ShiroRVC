@@ -25,8 +25,7 @@
         "validation_preview_height": 5.8,
         "segment_size": 12800,
         "c_mel": 45,
-        "c_mel_scratch": 25,
-        "mel_frequency_tilt": 0.5,
+        "mel_frequency_tilt": 0.0,
         "hf_floor_negative_weight": 0.0,
         "c_kl": 1.0,
         "holdout_fraction": 0.02,
@@ -44,7 +43,9 @@
         "overtrain_smoothing": 3,
         "overtrain_noise_window": 6,
         "ema": true,
-        "ema_decay": 0.999
+        "ema_decay": 0.999,
+        "c_speaker_adv": 0.1,
+        "energy_dropout": 0.1
     },
     "data": {
         "max_wav_value": 32768.0,
@@ -112,10 +113,16 @@
         "refinegan2_start_channels": 16,
         "refinegan2_leaky_relu_slope": 0.2,
         "refinegan2_adain_noise": "always",
-        "refinegan2_source_gain": true,
+        "refinegan2_source_gain": false,
         "refinegan2_source_noise_std": 0.003,
-        "refinegan2_source_harmonics": 200,
+        "refinegan2_source_harmonics": 0,
         "refinegan2_source_tilt": 1.0,
-        "architecture_id": "vits_gaussian_v1"
+        "refinegan2_output_gain": true,
+        "architecture_id": "vits_gaussian_v1",
+        "latent_mode": "direct",
+        "direct_encoder": "projection",
+        "content_bottleneck": 64,
+        "content_bottleneck_noise": 0.1,
+        "energy_conditioning": true
     }
 }

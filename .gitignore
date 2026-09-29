@@ -35,6 +35,7 @@ assets/datasets/*
 !assets/datasets/.gitkeep
 assets/training_presets/
 logs/*
+compare/
 temp/
 !logs/.gitkeep
 !logs/run_tensorboard_in_model_folder.bat

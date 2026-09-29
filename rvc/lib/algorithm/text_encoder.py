@@ -69,3 +69,65 @@ class TextEncoder(nn.Module):
         m, logs = torch.split(stats, self.out_channels, dim=1)
 
         return m, logs, x_mask
+
+
+class ProjectionEncoder(nn.Module):
+    """Per-frame content encoder for ``latent_mode: "direct"``, after
+    fish-diffusion's HiFiSinger: projection and an MLP, no attention.
+
+    The content features already carry context and the decoder has a wide
+    receptive field; a transformer here sits in the adversarial loop, where its
+    gradient spikes.  Returns ``(m, logs, x_mask)`` like ``TextEncoder``, with
+    ``logs`` zero since nothing is sampled.
+
+    ``f0=False`` leaves pitch to the decoder's excitation, as fish-diffusion
+    does: the coarse pitch embedding jumps at every bin change, and per frame
+    those jumps reach the decoder as frame-rate jitter in the high bands.
+
+    ``smoothing`` > 1 adds a depthwise conv over that many frames on the
+    output, started as a moving average: the content features also vary from
+    frame to frame, and nothing else in the direct path smooths them.
+    """
+
+    def __init__(
+        self,
+        out_channels: int,
+        hidden_channels: int,
+        embedding_dim: int,
+        f0: bool = True,
+        smoothing: int = 1,
+    ):
+        super().__init__()
+        self.emb_phone = nn.Linear(embedding_dim, hidden_channels)
+        self.emb_pitch = nn.Embedding(256, hidden_channels) if f0 else None
+        self.fuser = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.SiLU(),
+        )
+        self.proj = nn.Linear(hidden_channels, out_channels)
+        smoothing = int(smoothing)
+        if smoothing < 1 or smoothing % 2 == 0:
+            raise ValueError(f"smoothing must be odd and >= 1, not {smoothing}.")
+        self.smooth = None
+        if smoothing > 1:
+            self.smooth = nn.Conv1d(
+                out_channels,
+                out_channels,
+                smoothing,
+                padding=smoothing // 2,
+                groups=out_channels,
+                bias=False,
+            )
+            nn.init.constant_(self.smooth.weight, 1.0 / smoothing)
+
+    def forward(self, phone: torch.Tensor, pitch: torch.Tensor, lengths: torch.Tensor):
+        x = self.emb_phone(phone)
+        if self.emb_pitch is not None and pitch is not None:
+            x = x + self.emb_pitch(pitch)
+        x_mask = torch.unsqueeze(sequence_mask(lengths, x.size(1)), 1).to(x.dtype)
+        m = self.proj(self.fuser(x)).transpose(1, 2) * x_mask
+        if self.smooth is not None:
+            m = self.smooth(m) * x_mask
+        return m, torch.zeros_like(m), x_mask

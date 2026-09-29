@@ -286,12 +286,19 @@ def decoder_layout(model):
         # the tilt to explain a shape error.
         "source_harmonics": int(getattr(decoder, "source_harmonics", 0)),
         "source_tilt": float(getattr(decoder, "source_tilt", 1.0)),
+        # Non-persistent like the tilt: the partials' starting phases.
+        "source_phase": str(getattr(decoder, "source_phase", "random")),
+        "source_phase_jitter": float(getattr(decoder, "source_phase_jitter", 0.0)),
+        "source_branch": str(getattr(decoder, "source_branch", "linear")),
         # Imaging, not aliasing: what the interpolation filter leaves of the
         # spectral copies zero-stuffing makes.  It is just as invisible to
         # ``load_state_dict`` as the stage ordering, and with the anti-aliased
         # activations gone it is the last signal-path choice in this decoder
         # that no weight records.
         "upsample_filter": upsample_filter(decoder),
+        # NSF-BigVGAN's resblock type and per-stage oversampling.  The plain
+        # and oversampled activations share their keys.
+        "snake_layout": getattr(decoder, "snake_layout", None),
     }
 
 
@@ -313,6 +320,9 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             "adain_noise": "train",
             "source_harmonics": 0,
             "source_tilt": 1.0,
+            "source_phase": "random",
+            "source_phase_jitter": 0.0,
+            "source_branch": "linear",
             "upsample_filter": None,
         }
     imaging = found.get("upsample_filter") or None
@@ -327,6 +337,10 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
         # checkpoint load into a bare one without a word.
         "source_harmonics": int(found.get("source_harmonics", 0)),
         "source_tilt": float(found.get("source_tilt", 1.0)),
+        "source_phase": str(found.get("source_phase", "random")),
+        "source_phase_jitter": float(found.get("source_phase_jitter", 0.0)),
+        "source_branch": str(found.get("source_branch", "linear")),
+        "snake_layout": found.get("snake_layout"),
     }
     # Absent means the flat legacy design, sized to the checkpoint's own stage
     # count -- every RefineGAN run ever had these upsamplers, so unlike the
@@ -360,9 +374,9 @@ def assert_decoder_layout_matches(model, checkpoint_dict, origin="checkpoint"):
             f"Decoder layout mismatch: this run builds {expected} but the "
             f"{origin} was trained with {found}. The stage ordering does not "
             f"appear in any weight, so this is the only thing that can tell "
-            f"them apart. Set upsample_rates / refinegan2_source_gain / "
-            f"refinegan2_source_harmonics / refinegan2_source_tilt to "
-            f"match, or start a fresh run. ``upsample_filter`` is "
+            f"them apart. Set upsample_rates and the vocoder's source_gain / "
+            f"source_harmonics / source_tilt / source_phase / source_branch keys "
+            f"(refinegan2_* or nsf_bigvgan_*) to match, or start a fresh run. ``upsample_filter`` is "
             f"[widths, rolloffs, betas] per stage for the trunk's "
             f"interpolation filters and is not a config key: a mismatch there "
             f"means the checkpoint predates the current filter design."
@@ -468,6 +482,7 @@ def save_checkpoint(
     ema=None,
     extra=None,
     prior_noise_subspace=None,
+    aux_heads=None,
 ):
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
     model_instance = model.module if hasattr(model, "module") else model
@@ -518,6 +533,10 @@ def save_checkpoint(
         checkpoint_data["extra"] = dict(extra)
     if prior_noise_subspace is not None:
         checkpoint_data["prior_noise_subspace"] = prior_noise_subspace
+    # Training-only heads (``rvc/train/speaker_adversary.py``), each under its
+    # own key.
+    for key, state in (aux_heads or {}).items():
+        checkpoint_data[key] = state
 
     torch.save(checkpoint_data, checkpoint_path)
     info(f"Saved '{os.path.basename(checkpoint_path)}'.", tag="[SAVE]")

@@ -142,25 +142,36 @@ class SANConv2d(_SANConvMixin, nn.Conv2d):
         )
 
 
-def san_tail(module, x, fmap, san_training):
+def san_tail(module, x, fmap, san_training, projection=None):
     """``conv_post`` plus the flatten, in the one shape SAN can change.
 
     Every branch in this fork ends the same way, and factoring the ending is
     what keeps ``use_san`` from being five near-identical edits that can drift
     apart -- the kind of drift that left the AdaIN activations raw for months.
+
+    ``projection`` is a conditional term added to the logits.  With
+    ``san_training`` it is a ``(function, direction)`` pair added to the two
+    outputs, split the way ``_san_forward`` splits its own projection.
     """
 
     if not getattr(module, "use_san", False):
         x = module.conv_post(x)
+        if projection is not None:
+            x = x + projection
         fmap.append(x)
         return torch.flatten(x, 1, -1), fmap
 
     out = module.conv_post(x, san_training=san_training)
     if not san_training:
+        if projection is not None:
+            out = out + projection.float()
         fmap.append(out)
         return torch.flatten(out, 1, -1), fmap
 
     function_output, direction_output = out
+    if projection is not None:
+        function_output = function_output + projection[0].float()
+        direction_output = direction_output + projection[1].float()
     # The *function* output is the feature map: it is the one the generator's
     # feature-matching term reads, and the direction output is not something the
     # generator is allowed to see at all.

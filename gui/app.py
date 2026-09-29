@@ -37,10 +37,10 @@ from .widgets.dock import FloatingDock
 from .widgets.navlist import NavList
 from .widgets.console import LogConsole
 from .widgets.status import StatusBar
-from .views.inference import InferencePage
+from .views.classic import ClassicRvcPage
 from .views.monitor import MonitorPage
+from .views.rectified import RectifiedPage
 from .views.tools import ToolsPage
-from .views.training import TrainingPage
 from .views.tts import TtsPage
 
 from . import i18n
@@ -50,9 +50,9 @@ from .i18n import _, N_
 #: :func:`run` installs the catalog.  The labels go through ``_()`` where they
 #: are used, in :class:`Sidebar`.
 NAV = [
-    (N_("Inference"), "waveform", N_("Convert audio to a trained voice"), "Ctrl+1"),
-    (N_("Text to speech"), "speech", N_("Synthesise a line and convert it"), "Ctrl+2"),
-    (N_("Training"), "trend", N_("Prepare data and train a model"), "Ctrl+3"),
+    (N_("Rectified flow"), "flow", N_("Convert and train with the rectified-flow model"), "Ctrl+1"),
+    (N_("Classic RVC"), "waveform", N_("Convert and train with VITS-based RVC models"), "Ctrl+2"),
+    (N_("Text to speech"), "speech", N_("Synthesise a line and convert it"), "Ctrl+3"),
     (N_("Diagnostics"), "spark", N_("Metrics, previews and audio from a run"), "Ctrl+4"),
     (N_("Utilities"), "sliders", N_("Inspect, blend, download, analyze"), "Ctrl+5"),
 ]
@@ -236,7 +236,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         # Order must match NAV: the sidebar drives the stack by index.
         self.pages = [
-            InferencePage(), TtsPage(), TrainingPage(), MonitorPage(), ToolsPage(),
+            RectifiedPage(), ClassicRvcPage(), TtsPage(), MonitorPage(), ToolsPage(),
         ]
         for page in self.pages:
             page.busy.connect(self._on_page_busy)
@@ -244,13 +244,22 @@ class MainWindow(QMainWindow):
             page.log.connect(self._on_page_log)
             self.stack.addWidget(page)
 
-        self.training_page = next(
-            page for page in self.pages if isinstance(page, TrainingPage)
-        )
-        self._progress_live = False
-        self._progress_docked = False
+        #: Pages with a run progress card, in the order they get the dock
+        #: when more than one run is live.
+        classic = next(page for page in self.pages if isinstance(page, ClassicRvcPage))
+        classic.subpageChanged.connect(self._sync_progress_dock)
+        self.progress_pages = [
+            classic.training,
+            next(page for page in self.pages if isinstance(page, RectifiedPage)),
+        ]
+        self._progress_live: dict[QWidget, bool] = {}
+        #: The page whose card is in the dock, or None.
+        self._docked_page: QWidget | None = None
         self._card_flight = None
-        self.training_page.progressActive.connect(self._on_progress_active)
+        for page in self.progress_pages:
+            page.progressActive.connect(
+                lambda active, page=page: self._on_progress_active(page, active)
+            )
         # A run keeps going when the user navigates away -- it is a process in
         # the backend, not something this page owns -- so its progress card
         # follows them instead of disappearing with the page.
@@ -385,31 +394,49 @@ class MainWindow(QMainWindow):
         page.on_shown()
         self._sync_progress_dock()
 
-    def _on_progress_active(self, active: bool) -> None:
-        self._progress_live = active
+    def _on_progress_active(self, page: QWidget, active: bool) -> None:
+        self._progress_live[page] = active
         self._sync_progress_dock()
 
     def _sync_progress_dock(self) -> None:
-        """Float the training progress card whenever its page is not showing."""
-        away = self.stack.currentWidget() is not self.training_page
-        docked = self._progress_live and away
-        if docked == self._progress_docked:
+        """Float a run's progress card whenever its page is not showing."""
+        current = self.stack.currentWidget()
+        target = next(
+            (page for page in self.progress_pages
+             if self._progress_live.get(page) and not self._page_showing(page, current)),
+            None,
+        )
+        previous = self._docked_page
+        if target is previous:
             return
-        self._progress_docked = docked
+        self._docked_page = target
+        # One flight at a time: when one card replaces another, both just move.
+        animate = previous is None or target is None
+        if previous is not None:
+            self._move_progress(previous, into_dock=False, animate=animate)
+        if target is not None:
+            self._move_progress(target, into_dock=True, animate=animate)
 
-        card = self.training_page.progress
+    @staticmethod
+    def _page_showing(page: QWidget, current: QWidget) -> bool:
+        """``page`` is the sidebar page on screen, or the tab on screen inside it."""
+        shows = getattr(current, "shows", None)
+        return current is page or (shows is not None and shows(page))
+
+    def _move_progress(self, page: QWidget, into_dock: bool, animate: bool) -> None:
+        card = page.progress
         # Snapshot before the move, at the size it has where it is leaving
         # from: the two homes are different widths, and the flight morphs one
         # into the other.
-        animate = self.isVisible() and self.training_page.has_progress
+        animate = animate and self.isVisible() and page.has_progress
         start = self._card_rect(card) if animate else None
         snapshot = card.grab() if start is not None else None
 
-        if docked:
+        if into_dock:
             self.progress_dock.adopt(card)
         else:
             self.progress_dock.release()
-            self.training_page.reclaim_progress()
+            page.reclaim_progress()
 
         if start is None:
             return
@@ -421,7 +448,7 @@ class MainWindow(QMainWindow):
         end = self._card_rect(card)
         if end is None or end == start:
             return
-        self._fly_card(card, snapshot, start, end)
+        self._fly_card(card, snapshot, start, end, into_dock)
 
     def _card_rect(self, card: QWidget) -> QRect | None:
         """Where a card sits in the page area, or None if it has no size yet."""
@@ -429,16 +456,16 @@ class MainWindow(QMainWindow):
             return None
         return QRect(card.mapTo(self.stack, QPoint(0, 0)), card.size())
 
-    def _fly_card(self, card: QWidget, snapshot, start: QRect, end: QRect) -> None:
+    def _fly_card(self, card: QWidget, snapshot, start: QRect, end: QRect, into_dock: bool) -> None:
         """Move the card between its two homes instead of teleporting it."""
         # Whichever end it just landed in is hidden for the flight: the ghost
         # is the only copy the user should see moving.
-        hidden = self.progress_dock if self._progress_docked else card
+        hidden = self.progress_dock if into_dock else card
         hidden.hide()
 
         def landed() -> None:
             hidden.show()
-            if self._progress_docked:
+            if into_dock:
                 self.progress_dock.raise_()
             self._card_flight = None
 
@@ -685,9 +712,10 @@ class MainWindow(QMainWindow):
         self.console.setVisible(visible)
         self.status.console_button.setChecked(visible)
 
-        # Always Inference, never the last view used.  Converting is what this
-        # application is opened to do; landing on the training form because
-        # that is where the last session ended is a step backwards every time.
+        # Always the rectified page, which opens on its Inference tab, never the
+        # last view used.  Converting is what this application is opened to do;
+        # landing on a training form because that is where the last session
+        # ended is a step backwards every time.
         self.sidebar.list.setCurrentRow(0)
         self.stack.setCurrentIndex(0)
 

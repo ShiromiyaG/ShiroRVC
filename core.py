@@ -1,4 +1,5 @@
 import click
+import json
 import os
 import sys
 
@@ -17,6 +18,7 @@ from rvc.lib.process import (
 )
 from rvc.lib.terminal import (
     DEFAULT_CPU_THREADS,
+    error,
     info,
     install_rich_print,
     print_error_panel,
@@ -32,10 +34,12 @@ from rvc.lib.extras.prerequisites_download import (
     prequisites_download_pipeline,
 )
 from rvc.configs.vocoders import (
+    RECTIFIED_EXTRACTION,
     get_vocoder_sample_rates,
     normalize_vocoder,
 )
 from rvc.train.run_spec import TrainRunSpec
+from rvc.lib.model_bundle import RECTIFIED_KIND, RVC_KIND, VOCODER_KIND, is_model_bundle, wrong_kind_message
 from rvc.cli_options import (
     AUDIO_ANALYZER_OWN,
     BATCH_INFER_DEFAULTS,
@@ -50,6 +54,11 @@ from rvc.cli_options import (
     MODEL_INFORMATION_OWN,
     PREPROCESS_OWN,
     PREREQUISITES_OWN,
+    RECTIFIED_EXTRACT_OWN,
+    RECTIFIED_INFER_OWN,
+    RECTIFIED_PREPROCESS_OWN,
+    RECTIFIED_TRAIN_FLOW_OWN,
+    RECTIFIED_TRAIN_VOCODER_OWN,
     TRAIN_OWN,
     TTS_DEFAULTS,
     TTS_OWN,
@@ -85,6 +94,17 @@ def get_config():
 
 
 # Infer
+def model_kind_problem(checks, tag: str) -> str | None:
+    """The first ``wrong_kind_message`` of ``(path, kind, submodel)`` checks,
+    printed; None when every model is of the kind asked for."""
+    for path, kind, submodel in checks:
+        problem = wrong_kind_message(path, kind, submodel)
+        if problem:
+            error(problem, tag=tag)
+            return problem
+    return None
+
+
 def run_infer_script(
     pitch: int,
     filter_radius: int,
@@ -117,6 +137,9 @@ def run_infer_script(
     *,
     noise_scale: float = None,
 ):
+    problem = model_kind_problem([(pth_path, RVC_KIND, bundle_submodel)], "[INFER]")
+    if problem:
+        return problem, None
     kwargs = {
         "audio_input_path": input_path,
         "audio_output_path": output_path,
@@ -194,6 +217,9 @@ def run_batch_infer_script(
     *,
     noise_scale: float = None,
 ):
+    problem = model_kind_problem([(pth_path, RVC_KIND, None)], "[INFER]")
+    if problem:
+        return problem
     kwargs = {
         "audio_input_paths": input_folder,
         "audio_output_path": output_folder,
@@ -267,6 +293,9 @@ def run_tts_script(
     *,
     noise_scale: float = None,
 ):
+    problem = model_kind_problem([(pth_path, RVC_KIND, None)], "[TTS]")
+    if problem:
+        return problem, None
 
     tts_script_path = os.path.join(ROOT, "rvc", "lib", "extras", "tts.py")
 
@@ -382,11 +411,12 @@ def run_extract_script(
     include_mutes: int = 5,
     feature_precision: str = "fp32",
 ):
-    vocoder_arch = normalize_vocoder(vocoder_arch)
-    if int(sample_rate) not in get_vocoder_sample_rates(vocoder_arch):
-        raise ValueError(
-            f"{vocoder_arch} does not provide a configuration for {sample_rate} Hz."
-        )
+    if vocoder_arch != RECTIFIED_EXTRACTION:
+        vocoder_arch = normalize_vocoder(vocoder_arch)
+        if int(sample_rate) not in get_vocoder_sample_rates(vocoder_arch):
+            raise ValueError(
+                f"{vocoder_arch} does not provide a configuration for {sample_rate} Hz."
+            )
 
     model_path = os.path.join(LOGS_DIR, model_name)
     extract = os.path.join(ROOT, "rvc", "train", "extract", "extract.py")
@@ -512,6 +542,221 @@ def _stop_training_at_exit():
 
 
 atexit.register(_stop_training_at_exit)
+
+
+# Rectified flow
+rectified_process = None
+#: The rectified recipe ships one configuration, at 44.1 kHz.
+RECTIFIED_SAMPLE_RATE = 44100
+
+
+@lru_cache(maxsize=1)
+def import_rectified_converter():
+    from rvc.rectified.infer import RectifiedConverter
+
+    return RectifiedConverter()
+
+
+def run_rectified_infer_script(
+    input_path: str,
+    output_path: str,
+    flow_path: str,
+    vocoder_path: str,
+    sid: int = 0,
+    pitch: int = 0,
+    f0_method: str = "rmvpe",
+    steps: int = 16,
+    sampler: str = "euler",
+    cfg_scale: float = 1.0,
+    f0_autotune: bool = False,
+    f0_autotune_strength: float = 1.0,
+    seed: int = 0,
+    export_format: str = "WAV",
+    index_path: str = "",
+    index_rate: float = 0.5,
+    index_k: int = 8,
+    index_power: float = 2.0,
+    index_continuity: float = 0.5,
+    protect: float = 0.33,
+    formant_shift: float = 0.0,
+    content_guidance: float = 0.0,
+    guidance_rescale: float = 0.7,
+    split_audio: bool = False,
+    silence_gate_db: float = -60.0,
+    noise_temperature: float = 1.0,
+    flow_start: float = 0.0,
+    guidance_from: float = 0.0,
+    guidance_until: float = 1.0,
+    rescale_mode: str = "global",
+    schedule: str = "uniform",
+    f0_median: int = 0,
+    f0_octave_fix: bool = False,
+    content_context: float = 2.0,
+    flow_submodel: str = "",
+):
+    if not flow_path or not vocoder_path:
+        problem = "Pick a flow model and a vocoder model."
+        error(problem, tag="[RECTIFIED]")
+        return problem, None
+    problem = model_kind_problem(
+        [
+            (flow_path, RECTIFIED_KIND, flow_submodel if is_model_bundle(flow_path) else None),
+            (vocoder_path, VOCODER_KIND, None),
+        ],
+        "[RECTIFIED]",
+    )
+    if problem:
+        return problem, None
+    written = import_rectified_converter().convert(
+        audio_input_path=input_path,
+        audio_output_path=output_path,
+        flow_path=flow_path,
+        vocoder_path=vocoder_path,
+        sid=int(sid),
+        pitch=int(pitch),
+        f0_method=f0_method,
+        steps=int(steps),
+        sampler=sampler,
+        cfg_scale=float(cfg_scale),
+        f0_autotune=bool(f0_autotune),
+        f0_autotune_strength=float(f0_autotune_strength),
+        seed=int(seed),
+        export_format=export_format,
+        index_path=index_path or "",
+        index_rate=float(index_rate),
+        index_k=int(index_k),
+        index_power=float(index_power),
+        index_continuity=float(index_continuity),
+        protect=float(protect),
+        formant_shift=float(formant_shift),
+        content_guidance=float(content_guidance),
+        guidance_rescale=float(guidance_rescale),
+        split_audio=bool(split_audio),
+        silence_gate_db=float(silence_gate_db),
+        noise_temperature=float(noise_temperature),
+        flow_start=float(flow_start),
+        guidance_from=float(guidance_from),
+        guidance_until=float(guidance_until),
+        rescale_mode=rescale_mode,
+        schedule=schedule,
+        f0_median=int(f0_median),
+        f0_octave_fix=bool(f0_octave_fix),
+        content_context=float(content_context),
+        flow_submodel=flow_submodel or "",
+    )
+    if written is None:
+        return "Conversion failed; see the terminal for the error.", None
+    return f"File {input_path} converted successfully.", written
+
+
+def unload_rectified_models():
+    import_rectified_converter().unload()
+
+
+def _run_rectified_trainer(script: str, spec: dict) -> str:
+    global rectified_process
+
+    part = "vocoder" if script == "train_vocoder" else "flow"
+    model_dir = os.path.join(LOGS_DIR, spec["model_name"], part)
+    os.makedirs(model_dir, exist_ok=True)
+    spec_path = os.path.join(model_dir, "run_spec.json")
+    with open(spec_path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle, indent=4)
+    command = [python, os.path.join(ROOT, "rvc", "rectified", f"{script}.py"), spec_path]
+    rectified_process = spawn_trainer(command)
+    code = rectified_process.wait()
+    if code != 0:
+        return (
+            f"Training failed ({describe_exit_code(code)}). "
+            "See the terminal for the error."
+        )
+    return "Training has been successfully completed or stopped."
+
+
+def run_rectified_vocoder_train_script(
+    model_name: str,
+    total_epochs: int,
+    save_every: int,
+    batch_size: int,
+    gpu: str = "0",
+    pretrained_g: str = "",
+    pretrained_d: str = "",
+    checkpoints: str = "latest",
+    fresh: bool = False,
+    precision: str = "fp32",
+):
+    return _run_rectified_trainer(
+        "train_vocoder",
+        {
+            "model_name": model_name,
+            "total_epochs": int(total_epochs),
+            "save_every": int(save_every),
+            "batch_size": int(batch_size),
+            "gpu": str(gpu),
+            "pretrained_g": pretrained_g or "",
+            "pretrained_d": pretrained_d or "",
+            "checkpoints": str(checkpoints),
+            "fresh": bool(fresh),
+            "precision": str(precision).lower(),
+        },
+    )
+
+
+def run_rectified_flow_train_script(
+    model_name: str,
+    total_epochs: int,
+    save_every: int,
+    batch_size: int,
+    gpu: str = "0",
+    pretrained_flow: str = "",
+    vocoder: str = "",
+    learning_rate: float = 0.0,
+    checkpoints: str = "latest",
+    fresh: bool = False,
+    precision: str = "fp32",
+    compile: bool = False,
+    torch_compile_mode: str = "default",
+):
+    if not vocoder:
+        # The newest pretrained vocoder, as every interface picks when left empty.
+        from rvc.lib.catalog import relative
+        from rvc.rectified.common import default_pretrained
+
+        vocoder = default_pretrained("vocoder")
+        vocoder = relative(vocoder) if vocoder else ""
+    return _run_rectified_trainer(
+        "train_flow",
+        {
+            "model_name": model_name,
+            "total_epochs": int(total_epochs),
+            "save_every": int(save_every),
+            "batch_size": int(batch_size),
+            "gpu": str(gpu),
+            "pretrained_flow": pretrained_flow or "",
+            "vocoder": vocoder or "",
+            "learning_rate": float(learning_rate or 0.0),
+            "checkpoints": str(checkpoints),
+            "fresh": bool(fresh),
+            "precision": str(precision).lower(),
+            "compile": bool(compile),
+            "torch_compile_mode": str(torch_compile_mode),
+        },
+    )
+
+
+def stop_rectified_train_script():
+    if rectified_process is None or rectified_process.poll() is not None:
+        return "No rectified training process is running."
+    return stop_trainer(rectified_process)
+
+
+def _stop_rectified_at_exit():
+    if rectified_process is not None and rectified_process.poll() is None:
+        info("Interface is exiting; stopping the rectified training run.", tag="[TRAINING]")
+        stop_trainer(rectified_process)
+
+
+atexit.register(_stop_rectified_at_exit)
 
 
 # Index
@@ -647,13 +892,17 @@ def cli():
 @apply_options(INFER_OWN, inference_options(INFER_DEFAULTS), FORMANT_OPTIONS)
 def infer(**kwargs):
     """Run inference on a single audio file."""
-    run_infer_script(**kwargs)
+    _message, written = run_infer_script(**kwargs)
+    if written is None:
+        raise SystemExit(1)
 
 
 @cli.command("batch_infer")
 @apply_options(BATCH_INFER_OWN, inference_options(BATCH_INFER_DEFAULTS), FORMANT_OPTIONS)
 def batch_infer(**kwargs):
     """Run inference on every audio file in a folder."""
+    if model_kind_problem([(kwargs["pth_path"], RVC_KIND, None)], "[INFER]"):
+        raise SystemExit(1)
     run_batch_infer_script(**kwargs)
 
 
@@ -661,7 +910,9 @@ def batch_infer(**kwargs):
 @apply_options(TTS_OWN, inference_options(TTS_DEFAULTS))
 def tts(**kwargs):
     """Synthesize speech with edge-tts and convert it."""
-    run_tts_script(**kwargs)
+    _message, written = run_tts_script(**kwargs)
+    if written is None:
+        raise SystemExit(1)
 
 
 @cli.command("preprocess")
@@ -686,6 +937,47 @@ def extract(**kwargs):
 def train(**kwargs):
     """Train a model."""
     run_train_script(**kwargs)
+
+
+@cli.command("rectified_preprocess")
+@apply_options(RECTIFIED_PREPROCESS_OWN)
+def rectified_preprocess(**kwargs):
+    """Preprocess a dataset for the rectified-flow recipe (44.1 kHz)."""
+    kwargs["clean_strength"] = kwargs.pop("noise_reduction_strength")
+    run_preprocess_script(sample_rate=RECTIFIED_SAMPLE_RATE, **kwargs)
+
+
+@cli.command("rectified_extract")
+@apply_options(RECTIFIED_EXTRACT_OWN)
+def rectified_extract(**kwargs):
+    """Extract features and F0 for the rectified-flow recipe."""
+    run_extract_script(
+        sample_rate=RECTIFIED_SAMPLE_RATE, vocoder_arch=RECTIFIED_EXTRACTION, **kwargs
+    )
+
+
+@cli.command("rectified_train_flow")
+@apply_options(RECTIFIED_TRAIN_FLOW_OWN)
+def rectified_train_flow(**kwargs):
+    """Train the rectified-flow voice model on an extracted experiment."""
+    run_rectified_flow_train_script(**kwargs)
+
+
+@cli.command("rectified_train_vocoder")
+@apply_options(RECTIFIED_TRAIN_VOCODER_OWN)
+def rectified_train_vocoder(**kwargs):
+    """Pretrain the rectified-flow NSF-BigVGAN vocoder on an extracted experiment."""
+    run_rectified_vocoder_train_script(**kwargs)
+
+
+@cli.command("rectified_infer")
+@apply_options(RECTIFIED_INFER_OWN)
+def rectified_infer(**kwargs):
+    """Convert one audio file with a rectified-flow model and vocoder."""
+    message, written = run_rectified_infer_script(**kwargs)
+    print(message)
+    if written is None:
+        raise SystemExit(1)
 
 
 @cli.command("index")

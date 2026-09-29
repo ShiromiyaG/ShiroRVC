@@ -67,6 +67,50 @@ def _remember_input(path: str) -> None:
     prefs.set(_RECENT_INPUTS, [path, *recent][:_RECENT_LIMIT])
 
 
+def save_copy(page: Page, source: str) -> None:
+    """Copy a conversion result to a file the user names."""
+    if not source or not os.path.isfile(source):
+        page.notify.emit("error", _("There is no converted file to save yet."))
+        return
+
+    folder = Path(str(prefs.get("last_export_dir", "")) or str(Path.home()))
+    suffix = Path(source).suffix
+    # Suggest a name that is free: the obvious collision here is copying
+    # two takes of the same input into one folder, and a default that
+    # overwrites is one Enter away from losing the first.  Replacing an
+    # existing file is still possible, but only by picking it, and the
+    # dialog asks before it does.
+    suggested = folder / Path(source).name
+    index = 2
+    while suggested.exists():
+        suggested = suggested.with_name(f"{Path(source).stem} ({index}){suffix}")
+        index += 1
+
+    extension = suffix.lstrip(".").lower()
+    filters = f"{extension.upper()} (*.{extension});;{_('All files')} (*)" if extension else ""
+    chosen, _chosen_filter = QFileDialog.getSaveFileName(
+        page, _("Save a copy as"), str(suggested), filters
+    )
+    if not chosen:
+        return
+
+    destination = Path(chosen)
+    # This is a copy, not a conversion: the bytes stay in the source's
+    # format, so the name has to say so.
+    if suffix and destination.suffix.lower() != suffix.lower():
+        destination = destination.with_name(destination.name + suffix)
+
+    if os.path.abspath(destination) != os.path.abspath(source):
+        try:
+            shutil.copy2(source, destination)
+        except OSError as error:
+            page.notify.emit("error", _("Could not save the copy: {error}").format(error=error))
+            return
+
+    prefs.set("last_export_dir", str(destination.parent))
+    page.notify.emit("success", _("Saved to {path}").format(path=destination))
+
+
 class ModelSelector(QWidget):
     """Model, index and speaker, kept consistent with each other.
 
@@ -711,48 +755,7 @@ class InferencePage(Page):
         return page
 
     def _save_copy(self) -> None:
-        """Copy the last result to a file the user names."""
-        source = self.output_player.path() or self._last_output
-        if not source or not os.path.isfile(source):
-            self.notify.emit("error", _("There is no converted file to save yet."))
-            return
-
-        folder = Path(str(prefs.get("last_export_dir", "")) or str(Path.home()))
-        suffix = Path(source).suffix
-        # Suggest a name that is free: the obvious collision here is copying
-        # two takes of the same input into one folder, and a default that
-        # overwrites is one Enter away from losing the first.  Replacing an
-        # existing file is still possible, but only by picking it, and the
-        # dialog asks before it does.
-        suggested = folder / Path(source).name
-        index = 2
-        while suggested.exists():
-            suggested = suggested.with_name(f"{Path(source).stem} ({index}){suffix}")
-            index += 1
-
-        extension = suffix.lstrip(".").lower()
-        filters = f"{extension.upper()} (*.{extension});;{_('All files')} (*)" if extension else ""
-        chosen, _chosen_filter = QFileDialog.getSaveFileName(
-            self, _("Save a copy as"), str(suggested), filters
-        )
-        if not chosen:
-            return
-
-        destination = Path(chosen)
-        # This is a copy, not a conversion: the bytes stay in the source's
-        # format, so the name has to say so.
-        if suffix and destination.suffix.lower() != suffix.lower():
-            destination = destination.with_name(destination.name + suffix)
-
-        if os.path.abspath(destination) != os.path.abspath(source):
-            try:
-                shutil.copy2(source, destination)
-            except OSError as error:
-                self.notify.emit("error", _("Could not save the copy: {error}").format(error=error))
-                return
-
-        prefs.set("last_export_dir", str(destination.parent))
-        self.notify.emit("success", _("Saved to {path}").format(path=destination))
+        save_copy(self, self.output_player.path() or self._last_output)
 
     def _on_input_changed(self, path: str) -> None:
         if path and os.path.isfile(path):

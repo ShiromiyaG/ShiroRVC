@@ -73,6 +73,7 @@ from rvc.train.diagnostics import (
 from rvc.train.progress import EpochRecorder, emit_machine_progress
 from rvc.train.schedules import (
     fit_eval_interval,
+    fit_schedule,
     planned_step_count,
     prepare_schedulers,
 )
@@ -124,6 +125,7 @@ from utils import (
     block_tensorboard_flush_on_exit,
     log_tensorboard_media,
     log_validation_preview,
+    MediaLog,
     wave_to_mel,
     small_model_naming,
     old_session_cleanup,
@@ -149,6 +151,8 @@ from losses import (
 from mel_processing import build_ms_mel_loss, spectrogram_torch
 
 from rvc.train.process.extract_model import extract_model
+from rvc.train.speaker_adversary import KEY as SPEAKER_ADV_KEY, SpeakerAdversary
+from rvc.lib.algorithm.energy import frame_energy
 from rvc.train.prior_subspace import estimate_prior_subspace, pick_clips
 from rvc.lib.algorithm import commons
 from rvc.configs.vocoders import normalize_vocoder
@@ -247,6 +251,16 @@ preview_noise_scale = getattr(config.train, "preview_noise_scale", None)
 preview_noise_scale = (
     None if preview_noise_scale is None else float(preview_noise_scale)
 )
+# ``latent_mode: "direct"`` decodes the text encoder's output with no VAE; see
+# ``Synthesizer``.  Nothing below that reads the posterior or the flow runs.
+direct_mode = str(getattr(config.model, "latent_mode", "vits")) == "direct"
+# Weight of the speaker classifier behind gradient reversal on the content
+# bottleneck; see ``rvc/train/speaker_adversary.py``.  0 is off.
+c_speaker_adv = float(getattr(config.train, "c_speaker_adv", 0.0))
+speaker_adversary = None
+# Share of training items rendered without their energy conditioning; see
+# ``Synthesizer.encode_content``.  Only read when the model has one.
+energy_dropout = float(getattr(config.train, "energy_dropout", 0.1))
 # Posterior draw for the stage-1 reconstruction preview.  0 decodes ``m_q``,
 # which is what the holdout scorer already does (``holdout_noise_scale``);
 # raise it to see what the latent's own noise adds to the render.
@@ -350,17 +364,21 @@ import logging
 logging.getLogger("torch").setLevel(logging.ERROR)
 
 
-def eval_infer(net_g, reference):
+def eval_infer(net_g, reference, reference_audio=None):
     model = net_g.module if hasattr(net_g, "module") else net_g
+    energy = None
+    if reference_audio is not None and getattr(model, "energy_embedding", None) is not None:
+        energy = frame_energy(
+            reference_audio.reshape(1, -1), config.data.sample_rate, reference[0].shape[1]
+        )
     # Render the way a checkpoint exported with these weights does.  A failed
     # estimate keeps the previous basis.
-    if vocoder == "refinegan2":
-        basis = prior_subspace_for(model)
-        if basis is not None:
-            model.set_prior_noise_subspace(basis)
+    basis = prior_subspace_for(model)
+    if basis is not None:
+        model.set_prior_noise_subspace(basis)
     net_g.eval()
     with torch.no_grad():
-        o, *_ = model.infer(*reference, noise_scale=preview_noise_scale)
+        o, *_ = model.infer(*reference, noise_scale=preview_noise_scale, energy=energy)
     net_g.train()
     return o
 
@@ -374,10 +392,19 @@ _prior_subspace_cache = None
 _prior_subspace_last = None
 
 
+def prior_subspace_enabled():
+    """``prior_subspace`` set in the config, any vocoder; off by default.
+
+    When on, previews render with the basis and every checkpoint and export
+    carries it, which is what makes inference apply it.
+    """
+    return not direct_mode and bool(getattr(config.train, "prior_subspace", False))
+
+
 def prior_subspace_for(model_g, force: bool = False):
     """``prior_noise_subspace`` for the weights ``model_g`` holds now, or None.
 
-    RefineGAN2 only; see ``rvc/train/prior_subspace.py``.  A failure costs the
+    See ``rvc/train/prior_subspace.py``.  A failure costs the
     checkpoint its key, never the save; an estimate the device has no room for
     falls back to the last basis estimated instead.
 
@@ -387,7 +414,7 @@ def prior_subspace_for(model_g, force: bool = False):
     asks for: its basis has to belong to the weights it ships.
     """
     global _prior_subspace_clips, _prior_subspace_cache, _prior_subspace_last
-    if vocoder != "refinegan2":
+    if not prior_subspace_enabled():
         return None
     interval = int(getattr(config.train, "prior_subspace_interval", 5000))
     if not force and _prior_subspace_cache is not None:
@@ -443,7 +470,7 @@ def prior_subspace_for(model_g, force: bool = False):
 
 def prior_subspace_for_state(model_g, state_dict):
     """``prior_subspace_for`` on ``state_dict``, restoring ``model_g``'s weights after."""
-    if vocoder != "refinegan2":
+    if not prior_subspace_enabled():
         return None
     # On the CPU, like ``WeightEMA.applied``: no third copy of G on the device.
     live = {key: value.detach().to("cpu", copy=True) for key, value in model_g.state_dict().items()}
@@ -550,7 +577,7 @@ def eval_preview(net_g, reference, reference_audio, config):
             )
             eval_preview._announced = True
         return eval_reconstruct(net_g, reference, reference_audio, config)
-    return eval_infer(net_g, reference)
+    return eval_infer(net_g, reference, reference_audio)
 
 
 def setup_env_and_distr(rank, n_gpus, device, device_id, config):
@@ -574,7 +601,11 @@ def prepare_dataloaders(config, n_gpus, rank, batch_size):
         TextAudioLoaderMultiNSFsid,
     )
 
-    train_dataset = TextAudioLoaderMultiNSFsid(config.data, n_mel_bins=config.model.inter_channels)
+    train_dataset = TextAudioLoaderMultiNSFsid(
+        config.data,
+        n_mel_bins=config.model.inter_channels,
+        content_interpolation=getattr(config.model, "content_interpolation", "nearest"),
+    )
 
     # Carve a held-out set out of the dataset before anything else sees it;
     # everything that scores it lives in ``rvc.train.overtrain``.
@@ -644,9 +675,18 @@ def _checkpoint_extra(grad_scaler):
     return extra or None
 
 
+def _latest_generator_or(fallback):
+    """The run's own latest ``G_*.pth``, else ``fallback`` (the pretrain)."""
+    g_paths = glob.glob(os.path.join(experiment_dir, "G_*.pth"))
+    if not g_paths:
+        return fallback
+    return max(g_paths, key=lambda path: int(re.sub(r"\D", "", os.path.basename(path)) or 0))
+
+
 def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice_g, optimizer_choice_d, total_epoch_count, train_loader, device, device_id, n_gpus, rank, reset_pretrained_embeddings=False):
     # Init the models
     net_g = get_g_model(config, sample_rate, vocoder, use_checkpointing)
+    net_g.energy_dropout = energy_dropout
     net_d = get_d_model(config, vocoder, use_checkpointing)
     resumed_g_path = None
     # Training-loop controller state travelling with the D checkpoint.  Empty on
@@ -899,7 +939,17 @@ def main():
     """
     global gpus
 
-    wavs = [wav for wav in glob.glob(os.path.join(os.path.join(experiment_dir, "sliced_audios"), "*")) if wav.endswith((".wav", ".flac"))]
+    # The filelist, not ``sliced_audios``: a run may train on another run's slices.
+    wavs = []
+    if os.path.isfile(config.data.training_files):
+        with open(config.data.training_files, encoding="utf-8") as filelist:
+            for line in filelist:
+                path = line.split("|", 1)[0].strip()
+                if path and os.path.isfile(path):
+                    wavs.append(path)
+                    break
+    if not wavs:
+        wavs = [wav for wav in glob.glob(os.path.join(experiment_dir, "sliced_audios", "*")) if wav.endswith((".wav", ".flac"))]
     if wavs:
         _, sr = load_wav_to_torch(wavs[0])
         if sr != sample_rate:
@@ -1226,8 +1276,31 @@ def run(
     # growth interval.  Restarting it at ``init_scale`` on every resume replays
     # the initial overflow-and-back-off search, which throws away a handful of
     # steps each time -- and hides a run that had settled at a much lower scale.
-    global amp_skipped_steps, d_lr_balancer
+    global amp_skipped_steps, d_lr_balancer, speaker_adversary
     amp_skipped_steps = int(resumed_extra_d.get("amp_skipped_steps") or 0)
+    bottleneck = getattr(net_g.module if hasattr(net_g, "module") else net_g, "content_bottleneck", None)
+    if c_speaker_adv > 0:
+        if bottleneck is None:
+            raise ValueError("c_speaker_adv needs content_bottleneck > 0 in the model config.")
+        model = net_g.module if hasattr(net_g, "module") else net_g
+        speaker_adversary = SpeakerAdversary(
+            bottleneck.down.out_features,
+            model.emb_g.num_embeddings,
+            c_speaker_adv,
+            config,
+            device,
+            device_id,
+            n_gpus,
+        )
+    if speaker_adversary is not None:
+        source = _latest_generator_or(pretrainG)
+        restored = speaker_adversary.restore(source)
+        if rank == 0:
+            info(
+                f"Speaker adversary at weight {c_speaker_adv}"
+                + (f", restored from '{os.path.basename(source)}'." if restored else ", fresh."),
+                tag="[INIT]",
+            )
     d_lr_balancer = build_balancer(config.train)
     if d_lr_balancer is not None:
         balance_state = resumed_extra_d.get("d_lr_balance")
@@ -1282,6 +1355,9 @@ def run(
             purge_step=global_step + 1
         )
         block_tensorboard_flush_on_exit(writer_eval)
+        media_log = MediaLog(
+            os.path.join(experiment_dir, "eval", "media"), resume_step=global_step
+        )
 
         if global_step != 0:
             info(f"TensorBoard writer initialized; purging logs after step {global_step}.", tag="[INIT]")
@@ -1361,6 +1437,21 @@ def run(
     # transition itself and can have half of one.
     planned_steps = planned_step_count(total_epoch_count, train_loader, max_steps)
 
+    # A fixed horizon is lag, and on a short fine-tune the saved average would
+    # trail the live weights by a large share of the run.  Only shrinks, so
+    # from-scratch runs and long ones keep the configured decay.
+    if ema is not None and not from_scratch:
+        horizon = round(1.0 / (1.0 - ema.decay)) if ema.decay < 1.0 else 0
+        fitted = fit_schedule(horizon, planned_steps, 0.1)
+        if fitted != horizon:
+            ema.decay = 1.0 - 1.0 / fitted
+            if rank == 0:
+                info(
+                    f"Horizon {horizon} -> {fitted} steps (decay {ema.decay:.4f}) "
+                    f"for this {planned_steps}-step run.",
+                    tag="[EMA]",
+                )
+
     # The turn from "still learning" to "memorising" happens on the scale of a
     # run, not an epoch.
     overtrain_monitor = None
@@ -1407,7 +1498,7 @@ def run(
             [optim_g, optim_d],
             [scheduler_g, scheduler_d],
             train_loader,
-            [writer_eval],
+            [writer_eval, media_log],
             cache,
             total_epoch_count,
             epoch_save_frequency,
@@ -1436,14 +1527,6 @@ def run(
                 scheduler_g.step()
             if scheduler_d is not None and lr_scheduler_d in per_epoch:
                 scheduler_d.step()
-
-
-def spectral_loss_weight():
-    """``c_mel_scratch`` for a run without pretrains, when set; ``c_mel`` otherwise."""
-    scratch_weight = getattr(config.train, "c_mel_scratch", None)
-    if from_scratch and scratch_weight is not None:
-        return float(scratch_weight)
-    return float(config.train.c_mel)
 
 
 def warmup_active():
@@ -1488,12 +1571,23 @@ def apply_linear_warmup(optim_g, optim_d, global_step, warmup_steps, rank):
 
 
 def _log_reference_preview(
-    writer, config, epoch, global_step, generated, reference_audio, reference_source,
-    dpi=None, figsize=None,
+    media_log, config, epoch, global_step, generated, reference_audio,
+    reference_source, dpi=None, figsize=None,
 ):
     """Log one rendering of the reference sample: the mel comparison and both
     recordings when there is a reference recording, the generated audio alone
     when there is not."""
+    with media_log.writer(global_step) as writer:
+        _write_reference_preview(
+            writer, config, epoch, global_step, generated, reference_audio,
+            reference_source, dpi=dpi, figsize=figsize,
+        )
+
+
+def _write_reference_preview(
+    writer, config, epoch, global_step, generated, reference_audio, reference_source,
+    dpi=None, figsize=None,
+):
     if reference_audio is not None:
         eval_original_mel = wave_to_mel(
             config,
@@ -1545,7 +1639,7 @@ def _log_reference_preview(
 
 def _render_epoch_preview(
     net_g, ema, overtrain_monitor, optim_g, reference, reference_audio,
-    reference_source, config, writer, epoch, global_step,
+    reference_source, config, media_log, epoch, global_step,
 ):
     """Render the reference with the weights this run would hand over, log it,
     and put the live weights back."""
@@ -1575,7 +1669,7 @@ def _render_epoch_preview(
         o = eval_preview(net_g, reference, reference_audio, config)
     # The config's dpi/figsize are not applied here, unlike the per-step preview.
     _log_reference_preview(
-        writer, config, epoch, global_step, o, reference_audio, reference_source
+        media_log, config, epoch, global_step, o, reference_audio, reference_source
     )
 
     # Restore live weights immediately ~ checkpoint saving stays raw
@@ -1633,6 +1727,11 @@ def _save_training_checkpoints(
                     epoch,
                     g_path,
                     prior_noise_subspace=subspace_g,
+                    aux_heads=(
+                        {SPEAKER_ADV_KEY: speaker_adversary.state_dict()}
+                        if speaker_adversary is not None
+                        else None
+                    ),
                 )
             save_checkpoint(
                 net_d,
@@ -1733,7 +1832,7 @@ def training_loop(
     train_loader.batch_sampler.set_epoch(epoch)
 
     if writers is not None:
-        writer = writers[0]
+        writer, media_log = writers
 
     net_g.train()
     net_d.train()
@@ -1748,7 +1847,7 @@ def training_loop(
     data_iterator = enumerate(train_loader)
 
     epoch_recorder = EpochRecorder()
-    c_mel = spectral_loss_weight()
+    c_mel = float(config.train.c_mel)
 
     if not from_scratch:
         # Tensors init for averaged losses:
@@ -1913,7 +2012,14 @@ def training_loop(
 
             # Generator main forward pass:
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                model_output = net_g(spec, spec_lengths, sid, phone, phone_lengths, pitchf, pitch)
+                energy = (
+                    frame_energy(y, config.data.sample_rate, phone.shape[1])
+                    if model_g.energy_embedding is not None
+                    else None
+                )
+                model_output = net_g(
+                    spec, spec_lengths, sid, phone, phone_lengths, pitchf, pitch, energy=energy
+                )
 
                 y_hat, ids_slice, x_mask, z_mask, vae_parts = model_output
 
@@ -2141,6 +2247,7 @@ def training_loop(
                 # The flow runs at the prior's frame rate; a batch where the
                 # two rates disagree is not comparable and is skipped rather
                 # than silently trimmed.
+                and z is not None
                 and m_p.shape[-1] == z.shape[-1]
             ):
                 prior_gap_delta, prior_gap_error = prior_gap(
@@ -2155,6 +2262,19 @@ def training_loop(
                     y_hat,
                     config,
                 )
+            elif (
+                rank == 0
+                and direct_mode
+                and diagnostics_interval > 0
+                and global_step % diagnostics_interval == 0
+            ):
+                # ``y_hat`` already is the inference path here, so this is the
+                # same number ``prior_gap`` reports for a VITS run.
+                with torch.no_grad():
+                    prior_gap_error = F.l1_loss(
+                        wave_to_mel(config, y_hat).float(),
+                        wave_to_mel(config, y).float(),
+                    )
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
 
                 # Spectral loss.  The component terms are logged separately
@@ -2219,57 +2339,65 @@ def training_loop(
                     # a stack of nine numbers and not a second pass.
                     branch_adv_cache.append(branch_adv)
 
-                loss_kl, raw_kl = kl_loss(
-                    z_p,
-                    logs_q,
-                    m_p,
-                    logs_p,
-                    z_mask,
-                    return_terms=True,
-                )
-                # ``c_kl_scale`` is the launch's multiplier on the config's
-                # weight, so a staged pretrain can run stage 1 at a low KL
-                # without editing ``config.json`` -- which a later resume
-                # would then inherit silently.
-                loss_kl = loss_kl * config.train.c_kl * c_kl_scale
+                if direct_mode:
+                    loss_kl = loss_spectral.new_zeros(())
+                else:
+                    loss_kl, raw_kl = kl_loss(
+                        z_p,
+                        logs_q,
+                        m_p,
+                        logs_p,
+                        z_mask,
+                        return_terms=True,
+                    )
+                    # ``c_kl_scale`` is the launch's multiplier on the config's
+                    # weight, so a staged pretrain can run stage 1 at a low KL
+                    # without editing ``config.json`` -- which a later resume
+                    # would then inherit silently.
+                    loss_kl = loss_kl * config.train.c_kl * c_kl_scale
 
-                # KL diagnostic: per-dimension raw divergence.  Two things
-                # this deliberately does not do.  It does not re-form
-                # ``raw_kl`` -- that is the tensor ``kl_loss`` just built,
-                # handed back detached.  And it does not call ``.item()``:
-                # the three it used to make sat between the generator's
-                # forward and its backward, so each one drained the queue
-                # and gave up the CPU's run-ahead on a step that is
-                # dispatch-bound, for three floats nothing reads until the
-                # next logging interval.  The caches hold device tensors
-                # and are reduced where the series are written.
-                with torch.no_grad():
-                    raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
-                        dim=(0, 2)
-                    ).clamp(min=1)
-                    diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
-                    # ``.float()`` so the deque holds one dtype whatever
-                    # autocast handed this step, which is what lets the
-                    # window be reduced with a single ``torch.stack``.
-                    kl_std_cache.append(diagnostic_kl.std().float())
-                    kl_mean_cache.append(diagnostic_kl.mean().float())
-                    kl_active_cache.append(
-                        (diagnostic_kl > kl_active_threshold).float().mean()
-                    )
-                    last_kl_per_dim = diagnostic_kl
-                    # Masked mean sigma, prior beside posterior because neither
-                    # reads alone.  Both deques existed and were never filled,
-                    # so the tag stage 1 tells you to watch was never written.
-                    avg_rolling_cache["posterior_std_fast"].append(
-                        (torch.exp(logs_q.float()) * z_mask).sum()
-                        / (z_mask.sum().clamp(min=1) * logs_q.shape[1])
-                    )
-                    avg_rolling_cache["prior_std_fast"].append(
-                        (torch.exp(logs_p.float()) * x_mask).sum()
-                        / (x_mask.sum().clamp(min=1) * logs_p.shape[1])
-                    )
+                    # KL diagnostic: per-dimension raw divergence.  Two things
+                    # this deliberately does not do.  It does not re-form
+                    # ``raw_kl`` -- that is the tensor ``kl_loss`` just built,
+                    # handed back detached.  And it does not call ``.item()``:
+                    # the three it used to make sat between the generator's
+                    # forward and its backward, so each one drained the queue
+                    # and gave up the CPU's run-ahead on a step that is
+                    # dispatch-bound, for three floats nothing reads until the
+                    # next logging interval.  The caches hold device tensors
+                    # and are reduced where the series are written.
+                    with torch.no_grad():
+                        raw_kl_per_dim = (raw_kl * z_mask).sum(dim=(0, 2)) / z_mask.sum(
+                            dim=(0, 2)
+                        ).clamp(min=1)
+                        diagnostic_kl = raw_kl_per_dim.clamp_min(0.0)
+                        # ``.float()`` so the deque holds one dtype whatever
+                        # autocast handed this step, which is what lets the
+                        # window be reduced with a single ``torch.stack``.
+                        kl_std_cache.append(diagnostic_kl.std().float())
+                        kl_mean_cache.append(diagnostic_kl.mean().float())
+                        kl_active_cache.append(
+                            (diagnostic_kl > kl_active_threshold).float().mean()
+                        )
+                        last_kl_per_dim = diagnostic_kl
+                        # Masked mean sigma, prior beside posterior because neither
+                        # reads alone.  Both deques existed and were never filled,
+                        # so the tag stage 1 tells you to watch was never written.
+                        avg_rolling_cache["posterior_std_fast"].append(
+                            (torch.exp(logs_q.float()) * z_mask).sum()
+                            / (z_mask.sum().clamp(min=1) * logs_q.shape[1])
+                        )
+                        avg_rolling_cache["prior_std_fast"].append(
+                            (torch.exp(logs_p.float()) * x_mask).sum()
+                            / (x_mask.sum().clamp(min=1) * logs_p.shape[1])
+                        )
 
                 loss_core = loss_spectral + loss_kl
+                if speaker_adversary is not None:
+                    loss_speaker_adv = speaker_adversary.loss(
+                        model_g.content_bottleneck.code, x_mask, sid
+                    )
+                    loss_core = loss_core + loss_speaker_adv
                 loss_gan = loss_adv + loss_fm
                 loss_gen_total = loss_core + loss_gan
                 if rank == 0 and prior_gap_delta is not None:
@@ -2278,6 +2406,7 @@ def training_loop(
                         prior_gap_delta.item(),
                         global_step,
                     )
+                if rank == 0 and prior_gap_error is not None:
                     writer.add_scalar(
                         "diag/prior_mel_l1",
                         prior_gap_error.item(),
@@ -2286,6 +2415,8 @@ def training_loop(
 
             # Generator backward and update:
             optim_g.zero_grad(set_to_none=True)
+            if speaker_adversary is not None:
+                speaker_adversary.optimizer.zero_grad(set_to_none=True)
             module_grad_metrics = {}
             if grad_scaler is not None:
                 grad_scaler.scale(loss_gen_total).backward()
@@ -2302,8 +2433,12 @@ def training_loop(
             )
             if grad_scaler is not None:
                 grad_scaler.step(optim_g)
+                if speaker_adversary is not None:
+                    grad_scaler.step(speaker_adversary.optimizer)
             else:
                 optim_g.step()
+                if speaker_adversary is not None:
+                    speaker_adversary.optimizer.step()
             # Unwind the freeze.  A plain restore and not a ``finally``: the
             # batch loop catches nothing, ``run`` is the process target, so an
             # exception anywhere above ends this process rather than reaching
@@ -2570,6 +2705,13 @@ def training_loop(
                     part_key, deque(maxlen=rolling_loss_steps)
                 ).append(part_value.detach())
             avg_rolling_cache["loss_kl"].append(loss_kl.detach())
+            if speaker_adversary is not None:
+                avg_rolling_cache.setdefault(
+                    "loss_speaker_adv", deque(maxlen=rolling_loss_steps)
+                ).append(loss_speaker_adv.detach())
+                avg_rolling_cache.setdefault(
+                    "speaker_adv_accuracy", deque(maxlen=rolling_loss_steps)
+                ).append(speaker_adversary.accuracy)
 
             # D Grads:
             if grad_norm_d is not None:
@@ -2679,7 +2821,7 @@ def training_loop(
                             or key.startswith("posterior_")
                             or key.startswith("usage_")
                             or key.startswith("kl_")
-                            or key in ("scale_anchor", "content_rms")
+                            or key in ("scale_anchor", "content_rms", "speaker_adv_accuracy")
                         ):
                             category = "diag"
                         else:
@@ -2738,6 +2880,9 @@ def training_loop(
                         "diag/kl_mean_per_dim": cache_mean(kl_mean_cache),
                         "diag/kl_active_fraction": cache_mean(kl_active_cache),
                     }
+                    dec = (net_g.module if hasattr(net_g, "module") else net_g).dec
+                    if getattr(dec, "has_output_gain", False):
+                        diag_scalars["diag/output_gain"] = dec.output_log_gain.exp().item()
                     summarize(
                         writer=writer,
                         global_step=global_step,
@@ -2770,7 +2915,7 @@ def training_loop(
                     with averaged_weights((optimizer_choice_g, optim_g)):
                         o = eval_preview(net_g, reference, reference_audio, config)
                 _log_reference_preview(
-                    writer, config, epoch, global_step, o, reference_audio,
+                    media_log, config, epoch, global_step, o, reference_audio,
                     reference_source, dpi=validation_preview_dpi,
                     figsize=validation_preview_figsize,
                 )
@@ -2849,7 +2994,7 @@ def training_loop(
 
             _render_epoch_preview(
                 net_g, ema, overtrain_monitor, optim_g, reference, reference_audio,
-                reference_source, config, writer, epoch, global_step,
+                reference_source, config, media_log, epoch, global_step,
             )
 
         flush_writer(writer, rank)

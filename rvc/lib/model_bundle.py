@@ -1,5 +1,8 @@
 """ShiroRVC model bundles: several ``.pth`` models and their indexes in one file.
 
+The models are RVC checkpoints or rectified-flow exports; a flow's vocoder is
+referenced by path, not stored.
+
 A bundle is a zstd frame holding a ``torch.save`` of
 ``{"format", "version", "models": {name: {"model_state", "index_data", "index_meta"}}}``,
 followed by a zstd *skippable* frame with a small JSON manifest -- names,
@@ -17,6 +20,7 @@ import pickle
 import re
 import shutil
 import struct
+from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -30,7 +34,12 @@ MODEL_FILE_EXTENSIONS = (".pth", MODEL_BUNDLE_EXTENSION)
 MODEL_BUNDLE_FORMAT = "shiromiya-rvc-model-bundle"
 #: 2 added the manifest and stores each index file verbatim, footer included.
 #: The payload is otherwise laid out as in 1, which older builds still read.
-MODEL_BUNDLE_VERSION = 2
+#: 3 is a bundle holding a rectified flow, which a build before 3 would try to
+#: load as RVC; an RVC-only bundle is still written as 2.
+MODEL_BUNDLE_VERSION = 3
+RVC_KIND = "rvc"
+RECTIFIED_KIND = "rectified_flow"
+VOCODER_KIND = "rectified_vocoder"
 
 #: The manifest's frame: a zstd skippable frame whose data ends in
 #: ``<json length, u32 LE><magic>``, so it can be found from the end.
@@ -70,6 +79,9 @@ TRAINING_ARTIFACT_DIRS = frozenset(
         "zips",
         "__pycache__",
         ".torchinductor",
+        # Rectified-flow models, which the RVC pipeline cannot load.
+        "vocoder",
+        "flow",
     }
 )
 
@@ -218,8 +230,23 @@ def save_model_bundle(
     return bundle_path
 
 
+def model_kind(state: dict[str, Any]) -> str:
+    """``RECTIFIED_KIND`` for a rectified-flow export, else ``RVC_KIND``."""
+    return RECTIFIED_KIND if state.get("kind") == RECTIFIED_KIND else RVC_KIND
+
+
 def _model_info(state: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    if model_kind(state) == RECTIFIED_KIND:
+        return {
+            "kind": RECTIFIED_KIND,
+            "speakers_id": state.get("speaker_count"),
+            # The path the flow was trained with; the vocoder is not bundled.
+            "vocoder": state.get("vocoder") or "",
+            "sample_rate": (state.get("config") or {}).get("data", {}).get("sample_rate"),
+            "has_index": entry.get("index_data") is not None,
+        }
     return {
+        "kind": RVC_KIND,
         "speakers_id": state.get("speakers_id"),
         "vocoder": state.get("vocoder"),
         "sample_rate": state.get("sr"),
@@ -227,13 +254,19 @@ def _model_info(state: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _format_version(models: dict[str, Any]) -> int:
+    kinds = {model_kind(entry.get("model_state") or {}) for entry in models.values()}
+    return MODEL_BUNDLE_VERSION if RECTIFIED_KIND in kinds else 2
+
+
 def _manifest(bundle_data: dict[str, Any]) -> dict[str, Any]:
+    models = get_bundle_models(bundle_data)
     return {
         "format": MODEL_BUNDLE_FORMAT,
-        "version": MODEL_BUNDLE_VERSION,
+        "version": _format_version(models),
         "models": {
             name: _model_info(entry.get("model_state") or {}, entry)
-            for name, entry in get_bundle_models(bundle_data).items()
+            for name, entry in models.items()
         },
     }
 
@@ -277,12 +310,25 @@ def read_bundle_manifest(path: str | PathLike[str]) -> dict[str, Any] | None:
     return manifest
 
 
-def bundle_model_names(path: str | PathLike[str]) -> list[str]:
-    """Model names in a bundle, sorted; from the manifest when there is one."""
+def bundle_model_names(path: str | PathLike[str], kind: str | None = None) -> list[str]:
+    """Model names in a bundle, sorted, of one ``kind`` when given; from the
+    manifest when there is one."""
     manifest = read_bundle_manifest(path)
-    if manifest is not None:
-        return sorted(manifest["models"])
-    return sorted(get_bundle_models(load_model_bundle(path)))
+    if manifest is None:
+        manifest = _manifest(load_model_bundle(path))
+    return sorted(
+        name for name, info in manifest["models"].items()
+        if kind is None or info.get("kind", RVC_KIND) == kind
+    )
+
+
+def bundle_kinds(path: str | PathLike[str]) -> set[str]:
+    """The kinds of model a bundle holds, for listing it without loading it.
+    A bundle without a manifest predates rectified flows, so it is RVC."""
+    manifest = read_bundle_manifest(path)
+    if manifest is None:
+        return {RVC_KIND}
+    return {info.get("kind", RVC_KIND) for info in manifest["models"].values()}
 
 
 def bundle_model_info(
@@ -317,8 +363,80 @@ def speaker_ids(path: str | PathLike[str], model_name: str | None = None) -> lis
         import torch
 
         state = torch.load(str(path), map_location="cpu", weights_only=True)
-        count = state.get("speakers_id") if isinstance(state, dict) else None
+        count = None
+        if isinstance(state, dict):
+            count = state.get("speakers_id") or state.get("speaker_count")
     return list(range(count)) if count else [0]
+
+
+_KIND_NAMES = {
+    RVC_KIND: "an RVC model",
+    RECTIFIED_KIND: "a rectified-flow model",
+    VOCODER_KIND: "a rectified vocoder",
+    "bundle": "a model bundle",
+}
+_KIND_HOMES = {
+    RVC_KIND: "Use it in the Classic RVC tab (infer on the command line).",
+    RECTIFIED_KIND: "Use it as the flow model in the Rectified tab (rectified_infer on the command line).",
+    VOCODER_KIND: "Use it as the vocoder in the Rectified tab.",
+}
+
+
+@lru_cache(maxsize=64)
+def _checkpoint_kind(path: str, _mtime_ns: int, _size: int) -> str | None:
+    """What a ``.pth`` holds, read memory-mapped so the weights stay on disk;
+    None when it is none of ours or unreadable. Keyed on the file's stamp."""
+    import torch
+
+    try:
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        except RuntimeError:  # the legacy, non-zip format cannot be mapped
+            state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+    if not isinstance(state, dict):
+        return None
+    if state.get("kind") in (RECTIFIED_KIND, VOCODER_KIND):
+        return state["kind"]
+    if "weight" in state and "config" in state:
+        return RVC_KIND
+    return None
+
+
+def wrong_kind_message(
+    path: str | PathLike[str] | None, expected: str, submodel: str | None = None
+) -> str | None:
+    """Why ``path`` (one ``submodel`` of a bundle) cannot be used as a model
+    of kind ``expected``, or None when it can or cannot be told. Checked
+    before a conversion, so the wrong pick is named rather than failing
+    somewhere inside the model's construction."""
+    if not path or not os.path.isfile(path):
+        return None  # the loader reports a missing file
+    name = os.path.basename(path)
+    if is_model_bundle(path) and expected != VOCODER_KIND:
+        if not submodel:
+            kinds = bundle_kinds(path)
+            if expected in kinds:
+                return None
+            held = " and ".join(_KIND_NAMES.get(kind, kind) for kind in sorted(kinds))
+            return f"'{name}' holds {held}, not {_KIND_NAMES[expected]}. " + " ".join(
+                _KIND_HOMES[kind] for kind in sorted(kinds) if kind in _KIND_HOMES
+            )
+        info = bundle_model_info(path, submodel)
+        kind = info.get("kind", RVC_KIND) if info else None
+        name = f"{name} [{submodel}]"
+    elif is_model_bundle(path):
+        kind = "bundle"
+    else:
+        stat = os.stat(path)
+        kind = _checkpoint_kind(os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+    if kind is None or kind == expected:
+        return None
+    return (
+        f"'{name}' is {_KIND_NAMES.get(kind, kind)}, not {_KIND_NAMES[expected]}. "
+        f"{_KIND_HOMES.get(kind, '')}"
+    ).strip()
 
 
 def get_bundle_models(bundle_data: dict[str, Any]) -> dict[str, Any]:
@@ -365,7 +483,9 @@ def extract_model_bundle(
 ) -> list[dict[str, Any]]:
     """Write each model in a bundle back out as ``<name>/<name>.pth`` and ``.index``.
 
-    That is the layout Applio pairs by name.  The ``.pth`` is the checkpoint
+    That is the layout Applio pairs by name.  A rectified flow goes to
+    ``flow/<name>.pth`` with ``<name>.index`` beside the folder, where the
+    rectified model lists look.  The ``.pth`` is the checkpoint
     that went into the bundle, and the index carries this fork's metadata as a
     footer, which Applio ignores.  An index shared by every model is written
     once and hard-linked into the other folders.  Returns one report per model:
@@ -388,12 +508,18 @@ def extract_model_bundle(
     }
 
     output_dir = Path(output_dir)
+
+    def destinations(name: str, entry: dict[str, Any]) -> tuple[Path, Path]:
+        if model_kind(entry.get("model_state") or {}) == RECTIFIED_KIND:
+            return output_dir / "flow" / f"{name}.pth", output_dir / f"{name}.index"
+        return output_dir / name / f"{name}.pth", output_dir / name / f"{name}.index"
+
     if not overwrite:
         clashes = [
-            str(output_dir / name / f"{name}{suffix}")
-            for name in entries
-            for suffix in (".pth", ".index")
-            if (output_dir / name / f"{name}{suffix}").exists()
+            str(path)
+            for name, entry in entries.items()
+            for path in destinations(name, entry)
+            if path.exists()
         ]
         if clashes:
             raise FileExistsError("Already exists: " + ", ".join(clashes))
@@ -403,13 +529,13 @@ def extract_model_bundle(
     written: dict[int, tuple[Path, str]] = {}
     reports = []
     for name, entry in entries.items():
-        folder = output_dir / name
-        folder.mkdir(parents=True, exist_ok=True)
         state = entry["model_state"]
-        pth_path = folder / f"{name}.pth"
+        pth_path, index_path = destinations(name, entry)
+        pth_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(state, pth_path)
         report = {
             "name": name,
+            "kind": model_kind(state),
             "pth": pth_path,
             "index": None,
             "vocoder": str(state.get("vocoder", "HiFi-GAN")),
@@ -418,7 +544,6 @@ def extract_model_bundle(
 
         index_data = entry.get("index_data")
         if index_data is not None:
-            index_path = folder / f"{name}.index"
             if id(index_data) in written:
                 source, metric = written[id(index_data)]
                 _link_or_copy(source, index_path)
@@ -450,6 +575,13 @@ def extraction_report(reports: list[dict[str, Any]]) -> list[str]:
     for report in reports:
         index = report["index"].name if report["index"] else "no index"
         lines.append(f"{report['name']}: {report['pth'].name} + {index}")
+        if report.get("kind") == RECTIFIED_KIND:
+            lines.append(
+                "  Rectified flow: loads in ShiroRVC's Rectified tab only. "
+                f"It was trained with the vocoder '{report['vocoder'] or 'none'}', "
+                "which is not in the bundle."
+            )
+            continue
         if report["vocoder"] not in APPLIO_VOCODERS:
             lines.append(
                 f"  Applio does not know the vocoder '{report['vocoder']}' and "
@@ -660,7 +792,7 @@ def create_model_bundle(
 
     save_model_bundle(
         output_path,
-        {"format": MODEL_BUNDLE_FORMAT, "version": MODEL_BUNDLE_VERSION, "models": models},
+        {"format": MODEL_BUNDLE_FORMAT, "version": _format_version(models), "models": models},
         int(compression_level),
     )
     return report

@@ -6,18 +6,29 @@ call it to fill a dropdown.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
 
-from rvc.lib.model_bundle import is_model_bundle, is_model_file, walk_models
+from rvc.lib.model_bundle import RVC_KIND, bundle_kinds, is_model_bundle, is_model_file, walk_models
 from rvc.lib.paths import (
     AUDIO_DIR,
     CUSTOM_PRETRAINED_DIR,
     DATASET_DIR,
     LOGS_DIR,
+    MODELS_DIR,
     ROOT,
 )
+
+RECTIFIED_PRETRAINED_DIR = MODELS_DIR / "pretraineds" / "rectified"
+#: The default rectified-flow pretrain for each content embedder, in
+#: ``RECTIFIED_PRETRAINED_DIR``; a pretrain only fits the features it was
+#: trained on.
+RECTIFIED_FLOW_PRETRAINS = {
+    "contentvec": "pretrain_flow_contentvec.pth",
+    "spin_v2": "pretrain_flow_spin_v2.pth",
+}
 
 AUDIO_EXTENSIONS = (
     ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4",
@@ -72,7 +83,9 @@ def list_models(
         for name in filenames:
             if not is_model_file(name):
                 continue
-            if not bundles and is_model_bundle(name):
+            if is_model_bundle(name) and (
+                not bundles or RVC_KIND not in bundle_kinds(os.path.join(dirpath, name))
+            ):
                 continue
             if not training_checkpoints and name.startswith(("G_", "D_")):
                 continue
@@ -80,8 +93,15 @@ def list_models(
     return sorted(found, key=sort_key)
 
 
-def list_bundles(logs_dir: Path = LOGS_DIR) -> list[str]:
-    return [path for path in list_models(logs_dir) if is_model_bundle(path)]
+def list_bundles(logs_dir: Path = LOGS_DIR, kind: str | None = None) -> list[str]:
+    """Bundles under ``logs_dir``; with ``kind``, those holding a model of it."""
+    found = []
+    for dirpath, _dirnames, filenames in walk_models(logs_dir):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if is_model_bundle(name) and (kind is None or kind in bundle_kinds(path)):
+                found.append(relative(path))
+    return sorted(found, key=sort_key)
 
 
 def list_indexes(logs_dir: Path = LOGS_DIR) -> list[str]:
@@ -156,6 +176,23 @@ def list_training_models(logs_dir: Path = LOGS_DIR) -> list[str]:
         and not entry.name.startswith(_TRAINING_DIR_PREFIXES)
         and entry.name != "zips"
     )
+
+
+def experiment_embedder(model_name: str, logs_dir: Path = LOGS_DIR) -> str:
+    """The content embedder an experiment was extracted with; contentvec
+    before extraction has written it."""
+    try:
+        with open(Path(logs_dir) / model_name / "model_info.json", encoding="utf-8") as handle:
+            return json.load(handle).get("embedder_model", "contentvec")
+    except (OSError, ValueError):
+        return "contentvec"
+
+
+def default_flow_pretrain(embedder: str, root: Path = RECTIFIED_PRETRAINED_DIR) -> str:
+    """The default rectified-flow pretrain for ``embedder`` when it is on disk, else ""."""
+    name = RECTIFIED_FLOW_PRETRAINS.get(embedder)
+    path = Path(root) / name if name else None
+    return relative(path) if path is not None and path.is_file() else ""
 
 
 def list_experiment_speakers(model_name: str, logs_dir: Path = LOGS_DIR) -> list[int]:

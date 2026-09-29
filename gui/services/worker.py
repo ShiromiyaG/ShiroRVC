@@ -124,12 +124,18 @@ def cmd_infer(args):
         catalog.conversion_outputs(args["output_path"], args.get("export_format", "WAV"))
     )
     message, preview = _core().run_infer_script(**args)
+    if preview is None:  # refused before converting, e.g. a rectified model
+        raise RuntimeError(message)
     _require_written(before, preview)
     return {"message": message, "preview": preview}
 
 
 def cmd_batch_infer(args):
-    return {"message": _core().run_batch_infer_script(**args)}
+    core = _core()
+    problem = core.model_kind_problem([(args.get("pth_path"), core.RVC_KIND, None)], "[INFER]")
+    if problem:
+        raise RuntimeError(problem)
+    return {"message": core.run_batch_infer_script(**args)}
 
 
 def cmd_tts(args):
@@ -137,6 +143,8 @@ def cmd_tts(args):
         catalog.conversion_outputs(args["output_rvc_path"], args.get("export_format", "WAV"))
     )
     message, output = _core().run_tts_script(**args)
+    if output is None:
+        raise RuntimeError(message)
     _require_written(before, output)
     return {"message": message, "output": output}
 
@@ -155,6 +163,49 @@ def cmd_train(args):
 
 def cmd_stop_train(args):
     return {"message": _core().stop_train_script()}
+
+
+def cmd_rectified_infer(args):
+    message, written = _core().run_rectified_infer_script(**args)
+    if not written:
+        raise RuntimeError(message)
+    return {"message": message, "preview": written}
+
+
+def cmd_rectified_train(args):
+    """``args["part"]`` is ``flow`` or ``vocoder``.  One command for both, so the
+    detached-job guard allows one rectified run at a time: core tracks a single
+    rectified trainer process."""
+    args = dict(args)
+    part = args.pop("part")
+    core = _core()
+    run = (core.run_rectified_flow_train_script if part == "flow"
+           else core.run_rectified_vocoder_train_script)
+    message = run(**args)
+    if core.rectified_process is not None and core.rectified_process.returncode:
+        raise RuntimeError(message)
+    return {"message": message}
+
+
+def cmd_stop_rectified_train(args):
+    return {"message": _core().stop_rectified_train_script()}
+
+
+def cmd_rectified_unload(args):
+    _core().unload_rectified_models()
+    return {"message": "Rectified models unloaded."}
+
+
+def cmd_rectified_flow_info(args):
+    """A flow export's or bundle's flows, speakers and paired vocoder, read
+    without building it (``rvc.rectified.common.describe_flow``)."""
+    from rvc.rectified.common import describe_flow
+
+    try:
+        return describe_flow(args.get("flow_path"), args.get("sub_model"))
+    except Exception as error:  # noqa: BLE001 - as the Gradio tab: fall back to one speaker
+        note(f"Could not read the flow model: {error}")
+        return {"submodels": [], "submodel": "", "speakers": [0], "vocoder": ""}
 
 
 def cmd_index(args):
@@ -208,13 +259,13 @@ def cmd_speakers(args):
 
 
 def cmd_bundle_models(args):
-    from rvc.lib.model_bundle import bundle_model_names, is_model_bundle
+    from rvc.lib.model_bundle import RVC_KIND, bundle_model_names, is_model_bundle
 
     model = args.get("model")
     if not model or not is_model_bundle(model) or not os.path.isfile(model):
         return {"names": []}
     try:
-        return {"names": bundle_model_names(model)}
+        return {"names": bundle_model_names(model, args.get("kind", RVC_KIND))}
     except Exception as error:  # noqa: BLE001 - as the Gradio tab: no sub-models to offer
         note(f"Could not inspect the model bundle: {error}")
         return {"names": []}
@@ -284,6 +335,11 @@ HANDLERS = {
     "extract": cmd_extract,
     "train": cmd_train,
     "index": cmd_index,
+    "rectified_infer": cmd_rectified_infer,
+    "rectified_train": cmd_rectified_train,
+    "stop_rectified_train": cmd_stop_rectified_train,
+    "rectified_unload": cmd_rectified_unload,
+    "rectified_flow_info": cmd_rectified_flow_info,
     "model_info": cmd_model_info,
     "blend": cmd_blend,
     "download": cmd_download,
@@ -299,7 +355,7 @@ HANDLERS = {
 #: Commands answered on the reader thread rather than queued behind the running
 #: job.  Stopping a training run is the whole point: it has to be dispatchable
 #: precisely while a job is occupying the worker.
-CONTROL = {"ping", "stop_train"}
+CONTROL = {"ping", "stop_train", "stop_rectified_train"}
 
 #: Commands that get a thread of their own instead of a place in the queue.
 #: ``run_train_script`` waits on the trainer process for the whole run, and a
@@ -307,7 +363,7 @@ CONTROL = {"ping", "stop_train"}
 #: for hours.  The trainer is a process of its own, so converting beside it is
 #: what the web interface has always allowed; the queue is for work that would
 #: actually collide.
-DETACHED = {"train"}
+DETACHED = {"train", "rectified_train"}
 #: Detached commands running now, so a second one of the same kind is refused
 #: rather than started on top of the first.
 _detached: set[str] = set()
@@ -387,14 +443,18 @@ def _stop_training_before_exit() -> None:
     one started from the web interface.
     """
     core = sys.modules.get("core")
-    process = getattr(core, "training_process", None) if core else None
-    if process is None or process.poll() is not None:
+    if core is None:
         return
-    note("stopping the training run before exiting")
-    try:
-        note(core.stop_train_script())
-    except Exception as error:  # noqa: BLE001 - exiting regardless
-        note(f"could not stop the training run: {type(error).__name__}: {error}")
+    for attr, stop in (("training_process", "stop_train_script"),
+                       ("rectified_process", "stop_rectified_train_script")):
+        process = getattr(core, attr, None)
+        if process is None or process.poll() is not None:
+            continue
+        note("stopping the training run before exiting")
+        try:
+            note(getattr(core, stop)())
+        except Exception as error:  # noqa: BLE001 - exiting regardless
+            note(f"could not stop the training run: {type(error).__name__}: {error}")
 
 
 def dispatch(message: dict) -> None:

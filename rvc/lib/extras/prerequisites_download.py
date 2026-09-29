@@ -30,11 +30,13 @@ pretraineds_hifigan_list = [
 VOCODER_PRETRAINED_URLS = {
     "refinegan2": "",
     "hifi++": "",
+    "nsf-bigvgan": "",
 }
 
 vocoder_pretraineds = {
     "refinegan2": ("pretrained_refinegan2/", ["f0G32k.pth", "f0D32k.pth"]),
     "hifi++": ("pretrained_hifi++/", ["f0G32k.pth", "f0D32k.pth"]),
+    "nsf-bigvgan": ("pretrained_nsf-bigvgan/", ["f0G32k.pth", "f0D32k.pth"]),
 }
 
 
@@ -50,6 +52,17 @@ def vocoder_pretraineds_list(vocoder=None, sample_rate=None):
         if files:
             entries.append((remote_folder, files, url))
     return entries
+
+#: The default rectified-flow pretrains (``rvc.lib.catalog.RECTIFIED_FLOW_PRETRAINS``)
+#: that are published; spin_v2's is picked up once it is here.
+rectified_pretrains_list = [
+    ("Rectified_pretrains/", ["pretrain_flow_contentvec.pth"]),
+]
+
+#: OpenVPI vocoders the rectified flow's mel is made for.
+openvpi_vocoders_list = [
+    ("vocoders/", ["pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth"]),
+]
 
 models_list = [
     # Both live under ``predictors/`` in the resource repo, so both go through
@@ -76,11 +89,14 @@ folder_mapping_list = {
     # Must match ``pretrained_dir`` in vocoders.json: pretrained_selector reads there.
     "pretrained_refinegan2/": "rvc/models/pretraineds/refinegan2/",
     "pretrained_hifi++/": "rvc/models/pretraineds/hifi-gan++/",
+    "pretrained_nsf-bigvgan/": "rvc/models/pretraineds/nsf-bigvgan/",
     "embedders/contentvec/": "rvc/models/embedders/contentvec/",
     "embedders/spin_v2": "rvc/models/embedders/spin_v2/",
     "predictors/": "rvc/models/predictors/",
     "fireredvad/VAD/": "rvc/models/fireredvad/VAD/",
     "formant/": "rvc/models/formant/",
+    "vocoders/": "rvc/models/pretraineds/rectified/",
+    "Rectified_pretrains/": "rvc/models/pretraineds/rectified/",
 }
 
 
@@ -246,5 +262,8 @@ def prequisites_download_pipeline(
     if exe and os.name == "nt":
         entries += executables_list
     if pretraineds_hifigan:
-        entries += pretraineds_hifigan_list + vocoder_pretraineds_list()
+        entries += (
+            pretraineds_hifigan_list + vocoder_pretraineds_list()
+            + openvpi_vocoders_list + rectified_pretrains_list
+        )
     _download(entries, "Downloading all files")

@@ -10,6 +10,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from rvc.configs.vocoders import (
+    RECTIFIED_EXTRACTION,
     get_vocoder_sample_rates,
     normalize_vocoder,
 )
@@ -18,6 +19,7 @@ import soundfile as sf
 import concurrent.futures
 import multiprocessing as mp
 import json
+from collections import deque
 
 from rvc.lib.terminal import (
     error as print_error,
@@ -103,7 +105,7 @@ class FeatureInput:
         )
         return np.rint(f0_mel).astype(np.uint8, copy=False)
 
-    def process_batch(self, batched_model, group):
+    def process_batch(self, batched_model, group, audio=None):
         """``process_file`` for several equal-length clips in one pass.
 
         Falls back to the single path for the whole group on any failure: a
@@ -111,7 +113,8 @@ class FeatureInput:
         cost the other fifteen.
         """
         try:
-            audio = [load_audio_16k(info[0]) for info in group]
+            if audio is None:
+                audio = [load_audio_16k(info[0]) for info in group]
             contours = batched_model.infer_from_audio_batch(audio, thred=0.03)
         except Exception as error:
             print_error(
@@ -129,13 +132,13 @@ class FeatureInput:
             np.save(opt_path_full, feature_pit, allow_pickle=False)
             np.save(opt_path_coarse, self.coarse_f0(feature_pit), allow_pickle=False)
 
-    def process_file(self, file_info):
+    def process_file(self, file_info, audio=None):
         inp_path, opt_path_coarse, opt_path_full, _ = file_info
         if os.path.exists(opt_path_coarse) and os.path.exists(opt_path_full):
             return
 
         try:
-            np_arr = load_audio_16k(inp_path)
+            np_arr = load_audio_16k(inp_path) if audio is None else audio
             feature_pit = np.asarray(self.compute_f0(np_arr), dtype=np.float32)
             np.save(opt_path_full, feature_pit, allow_pickle=False)
             coarse_pit = self.coarse_f0(feature_pit)
@@ -154,7 +157,44 @@ class FeatureInput:
 BATCH_SIZE = 16
 
 
-def _grouped_by_length(files):
+#: Threads reading clip headers; the scan is I/O, not compute.
+SCAN_THREADS = 16
+
+
+def _clip_length(source):
+    """``source``'s length at 16 kHz, from its header; -1 when unreadable."""
+    if is_noise_source(source):
+        # Synthesised, and every mute clip is the same length.
+        return NOISE_SAMPLES
+    try:
+        clip = sf.info(source)
+    except Exception:
+        return -1
+    # The length after resampling, the same way ``load_audio_16k`` derives it:
+    # bucketing on the source frame count would put a clip at the project rate
+    # in the same batch as a mute whose count is already at 16 kHz.
+    return int(round(clip.frames * 16000 / clip.samplerate))
+
+
+def scan_lengths(sources):
+    """``{source: length at 16 kHz}`` for ``sources``, headers read in parallel
+    once for both stages."""
+    lengths = {}
+    if not sources:
+        return lengths
+    with concurrent.futures.ThreadPoolExecutor(SCAN_THREADS) as pool, progress_task(
+        len(sources), "Scanning clip lengths", leave=True
+    ) as (progress, task_id):
+        for index, (source, length) in enumerate(
+            zip(sources, pool.map(_clip_length, sources, chunksize=256)), 1
+        ):
+            lengths[source] = length
+            if index % 1024 == 0 or index == len(sources):
+                progress.update(task_id, completed=index)
+    return lengths
+
+
+def _grouped_by_length(files, lengths=None):
     """``files`` bucketed by exact 16 kHz sample count, longest bucket first.
 
     Exact, not approximate: a batch has to be one tensor, and padding clips to
@@ -162,33 +202,66 @@ def _grouped_by_length(files):
     follows -- measured at up to 95% relative error on the embeddings.  Equal
     lengths make a batch the same arithmetic as the loop it replaces.
 
-    This costs nothing to know.  Preprocessing cuts on a fixed grid, so the
-    great majority of a dataset lands on one length (78% of a real experiment
-    here, all 3.00 s); the ragged tails fall into small buckets and, at worst,
-    into buckets of one, which is exactly the old path.
+    Preprocessing cuts on a fixed grid, so the great majority of a dataset
+    lands on one length (78% of a real experiment here, all 3.00 s); the
+    ragged tails fall into small buckets and, at worst, into buckets of one,
+    which is exactly the old path.
+
+    ``lengths`` (from ``scan_lengths``) saves reading the headers again; a
+    clip missing from it is read here. Unreadable clips (-1) share a bucket and
+    fail one at a time through the batch fallback.
     """
+    lengths = lengths or {}
     buckets = {}
     for file_info in files:
         source = file_info[0]
-        if is_noise_source(source):
-            # Synthesised, and every mute clip is the same length: no stat to
-            # do, and they all land in one bucket.
-            frames = NOISE_SAMPLES
-        else:
-            try:
-                clip = sf.info(source)
-                # The length after resampling, the same way ``load_audio_16k``
-                # derives it: bucketing on the source frame count would put a
-                # clip at the project rate in the same batch as a mute whose
-                # count is already at 16 kHz.
-                frames = int(round(clip.frames * 16000 / clip.samplerate))
-            except Exception:
-                frames = -1  # unreadable: give it its own bucket, fail it alone
+        frames = lengths.get(source)
+        if frames is None:
+            frames = _clip_length(source)
         buckets.setdefault(frames, []).append(file_info)
     return sorted(buckets.values(), key=len, reverse=True)
 
 
-def process_files(files, f0_method, device, threads):
+def _pending_groups(files, lengths, done):
+    """``(group, size)`` per batch of equal-length clips: the clips ``done``
+    does not rule out, and how many the batch held for the progress bar."""
+    for bucket in _grouped_by_length(files, lengths):
+        for start in range(0, len(bucket), BATCH_SIZE):
+            chunk = bucket[start : start + BATCH_SIZE]
+            yield [info for info in chunk if not done(info)], len(chunk)
+
+
+def _prefetched(groups, workers):
+    """``(group, size, audio)`` in order, the audio of the next batches decoded
+    and resampled on ``workers`` threads while the GPU runs the current one.
+    ``audio`` is None for an empty group or when a clip would not load; the
+    callers then fall back to their one-clip path, which reports the error."""
+
+    def load(group):
+        return [_clip_audio(info[0]) for info in group] if group else None
+
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        queue = deque()
+        groups = iter(groups)
+
+        def submit():
+            item = next(groups, None)
+            if item is not None:
+                queue.append((*item, pool.submit(load, item[0])))
+
+        for _ in range(workers * 2):
+            submit()
+        while queue:
+            group, size, future = queue.popleft()
+            submit()
+            try:
+                audio = future.result()
+            except Exception:
+                audio = None
+            yield group, size, audio
+
+
+def process_files(files, f0_method, device, threads, lengths=None):
     if device == "cpu":
         torch.set_num_threads(max(1, threads))
     fe = FeatureInput(f0_method=f0_method, device=device)
@@ -196,27 +269,27 @@ def process_files(files, f0_method, device, threads):
     batched = getattr(fe.model, "model", None)
     batched = batched if hasattr(batched, "infer_from_audio_batch") else None
 
+    groups = _pending_groups(
+        files, lengths, lambda info: os.path.exists(info[1]) and os.path.exists(info[2])
+    )
     with progress_task(len(files), f"F0 {device}", leave=True) as (progress, task_id):
-        for bucket in _grouped_by_length(files):
-            for start in range(0, len(bucket), BATCH_SIZE):
-                group = [
-                    info
-                    for info in bucket[start : start + BATCH_SIZE]
-                    if not (os.path.exists(info[1]) and os.path.exists(info[2]))
-                ]
-                done = len(bucket[start : start + BATCH_SIZE])
-                if not group:
-                    progress.advance(task_id, done)
-                    continue
-                if batched is None or len(group) == 1:
-                    for info in group:
-                        fe.process_file(info)
-                else:
-                    fe.process_batch(batched, group)
-                progress.advance(task_id, done)
+        for group, size, audio in _prefetched(groups, max(2, threads)):
+            if batched is None or len(group) == 1 or audio is None:
+                for index, info in enumerate(group):
+                    fe.process_file(info, None if audio is None else audio[index])
+            else:
+                fe.process_batch(batched, group, audio)
+            progress.advance(task_id, size)
 
 
-def run_pitch_extraction(files, devices, f0_method, threads):
+def _lengths_for(files, lengths):
+    """The part of ``lengths`` one worker needs, so each pickles only its own."""
+    if not lengths:
+        return None
+    return {info[0]: lengths[info[0]] for info in files if info[0] in lengths}
+
+
+def run_pitch_extraction(files, devices, f0_method, threads, lengths=None):
     devices_str = ", ".join(devices)
     info(
         f"Pitch extraction: {f0_method}, {num_processes} threads on {devices_str}.",
@@ -232,6 +305,7 @@ def run_pitch_extraction(files, devices, f0_method, threads):
                 f0_method,
                 devices[i],
                 threads // len(devices),
+                _lengths_for(files[i :: len(devices)], lengths),
             )
             for i in range(len(devices))
         ]
@@ -261,7 +335,7 @@ def _clip_audio(source):
 
 def process_file_embedding(
     files, embedder_model, device_num, device, n_threads,
-    feature_precision="fp32",
+    feature_precision="fp32", lengths=None,
 ):
     dtype = FEATURE_PRECISIONS.get(feature_precision, np.float32)
     model, do_normalize = load_embedder_model(embedder_model)
@@ -282,11 +356,12 @@ def process_file_embedding(
         else:
             warning(f"{source} produced NaN values; skipping.", tag="[EXTRACT]")
 
-    def worker(file_info):
+    def worker(file_info, audio=None):
         source, _, _, out_file_path = file_info
         if os.path.exists(out_file_path):
             return
-        feats = torch.from_numpy(_clip_audio(source)).to(device).float()
+        audio = _clip_audio(source) if audio is None else audio
+        feats = torch.from_numpy(audio).to(device).float()
         feats = feats.view(1, -1)
         with torch.autocast(
             device_type="cuda",
@@ -296,7 +371,7 @@ def process_file_embedding(
             result = extract_features(model, feats, "v2", do_normalize=do_normalize)
         save(file_info, result.squeeze(0).float().cpu().numpy())
 
-    def batch_worker(group):
+    def batch_worker(group, audio):
         """One forward pass for a group of equal-length clips.
 
         Same all-or-nothing fallback as the pitch stage: on any failure the
@@ -304,8 +379,7 @@ def process_file_embedding(
         neighbours a retry rather than their features.
         """
         try:
-            audio = np.stack([_clip_audio(info[0]) for info in group])
-            feats = torch.from_numpy(audio).to(device).float()
+            feats = torch.from_numpy(np.stack(audio)).to(device).float()
             with torch.autocast(
                 device_type="cuda",
                 dtype=torch.float16,
@@ -330,24 +404,20 @@ def process_file_embedding(
         f"Features {device}",
         leave=True,
     ) as (progress, task_id):
+        groups = _pending_groups(files, lengths, lambda info: os.path.exists(info[3]))
         with torch.inference_mode():
-            for bucket in _grouped_by_length(files):
-                for start in range(0, len(bucket), BATCH_SIZE):
-                    chunk = bucket[start : start + BATCH_SIZE]
-                    group = [i for i in chunk if not os.path.exists(i[3])]
-                    if not group:
-                        progress.advance(task_id, len(chunk))
-                        continue
-                    if len(group) == 1:
-                        worker(group[0])
-                    else:
-                        batch_worker(group)
-                    progress.advance(task_id, len(chunk))
+            for group, size, audio in _prefetched(groups, max(2, n_threads)):
+                if len(group) == 1 or audio is None:
+                    for index, info in enumerate(group):
+                        worker(info, None if audio is None else audio[index])
+                else:
+                    batch_worker(group, audio)
+                progress.advance(task_id, size)
 
 
 def run_embedding_extraction(
     files, devices, embedder_model, threads,
-    feature_precision="fp32",
+    feature_precision="fp32", lengths=None,
 ):
     devices_str = ", ".join(devices)
     info(
@@ -365,6 +435,7 @@ def run_embedding_extraction(
                 devices[i],
                 threads // len(devices),
                 feature_precision,
+                _lengths_for(files[i :: len(devices)], lengths),
             )
             for i in range(len(devices))
         ]
@@ -383,11 +454,13 @@ if __name__ == "__main__":
     num_processes = int(sys.argv[3])
     gpus = sys.argv[4]
     sample_rate = sys.argv[5]
-    vocoder_arch = normalize_vocoder(sys.argv[6])
-    if int(sample_rate) not in get_vocoder_sample_rates(vocoder_arch):
-        raise ValueError(
-            f"{vocoder_arch} does not provide a configuration for {sample_rate} Hz."
-        )
+    vocoder_arch = sys.argv[6]
+    if vocoder_arch != RECTIFIED_EXTRACTION:
+        vocoder_arch = normalize_vocoder(vocoder_arch)
+        if int(sample_rate) not in get_vocoder_sample_rates(vocoder_arch):
+            raise ValueError(
+                f"{vocoder_arch} does not provide a configuration for {sample_rate} Hz."
+            )
     embedder_model = sys.argv[7]
     include_mutes = int(sys.argv[8]) if len(sys.argv) > 8 else 5
     feature_precision = sys.argv[9] if len(sys.argv) > 9 else "fp32"
@@ -433,21 +506,47 @@ if __name__ == "__main__":
         ]
         files.append(file_info)
 
-    devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
+    # Features from the removed content perturbation are deleted before the
+    # flag, so an interrupted run still redoes them.
+    if data.get("content_perturbation"):
+        info("Features were extracted from perturbed audio; re-extracting them.", tag="[EXTRACT]")
+        for file_info in files:
+            if os.path.exists(file_info[3]):
+                os.remove(file_info[3])
+        del data["content_perturbation"]
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=4)
 
-    run_pitch_extraction(files, devices, f0_method, num_processes)
+    devices =["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
+
+    # Finished clips are dropped before anything reads an audio header, so a
+    # resumed extraction starts where it stopped.
+    pitch_pending = [f for f in files if not (os.path.exists(f[1]) and os.path.exists(f[2]))]
+    embed_pending = [f for f in files if not os.path.exists(f[3])]
+    lengths = scan_lengths(sorted({f[0] for f in pitch_pending + embed_pending}))
+
+    if pitch_pending:
+        run_pitch_extraction(pitch_pending, devices, f0_method, num_processes, lengths)
+    else:
+        info("Pitch already extracted for every clip.", tag="[EXTRACT]")
 
     # The mute clips' pitch is written, not tracked (they are unvoiced by
     # construction), so they join only the embedding pass.
     _, mute_files = prepare_noise_mutes(exp_dir, sample_rate, embedder_model, include_mutes)
+    embed_pending += [f for f in mute_files if not os.path.exists(f[3])]
 
-    run_embedding_extraction(
-        files + mute_files,
-        devices,
-        embedder_model,
-        num_processes,
-        feature_precision,
-    )
+    if embed_pending:
+        run_embedding_extraction(
+            embed_pending,
+            devices,
+            embedder_model,
+            num_processes,
+            feature_precision,
+            lengths,
+        )
+    else:
+        info("Features already extracted for every clip.", tag="[EXTRACT]")
 
-    generate_config(sample_rate, exp_dir, vocoder_arch, embedder_model)
+    if vocoder_arch != RECTIFIED_EXTRACTION:
+        generate_config(sample_rate, exp_dir, vocoder_arch, embedder_model)
     generate_filelist(exp_dir, sample_rate, include_mutes, embedder_model, vocoder_arch)

@@ -315,7 +315,9 @@ TTS_OWN = [
 ]
 
 # ---- preprocess ----
-PREPROCESS_OWN = [
+# Split around --sample_rate so rectified_preprocess, which has one rate, can
+# reuse the rest.
+_PREPROCESS_SOURCE = [
     click.option(
         "--model_name",
         type=str,
@@ -328,12 +330,8 @@ PREPROCESS_OWN = [
         required=True,
         help="Path to the dataset directory.",
     ),
-    click.option(
-        "--sample_rate",
-        type=click.Choice(get_all_vocoder_sample_rates()),
-        required=True,
-        help="Target sampling rate for the audio data.",
-    ),
+]
+_PREPROCESS_SETTINGS = [
     click.option(
         "--cpu_threads",
         type=click.IntRange(1, min(cpu_count(), 192)),
@@ -402,9 +400,20 @@ PREPROCESS_OWN = [
         help="Both use SoXr. ffmpeg keeps ~850 Hz more top band (flat to 15.85 kHz at 32 kHz against librosa's 15.0) for ~3 ms more filter ringing; librosa is the gentler, shorter filter.",
     ),
 ]
+PREPROCESS_OWN = [
+    *_PREPROCESS_SOURCE,
+    click.option(
+        "--sample_rate",
+        type=click.Choice(get_all_vocoder_sample_rates()),
+        required=True,
+        help="Target sampling rate for the audio data.",
+    ),
+    *_PREPROCESS_SETTINGS,
+]
 
 # ---- extract ----
-EXTRACT_OWN = [
+# Split around --sample_rate and --vocoder_arch, which rectified_extract fixes.
+_EXTRACT_HEAD = [
     click.option("--model_name", type=str, required=True, help="Name of the model."),
     click.option(
         "--f0_method",
@@ -427,19 +436,8 @@ EXTRACT_OWN = [
         show_default=True,
         help="GPU device to use for feature extraction (optional).",
     ),
-    click.option(
-        "--sample_rate",
-        type=click.Choice(get_all_vocoder_sample_rates()),
-        required=True,
-        help="Target sampling rate for the audio data.",
-    ),
-    click.option(
-        "--vocoder_arch",
-        type=click.Choice(get_vocoder_cli_choices()),
-        default=get_default_vocoder(),
-        show_default=True,
-        help="Choose the vocoder architecture",
-    ),
+]
+_EXTRACT_TAIL = [
     click.option(
         "--embedder_model",
         type=click.Choice(["contentvec", "spin_v2"]),
@@ -461,6 +459,23 @@ EXTRACT_OWN = [
         show_default=True,
         help="Precision the extracted embeddings are stored at. fp32 doubles the feature cache on disk but keeps the retrieval index free of a quantisation floor; fp16 halves it. Either can be read back without re-extracting.",
     ),
+]
+EXTRACT_OWN = [
+    *_EXTRACT_HEAD,
+    click.option(
+        "--sample_rate",
+        type=click.Choice(get_all_vocoder_sample_rates()),
+        required=True,
+        help="Target sampling rate for the audio data.",
+    ),
+    click.option(
+        "--vocoder_arch",
+        type=click.Choice(get_vocoder_cli_choices()),
+        default=get_default_vocoder(),
+        show_default=True,
+        help="Choose the vocoder architecture",
+    ),
+    *_EXTRACT_TAIL,
 ]
 
 # ---- train ----
@@ -627,6 +642,100 @@ TRAIN_OWN = [
         show_default=True,
         help="Choose the method for generating the index file.",
     ),
+]
+
+# ---- rectified_train_flow ----
+RECTIFIED_TRAIN_FLOW_OWN = [
+    click.option("--model_name", type=str, required=True, help="Name of the extracted experiment."),
+    click.option("--total_epochs", type=click.IntRange(1, 10000), default=100, show_default=True, help="Epochs to train."),
+    click.option("--save_every", type=click.IntRange(1, 1000), default=10, show_default=True, help="Save a checkpoint and an export every this many epochs."),
+    click.option("--batch_size", type=click.IntRange(1, 256), default=16, show_default=True, help="Clips per step."),
+    click.option("--gpu", type=str, default="0", show_default=True, help="GPUs to train on, separated by '-' (e.g. 0-1). Batch size is per GPU."),
+    click.option("--pretrained_flow", type=str, default="", help="Flow export or checkpoint to fine-tune from; empty trains from scratch."),
+    click.option("--vocoder", type=str, default="", help="Vocoder that renders the audio previews and is paired with the exports. Empty uses the newest in rvc/models/pretraineds/rectified."),
+    click.option("--learning_rate", type=float, default=0.0, show_default=True, help="0 uses the config's rate."),
+    click.option(
+        "--checkpoints",
+        type=click.Choice(["latest", "all", "none"]),
+        default="latest",
+        show_default=True,
+        help="Training checkpoints to keep: the latest, all, or none. Without them only the exports are saved and a stopped run starts over; exports are always kept.",
+    ),
+    click.option("--fresh", type=click.BOOL, default=False, show_default=True, help="Ignore this run's checkpoints and start over."),
+    click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
+    click.option("--compile", type=click.BOOL, default=False, show_default=True, help="torch.compile the flow backbone. Needs CUDA and Triton."),
+    click.option(
+        "--torch_compile_mode",
+        type=click.Choice(["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]),
+        default="default",
+        show_default=True,
+        help="Torch compile mode used for the flow backbone.",
+    ),
+]
+
+# ---- rectified_preprocess / rectified_extract ----
+RECTIFIED_PREPROCESS_OWN = [*_PREPROCESS_SOURCE, *_PREPROCESS_SETTINGS]
+RECTIFIED_EXTRACT_OWN = [*_EXTRACT_HEAD, *_EXTRACT_TAIL]
+
+# ---- rectified_train_vocoder ----
+RECTIFIED_TRAIN_VOCODER_OWN = [
+    click.option("--model_name", type=str, required=True, help="Name of the extracted experiment."),
+    click.option("--total_epochs", type=click.IntRange(1, 10000), default=250, show_default=True, help="Epochs to train."),
+    click.option("--save_every", type=click.IntRange(1, 1000), default=10, show_default=True, help="Save a checkpoint and an export every this many epochs."),
+    click.option("--batch_size", type=click.IntRange(1, 256), default=16, show_default=True, help="Clips per step."),
+    click.option("--gpu", type=str, default="0", show_default=True, help="GPUs to train on, separated by '-' (e.g. 0-1). Batch size is per GPU."),
+    click.option("--pretrained_g", type=str, default="", help="Vocoder checkpoint or export to fine-tune from; empty trains from scratch."),
+    click.option("--pretrained_d", type=str, default="", help="The matching discriminator checkpoint."),
+    click.option(
+        "--checkpoints",
+        type=click.Choice(["latest", "all", "none"]),
+        default="latest",
+        show_default=True,
+        help="Training checkpoints to keep: the latest, all, or none. Without them only the exports are saved and a stopped run starts over; exports are always kept.",
+    ),
+    click.option("--fresh", type=click.BOOL, default=False, show_default=True, help="Ignore this run's checkpoints and start over."),
+    click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
+]
+
+# ---- rectified_infer ----
+# Mirror SAMPLERS, SCHEDULES and RESCALE_MODES in rvc/rectified/flow_model.py,
+# which imports torch.
+RECTIFIED_INFER_OWN = [
+    click.option("--input_path", type=str, required=True, help="Full path to the input audio file."),
+    click.option("--output_path", type=str, required=True, help="Full path to the output audio file."),
+    click.option("--flow_path", type=str, required=True, help="Exported rectified-flow model (.pth), or a model bundle (.srvc) holding one."),
+    click.option("--flow_submodel", type=str, default="", help="The flow to use inside a bundle; empty uses its first. A bundled index replaces --index_path."),
+    click.option("--vocoder_path", type=str, required=True, help="Rectified NSF-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint."),
+    click.option("--index_path", type=str, default="", help="Optional RVC index over the voice model's training features."),
+    click.option("--sid", type=int, default=0, show_default=True, help="Speaker ID for multi-speaker models."),
+    click.option("--pitch", type=click.IntRange(-24, 24), default=0, show_default=True, help="Pitch shift in semitones."),
+    click.option("--f0_method", type=click.Choice(["crepe", "crepe-tiny", "rmvpe", "fcpe"]), default="rmvpe", show_default=True, help="Pitch extraction algorithm."),
+    click.option("--f0_autotune", type=click.BOOL, default=False, show_default=True, help="Apply autotune."),
+    click.option("--f0_autotune_strength", type=click.FloatRange(0, 1), default=1.0, show_default=True, help="Higher values snap pitch to the chromatic grid."),
+    click.option("--f0_median", type=click.IntRange(0, 10), default=0, show_default=True, help="Median over this many 10 ms frames either side of each voiced frame. 0 turns it off."),
+    click.option("--f0_octave_fix", type=click.BOOL, default=False, show_default=True, help="Fold pitch that jumps an octave away from its surroundings back into place."),
+    click.option("--formant_shift", type=click.FloatRange(-5, 5), default=0.0, show_default=True, help="Formant shift in semitones, apart from the pitch."),
+    click.option("--steps", type=click.IntRange(1, 64), default=16, show_default=True, help="ODE steps from noise to mel."),
+    click.option("--sampler", type=click.Choice(["euler", "heun"]), default="euler", show_default=True, help="Heun costs two model passes per step."),
+    click.option("--schedule", type=click.Choice(["uniform", "sway", "logit-normal"]), default="uniform", show_default=True, help="Spacing of the steps."),
+    click.option("--noise_temperature", type=click.FloatRange(0, 1.5), default=1.0, show_default=True, help="Scale of the starting noise. 1 is what the model was trained on."),
+    click.option("--flow_start", type=click.FloatRange(0, 0.95), default=0.0, show_default=True, help="Flow time sampling starts from, on the aux decoder's mel. 0 uses the model's own."),
+    click.option("--cfg_scale", type=click.FloatRange(1, 5), default=1.0, show_default=True, help="Classifier-free guidance on the speaker. 1 turns it off."),
+    click.option("--content_guidance", type=click.FloatRange(0, 1), default=0.0, show_default=True, help="Push away from a blurred copy of the content. 0 turns it off."),
+    click.option("--guidance_from", type=click.FloatRange(0, 1), default=0.0, show_default=True, help="Flow time (0 noise, 1 mel) guidance starts at."),
+    click.option("--guidance_until", type=click.FloatRange(0, 1), default=1.0, show_default=True, help="Flow time guidance stops at."),
+    click.option("--guidance_rescale", type=click.FloatRange(0, 1), default=0.7, show_default=True, help="Pull guided output back to the unguided level."),
+    click.option("--rescale_mode", type=click.Choice(["global", "frame"]), default="global", show_default=True, help="Measure the rescale level over the whole pass or per frame."),
+    click.option("--index_rate", type=click.FloatRange(0, 1), default=0.5, show_default=True, help="Index influence."),
+    click.option("--index_k", type=click.IntRange(1, 64), default=8, show_default=True, help="Index neighbours averaged per frame."),
+    click.option("--index_power", type=click.FloatRange(0, 8), default=2.0, show_default=True, help="Inverse-distance weighting exponent of those neighbours."),
+    click.option("--index_continuity", type=click.FloatRange(0, 4), default=0.5, show_default=True, help="Reward for neighbours that continue the previous frame's match."),
+    click.option("--protect", type=click.FloatRange(0, 0.5), default=0.33, show_default=True, help="Protect voiceless consonants from the index."),
+    click.option("--split_audio", type=click.BOOL, default=False, show_default=True, help="Split the input at silences."),
+    click.option("--silence_gate_db", type=click.FloatRange(-120, 0), default=-60.0, show_default=True, help="Fade the output out where the input is quieter than this, in dBFS. -120 disables it."),
+    click.option("--content_context", type=click.FloatRange(0, 10), default=2.0, show_default=True, help="Seconds of audio the content encoder sees either side of each 30 s pass."),
+    click.option("--seed", type=int, default=0, show_default=True, help="0 picks a random seed."),
+    click.option("--export_format", type=click.Choice(["WAV", "MP3", "FLAC", "OGG", "M4A"]), default="WAV", show_default=True, help="Output audio format."),
 ]
 
 # ---- index ----

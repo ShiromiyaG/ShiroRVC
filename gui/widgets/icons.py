@@ -375,6 +375,14 @@ def _chip(path: QPainterPath) -> None:
         path.lineTo(21.5, offset)
 
 
+def _flow(path: QPainterPath) -> None:
+    """Rectified flow: straight paths from scattered noise to one point."""
+    for y in (4, 12, 20):
+        path.moveTo(3, y)
+        path.cubicTo(10, y, 12, 12, 18, 12)
+    path.addEllipse(QPointF(19.5, 12), 1.8, 1.8)
+
+
 DRAWINGS = {
     "waveform": _waveform,
     "speech": _speech,
@@ -397,6 +405,7 @@ DRAWINGS = {
     "moon": _moon,
     "terminal": _terminal,
     "chip": _chip,
+    "flow": _flow,
     "globe": _globe,
     "mic": _mic,
     "shiba": _shiba,

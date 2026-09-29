@@ -12,7 +12,11 @@ from rvc.configs.vocoders import (
     get_vocoder_spec,
     normalize_vocoder,
 )
-from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
+from rvc.lib.algorithm.commons import (
+    CONTENT_INTERPOLATIONS,
+    rand_slice_segments,
+    slice_segments,
+)
 from rvc.lib.terminal import info, warning
 from rvc.train.messages import (
     FRONTEND_COMPILE_ENABLE_FAILED,
@@ -24,9 +28,10 @@ from rvc.train.messages import (
 # Normalizing Flow
 from rvc.lib.algorithm.normalizing_flow import ResidualCouplingBlock
 # Text Encoder
-from rvc.lib.algorithm.text_encoder import TextEncoder
+from rvc.lib.algorithm.text_encoder import ProjectionEncoder, TextEncoder
 # Posterior Encoder
 from rvc.lib.algorithm.posterior_encoder import PosteriorEncoder
+from rvc.lib.algorithm.content_bottleneck import ContentBottleneck
 
 
 debug_shapes = False
@@ -184,6 +189,41 @@ class Synthesizer(torch.nn.Module):
                 # shipped and what its earlier checkpoints were trained with.
                 # See ``ADAIN_NOISE_MODES``.
                 adain_noise=decoder_config.get("refinegan2_adain_noise", "always"),
+                output_gain=bool(decoder_config.get("refinegan2_output_gain", False)),
+            )
+        elif generator_id == "nsf_bigvgan":
+            self._assert_rate_supported(vocoder_spec, sr)
+            self.dec = generators.NSFBigVGANGenerator(
+                sample_rate=int(sr),
+                upsample_rates=tuple(dec_kwargs["upsample_rates"]),
+                upsample_initial_channel=dec_kwargs["upsample_initial_channel"],
+                resblock_kernel_sizes=dec_kwargs["resblock_kernel_sizes"],
+                resblock_dilation_sizes=dec_kwargs["resblock_dilation_sizes"],
+                resblock=str(resblock),
+                antialias=decoder_config.get("nsf_bigvgan_antialias", True),
+                num_mels=inter_channels,
+                gin_channels=gin_channels,
+                checkpointing=dec_kwargs["checkpointing"],
+                source_gain=bool(
+                    decoder_config.get("nsf_bigvgan_source_gain", False)
+                ),
+                source_noise_std=float(
+                    decoder_config.get("nsf_bigvgan_source_noise_std", 0.003)
+                ),
+                source_harmonics=int(
+                    decoder_config.get("nsf_bigvgan_source_harmonics", 0)
+                ),
+                source_tilt=float(
+                    decoder_config.get("nsf_bigvgan_source_tilt", 1.0)
+                ),
+                source_phase=str(decoder_config.get("nsf_bigvgan_source_phase", "random")),
+                source_phase_jitter=float(
+                    decoder_config.get("nsf_bigvgan_source_phase_jitter", 0.0)
+                ),
+                source_branch=str(
+                    decoder_config.get("nsf_bigvgan_source_branch", "linear")
+                ),
+                output_gain=bool(decoder_config.get("nsf_bigvgan_output_gain", False)),
             )
         else:
             raise ValueError(f"Unsupported vocoder: {vocoder_id}")
@@ -199,41 +239,97 @@ class Synthesizer(torch.nn.Module):
         )
         info(f"Vocoder: {vocoder_spec['label']}", tag="[INIT]")
 
-        # [TextEncoder] maps extracted features to latent space (p)
-        self.enc_p = TextEncoder(
-            out_channels=inter_channels,
-            hidden_channels=hidden_channels,
-            filter_channels=filter_channels,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            kernel_size=kernel_size,
-            p_dropout=p_dropout,
-            embedding_dim=text_enc_hidden_dim,
-            f0=use_f0,
+        # ``direct`` decodes the text encoder's mean as it is: no posterior, no
+        # flow, no prior draw, the same input in training and at inference.
+        self.latent_mode = str(vocoder_options.get("latent_mode", "vits"))
+        if self.latent_mode not in ("vits", "direct"):
+            raise ValueError(f"latent_mode must be 'vits' or 'direct', not {self.latent_mode!r}.")
+        # Read by whatever feeds ``phone``: training, previews and inference
+        # all upsample the 50 Hz features the way the model was trained on.
+        self.content_interpolation = str(
+            vocoder_options.get("content_interpolation", "nearest")
         )
+        if self.content_interpolation not in CONTENT_INTERPOLATIONS:
+            raise ValueError(
+                f"content_interpolation must be one of {CONTENT_INTERPOLATIONS}, "
+                f"not {self.content_interpolation!r}."
+            )
+        direct_encoder = str(vocoder_options.get("direct_encoder", "transformer"))
+        if direct_encoder not in ("transformer", "projection"):
+            raise ValueError(
+                f"direct_encoder must be 'transformer' or 'projection', not {direct_encoder!r}."
+            )
+        if direct_encoder == "projection" and self.latent_mode != "direct":
+            raise ValueError("direct_encoder 'projection' needs latent_mode 'direct'.")
 
+        if direct_encoder == "projection":
+            self.enc_p = ProjectionEncoder(
+                out_channels=inter_channels,
+                hidden_channels=hidden_channels,
+                embedding_dim=text_enc_hidden_dim,
+                f0=use_f0 and bool(vocoder_options.get("direct_encoder_pitch", True)),
+                smoothing=int(vocoder_options.get("direct_smoothing", 1)),
+            )
+        else:
+            # [TextEncoder] maps extracted features to latent space (p)
+            self.enc_p = TextEncoder(
+                out_channels=inter_channels,
+                hidden_channels=hidden_channels,
+                filter_channels=filter_channels,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                kernel_size=kernel_size,
+                p_dropout=p_dropout,
+                embedding_dim=text_enc_hidden_dim,
+                f0=use_f0,
+            )
 
-        # [PosteriorEncoder] extracts latents (z) from target audio (training only)
-        self.enc_q = PosteriorEncoder(
-            in_channels=spec_channels,
-            out_channels=inter_channels,
-            hidden_channels=hidden_channels,
-            gin_channels=gin_channels,
-            kernel_size=5,
-            dilation_rate=1,
-            n_layers=16,
+        width = int(vocoder_options.get("content_bottleneck", 0))
+        self.content_bottleneck = (
+            ContentBottleneck(
+                text_enc_hidden_dim,
+                width,
+                float(vocoder_options.get("content_bottleneck_noise", 0.0)),
+            )
+            if width > 0
+            else None
         )
-
-        # [Flow] reversible transform between content priors (p) and speaker-conditioned latents (z)
-        self.flow = ResidualCouplingBlock(
-            channels=inter_channels,
-            hidden_channels=hidden_channels,
-            n_flows=4,
-            n_layers=3,
-            kernel_size=5,
-            dilation_rate=1,
-            gin_channels=gin_channels,
+        # Frame loudness added to the content, from the audio being converted
+        # (``rvc.lib.algorithm.energy``).  A kernel of 3 so it also sees the
+        # local slope, which is where onsets are.
+        self.energy_embedding = (
+            torch.nn.Conv1d(1, text_enc_hidden_dim, 3, padding=1)
+            if bool(vocoder_options.get("energy_conditioning", False))
+            else None
         )
+        # Share of training items whose energy is dropped, so a render without
+        # it (no audio at hand) is still in distribution.  Set by the trainer.
+        self.energy_dropout = 0.0
+
+        self.enc_q = None
+        self.flow = None
+        if self.latent_mode == "vits":
+            # [PosteriorEncoder] extracts latents (z) from target audio (training only)
+            self.enc_q = PosteriorEncoder(
+                in_channels=spec_channels,
+                out_channels=inter_channels,
+                hidden_channels=hidden_channels,
+                gin_channels=gin_channels,
+                kernel_size=5,
+                dilation_rate=1,
+                n_layers=16,
+            )
+
+            # [Flow] reversible transform between content priors (p) and speaker-conditioned latents (z)
+            self.flow = ResidualCouplingBlock(
+                channels=inter_channels,
+                hidden_channels=hidden_channels,
+                n_flows=4,
+                n_layers=3,
+                kernel_size=5,
+                dilation_rate=1,
+                gin_channels=gin_channels,
+            )
 
         # [Speaker Embedding] maps identity to global conditioning (g)
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
@@ -301,7 +397,7 @@ class Synthesizer(torch.nn.Module):
 
     def enable_decoder_compile(self, mode: str = "default") -> bool:
         """Compile the selected vocoder's training forward without wrapping it."""
-        if self.vocoder not in {"hifi", "hifi++", "refinegan2"}:
+        if self.vocoder not in {"hifi", "hifi++", "refinegan2", "nsf-bigvgan"}:
             return False
         if getattr(self, "_decoder_compile_enabled", False):
             return getattr(self, "_decoder_compile_mode", mode) == mode
@@ -438,10 +534,17 @@ class Synthesizer(torch.nn.Module):
         phone_lengths: Optional[torch.Tensor] = None,
         pitchf: Optional[torch.Tensor] = None,
         pitch: Optional[torch.Tensor] = None,
+        energy: Optional[torch.Tensor] = None,
     ):
         g = self.emb_g(ds).unsqueeze(-1)
 
-        m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
+        m_p, logs_p, x_mask = self.encode_content(phone, phone_lengths, pitch, energy)
+
+        if self.latent_mode == "direct":
+            m_slice, ids_slice = rand_slice_segments(m_p, phone_lengths, self.segment_size)
+            pitchf_slice = slice_segments(pitchf, ids_slice, self.segment_size, 2)
+            o = self.dec(m_slice, pitchf_slice, g=g)
+            return o, ids_slice, x_mask, x_mask, (None, None, m_p, logs_p, None, None)
 
         if spec is not None:
             z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
@@ -452,7 +555,8 @@ class Synthesizer(torch.nn.Module):
                 pitchf_slice = slice_segments(pitchf, ids_slice, self.segment_size, 2)
 
             o = self.dec(z_slice, pitchf_slice, g=g)
-            return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+            latents = (z, z_p, m_p, logs_p, m_q, logs_q)
+            return o, ids_slice, x_mask, spec_mask, latents
         else:
             warning(
                 "No spectrogram was passed to the forward pass; skipping this "
@@ -460,6 +564,28 @@ class Synthesizer(torch.nn.Module):
                 tag="[TRAIN]",
             )
             return None, None, x_mask, None, (None, None, m_p, logs_p, None, None)
+
+    def encode_content(
+        self,
+        phone: torch.Tensor,
+        phone_lengths: torch.Tensor,
+        pitch: Optional[torch.Tensor] = None,
+        energy: Optional[torch.Tensor] = None,
+    ):
+        """``enc_p`` after the content bottleneck and the energy embedding.
+
+        ``energy`` is [batch, frames] from ``rvc.lib.algorithm.energy``; None
+        leaves it out.  Every path into ``enc_p`` goes through here.
+        """
+        if self.content_bottleneck is not None:
+            phone = self.content_bottleneck(phone)
+        if self.energy_embedding is not None and energy is not None:
+            embed = self.energy_embedding(energy.to(phone.dtype).unsqueeze(1)).transpose(1, 2)
+            if self.training and self.energy_dropout > 0:
+                kept = torch.rand(embed.shape[0], 1, 1, device=embed.device) >= self.energy_dropout
+                embed = embed * kept.to(embed.dtype)
+            phone = phone + embed
+        return self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
     @torch.jit.export
     def infer(
@@ -471,8 +597,10 @@ class Synthesizer(torch.nn.Module):
         sid: torch.Tensor = None,
         seed: int = 0,
         noise_scale: Optional[float] = None,
+        energy: Optional[torch.Tensor] = None,
     ):
-        """``noise_scale`` ``None`` means ``prior_noise_scale``."""
+        """``noise_scale`` ``None`` means ``prior_noise_scale``; ``energy`` as in
+        ``encode_content``."""
         if seed != 0:
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
@@ -482,7 +610,11 @@ class Synthesizer(torch.nn.Module):
 
         g = self.emb_g(sid).unsqueeze(-1)
 
-        m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
+        m_p, logs_p, x_mask = self.encode_content(phone, phone_lengths, pitch, energy)
+
+        if self.latent_mode == "direct":
+            o = self.dec(m_p * x_mask, nsff0, g)
+            return o, x_mask, (m_p, None, m_p, logs_p)
 
         z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)

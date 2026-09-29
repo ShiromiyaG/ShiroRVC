@@ -56,6 +56,48 @@ _MAX_CPU_THREADS = max(1, min(os.cpu_count() or 1, 192))
 _DEFAULT_CPU_THREADS = max(1, min(4, _MAX_CPU_THREADS))
 
 
+def apply_precision_support(precision: SearchableCombo, devices: list[dict]) -> None:
+    """Pick the default precision from the best device's capability.
+
+    No CUDA device disables the picker at FP32; below 7.0 (no FP16 tensor
+    cores) it stays available at FP32; at 7.0 or better it defaults to FP16.
+    BF16 is never the default, and below 8.0 it has no native kernels.
+    """
+
+    best = -1
+    for device in devices:
+        try:
+            major = int(str(device.get("capability", "0")).split(".")[0])
+        except (TypeError, ValueError):
+            continue
+        best = max(best, major)
+
+    has_cuda = best >= 0
+    has_tensor_cores = best >= 7
+
+    combo = precision.combo
+    precision.setEnabled(has_cuda)
+    combo.setCurrentIndex(combo.findData("fp16" if has_tensor_cores else "fp32"))
+    if not has_cuda:
+        tooltip = _("Autocast needs a CUDA GPU, so the setting would do nothing.")
+    elif not has_tensor_cores:
+        tooltip = _(
+            "This GPU has no FP16 tensor cores: autocast still halves activation "
+            "memory, but it may not make the steps any faster."
+        )
+    elif best < 8:
+        tooltip = _(
+            "FP16: less VRAM and faster steps, with a GradScaler. "
+            "BF16 has no native kernels on this GPU."
+        )
+    else:
+        tooltip = _(
+            "FP16: less VRAM and faster steps, with a GradScaler. "
+            "BF16: no scaler; precision-sensitive paths stay in FP32."
+        )
+    precision.setToolTip(tooltip)
+
+
 class TrainingPage(Page):
     title = N_("Training")
     subtitle = N_("Prepare a dataset and train a voice, one step at a time.")
@@ -382,7 +424,7 @@ class TrainingPage(Page):
         advanced.add_group(_("Performance"))
         self.checkpointing = Toggle(_("Gradient checkpointing"), _("Trades speed for a much smaller VRAM footprint."))
         # Autocast dtype over FP32 master weights.  Disabled until a CUDA device
-        # is reported; see ``_apply_precision_support`` for the default.
+        # is reported; see ``apply_precision_support`` for the default.
         self.precision = SearchableCombo(editable=False)
         self.precision.refresh_button.hide()
         self.precision.set_pairs([("FP32", "fp32"), ("FP16", "fp16"), ("BF16", "bf16")])
@@ -918,50 +960,9 @@ class TrainingPage(Page):
     def apply_theme(self, tokens: dict[str, str]) -> None:
         super().apply_theme(tokens)
 
-    def _apply_precision_support(self, devices: list[dict]) -> None:
-        """Pick the default precision from the best device's capability.
-
-        No CUDA device disables the picker at FP32; below 7.0 (no FP16 tensor
-        cores) it stays available at FP32; at 7.0 or better it defaults to FP16.
-        BF16 is never the default, and below 8.0 it has no native kernels.
-        """
-
-        best = -1
-        for device in devices:
-            try:
-                major = int(str(device.get("capability", "0")).split(".")[0])
-            except (TypeError, ValueError):
-                continue
-            best = max(best, major)
-
-        has_cuda = best >= 0
-        has_tensor_cores = best >= 7
-
-        combo = self.precision.combo
-        self.precision.setEnabled(has_cuda)
-        combo.setCurrentIndex(combo.findData("fp16" if has_tensor_cores else "fp32"))
-        if not has_cuda:
-            tooltip = _("Autocast needs a CUDA GPU, so the setting would do nothing.")
-        elif not has_tensor_cores:
-            tooltip = _(
-                "This GPU has no FP16 tensor cores: autocast still halves activation "
-                "memory, but it may not make the steps any faster."
-            )
-        elif best < 8:
-            tooltip = _(
-                "FP16: less VRAM and faster steps, with a GradScaler. "
-                "BF16 has no native kernels on this GPU."
-            )
-        else:
-            tooltip = _(
-                "FP16: less VRAM and faster steps, with a GradScaler. "
-                "BF16: no scaler; precision-sensitive paths stay in FP32."
-            )
-        self.precision.setToolTip(tooltip)
-
     def populate_gpus(self, devices: list[dict]) -> None:
         """Fill the device pickers once the backend has queried torch."""
-        self._apply_precision_support(devices)
+        apply_precision_support(self.precision, devices)
         if not devices:
             return
         labels = [f"{device['index']}" for device in devices]

@@ -1,0 +1,539 @@
+from contextlib import nullcontext
+from typing import Sequence
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils.parametrize import (
+    register_parametrization,
+    remove_parametrizations,
+)
+from torch.utils.checkpoint import checkpoint
+
+from rvc.lib.algorithm.commons import expand_f0, get_padding, init_weights
+from rvc.lib.algorithm.generators.refinegan2 import (
+    DC_WINDOW_SECONDS,
+    DEFAULT_UPSAMPLE_BETA,
+    DEFAULT_UPSAMPLE_ROLLOFF,
+    DEFAULT_UPSAMPLE_WIDTH,
+    SOURCE_GAIN_KERNEL,
+    SineGenerator,
+    UnitNorm,
+    _match_output_gain,
+    _refuse_learned_output_gain,
+    remove_dc,
+)
+from rvc.lib.algorithm.resampling import (
+    AntiAliasedActivation,
+    AntiAliasedUpsample1d,
+    FixedLowPass1d,
+    filter_schedule,
+)
+
+
+try:
+    from rvc.lib.algorithm.generators.snake_triton import (
+        FusedResidualSnakeBeta,
+        FusedSnakeBeta,
+    )
+except ImportError:
+    FusedSnakeBeta = FusedResidualSnakeBeta = None
+
+
+#: Decimation filter that brings the excitation down to each stage's rate.
+#: With hundreds of partials in the source, a strided conv would fold them.
+SOURCE_DECIMATION = dict(width=12, rolloff=0.88, filter_beta=6.0)
+
+#: Channels of the rectified source branch at the output rate; doubled per
+#: stage on the way down, as RefineGAN2's ``start_channels``.
+SOURCE_BRANCH_CHANNELS = 16
+SOURCE_BRANCH_SLOPE = 0.1
+
+
+class _SnakeBetaFunction(torch.autograd.Function):
+    """SnakeBeta that saves only its input for backward.
+
+    Autograd over the plain expression keeps ``alpha * x``, its sine and the
+    square alive -- three more tensors at the oversampled rate per activation.
+    """
+
+    @staticmethod
+    def forward(ctx, x, log_alpha, log_beta):
+        ctx.save_for_backward(x, log_alpha, log_beta)
+        alpha = log_alpha.exp()[:, None]
+        inv_beta = torch.exp(-log_beta)[:, None]
+        return torch.addcmul(x, torch.sin(x * alpha).square(), inv_beta)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, log_alpha, log_beta = ctx.saved_tensors
+        alpha = log_alpha.exp()[:, None]
+        inv_beta = torch.exp(-log_beta)[:, None]
+        sine = torch.sin(x * alpha)
+        # d/du sin^2(u) = sin(2u) = 2 sin(u) cos(u)
+        slope = grad * (2.0 * sine * torch.cos(x * alpha))
+        grad_x = torch.addcmul(grad, slope, alpha * inv_beta).to(x.dtype)
+        grad_log_alpha = (slope * x).sum((0, 2)) * (alpha * inv_beta)[:, 0]
+        grad_log_beta = -(grad * sine.square()).sum((0, 2)) * inv_beta[:, 0]
+        return grad_x, grad_log_alpha.to(log_alpha.dtype), grad_log_beta.to(log_beta.dtype)
+
+
+class SnakeBeta(nn.Module):
+    """BigVGAN v2's ``x + sin^2(alpha * x) / beta``, per-channel, log-scale."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.zeros(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _SnakeBetaFunction.apply(x, self.alpha, self.beta)
+
+
+class StageRateActivation(nn.Module):
+    """SnakeBeta at the stage's own rate, with ``AntiAliasedActivation``'s keys."""
+
+    def __init__(self, activation: nn.Module):
+        super().__init__()
+        self.activation = activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(x)
+
+
+class AntiAliasedSnakeBeta(AntiAliasedActivation):
+    """``AntiAliasedActivation(SnakeBeta)``, fused into one Triton op on CUDA.
+
+    Same keys and same output; the unfused path runs on the CPU or without
+    Triton.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__(SnakeBeta(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if FusedSnakeBeta is None or not x.is_cuda:
+            return super().forward(x)
+        return FusedSnakeBeta.apply(x, *self._fused_args(x))
+
+    def forward_residual(self, x: torch.Tensor, r: torch.Tensor):
+        """``(self(x + r), x + r)`` with the add inside the kernel; CUDA only."""
+        return FusedResidualSnakeBeta.apply(x, r, *self._fused_args(x))
+
+    def _fused_args(self, x: torch.Tensor):
+        # Written in the dtype the next conv runs in rather than cast to it.
+        if torch.is_autocast_enabled(x.device.type):
+            dtype = torch.get_autocast_dtype(x.device.type)
+        else:
+            dtype = x.dtype
+        return (
+            self.activation.alpha,
+            self.activation.beta,
+            self.up.phase_weight,
+            self.down.kernel[0, 0],
+            self.up.phase_pad,
+            dtype,
+        )
+
+
+def snake_activation(channels: int, antialias: bool = True) -> nn.Module:
+    if antialias:
+        return AntiAliasedSnakeBeta(channels)
+    return StageRateActivation(SnakeBeta(channels))
+
+
+def _conv(channels: int, kernel_size: int, dilation: int = 1) -> nn.Module:
+    conv = weight_norm(
+        nn.Conv1d(
+            channels,
+            channels,
+            kernel_size,
+            dilation=dilation,
+            padding=get_padding(kernel_size, dilation),
+        )
+    )
+    conv.apply(init_weights)
+    return conv
+
+
+class AMPBlock(nn.Module):
+    """BigVGAN's AMPBlock: dilated convs behind SnakeBeta activations.
+
+    ``pairs`` is AMPBlock1 (two convs and two activations per dilation);
+    without it, AMPBlock2, with half of each.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        dilation: Sequence[int],
+        antialias: bool = True,
+        pairs: bool = True,
+    ):
+        super().__init__()
+        self.convs1 = nn.ModuleList([_conv(channels, kernel_size, d) for d in dilation])
+        self.acts1 = nn.ModuleList(
+            [snake_activation(channels, antialias) for _ in dilation]
+        )
+        if pairs:
+            self.convs2 = nn.ModuleList([_conv(channels, kernel_size) for _ in dilation])
+            self.acts2 = nn.ModuleList(
+                [snake_activation(channels, antialias) for _ in dilation]
+            )
+
+        # Set by ``apply_precision_policy`` under AMP.
+        self.fp32_residuals = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fp32_residuals:
+            x = x.float()
+        if self._fusable(x):
+            return self._forward_fused(x)
+        if not hasattr(self, "convs2"):
+            for c1, a1 in zip(self.convs1, self.acts1):
+                x = c1(a1(x)) + x
+            return x
+        for c1, c2, a1, a2 in zip(self.convs1, self.convs2, self.acts1, self.acts2):
+            x = c2(a2(c1(a1(x)))) + x
+        return x
+
+    def _fusable(self, x: torch.Tensor) -> bool:
+        return (
+            FusedResidualSnakeBeta is not None
+            and x.is_cuda
+            and x.dtype == torch.float32
+            and all(isinstance(act, AntiAliasedSnakeBeta) for act in self.acts1)
+        )
+
+    def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        """``forward`` with each residual add done inside the next activation."""
+        y = None
+        for index, (c1, a1) in enumerate(zip(self.convs1, self.acts1)):
+            if y is None:
+                h = a1(x)
+            else:
+                h, x = a1.forward_residual(x, y)
+            y = c1(h)
+            if hasattr(self, "convs2"):
+                y = self.convs2[index](self.acts2[index](y))
+        return y + x
+
+
+class NSFBigVGANGenerator(nn.Module):
+    """BigVGAN v2 at voice scale, driven by a harmonic-plus-noise excitation.
+
+    Against BigVGAN v2: RefineGAN2's width (``upsample_initial_channel`` 512
+    instead of 1536) and stage layout, so the same ``v4`` discriminator and
+    32 kHz config apply; the learned transposed convolutions replaced by a
+    channel projection at the input rate followed by RefineGAN2's fixed
+    windowed-sinc upsampler; and the excitation, band-limited down to each
+    stage's rate, added after every upsampler as in NSF-HiFi-GAN. The
+    activations stay BigVGAN's -- SnakeBeta at 2x oversampling.  The output is
+    ``tanh`` of a unit-norm ``conv_post``, as in RefineGAN2, with its DC
+    removed first (``remove_dc``).
+
+    Args:
+        source_gain (bool, optional): Scale the excitation by per-band
+            envelopes projected from ``z`` and the speaker, as RefineGAN2 does.
+        source_harmonics (int, optional): Partials above the fundamental in
+            the excitation. Sizes ``m_source.merge.0.weight``.
+        source_tilt (float, optional): Partial ``j`` gets amplitude
+            ``j ** -tilt``.
+        source_phase (str, optional): ``random`` or ``coherent`` initial
+            phases for the partials; see ``SineGenerator``.
+        source_phase_jitter (float, optional): Per-call spread of the
+            coherent phases, in cycles.
+        source_branch (str, optional): ``linear`` adds the one-channel
+            excitation to every stage through a conv. ``rectified`` runs it
+            through a conv and an oversampled ``leaky_relu`` at the output
+            rate first, then a learned multi-channel pyramid, as RefineGAN2
+            does: SnakeBeta is smooth and makes few harmonics of its own, and
+            the rectifier's kink gives every harmonic the fundamental's phase,
+            one pulse per period.
+        source_random_start_phase (bool, optional): Start the excitation's
+            fundamental at a random phase on every training call; see
+            ``SineGenerator``. Inference is unaffected.
+        output_gain (bool, optional): A learned output level ``exp(s)`` on the
+            unit-norm ``conv_post``, as in RefineGAN2.
+        resblock (str, optional): ``"1"`` for AMPBlock1, ``"2"`` for AMPBlock2,
+            which has half the convs and half the activations.
+        antialias (bool or sequence of bool, optional): Oversample the
+            activations, per stage. The work is proportional to channels x
+            rate, which doubles every stage, so the last stage is about half
+            of it and the first two about a fifth.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 32000,
+        upsample_rates: Sequence[int] = (5, 4, 4, 4),
+        upsample_initial_channel: int = 512,
+        resblock_kernel_sizes: Sequence[int] = (3, 7, 11),
+        resblock_dilation_sizes: Sequence[Sequence[int]] = ((1, 3, 5),) * 3,
+        resblock: str = "1",
+        antialias: "bool | Sequence[bool]" = True,
+        num_mels: int = 192,
+        gin_channels: int = 256,
+        checkpointing: bool = False,
+        filter_width: "int | Sequence[int]" = DEFAULT_UPSAMPLE_WIDTH,
+        rolloff: "float | Sequence[float]" = DEFAULT_UPSAMPLE_ROLLOFF,
+        filter_beta: "float | Sequence[float]" = DEFAULT_UPSAMPLE_BETA,
+        source_gain: bool = False,
+        source_noise_std: float = 0.003,
+        source_harmonics: int = 0,
+        source_tilt: float = 1.0,
+        source_phase: str = "random",
+        source_phase_jitter: float = 0.0,
+        source_branch: str = "linear",
+        source_random_start_phase: bool = False,
+        output_gain: bool = False,
+    ):
+        super().__init__()
+        self.sample_rate = int(sample_rate)
+        self.dc_window = int(DC_WINDOW_SECONDS * self.sample_rate) | 1
+        self.upsample_rates = tuple(int(rate) for rate in upsample_rates)
+        self.upp = int(np.prod(self.upsample_rates))
+        self.checkpointing = checkpointing
+        self.num_kernels = len(resblock_kernel_sizes)
+
+        count = len(self.upsample_rates)
+        if str(resblock) not in ("1", "2"):
+            raise ValueError(f"resblock must be '1' or '2', received {resblock!r}.")
+        if isinstance(antialias, bool):
+            antialias = (antialias,) * count
+        antialias = tuple(bool(value) for value in antialias)
+        if len(antialias) != count:
+            raise ValueError(
+                f"antialias has {len(antialias)} entries for {count} stages."
+            )
+        # Keys are the same either way, so ``decoder_layout`` records this.
+        self.snake_layout = {"resblock": str(resblock), "antialias": list(antialias)}
+        self.filter_width = filter_schedule(filter_width, count, "filter_width", 1)
+        self.rolloff = filter_schedule(rolloff, count, "rolloff", 0.0)
+        self.filter_beta = filter_schedule(filter_beta, count, "filter_beta", 0.0)
+
+        # Read by the checkpoint guards in ``rvc/train/checkpoints.py``.
+        self.source_type = "sine"
+        self.source_harmonics = int(source_harmonics)
+        self.source_tilt = float(source_tilt)
+        self.source_phase = str(source_phase)
+        self.source_phase_jitter = float(source_phase_jitter)
+        self.m_source = SineGenerator(
+            self.sample_rate,
+            harmonic_num=self.source_harmonics,
+            noise_std=float(source_noise_std),
+            harmonic_tilt=self.source_tilt,
+            harmonic_phase=self.source_phase,
+            phase_jitter=self.source_phase_jitter,
+            random_start_phase=source_random_start_phase,
+        )
+
+        # Output-rate excitation -> each earlier stage's rate, last stage first.
+        self.source_downs = nn.ModuleList(
+            [
+                FixedLowPass1d(rate, stride=rate, **SOURCE_DECIMATION)
+                for rate in reversed(self.upsample_rates[1:])
+            ]
+        )
+
+        if source_branch not in ("linear", "rectified"):
+            raise ValueError(
+                f"source_branch must be 'linear' or 'rectified', not {source_branch!r}."
+            )
+        self.source_branch = source_branch
+        # Source channels at each stage, first stage first.
+        if source_branch == "rectified":
+            source_channels = [
+                SOURCE_BRANCH_CHANNELS * 2**index for index in range(count)
+            ][::-1]
+            self.source_pre = weight_norm(
+                nn.Conv1d(1, SOURCE_BRANCH_CHANNELS, 7, 1, padding=3)
+            )
+            self.source_act = AntiAliasedActivation(
+                leaky_relu_slope=SOURCE_BRANCH_SLOPE
+            )
+            self.source_blocks = nn.ModuleList(
+                [
+                    weight_norm(nn.Conv1d(channels, channels * 2, 7, 1, padding=3))
+                    for channels in reversed(source_channels[1:])
+                ]
+            )
+        else:
+            source_channels = [1] * count
+
+        self.has_source_gain = bool(source_gain)
+        if self.has_source_gain:
+            gain_channels = self.m_source.gain_channels
+            self.source_gain = nn.Conv1d(
+                num_mels,
+                gain_channels,
+                SOURCE_GAIN_KERNEL,
+                padding=SOURCE_GAIN_KERNEL // 2,
+            )
+            # Same start as RefineGAN2: unit gain on every partial band, the
+            # two filtered noise channels off.
+            nn.init.zeros_(self.source_gain.weight)
+            nn.init.constant_(self.source_gain.bias, 0.5413248546129181)
+            with torch.no_grad():
+                self.source_gain.bias[-3] = -6.0
+                self.source_gain.bias[-1] = -6.0
+            if gin_channels != 0:
+                self.source_gain_cond = nn.Conv1d(gin_channels, gain_channels, 1)
+                nn.init.zeros_(self.source_gain_cond.weight)
+                nn.init.zeros_(self.source_gain_cond.bias)
+            self.source_gain_ups = nn.ModuleList(
+                [
+                    AntiAliasedUpsample1d(
+                        rate,
+                        filter_width=self.filter_width[stage],
+                        rolloff=self.rolloff[stage],
+                        filter_beta=self.filter_beta[stage],
+                    )
+                    for stage, rate in enumerate(self.upsample_rates)
+                ]
+            )
+
+        channels = int(upsample_initial_channel)
+        self.conv_pre = weight_norm(nn.Conv1d(num_mels, channels, 7, 1, padding=3))
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, channels, 1)
+
+        self.projections = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.source_convs = nn.ModuleList()
+        self.resblocks = nn.ModuleList()
+        for stage, rate in enumerate(self.upsample_rates):
+            new_channels = channels // 2
+            # Halving the channels before the upsampler keeps the conv at the
+            # input rate, where it costs 1/rate of the same conv after it.
+            self.projections.append(
+                weight_norm(nn.Conv1d(channels, new_channels, 7, 1, padding=3))
+            )
+            self.ups.append(
+                AntiAliasedUpsample1d(
+                    rate,
+                    filter_width=self.filter_width[stage],
+                    rolloff=self.rolloff[stage],
+                    filter_beta=self.filter_beta[stage],
+                )
+            )
+            self.source_convs.append(
+                nn.Conv1d(source_channels[stage], new_channels, 7, 1, padding=3)
+            )
+            for kernel, dilation in zip(resblock_kernel_sizes, resblock_dilation_sizes):
+                self.resblocks.append(
+                    AMPBlock(
+                        new_channels,
+                        kernel,
+                        dilation,
+                        antialias=antialias[stage],
+                        pairs=str(resblock) == "1",
+                    )
+                )
+            channels = new_channels
+        self.projections.apply(init_weights)
+
+        self.activation_post = snake_activation(channels, antialias[-1])
+        # Unit norm, not weight norm: a learned output gain took 99% of the
+        # generator's gradient in the first pretrain, as it did in RefineGAN2.
+        self.conv_post = nn.Conv1d(channels, 1, 7, 1, padding=3, bias=False)
+        register_parametrization(self.conv_post, "weight", UnitNorm())
+        self.register_load_state_dict_pre_hook(_refuse_learned_output_gain)
+        self.has_output_gain = bool(output_gain)
+        if self.has_output_gain:
+            self.output_log_gain = nn.Parameter(torch.zeros(()))
+        self.register_load_state_dict_pre_hook(_match_output_gain)
+
+        # Set by ``apply_precision_policy`` under AMP: the excitation, the
+        # upsampling filters and the output layer then run in FP32.
+        self.fp32_residuals = False
+
+    def _fp32_region(self, x: torch.Tensor):
+        if not self.fp32_residuals:
+            return nullcontext()
+        return torch.autocast(x.device.type, enabled=False)
+
+    def _fp32(self, x: torch.Tensor) -> torch.Tensor:
+        return x.float() if self.fp32_residuals else x
+
+    def _source_gain(self, z: torch.Tensor, g: torch.Tensor = None):
+        """Excitation gains, (batch, frames * upp, gain_channels), or None."""
+        if not self.has_source_gain:
+            return None
+        gain = self.source_gain(z)
+        if g is not None and hasattr(self, "source_gain_cond"):
+            gain = gain + self.source_gain_cond(g)
+        for ups in self.source_gain_ups:
+            gain = ups(gain)
+        return F.softplus(gain).transpose(1, 2)
+
+    def _excitation(self, z, f0, g):
+        """The excitation at every stage's output rate, first stage first."""
+        f0 = expand_f0(f0, z.shape[-1] * self.upp)
+        with self._fp32_region(z):
+            gain = self._source_gain(self._fp32(z), None if g is None else self._fp32(g))
+            source = self.m_source(f0.transpose(1, 2), gain).transpose(1, 2)
+            if self.source_branch == "rectified":
+                sources = [self.source_act(self.source_pre(source))]
+                for down, block in zip(self.source_downs, self.source_blocks):
+                    sources.append(block(down(sources[-1])))
+            else:
+                sources = [source]
+                for down in self.source_downs:
+                    sources.append(down(sources[-1]))
+        return sources[::-1]
+
+    def _upsample(self, stage: int, x: torch.Tensor) -> torch.Tensor:
+        x = self.projections[stage](x)
+        with self._fp32_region(x):
+            return self.ups[stage](self._fp32(x))
+
+    def forward(self, x: torch.Tensor, f0: torch.Tensor, g: torch.Tensor = None):
+        if f0.dim() == 2:
+            f0 = f0.unsqueeze(1)
+        sources = self._excitation(x, f0, g)
+
+        x = self.conv_pre(x)
+        if g is not None:
+            x = x + self.cond(g)
+
+        checkpointed = self.training and self.checkpointing
+        for stage in range(len(self.upsample_rates)):
+            if checkpointed:
+                x = checkpoint(self._upsample, stage, x, use_reentrant=False)
+            else:
+                x = self._upsample(stage, x)
+            x = x + self.source_convs[stage](sources[stage])
+
+            blocks = self.resblocks[
+                stage * self.num_kernels : (stage + 1) * self.num_kernels
+            ]
+            xs = None
+            for block in blocks:
+                y = checkpoint(block, x, use_reentrant=False) if checkpointed else block(x)
+                xs = y if xs is None else xs + y
+            x = xs / self.num_kernels
+
+        with self._fp32_region(x):
+            x = self.activation_post(self._fp32(x))
+            x = self.conv_post(x)
+            if self.has_output_gain:
+                x = x * self.output_log_gain.exp()
+            # SnakeBeta's features all have a positive mean, and the waveform
+            # discriminators push the output's DC around: summed over every
+            # sample, that coherent term was ~99% of conv_post's gradient.
+            x = remove_dc(x, self.dc_window)
+            # Not v2's clamp: with no gain on ``conv_post`` the output starts
+            # past 1, and a saturated clamp passes no gradient to the trunk.
+            return torch.tanh(x)
+
+    def remove_weight_norm(self) -> None:
+        for module in list(self.modules()):
+            if hasattr(module, "parametrizations") and hasattr(
+                module.parametrizations, "weight"
+            ):
+                remove_parametrizations(module, "weight", leave_parametrized=True)

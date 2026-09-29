@@ -4,6 +4,8 @@ from functools import lru_cache
 
 
 _REGISTRY_PATH = os.path.join(os.path.dirname(__file__), "vocoders.json")
+#: Extraction's vocoder for the rectified recipe, which has no RVC config to write.
+RECTIFIED_EXTRACTION = "rectified"
 
 
 @lru_cache(maxsize=1)

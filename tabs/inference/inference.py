@@ -15,6 +15,7 @@ from rvc.lib.terminal import warning
 from rvc.lib.text import format_title
 from rvc.lib import catalog
 from rvc.lib.model_bundle import (
+    RVC_KIND,
     bundle_model_names,
     is_model_bundle,
     speaker_ids,
@@ -147,7 +148,7 @@ def get_bundle_model_names(model):
     if not model or not is_model_bundle(model) or not os.path.exists(os.path.join(ROOT, model)):
         return []
     try:
-        return bundle_model_names(os.path.join(ROOT, model))
+        return bundle_model_names(os.path.join(ROOT, model), RVC_KIND)
     except Exception as e:
         warning(f"Could not inspect the model bundle: {e}", tag="[INFER]")
         return []

@@ -18,6 +18,26 @@ from torch.nn import functional as F
 
 from rvc.lib.algorithm.commons import cache_scope
 
+try:
+    from rvc.lib.algorithm.upsample_triton import PolyphaseUpsample
+except ImportError:
+    PolyphaseUpsample = None
+
+
+def polyphase_weights(kernel: Tensor, factor: int, taps: int) -> Tensor:
+    """``kernel`` split into ``factor`` phases, (factor, taps), flipped for ``conv1d``.
+
+    ``w[taps-1-j] = phase[j]``, so a phase shorter than ``taps`` -- which
+    happens whenever the length is not a multiple of ``factor`` -- is
+    right-aligned.  Left-aligning it shifts that phase alone by one sample,
+    which barely moves a spectrum and is plainly wrong in an A/B.
+    """
+    weight = kernel.new_zeros(factor, taps)
+    for phase in range(factor):
+        part = kernel[phase::factor]
+        weight[phase, taps - part.numel() :] = part.flip(-1)
+    return weight
+
 
 def _safe_pad(x: Tensor, padding: int) -> Tensor:
     if padding == 0:
@@ -173,6 +193,11 @@ class AntiAliasedUpsample1d(nn.Module):
         # ``n`` reads inputs ``n - left`` through ``n + right``.
         left = self.pad - whole + taps - 1
         self.phase_pad = (left, taps - 1 - left)
+        self.register_buffer(
+            "phase_weight",
+            polyphase_weights(self.kernel[0, 0], self.factor, taps),
+            persistent=False,
+        )
 
     def _polyphase(self, x: Tensor):
         """The kernel split into ``factor`` phases, cached per device/dtype.
@@ -191,17 +216,7 @@ class AntiAliasedUpsample1d(nn.Module):
         channels = int(x.shape[1])
         key = (channels, x.dtype, x.device)
         if getattr(self, "_poly_key", None) != key:
-            kernel = self.kernel.to(device=x.device, dtype=x.dtype)[0, 0]
-            taps = self.taps
-            weight = kernel.new_zeros(self.factor, 1, taps)
-            for phase in range(self.factor):
-                part = kernel[phase :: self.factor]
-                # ``w[taps-1-j] = phase[j]``, so a phase shorter than ``taps``
-                # -- which happens whenever ``K`` is not a multiple of
-                # ``factor`` -- is right-aligned.  Left-aligning it shifts that
-                # phase alone by one sample, which barely moves a spectrum and
-                # is plainly wrong in an A/B.
-                weight[phase, 0, taps - part.numel() :] = part.flip(-1)
+            weight = self.phase_weight.to(device=x.device, dtype=x.dtype)[:, None]
             with cache_scope():
                 self._poly_cache = weight.repeat(channels, 1, 1).contiguous()
             self._poly_key = key
@@ -254,6 +269,10 @@ class AntiAliasedUpsample1d(nn.Module):
         # no test.  The two agree to 4e-7.
         if torch.compiler.is_compiling():
             return self._transposed(x)
+
+        if PolyphaseUpsample is not None and x.is_cuda:
+            padded = F.pad(x, self.phase_pad, mode="replicate")
+            return PolyphaseUpsample.apply(padded, self.phase_weight, x.shape[-1])
 
         batch, channels, length = x.shape[0], x.shape[1], x.shape[-1]
         weight = self._polyphase(x)

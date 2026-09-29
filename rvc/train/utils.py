@@ -1,6 +1,7 @@
 import os
 import glob
 import json
+import shutil
 import signal
 import sys
 
@@ -51,6 +52,7 @@ from rvc.train.previews import (  # noqa: F401
     _write_atomically,
     log_validation_preview,
     log_tensorboard_media,
+    MediaLog,
 )
 
 
@@ -324,12 +326,8 @@ def old_session_cleanup(app_root, model_name):
                 os.remove(file_path)
         for name in dirs:
             if name == "eval":
-                folder_path = os.path.join(root, name)
-                for item in os.listdir(folder_path):
-                    item_path = os.path.join(folder_path, item)
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                os.rmdir(folder_path)
+                # rmtree: the preview media live in ``eval/media``.
+                shutil.rmtree(os.path.join(root, name))
 
     info("Cleanup done.", tag="[INIT]")
 

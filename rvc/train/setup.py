@@ -145,6 +145,11 @@ def get_d_model(config, vocoder, use_checkpointing):
         univhd_f_min=float(setting("d_univhd_f_min", 80.0)),
         univhd_channels=int(setting("d_univhd_channels", 32)),
         univhd_half_harmonic=bool(setting("d_univhd_half_harmonic", True)),
+        univhd_max_hz=(
+            None
+            if setting("d_univhd_max_hz", None) is None
+            else float(setting("d_univhd_max_hz", None))
+        ),
         # ``None`` keeps the version's pinned weight; a config key overrides it
         # on any version.  See ``UNIVHD_WEIGHT_BY_VERSION``.
         univhd_weight=(
@@ -152,6 +157,9 @@ def get_d_model(config, vocoder, use_checkpointing):
             if setting("d_univhd_weight", None) is None
             else float(setting("d_univhd_weight", None))
         ),
+        msd_weight=float(setting("d_msd_weight", 1.0)),
+        # Set by the rectified vocoder's ``build_discriminator`` from its mel.
+        mrd_mel_cond=setting("mrd_mel_cond", None),
     )
 
 

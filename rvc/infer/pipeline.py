@@ -3,7 +3,6 @@ import random
 import gc
 import re
 import torch
-import torch.nn.functional as F
 import torchcrepe
 import numpy as np
 from scipy import signal
@@ -20,6 +19,8 @@ install_rich_print()
 
 from rvc.lib.predictors.f0 import CREPE, RMVPE, FCPE
 from rvc.lib.utils import extract_features
+from rvc.lib.algorithm.commons import upsample_content
+from rvc.lib.algorithm.energy import frame_energy
 # The dataset preprocessor's BS.1770 filters, so inference measures loudness
 # the way the training data was levelled.  numpy and scipy only.
 from rvc.train.preprocess.loudness import LOUDNESS_OFFSET, k_weighting
@@ -428,16 +429,13 @@ class Pipeline:
             if retriever is not None and retriever.ready and index_rate > 0:
                 feats = retriever.retrieve(feats, index_rate, retrieval_config)
 
-            feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
-                0, 2, 1
-            )
+            interpolation = getattr(net_g, "content_interpolation", "nearest")
+            feats = upsample_content(feats, interpolation)
 
             p_len = min(audio0.shape[0] // self.window, feats.shape[1])
 
             if pitch_guidance:
-                feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
-                    0, 2, 1
-                )
+                feats0 = upsample_content(feats0, interpolation)
                 pitch, pitchf = pitch[:, :p_len], pitchf[:, :p_len]
                 if protect < 0.5:
                     pitchff = pitchf.clone()
@@ -450,6 +448,14 @@ class Pipeline:
             else:
                 pitch, pitchf = None, None
             p_len = torch.tensor([p_len], device=self.device).long()
+            energy = None
+            if getattr(net_g, "energy_embedding", None) is not None:
+                # From the audio being converted, like the pitch.
+                energy = frame_energy(
+                    torch.from_numpy(audio0).float().view(1, -1).to(self.device),
+                    16000,
+                    feats.shape[1],
+                )
 
             audio1 = (
                 net_g.infer(
@@ -460,6 +466,7 @@ class Pipeline:
                     sid=sid,
                     seed=seed,
                     noise_scale=noise_scale,
+                    energy=energy,
                 )[0][0, 0]
                 .detach()
                 .cpu()

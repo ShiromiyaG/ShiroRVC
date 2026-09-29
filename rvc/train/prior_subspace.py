@@ -14,6 +14,8 @@ import random
 import numpy as np
 import torch
 
+from rvc.lib.algorithm.commons import upsample_content
+
 KEY = "prior_noise_subspace"
 N_FFT, HOP = 2048, 160
 #: Smallest pass worth running, and the share of the free memory a pass plans to
@@ -142,7 +144,10 @@ def valley_gradients(net_g, batch: list[list[str]], sr: int, hop: int, max_frame
     device = net_g.emb_g.weight.device
     loaded = []
     for parts in batch:
-        phone = np.repeat(np.load(parts[1]), 2, axis=0)
+        phone = upsample_content(
+            torch.from_numpy(np.load(parts[1])).float(),
+            getattr(net_g, "content_interpolation", "nearest"),
+        ).numpy()
         pitch, pitchf = np.load(parts[2]), np.load(parts[3])
         loaded.append((parts, phone, pitch, pitchf))
     frames = min(
@@ -156,7 +161,7 @@ def valley_gradients(net_g, batch: list[list[str]], sr: int, hop: int, max_frame
 
     with torch.no_grad():
         g = net_g.emb_g(sid).unsqueeze(-1)
-        m_p, _, x_mask = net_g.enc_p(phone=phone, pitch=pitch_t, lengths=lengths)
+        m_p, _, x_mask = net_g.encode_content(phone, lengths, pitch_t)
         z0 = net_g.flow(m_p * x_mask, x_mask, g=g, reverse=True)
 
     z = z0.clone().requires_grad_(True)

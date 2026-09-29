@@ -29,6 +29,20 @@ from rvc.lib.algorithm.resampling import (
     filter_schedule,
 )
 
+try:
+    from rvc.lib.algorithm.upsample_triton import PolyphaseDecimate
+except ImportError:
+    PolyphaseDecimate = None
+
+try:
+    from rvc.lib.algorithm.generators.resblock_triton import (
+        AdaINEnter,
+        AdaINLeave,
+        ResidualStep,
+    )
+except ImportError:
+    AdaINEnter = None
+
 
 #: Interpolation filter for the trunk's upsamplers, one entry per stage.
 #:
@@ -162,6 +176,24 @@ class UnitNorm(nn.Module):
         )
 
 
+#: Moving-average window the output's DC is taken from, in seconds.  At 0.1 s
+#: the highpass it makes ripples by under 0.4 dB from 80 Hz up.
+DC_WINDOW_SECONDS = 0.1
+
+
+def remove_dc(x: torch.Tensor, window: int) -> torch.Tensor:
+    """``x`` minus its centred moving average, shortened at the edges."""
+    length = x.shape[-1]
+    half = window // 2
+    # Float64: a running sum over minutes of audio would lose the mean in FP32.
+    total = F.pad(x.double().cumsum(-1), (1, 0))
+    index = torch.arange(length, device=x.device)
+    low = (index - half).clamp(min=0)
+    high = (index + half + 1).clamp(max=length)
+    mean = (total[..., high] - total[..., low]) / (high - low)
+    return x - mean.to(x.dtype)
+
+
 #: What a ``conv_post`` with a learned gain leaves in a state dict: the new
 #: ``weight_norm`` API's gain, then the old one's.
 LEGACY_OUTPUT_GAIN_KEYS = (
@@ -191,11 +223,31 @@ def _refuse_learned_output_gain(
     ]
     if found:
         error_msgs.append(
-            f"'{found[0]}' is a learned output gain, and RefineGAN2's conv_post "
-            "no longer has one (unit-norm since 2026-09-18; see UnitNorm). This "
+            f"'{found[0]}' is a learned output gain, and this decoder's conv_post "
+            "has none (unit-norm; see UnitNorm). This "
             "decoder was trained against that gain and cannot be converted -- "
             "train a fresh pretrain."
         )
+
+
+def _match_output_gain(
+    module, state_dict, prefix, local_metadata, strict, missing_keys,
+    unexpected_keys, error_msgs,
+):
+    """Load hook for ``output_log_gain``.  Into a decoder built without one it
+    is refused: a non-strict load would drop it and render ``exp(s)`` off in
+    level.  Missing from a decoder built with one, it starts at 0 -- a gain of
+    1, the output the checkpoint was trained to give."""
+
+    key = prefix + "output_log_gain"
+    if not getattr(module, "has_output_gain", False):
+        if key in state_dict:
+            error_msgs.append(
+                f"'{key}' is a learned output gain but this decoder was built "
+                "without one; set the config's output_gain option to load it."
+            )
+    elif key not in state_dict:
+        state_dict[key] = torch.zeros(())
 
 
 class ResBlock(nn.Module):
@@ -348,6 +400,8 @@ class ParallelResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
+        if self._fusable(x):
+            return self._forward_fused(x)
         x = self.input_conv(x)
         # Summed as they come: ``stack`` held every output plus a copy of all
         # of them before ``mean`` read it back.
@@ -355,6 +409,50 @@ class ParallelResBlock(nn.Module):
         for block in self.blocks[1:]:
             out = out + block(x)
         return out / len(self.blocks)
+
+    def _fusable(self, x: torch.Tensor) -> bool:
+        """The fused path computes the residual stream in FP32, which is what
+        the eager one does under AMP (``fp32_residuals``) or in plain FP32."""
+        if AdaINEnter is None or not x.is_cuda or torch.compiler.is_compiling():
+            return False
+        if torch.is_autocast_enabled("cuda"):
+            return all(block[1].fp32_residuals for block in self.blocks)
+        return x.dtype == torch.float32
+
+    def _forward_fused(self, x: torch.Tensor):
+        """``forward`` on channels-last (B, C, 1, T): cuDNN's NHWC kernels with no
+        layout conversion per conv, and the elementwise chain in
+        ``resblock_triton``.  Same values, returned as a (B, C, T) view."""
+        amp = torch.is_autocast_enabled("cuda")
+        dtype = torch.get_autocast_dtype("cuda") if amp else torch.float32
+        x = x.unsqueeze(2).to(dtype=dtype, memory_format=torch.channels_last)
+        h = _conv_channels_last(self.input_conv, x)
+        out = None
+        for enter, res, leave in self.blocks:
+            slope = res.leaky_relu_slope
+            x, t = AdaINEnter.apply(h, *_adain_noise(enter), slope, dtype)
+            last = len(res.convs1) - 1
+            for i, (c1, c2) in enumerate(zip(res.convs1, res.convs2)):
+                t = F.leaky_relu(_conv_channels_last(c1, t), slope, inplace=True)
+                y = _conv_channels_last(c2, t)
+                if i < last:
+                    x, t = ResidualStep.apply(x, y, slope, dtype)
+            out = AdaINLeave.apply(x, y, *_adain_noise(leave), out, 1.0 / len(self.blocks))
+        return out.squeeze(2)
+
+
+def _conv_channels_last(conv: nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
+    """``conv`` on (B, C, 1, T) as the equivalent (1, k) ``conv2d``."""
+    return F.conv2d(
+        x, conv.weight.unsqueeze(2), conv.bias, 1,
+        (0, conv.padding[0]), (1, conv.dilation[0]),
+    )
+
+
+def _adain_noise(adain: "AdaIN"):
+    """``(weight, noise on, slope)`` for the fused kernels."""
+    noise = adain.noise == "always" or (adain.noise == "train" and adain.training)
+    return getattr(adain, "weight", None), noise, adain.activation.negative_slope
 
 
 class SineGenerator(nn.Module):
@@ -423,8 +521,31 @@ class SineGenerator(nn.Module):
         noise_std=0.003,
         voiced_threshold=0,
         harmonic_tilt=1.0,
+        harmonic_phase="random",
+        phase_jitter=0.0,
+        random_start_phase=False,
     ):
+        """``harmonic_phase`` ``coherent`` starts every partial at phase 0, so
+        they add up to one pulse per period, as a glottal cycle does; ``random``
+        draws a new offset per partial on every call, and above ~4 kHz, where
+        several partials share a critical band, that reads as roughness.
+
+        ``phase_jitter`` draws each overtone's coherent offset uniformly within
+        +- that many cycles on every call: an exactly repeating source let the
+        discriminators separate within 150 steps.
+
+        ``random_start_phase`` starts the fundamental anywhere in its cycle on
+        every training call. Otherwise every crop begins at phase zero, and a
+        phase-locked excitation puts its pulses at the same offset from the
+        crop's start every time, which no real recording does."""
         super(SineGenerator, self).__init__()
+        if harmonic_phase not in ("random", "coherent"):
+            raise ValueError(
+                f"harmonic_phase must be 'random' or 'coherent', not {harmonic_phase!r}."
+            )
+        self.harmonic_phase = harmonic_phase
+        self.phase_jitter = float(phase_jitter)
+        self.random_start_phase = bool(random_start_phase)
         self.sine_amp = sine_amp
         self.noise_std = noise_std
         self.harmonic_num = harmonic_num
@@ -534,18 +655,30 @@ class SineGenerator(nn.Module):
     def _phase(self, f0):
         """The fundamental's phase in cycles, (batch, length, 1), and each
         partial's random initial phase, (batch, dim)."""
-        # rad_values is F0 in rad mod 1 (the integer cycle count doesn't affect phase)
-        rad_values = (f0 / self.sampling_rate) % 1
+        # rad_values is F0 in rad mod 1 (the integer cycle count doesn't affect phase).
+        # Scanned as (batch, length): over dim 1 of (batch, length, 1) CUDA
+        # runs the cumsum as an outer-dim scan, parallel over that size-1 axis.
+        rad_values = (f0[..., 0] / self.sampling_rate) % 1
 
         # random initial phase per harmonic, none for the fundamental
-        rand_ini = torch.rand(f0.shape[0], self.dim, device=f0.device)
-        rand_ini[:, 0] = 0
+        if self.harmonic_phase == "coherent":
+            rand_ini = torch.zeros(f0.shape[0], self.dim, device=f0.device)
+            if self.phase_jitter > 0:
+                rand_ini.uniform_(-self.phase_jitter, self.phase_jitter)
+                rand_ini[:, 0] = 0
+        else:
+            rand_ini = torch.rand(f0.shape[0], self.dim, device=f0.device)
+            rand_ini[:, 0] = 0
 
-        tmp_over_one = torch.cumsum(rad_values, 1) % 1
-        tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
+        tmp_over_one = torch.cumsum(rad_values, -1) % 1
+        tmp_over_one_idx = (tmp_over_one[:, 1:] - tmp_over_one[:, :-1]) < 0
         cumsum_shift = torch.zeros_like(rad_values)
-        cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-        return torch.cumsum(rad_values + cumsum_shift, dim=1), rand_ini
+        cumsum_shift[:, 1:] = tmp_over_one_idx * -1.0
+        phase = torch.cumsum(rad_values + cumsum_shift, dim=-1)[..., None]
+        if self.random_start_phase and self.training:
+            # Added before the partials multiply it, so it is a time shift.
+            phase = phase + torch.rand(phase.shape[0], 1, 1, device=phase.device)
+        return phase, rand_ini
 
     def _f02sine(self, f0):
         """f0: (batchsize, length, 1).  Returns (batchsize, length, dim) sines."""
@@ -626,7 +759,7 @@ class RefineGAN2Generator(nn.Module):
     interpolation filter that crops its own group delay, an excitation gain
     projected from the conditioning, f0 interpolated in log with a hard
     voiced/unvoiced gate, and an output projection with no learned gain
-    (``UnitNorm``).
+    (``UnitNorm``) whose DC is removed before the ``tanh`` (``remove_dc``).
 
     Args:
         source_gain (bool, optional): Scale the excitation by envelopes
@@ -642,6 +775,11 @@ class RefineGAN2Generator(nn.Module):
             ``j ** -tilt``. 1.0 is a sawtooth's -6 dB/octave and is within
             ~5 dB of a real voice across the band. Leaves no state-dict key,
             so ``decoder_layout`` carries it. Defaults to 1.0.
+        output_gain (bool, optional): A learned output level ``exp(s)`` on the
+            unit-norm ``conv_post``, which frees the trunk's scale as
+            RefineGAN's ``weight_norm`` gain did.  In log scale, ``s``'s
+            gradient follows the output rather than the trunk's size, and
+            weight decay pulls the gain to 1 instead of 0. Defaults to False.
 
     Every pointwise nonlinearity here is a plain ``leaky_relu`` at its own
     rate.  The anti-aliased activations this decoder used to wrap them in are
@@ -669,9 +807,11 @@ class RefineGAN2Generator(nn.Module):
         adain_noise: str = "always",
         source_harmonics: int = 0,
         source_tilt: float = 1.0,
+        output_gain: bool = False,
     ):
         super().__init__()
         self.sample_rate = int(sample_rate)
+        self.dc_window = int(DC_WINDOW_SECONDS * self.sample_rate) | 1
         self.upsample_rates = upsample_rates
         self.leaky_relu_slope = leaky_relu_slope
         self.checkpointing = checkpointing
@@ -1028,6 +1168,10 @@ class RefineGAN2Generator(nn.Module):
         self.conv_post = nn.Conv1d(channels, 1, 7, 1, padding=3, bias=False)
         register_parametrization(self.conv_post, "weight", UnitNorm())
         self.register_load_state_dict_pre_hook(_refuse_learned_output_gain)
+        self.has_output_gain = bool(output_gain)
+        if self.has_output_gain:
+            self.output_log_gain = nn.Parameter(torch.zeros(()))
+        self.register_load_state_dict_pre_hook(_match_output_gain)
 
         self.out_tanh = nn.Tanh()
 
@@ -1060,10 +1204,16 @@ class RefineGAN2Generator(nn.Module):
     # The kernel is what ``torchaudio.functional.resample`` builds, cached per
     # reduced ratio: it rebuilt it on every call, with a host-to-device copy
     # each time, and it only depends on ``orig / gcd``, ``new / gcd``.
+    #
+    # On CUDA the same filter runs as a Triton kernel: cuDNN runs this
+    # one-channel strided conv's backward in a slow direct kernel, 28% of the
+    # decoder's step at ``[10, 8, 2, 2]``.
     @torch.compiler.disable
     def _decimate(self, x: torch.Tensor, orig_freq: int, new_freq: int):
         gcd = math.gcd(orig_freq, new_freq)
-        key = (orig_freq // gcd, new_freq // gcd, x.dtype, x.device)
+        triton = PolyphaseDecimate is not None and x.is_cuda and new_freq == gcd
+        dtype = torch.float32 if triton else x.dtype
+        key = (orig_freq // gcd, new_freq // gcd, dtype, x.device)
         cache = self.__dict__.setdefault("_decimate_kernels", {})
         if key not in cache:
             with cache_scope():
@@ -1076,9 +1226,13 @@ class RefineGAN2Generator(nn.Module):
                     resampling_method="sinc_interp_kaiser",
                     beta=14.769656459379492,
                     device=x.device,
-                    dtype=x.dtype,
+                    dtype=dtype,
                 )
         kernel, width = cache[key]
+        if triton:
+            return PolyphaseDecimate.apply(
+                x, kernel.reshape(-1), orig_freq // gcd, width
+            )
         return _apply_sinc_resample_kernel(
             x.contiguous(), orig_freq, new_freq, gcd, kernel, width
         )
@@ -1227,6 +1381,11 @@ class RefineGAN2Generator(nn.Module):
         with self._fp32_region(x):
             x = F.leaky_relu(self._fp32(x), self.leaky_relu_slope)
             x = self.conv_post(x)
+            if self.has_output_gain:
+                x = x * self.output_log_gain.exp()
+            # The leaky_relu features all have a positive mean, so the
+            # waveform discriminators' DC tug-of-war lands on conv_post.
+            x = remove_dc(x, self.dc_window)
             x = self.out_tanh(x)
 
         return x

@@ -33,11 +33,13 @@ from rvc.lib import index_meta
 from rvc.lib.catalog import is_audio_file
 from rvc.lib.paths import INFER_PID_PATH
 from rvc.lib.model_bundle import (
+    RVC_KIND,
     default_model_name,
     get_bundle_model_state,
     get_bundle_models,
     is_model_bundle,
     load_model_bundle,
+    model_kind,
 )
 from rvc.configs.config import Config
 from rvc.configs.vocoders import normalize_vocoder
@@ -157,8 +159,7 @@ class VoiceConverter:
         -inf disables the gate.
 
         noise_scale: scale of the prior draw the model decodes. None uses the
-        model's own default (0.3 for RefineGAN2, 0.66666 otherwise or when the
-        checkpoint carries ``prior_noise_subspace``).
+        model's own default, 0.66666.
         """
         if not model_path:
             print_error("No model provided. Aborting conversion.", tag="[INFER]")
@@ -393,9 +394,23 @@ class VoiceConverter:
 
         models = get_bundle_models(bundle_data)
         if models:
-            name = bundle_submodel or default_model_name(models)
+            rvc_models = [
+                model for model, entry in models.items()
+                if model_kind(entry.get("model_state") or {}) == RVC_KIND
+            ]
+            name = bundle_submodel or default_model_name(rvc_models)
             if name not in models:
-                print_error(f"Sub-model '{name}' is not in the bundle.", tag="[INFER]")
+                print_error(
+                    f"Sub-model '{name}' is not in the bundle." if name
+                    else "The bundle holds no RVC model.",
+                    tag="[INFER]",
+                )
+                return
+            if name not in rvc_models:
+                print_error(
+                    f"'{name}' is a rectified-flow model; convert with it in the Rectified tab.",
+                    tag="[INFER]",
+                )
                 return
             if not bundle_submodel:
                 info(f"No sub-model chosen; using '{name}'.", tag="[INFER]")
@@ -453,6 +468,7 @@ class VoiceConverter:
             self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
 
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
+            # Present only when the model trained with ``prior_subspace`` on.
             self.net_g.set_prior_noise_subspace(self.active_cpt.get("prior_noise_subspace"))
             # ``remove_training_modules`` drops the posterior on either
             # frontend and keeps the flow where inference needs it.

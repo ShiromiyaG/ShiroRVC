@@ -369,6 +369,7 @@ def holdout_metrics(
     # librosa in, and the excerpt/monitor half of this module is used without
     # either.
     from rvc.train.utils import wave_to_mel
+    from rvc.lib.algorithm.energy import frame_energy
 
     model = net_g.module if hasattr(net_g, "module") else net_g
     # ``flow`` is what turns a prior draw into something the decoder can use;
@@ -433,9 +434,14 @@ def holdout_metrics(
                 wave = wave.to(device, non_blocking=True)
 
                 g = model.emb_g(sid).unsqueeze(-1)
+                energy = (
+                    frame_energy(wave, config.data.sample_rate, phone.shape[1])
+                    if getattr(model, "energy_embedding", None) is not None
+                    else None
+                )
                 if manual_prior:
-                    m_p, logs_p, x_mask = model.enc_p(
-                        phone=phone, pitch=pitch, lengths=phone_lengths
+                    m_p, logs_p, x_mask = model.encode_content(
+                        phone, phone_lengths, pitch, energy
                     )
                     z_p = m_p
                     if noise_scale:
@@ -451,7 +457,7 @@ def holdout_metrics(
                     )
                 else:
                     prior_wave, *_ = model.infer(
-                        phone, phone_lengths, pitch, pitchf, sid, 0
+                        phone, phone_lengths, pitch, pitchf, sid, 0, energy=energy
                     )
                     frames = pitchf.shape[-1]
 

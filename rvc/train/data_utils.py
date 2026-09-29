@@ -7,6 +7,7 @@ import torch.utils.data
 from mel_processing import spectrogram_torch
 from utils import load_filepaths_and_text, load_wav_to_torch
 
+from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.terminal import warning
 from rvc.train.extract.noise_mutes import is_mute_path
 
@@ -24,6 +25,46 @@ def source_group_key(audiopath):
     return head if separator else stem
 
 
+def _slice_number(audiopath, fallback):
+    """The ``{slice}`` field of a slice name, for ordering within a recording."""
+    stem = os.path.splitext(os.path.basename(audiopath))[0]
+    tail = stem.rpartition("_")[2]
+    return int(tail) if tail.isdigit() else fallback
+
+
+def _contiguous_holdout(audiopaths_and_text, groups, keys, target, rng, block=8):
+    """Hold out ``block``-slice runs spread over the recordings in ``keys``.
+
+    Slices are cut with overlap, so the neighbour on each side of a block is
+    returned as a guard to be dropped from training too. Returns
+    ``(holdout_indices, guard_indices)``.
+    """
+    blocks = -(-target // block)
+    per_group = dict.fromkeys(keys, 0)
+    for position in range(blocks):
+        per_group[keys[position % len(keys)]] += 1
+
+    held, guards = [], []
+    for key, count in per_group.items():
+        if not count:
+            continue
+        rows = sorted(
+            groups[key],
+            key=lambda index: _slice_number(audiopaths_and_text[index][0], index),
+        )
+        # Leave at least three quarters of the recording to training.
+        count = min(count, len(rows) // (4 * (block + 2)))
+        if not count:
+            continue
+        # One block per equal part, so the blocks cover the whole recording.
+        span = len(rows) // count
+        for part in range(count):
+            start = part * span + 1 + rng.randrange(span - block - 1)
+            held.extend(rows[start : start + block])
+            guards.extend((rows[start - 1], rows[start + block]))
+    return held, guards
+
+
 def holdout_split_indices(
     audiopaths_and_text,
     fraction=0.02,
@@ -37,9 +78,11 @@ def holdout_split_indices(
 
     Splits by *source recording*, not by slice: slices from one recording
     share room tone, mic placement and phonetic context, so a slice-wise
-    holdout would let a model memorise its way to a good score. Deterministic
-    in ``seed`` so the split doesn't drift between resumes. Returns an empty
-    holdout when the dataset can't afford one.
+    holdout would let a model memorise its way to a good score. When too few
+    recordings fit the budget, contiguous blocks are held out from inside them
+    instead (see :func:`_contiguous_holdout`). Deterministic in ``seed`` so the
+    split doesn't drift between resumes. Returns an empty holdout when the
+    dataset can't afford one.
     """
     total = len(audiopaths_and_text)
     groups = {}
@@ -51,36 +94,42 @@ def holdout_split_indices(
         groups.setdefault(source_group_key(row[0]), []).append(index)
 
     target = min(int(maximum), max(int(minimum), int(total * float(fraction))))
-    # Four groups so at least two survive in training, and a 4x margin so the
-    # holdout never eats a meaningful share of a small dataset.
-    if len(groups) < 4 or target * 4 > total:
+    # The 4x margin keeps the holdout from eating a meaningful share of a
+    # small dataset.
+    if not groups or target * 4 > total:
         return list(range(total)), []
 
+    rng = random.Random(seed)
     keys = sorted(groups)
-    random.Random(seed).shuffle(keys)
+    rng.shuffle(keys)
 
     held_keys = set()
     held_count = 0
     for key in keys:
         if held_count >= target:
             break
-        group = groups[key]
-        # One long recording can hold more slices than the whole budget.
-        # Skipping it keeps the holdout from collapsing to a single source.
-        if len(group) > target and held_keys:
+        # A recording larger than the whole budget would take far more than
+        # ``fraction`` out of training and leave the holdout one source wide.
+        if len(groups[key]) > target:
             continue
         held_keys.add(key)
-        held_count += len(group)
+        held_count += len(groups[key])
 
-    if not held_keys or len(groups) - len(held_keys) < 2:
-        return list(range(total)), []
+    guards = []
+    if held_count >= target and len(groups) - len(held_keys) >= 2:
+        holdout_indices = [index for key in held_keys for index in groups[key]]
+    else:
+        # Too few recordings, or all of them long: hold out blocks from
+        # inside them instead.
+        holdout_indices, guards = _contiguous_holdout(
+            audiopaths_and_text, groups, keys, target, rng
+        )
+        if not holdout_indices:
+            return list(range(total)), []
 
-    train_indices, holdout_indices = [], []
-    for index, row in enumerate(audiopaths_and_text):
-        if source_group_key(row[0]) in held_keys:
-            holdout_indices.append(index)
-        else:
-            train_indices.append(index)
+    # Guards are neither trained on nor scored.
+    excluded = set(holdout_indices) | set(guards)
+    train_indices = [index for index in range(total) if index not in excluded]
 
     # Only the evaluation list is trimmed (by duration, not just count, since
     # eval cost is seconds of audio to synthesise) so trimming can't leak
@@ -108,8 +157,9 @@ def holdout_split_indices(
 
 
 class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
-    def __init__(self, hparams, n_mel_bins=192):
+    def __init__(self, hparams, n_mel_bins=192, content_interpolation="nearest"):
         self.audiopaths_and_text = load_filepaths_and_text(hparams.training_files)
+        self.content_interpolation = content_interpolation
         self.max_wav_value = hparams.max_wav_value
         self.sample_rate = hparams.sample_rate
         self.filter_length = hparams.filter_length
@@ -184,7 +234,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
 
     def get_labels(self, phone, pitch, pitchf):
         phone = np.load(phone, allow_pickle=False)
-        phone = torch.from_numpy(phone).float().repeat_interleave(2, dim=0)
+        phone = upsample_content(torch.from_numpy(phone).float(), self.content_interpolation)
         if debug_shapes:
             print(f"[ Data_Utils [DEBUG]:get_labels] after scaling = {phone.shape}")  # AFTER repeat
 

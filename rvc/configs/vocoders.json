@@ -35,7 +35,7 @@
     },
     "refinegan2": {
         "label": "RefineGAN v2",
-        "enabled": true,
+        "enabled": false,
         "description": "RefineGAN decoder driven by a multi-harmonic excitation source, trained against multi-resolution spectrogram, UnivHD and SAN discriminators. Needs its own pretrain. 32 kHz only.",
         "architecture": "refinegan2",
         "config_dir": "refinegan2",
@@ -49,6 +49,24 @@
         "aliases": [
             "refinegan",
             "RefineGAN"
+        ]
+    },
+    "nsf-bigvgan": {
+        "label": "NSF-BigVGAN",
+        "enabled": false,
+        "description": "BigVGAN v2's anti-aliased SnakeBeta generator at RefineGAN v2's size, driven by the same multi-harmonic excitation at every stage and trained against RefineGAN v2's discriminators. Needs its own pretrain. 32 kHz only.",
+        "architecture": "nsf-bigvgan",
+        "config_dir": "nsf-bigvgan",
+        "sample_rates": [
+            32000
+        ],
+        "pretrained_dir": "nsf-bigvgan",
+        "generator": "nsf_bigvgan",
+        "discriminator": "v4",
+        "architecture_id": "nsf_bigvgan_v1",
+        "aliases": [
+            "bigvgan",
+            "nsf_bigvgan"
         ]
     }
 }
