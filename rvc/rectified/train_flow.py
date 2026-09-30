@@ -27,7 +27,6 @@ from rvc.lib.terminal import (
     warning,
 )
 from rvc.rectified.common import (
-    ClipCurves,
     RectifiedDataset,
     amp_setup,
     check_pretrain_embedder,
@@ -35,7 +34,6 @@ from rvc.rectified.common import (
     embedder_of,
     latest_checkpoint,
     load_run_config,
-    measure_clip_curves,
     precision_label,
     pretrained_weights,
     read_filelist,
@@ -135,13 +133,6 @@ def main(spec_path: str) -> None:
     with open(spec_path, encoding="utf-8") as handle:
         spec = json.load(handle)
     install_stop_handlers()
-    # Once, before the ranks start, which would otherwise wait on it.
-    name = spec["model_name"]
-    config = load_run_config(name)
-    measure_clip_curves(
-        name, read_filelist(name), config["data"]["sample_rate"],
-        loader_workers(config["flow"].get("num_workers", 4)),
-    )
     launch(train, spec_path, parse_gpus(spec.get("gpu", "0")))
 
 
@@ -165,16 +156,15 @@ def train(ranks: Ranks, spec_path: str) -> None:
     entries = read_filelist(name)
     speakers = speaker_count(entries)
     segment = int(settings["segment_frames"])
-    workers = loader_workers(settings.get("num_workers", 4))
-    curves = ClipCurves(name)
     entries, holdout_entries = split_holdout(entries, int(settings.get("holdout_clips", 0)))
-    dataset = RectifiedDataset(entries, config, "flow", segment, curves=curves)
+    dataset = RectifiedDataset(entries, config, "flow", segment)
     # Per GPU, as in the RVC trainer.
     batch_size = int(spec["batch_size"])
     if len(dataset) // ranks.world < batch_size:
         raise ValueError(
             f"{len(dataset)} clips is fewer than one batch of {batch_size} on each of {ranks.world} GPU(s)."
         )
+    workers = loader_workers(settings.get("num_workers", 4))
     # Every batch padded to the crop length, one shape for the compiled backbone.
     collate = partial(collate_flow, frames=segment)
     sampler = ranks.sampler(dataset)
@@ -193,7 +183,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     holdout = None
     if holdout_entries and main_rank:
         holdout = DataLoader(
-            RectifiedDataset(holdout_entries, config, "flow", segment, augment=False, curves=curves),
+            RectifiedDataset(holdout_entries, config, "flow", segment, augment=False),
             batch_size=min(batch_size, len(holdout_entries)),
             num_workers=min(2, workers),
             collate_fn=collate,

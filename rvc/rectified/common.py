@@ -10,7 +10,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
@@ -218,109 +218,6 @@ def check_pretrain_embedder(path: str, embedder: str) -> None:
         )
 
 
-def read_audio(path: str, sample_rate: int) -> torch.Tensor:
-    """Mono ``path``, which must already be at ``sample_rate``."""
-    data, rate = sf.read(path, dtype="float32")
-    audio = torch.from_numpy(data)
-    if rate != sample_rate:
-        raise ValueError(
-            f"{path} is {rate} Hz; the rectified models train at "
-            f"{sample_rate} Hz. Preprocess the dataset at that rate."
-        )
-    return audio.mean(-1) if audio.dim() == 2 else audio
-
-
-def clip_curves(audio: torch.Tensor, f0: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Smoothed loudness and aperiodic share of ``audio`` [samples], whose
-    pitch ``f0`` is at ``FEATURE_RATE``; [time, 2] at ``FEATURE_RATE``."""
-    feature_frames = audio.shape[-1] // (sample_rate // FEATURE_RATE)
-    audio = audio.unsqueeze(0)
-    energy = frame_energy(audio, sample_rate, feature_frames)
-    share = aperiodicity(audio, sample_rate, f0.unsqueeze(0), feature_frames)
-    return smooth_curve(torch.cat([energy, share])).T.contiguous()
-
-
-#: Bump when ``clip_curves`` changes, so stored curves are measured again.
-CURVES_VERSION = 1
-
-
-def curves_path(model_name: str) -> str:
-    return os.path.join(LOGS_DIR, model_name, "rectified_curves.npz")
-
-
-def _curve_clips(entries):
-    """Each distinct (audio, pitch) pair of ``entries``, keyed by the audio
-    path relative to the root, with both files' mtimes."""
-    clips = {}
-    for entry in entries:
-        key = os.path.relpath(entry[0], ROOT)
-        if key not in clips:
-            clips[key] = (entry[0], entry[3], os.stat(entry[0]).st_mtime_ns, os.stat(entry[3]).st_mtime_ns)
-    return clips
-
-
-class _CurveSource(Dataset):
-    def __init__(self, clips, sample_rate: int):
-        self.clips = clips
-        self.sample_rate = sample_rate
-
-    def __len__(self):
-        return len(self.clips)
-
-    def __getitem__(self, index):
-        audio_path, f0_path = self.clips[index]
-        f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
-        return clip_curves(read_audio(audio_path, self.sample_rate), f0, self.sample_rate)
-
-
-def measure_clip_curves(model_name: str, entries, sample_rate: int, workers: int) -> None:
-    """Write ``curves_path`` with every clip's ``clip_curves``, unless it is
-    already there for these clips and their audio and pitch are unchanged."""
-    from rvc.lib.terminal import info, progress_task
-
-    path = curves_path(model_name)
-    clips = _curve_clips(entries)
-    try:
-        with np.load(path, allow_pickle=False) as stored:
-            if int(stored["version"]) == CURVES_VERSION:
-                known = dict(zip(stored["keys"].tolist(), map(tuple, stored["stamps"].tolist())))
-                if all(known.get(key) == clip[2:] for key, clip in clips.items()):
-                    return
-    except (OSError, KeyError, ValueError):
-        pass
-
-    info(f"Measuring loudness and breathiness of {len(clips)} clips.", tag="[CURVES]")
-    source = _CurveSource([clip[:2] for clip in clips.values()], sample_rate)
-    curves = []
-    with progress_task(len(source), "Loudness and breathiness") as (progress, task):
-        for item in DataLoader(source, batch_size=None, num_workers=workers):
-            curves.append(item.numpy())
-            progress.update(task, advance=1)
-    offsets = np.cumsum([0] + [len(item) for item in curves])
-    partial = f"{path}.tmp"
-    with open(partial, "wb") as handle:
-        np.savez(
-            handle, version=CURVES_VERSION, keys=np.array(list(clips)),
-            stamps=np.array([clip[2:] for clip in clips.values()], dtype=np.int64).reshape(-1, 2),
-            offsets=offsets, curves=np.concatenate(curves).astype(np.float32),
-        )
-    os.replace(partial, path)
-
-
-class ClipCurves:
-    """The curves ``measure_clip_curves`` wrote, looked up by audio path."""
-
-    def __init__(self, model_name: str):
-        with np.load(curves_path(model_name), allow_pickle=False) as stored:
-            self.curves = torch.from_numpy(stored["curves"])
-            offsets = stored["offsets"].tolist()
-            self.spans = {key: (offsets[i], offsets[i + 1]) for i, key in enumerate(stored["keys"].tolist())}
-
-    def get(self, audio_path: str) -> torch.Tensor:
-        start, stop = self.spans[os.path.relpath(audio_path, ROOT)]
-        return self.curves[start:stop]
-
-
 class RectifiedDataset(Dataset):
     """Clips from an extracted RVC experiment.
 
@@ -329,12 +226,10 @@ class RectifiedDataset(Dataset):
     crops of up to ``segment_frames``. The mel is taken over the whole clip
     before cropping, as at inference. Flow items are pitch-shifted and
     time-stretched at random with the config's probabilities; without
-    ``augment``, they are neither, nor randomly cropped. Flow items read
-    loudness and breathiness from ``curves`` when given, a ``ClipCurves``.
+    ``augment``, they are neither, nor randomly cropped.
     """
 
-    def __init__(self, entries, config: dict, mode: str, segment_frames: int, augment: bool = True,
-                 curves=None):
+    def __init__(self, entries, config: dict, mode: str, segment_frames: int, augment: bool = True):
         if mode not in ("vocoder", "flow"):
             raise ValueError(f"mode must be 'vocoder' or 'flow', not {mode!r}.")
         self.entries = entries
@@ -350,13 +245,34 @@ class RectifiedDataset(Dataset):
         self.stretch_range = tuple(config["flow"].get("time_stretch_range", (1.0, 1.0)))
         self.stretch_prob = float(config["flow"].get("time_stretch_prob", 0.0))
         self.augment = augment
-        self.curves = curves
 
     def __len__(self):
         return len(self.entries)
 
     def _audio(self, path):
-        return read_audio(path, self.sample_rate)
+        data, sample_rate = sf.read(path, dtype="float32")
+        audio = torch.from_numpy(data)
+        if sample_rate != self.sample_rate:
+            raise ValueError(
+                f"{path} is {sample_rate} Hz; the rectified models train at "
+                f"{self.sample_rate} Hz. Preprocess the dataset at that rate."
+            )
+        return audio.mean(-1) if audio.dim() == 2 else audio
+
+    def _energy(self, audio, frames, hop):
+        """Smoothed loudness per mel frame of ``hop`` samples, [batch, frames],
+        from ``audio`` [batch, samples]."""
+        feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
+        energy = smooth_curve(frame_energy(audio, self.sample_rate, feature_frames))
+        return to_mel_rate(energy.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+
+    def _breathiness(self, audio, f0, frames, hop):
+        """Smoothed aperiodic share per mel frame of ``hop`` samples, [batch,
+        frames], from ``audio`` [batch, samples] and its pitch ``f0`` [batch,
+        time] at ``FEATURE_RATE``."""
+        feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
+        share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
+        return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
 
     def __getitem__(self, index):
         wav_path, content_path, _, f0_path, sid = self.entries[index]
@@ -368,11 +284,7 @@ class RectifiedDataset(Dataset):
             torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
             self.data["content_interpolation"],
         )
-        if self.curves is not None:
-            curves = self.curves.get(wav_path)
-        else:
-            curves = clip_curves(audio, source_f0, self.sample_rate)
-        return self._flow_item(audio, source_f0, content, curves, int(sid))
+        return self._flow_item(audio, source_f0, content, int(sid))
 
     def _vocoder_item(self, audio, f0):
         frames = min(audio.shape[0] // self.hop, mel_frames(f0.shape[0], self.sample_rate, self.hop))
@@ -388,10 +300,10 @@ class RectifiedDataset(Dataset):
         stop = start + self.segment_frames
         return mel[:, start:stop], f0[start:stop], audio[start * self.hop : stop * self.hop]
 
-    def _flow_item(self, audio, source_f0, content, curves, sid):
+    def _flow_item(self, audio, source_f0, content, sid):
         """A crop shifted by ``key_shift`` semitones (pitch and formants) and
         stretched by ``speed`` (a longer hop reads the clip faster), both drawn
-        when augmenting. ``curves`` are the clip's ``clip_curves``."""
+        when augmenting."""
         key_shift, hop = 0.0, self.hop
         if self.augment and self.key_shift_range > 0 and random.random() < self.key_shift_prob:
             key_shift = random.uniform(-self.key_shift_range, self.key_shift_range)
@@ -410,7 +322,8 @@ class RectifiedDataset(Dataset):
         f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, hop) * 2.0 ** (key_shift / 12.0)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), key_shift, hop)[0, :, :frames]
-        energy, breathiness = to_mel_rate(curves, frames, self.sample_rate, hop).unbind(-1)
+        energy = self._energy(audio.unsqueeze(0), frames, hop)[0]
+        breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
 
         length = min(frames, self.segment_frames)
         start = random.randint(0, frames - length) if self.augment else 0
@@ -430,11 +343,11 @@ class RectifiedDataset(Dataset):
             frames = min(frames, max_frames)
         audio = audio[: frames * self.hop]
         content = to_mel_rate(content, frames, self.sample_rate, self.hop)
-        curves = to_mel_rate(clip_curves(audio, f0, self.sample_rate), frames, self.sample_rate, self.hop)
-        energy, breathiness = curves.T.unsqueeze(1)
+        breathiness = self._breathiness(audio.unsqueeze(0), f0.unsqueeze(0), frames, self.hop)
         f0 = f0_to_mel_rate(f0, frames, self.sample_rate, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
+        energy = self._energy(audio.unsqueeze(0), frames, self.hop)
         return (
             mel, content.unsqueeze(0), f0.unsqueeze(0), energy, breathiness,
             audio.unsqueeze(0), int(sid), path,
