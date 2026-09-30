@@ -466,6 +466,8 @@ class RectifiedFlow(nn.Module):
         guidance_interval: tuple = (0.0, 1.0),
         rescale_mode: str = "global",
         schedule: str = "uniform",
+        churn: float = 0.0,
+        churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
     ):
         """Integrate the ODE from ``noise`` (drawn when None) to a normalised
         mel, [B, n_mels, T]; from ``t_start`` on the aux decoder's mel when the
@@ -484,6 +486,12 @@ class RectifiedFlow(nn.Module):
         sampling begins at, from the aux decoder's mel; None, or anything
         before ``t_start``, is ``t_start``, and it is ignored without an aux
         decoder. ``schedule`` is one of ``SCHEDULES``.
+
+        ``churn`` makes the sampler stochastic, as EDM's: before each step the
+        state is re-noised back ``churn`` times that step's length (never
+        before the trained ``t_start``), and the step then covers the longer
+        span; 0 is the plain ODE. ``churn_noise(step)`` gives that step's fresh
+        noise, drawn when None.
         """
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
@@ -548,8 +556,18 @@ class RectifiedFlow(nn.Module):
             x = noise * mask
         times = time_grid(schedule, max(1, int(steps)), t0, x.device)
         for index in range(times.shape[0] - 1):
-            t = times[index].expand(batch)
-            dt = times[index + 1] - times[index]
+            now = float(times[index])
+            back = max(self.t_start, now - float(churn) * float(times[index + 1] - times[index]))
+            if churn > 0 and 0 < back < now:
+                # Keeps x on the path (1 - t) noise + t mel: the kept noise shrinks
+                # with the data and fresh noise tops it up to (1 - back).
+                fresh = torch.randn_like(x) if churn_noise is None else churn_noise(index)
+                scale = back / now
+                top_up = math.sqrt(max((1.0 - back) ** 2 - (scale * (1.0 - now)) ** 2, 0.0))
+                x = (scale * x + float(temperature) * top_up * fresh) * mask
+                now = back
+            t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
+            dt = times[index + 1] - now
             v = field(x, t)
             if method == "heun":
                 v_next = field(x + dt * v, times[index + 1].expand(batch))

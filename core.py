@@ -567,7 +567,7 @@ def run_rectified_infer_script(
     f0_method: str = "rmvpe",
     steps: int = 16,
     sampler: str = "euler",
-    cfg_scale: float = 1.0,
+    cfg_scale: float = 2.0,
     f0_autotune: bool = False,
     f0_autotune_strength: float = 1.0,
     seed: int = 0,
@@ -579,7 +579,7 @@ def run_rectified_infer_script(
     index_continuity: float = 0.5,
     protect: float = 0.33,
     formant_shift: float = 0.0,
-    content_guidance: float = 0.0,
+    content_guidance: float = 0.1,
     guidance_rescale: float = 0.7,
     split_audio: bool = False,
     silence_gate_db: float = -60.0,
@@ -589,10 +589,12 @@ def run_rectified_infer_script(
     guidance_until: float = 1.0,
     rescale_mode: str = "global",
     schedule: str = "uniform",
+    churn: float = 0.0,
     f0_median: int = 0,
     f0_octave_fix: bool = False,
     content_context: float = 2.0,
     flow_submodel: str = "",
+    match_level: bool = True,
 ):
     if not flow_path or not vocoder_path:
         problem = "Pick a flow model and a vocoder model."
@@ -639,10 +641,12 @@ def run_rectified_infer_script(
         guidance_until=float(guidance_until),
         rescale_mode=rescale_mode,
         schedule=schedule,
+        churn=float(churn),
         f0_median=int(f0_median),
         f0_octave_fix=bool(f0_octave_fix),
         content_context=float(content_context),
         flow_submodel=flow_submodel or "",
+        match_level=bool(match_level),
     )
     if written is None:
         return "Conversion failed; see the terminal for the error.", None

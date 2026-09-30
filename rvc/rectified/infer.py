@@ -196,6 +196,7 @@ class RectifiedConverter:
         """Normalised mel [1, n_mels, T], in overlapping passes crossfaded."""
         frames = content.shape[1]
         noise = torch.randn(1, self.flow.n_mels, frames, device=self.device)
+        churn_seed = int(torch.randint(2**31 - 1, ()))
         speaker = torch.tensor([sid], device=self.device)
         mel = torch.zeros_like(noise)
         weight = torch.zeros(1, 1, frames, device=self.device)
@@ -205,7 +206,7 @@ class RectifiedConverter:
             while start < frames:
                 stop = self._flow_pass(
                     content, f0, energy, breathiness, key_shift, speaker, noise, mel, weight, start,
-                    steps, sampler, guidance, lambda: progress.advance(task),
+                    steps, sampler, guidance, lambda: progress.advance(task), churn_seed,
                 )
                 if stop == frames:
                     break
@@ -213,17 +214,23 @@ class RectifiedConverter:
         return mel / weight.clamp_min(1e-4)
 
     def _flow_pass(self, content, f0, energy, breathiness, key_shift, speaker, noise, mel, weight, start,
-                   steps, sampler, guidance, callback):
+                   steps, sampler, guidance, callback, churn_seed):
         """One flow pass from ``start``, added into ``mel`` and ``weight`` with
         its crossfade ramps; returns where it stopped."""
         frames = content.shape[1]
         stop = min(frames, start + FLOW_CHUNK)
+
+        def churn_noise(step):
+            # Drawn over the whole input so overlapping passes share it.
+            generator = torch.Generator(self.device).manual_seed(churn_seed + step)
+            return torch.randn(noise.shape, generator=generator, device=self.device)[..., start:stop]
+
         mask = torch.ones(1, 1, stop - start, device=self.device)
         part = self.flow.sample(
             content[:, start:stop], f0[:, start:stop], energy[:, start:stop],
             speaker, mask, steps=steps, method=sampler, **guidance,
             breathiness=breathiness[:, start:stop], key_shift=key_shift,
-            noise=noise[..., start:stop], callback=callback,
+            noise=noise[..., start:stop], callback=callback, churn_noise=churn_noise,
         )
         ramp = torch.ones(stop - start, device=self.device)
         fade = min(FLOW_OVERLAP, stop - start)
@@ -277,7 +284,7 @@ class RectifiedConverter:
         f0_method: str = "rmvpe",
         steps: int = 16,
         sampler: str = "euler",
-        cfg_scale: float = 1.0,
+        cfg_scale: float = 2.0,
         f0_autotune: bool = False,
         f0_autotune_strength: float = 1.0,
         seed: int = 0,
@@ -289,7 +296,7 @@ class RectifiedConverter:
         index_continuity: float = 0.5,
         protect: float = 0.33,
         formant_shift: float = 0.0,
-        content_guidance: float = 0.0,
+        content_guidance: float = 0.1,
         guidance_rescale: float = 0.7,
         split_audio: bool = False,
         silence_gate_db: float = -60.0,
@@ -299,10 +306,12 @@ class RectifiedConverter:
         guidance_until: float = 1.0,
         rescale_mode: str = "global",
         schedule: str = "uniform",
+        churn: float = 0.0,
         f0_median: int = 0,
         f0_octave_fix: bool = False,
         content_context: float = 2.0,
         flow_submodel: str = "",
+        match_level: bool = True,
     ):
         """Convert one file; returns the path written, or None on failure.
 
@@ -321,9 +330,13 @@ class RectifiedConverter:
         ``noise_temperature``, ``flow_start`` (0 keeps the model's own),
         ``guidance_from``/``guidance_until``, ``rescale_mode`` and ``schedule``
         are ``RectifiedFlow.sample``'s ``temperature``, ``start``,
-        ``guidance_interval``, ``rescale_mode`` and ``schedule``; ``f0_median``
+        ``guidance_interval``, ``rescale_mode``, ``schedule`` and ``churn``; ``f0_median``
         and ``f0_octave_fix`` clean the input's pitch; ``content_context`` is
-        the seconds of audio each content pass sees either side."""
+        the seconds of audio each content pass sees either side.
+
+        ``match_level`` peak-normalises the input as the training data was, since
+        the energy input is absolute, and scales the output back to the input's
+        level; off, the input is only attenuated when it would clip."""
         try:
             started = time.time()
             self._load_flow(flow_path, flow_submodel)
@@ -348,6 +361,7 @@ class RectifiedConverter:
                                       + (", octave fix" if f0_octave_fix else "")),
                     ("Sampling", f"{steps} {sampler} steps, {schedule} schedule, "
                                  f"temperature {noise_temperature:g}"
+                                 + (f", churn {churn:g}" if churn > 0 else "")
                                  + (f", start {flow_start:g}" if flow_start > 0 else "")),
                     ("Guidance", f"speaker {cfg_scale:g}, content {content_guidance:g}, "
                                  f"rescale {guidance_rescale:g} ({rescale_mode}), "
@@ -358,6 +372,7 @@ class RectifiedConverter:
                      else f"bundled, rate {index_rate:g}, protect {protect:g}" if self.flow_index is not None
                      else f"{os.path.basename(index_path)}, rate {index_rate:g}, protect {protect:g}"
                      if index_path else "off"),
+                    ("Match level", "on" if match_level else "off"),
                     ("Split audio", "on" if split_audio else "off"),
                     ("Silence gate", f"{silence_gate_db:g} dBFS"),
                     ("Seed", seed),
@@ -366,10 +381,13 @@ class RectifiedConverter:
             )
 
             audio = load_audio_infer(audio_input_path, INPUT_RATE)
-            peak = np.abs(audio).max() / 0.95
-            if peak > 1:
-                audio = audio / peak
-            audio = audio.astype(np.float32)
+            peak = float(np.abs(audio).max())
+            gain = 0.95 / peak if peak > 0 else 1.0
+            if not match_level:
+                gain = min(gain, 1.0)
+            audio = (audio * gain).astype(np.float32)
+            # Only the boost is undone; a hot input stays attenuated.
+            restore = 1.0 / max(gain, 1.0)
             sample_rate = self.vocoder_config["data"]["sample_rate"]
             retriever = self._load_retriever(index_path) if index_rate > 0 else None
             from rvc.infer.pipeline import AudioProcessor
@@ -417,12 +435,14 @@ class RectifiedConverter:
                     dict(cfg_scale=float(cfg_scale), content_guidance=float(content_guidance),
                          guidance_rescale=float(guidance_rescale), rescale_mode=rescale_mode,
                          guidance_interval=(float(guidance_from), float(guidance_until)),
-                         temperature=float(noise_temperature), schedule=schedule,
+                         temperature=float(noise_temperature), schedule=schedule, churn=float(churn),
                          start=float(flow_start) or None),
                 )
                 # The vocoder takes the normalised mel the flow produces.
-                output = self._render(mel, f0)
-                return AudioProcessor.gate_to_source(audio, INPUT_RATE, output, sample_rate, silence_gate_db)
+                output = self._render(mel, f0) * restore
+                return AudioProcessor.gate_to_source(
+                    audio * restore, INPUT_RATE, output, sample_rate, silence_gate_db
+                )
 
             if split_audio:
                 segments, intervals = process_audio(audio, INPUT_RATE)

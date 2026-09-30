@@ -222,6 +222,15 @@ def rectified_inference_tab():
                     value="uniform",
                     interactive=True,
                 )
+                churn = gr.Slider(
+                    minimum=0.0,
+                    maximum=2.0,
+                    step=0.05,
+                    label=_("Churn"),
+                    info=_("Re-noises the mel back this many step lengths before each step, so the model can correct its own errors. Can bring back texture in the highs; too much adds grain. 0 is the plain ODE; works with either sampler."),
+                    value=0.0,
+                    interactive=True,
+                )
             with gr.Row():
                 noise_temperature = gr.Slider(
                     minimum=0.0,
@@ -250,7 +259,7 @@ def rectified_inference_tab():
                     step=0.1,
                     label=_("Speaker Guidance"),
                     info=_("Classifier-free guidance on the speaker. 1 turns it off; higher pushes toward the target voice."),
-                    value=1.0,
+                    value=2.0,
                     interactive=True,
                 )
                 content_guidance = gr.Slider(
@@ -259,7 +268,7 @@ def rectified_inference_tab():
                     step=0.05,
                     label=_("Content Guidance"),
                     info=_("Pushes away from a blurred copy of the content for clearer articulation. 0 turns it off."),
-                    value=0.0,
+                    value=0.1,
                     interactive=True,
                 )
             with gr.Row():
@@ -390,6 +399,12 @@ def rectified_inference_tab():
                     value=False,
                     interactive=True,
                 )
+                match_level = gr.Checkbox(
+                    label=_("Match Training Level"),
+                    info=_("Peak-normalise the input as the training data was, then bring the output back to the input's level. The model reads loudness as timbre, so a quiet input otherwise sounds darker."),
+                    value=True,
+                    interactive=True,
+                )
                 silence_gate_db = gr.Slider(
                     minimum=-120,
                     maximum=0,
@@ -420,7 +435,7 @@ def rectified_inference_tab():
         index_path, index_rate, index_k, index_power, index_continuity, protect,
         formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
         noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
-        f0_median, f0_octave_fix, content_context, flow_submodel,
+        f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
     ):
         if not flow_model or not vocoder_model:
             return _("Pick a flow model and a vocoder model."), None
@@ -472,6 +487,8 @@ def rectified_inference_tab():
             f0_octave_fix=f0_octave_fix,
             content_context=content_context,
             flow_submodel=flow_submodel if is_model_bundle(flow_model) else "",
+            match_level=match_level,
+            churn=churn,
         )
 
     def refresh():
@@ -528,7 +545,7 @@ def rectified_inference_tab():
             index_file, index_rate, index_k, index_power, index_continuity, protect,
             formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
             noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
-            f0_median, f0_octave_fix, content_context, flow_submodel,
+            f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
         ],
         outputs=[output_info, output_audio],
     )
