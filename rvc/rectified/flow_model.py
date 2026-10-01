@@ -11,7 +11,18 @@ from rvc.lib.algorithm.content_bottleneck import ContentBottleneck
 #: Centre and spread of log f0, so the normalised pitch sits roughly in [-2, 2].
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
-SAMPLERS = ("euler", "heun")
+#: "mean" takes each step with the mean velocity over it, which only a model
+#: trained with mean flow has.
+SAMPLERS = ("euler", "heun", "mean")
+#: Share of the frames that get the second time under ``dual_timestep``.
+DUAL_TIMESTEP_SHARE = 0.25
+
+
+def adaptive_weight(error: torch.Tensor) -> torch.Tensor:
+    """MeanFlow's per-item loss weight, 1 / (error + c): each item pulls alike
+    whatever its error, which a bootstrapped target far off would otherwise
+    dominate."""
+    return (error.detach() + 1e-3).reciprocal()
 #: Step spacing over the sampled time range: even; sway (F5-TTS), denser near
 #: the start; logit-normal, the density training draws its times from.
 SCHEDULES = ("uniform", "sway", "logit-normal")
@@ -104,8 +115,8 @@ class ConvNeXtBlock(nn.Module):
 
 
 class ConditionEncoder(nn.Module):
-    """Content, pitch, loudness, breathiness, key shift and speaker ->
-    per-frame conditioning.
+    """Content, pitch, loudness, breathiness, tension, key shift and speaker
+    -> per-frame conditioning.
 
     Speaker row ``speaker_count`` is the null speaker used for classifier-free
     guidance. ``key_shift`` is the formant shift in semitones: training shifts
@@ -128,6 +139,7 @@ class ConditionEncoder(nn.Module):
         key_shift: bool = False,
         content_bottleneck_noise: float = 0.0,
         speed: bool = False,
+        tension: bool = False,
     ):
         super().__init__()
         self.speaker_count = int(speaker_count)
@@ -144,6 +156,12 @@ class ConditionEncoder(nn.Module):
             self.harmonics = nn.Conv1d(harmonic_prior.basis.shape[0], hidden_channels, 1)
         self.energy = nn.Conv1d(1, hidden_channels, 3, padding=1)
         self.breathiness = nn.Conv1d(1, hidden_channels, 3, padding=1) if breathiness else None
+        self.tension = None
+        if tension:
+            # From zero, so a checkpoint without the input starts unchanged.
+            self.tension = nn.Conv1d(1, hidden_channels, 3, padding=1)
+            nn.init.zeros_(self.tension.weight)
+            nn.init.zeros_(self.tension.bias)
         self.key_shift = nn.Linear(1, hidden_channels) if key_shift else None
         self.speed = nn.Linear(1, hidden_channels) if speed else None
         self.speaker = nn.Embedding(self.speaker_count + 1, speaker_channels)
@@ -154,11 +172,13 @@ class ConditionEncoder(nn.Module):
         """The speaker's embedding, [B, hidden]; the null row for guidance."""
         return self.speaker_proj(self.speaker(speaker))
 
-    def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None):
-        """``content`` [B, T, C], ``f0``, ``energy`` and ``breathiness`` [B, T],
-        ``speaker``, ``key_shift`` and ``speed`` [B], ``mask`` [B, 1, T] ->
-        [B, hidden, T]. Missing ``breathiness``, ``key_shift`` and ``speed``
-        read as fully aperiodic, 0 and 1."""
+    def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None,
+                tension=None):
+        """``content`` [B, T, C], ``f0``, ``energy``, ``breathiness`` and
+        ``tension`` [B, T], ``speaker``, ``key_shift`` and ``speed`` [B],
+        ``mask`` [B, 1, T] -> [B, hidden, T]. Missing ``breathiness``,
+        ``tension``, ``key_shift`` and ``speed`` read as fully aperiodic, 0, 0
+        and 1."""
         if self.bottleneck is not None:
             content = self.bottleneck(content)
         x = self.content(content).transpose(1, 2)
@@ -170,6 +190,10 @@ class ConditionEncoder(nn.Module):
             if breathiness is None:
                 breathiness = torch.ones_like(energy)
             x = x + self.breathiness(breathiness.unsqueeze(1))
+        if self.tension is not None:
+            if tension is None:
+                tension = torch.zeros_like(energy)
+            x = x + self.tension(tension.unsqueeze(1))
         if self.key_shift is not None:
             if key_shift is None:
                 key_shift = torch.zeros(content.shape[0], device=content.device)
@@ -185,12 +209,12 @@ class ConditionEncoder(nn.Module):
         return x
 
 
-def timestep_embedding(t: torch.Tensor, channels: int) -> torch.Tensor:
+def timestep_embedding(t: torch.Tensor, channels: int, scale: float = 1000.0) -> torch.Tensor:
     half = channels // 2
     frequencies = torch.exp(
         -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
     )
-    angles = (t.float() * 1000.0)[:, None] * frequencies[None]
+    angles = (t.float() * scale)[:, None] * frequencies[None]
     return torch.cat((angles.sin(), angles.cos()), dim=-1)
 
 
@@ -209,9 +233,11 @@ class _ATanGLU(torch.autograd.Function):
         return grad * atan_gate, grad * decay_out
 
 
-def atan_glu(x: torch.Tensor) -> torch.Tensor:
+def atan_glu(x: torch.Tensor, fused: bool = True) -> torch.Tensor:
+    """``fused`` off takes the plain product, which forward-mode
+    differentiation needs."""
     out, gate = x.chunk(2, dim=-1)
-    if torch.is_grad_enabled():
+    if fused and torch.is_grad_enabled():
         return _ATanGLU.apply(out, gate)
     return out * torch.atan(gate)
 
@@ -238,8 +264,9 @@ class LYNXNet2Block(nn.Module):
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
 
-    def forward(self, x, mask, embedding=None):
-        """``x`` [B, T, C], ``mask`` [B, T, 1], ``embedding`` [B, 1, C]."""
+    def forward(self, x, mask, embedding=None, fused=True):
+        """``x`` [B, T, C], ``mask`` [B, T, 1], ``embedding`` [B, 1 or T, C];
+        ``fused`` is ``atan_glu``'s."""
         y = self.norm(x)
         gate = None
         if self.modulation is not None:
@@ -247,7 +274,7 @@ class LYNXNet2Block(nn.Module):
             # Not ``1 + scale``: in BF16 that rounds modulations under ~0.004 to nothing.
             y = y + y * scale + shift
         y = self.depthwise((y * mask).transpose(1, 2)).transpose(1, 2)
-        y = self.down(atan_glu(self.mid(atan_glu(self.up(y)))))
+        y = self.down(atan_glu(self.mid(atan_glu(self.up(y), fused)), fused))
         if gate is not None:
             y = y + gate * y
         return (x + y) * mask
@@ -256,17 +283,33 @@ class LYNXNet2Block(nn.Module):
 class LYNXNet2Backbone(nn.Module):
     """DiffSinger's current LYNXNet2: condition and time added once at the
     input, then depthwise-separable gated blocks. ``adaln`` also modulates
-    every block by time and speaker, as RIFT-SVC's DiT does."""
+    every block by time and speaker, as RIFT-SVC's DiT does. ``span`` adds
+    MeanFlow's second time input, the length of the step whose mean velocity
+    is predicted.
+
+    ``time_scale`` multiplies the flow time before its sinusoids: 1000 is
+    DiffSinger's; 1, as SiT has it, keeps the network smooth in time, which
+    mean flow needs because its target is the network's own time derivative."""
 
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 adaln=False):
+                 adaln=False, span=False, time_scale=1000.0):
         super().__init__()
         self.channels = int(channels)
+        self.time_scale = float(time_scale)
         self.input = nn.Linear(n_mels, channels)
         self.input_cond = nn.Conv1d(cond_channels, channels, 1)
         self.time_mlp = nn.Sequential(
             nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
+        self.span_mlp = None
+        if span:
+            # No biases, on features that vanish at 0: a zero span adds exactly
+            # nothing, so the instantaneous velocity is the network without it.
+            self.span_mlp = nn.Sequential(
+                nn.Linear(channels, channels * 4, bias=False), nn.GELU(),
+                nn.Linear(channels * 4, channels, bias=False),
+            )
+            nn.init.zeros_(self.span_mlp[-1].weight)
         self.layers = nn.ModuleList(
             [LYNXNet2Block(channels, expansion, kernel_size, adaln) for _ in range(layers)]
         )
@@ -279,8 +322,17 @@ class LYNXNet2Backbone(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, x, t, cond, mask, voice=None):
-        time = self.time_mlp(timestep_embedding(t, self.channels))[:, None, :]
+    def forward(self, x, t, cond, mask, voice=None, span=None):
+        """``t`` is [B], or [B, T] for a time per frame. ``span`` [B] is the
+        length of the step from ``t`` whose mean velocity is wanted; None is
+        the velocity at ``t``."""
+        time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
+        time = time.view(t.shape[0], -1, self.channels)
+        if span is not None:
+            features = timestep_embedding(span.reshape(-1), self.channels, self.time_scale)
+            half = self.channels // 2
+            features = torch.cat((features[:, :half], 1.0 - features[:, half:]), dim=-1)
+            time = time + self.span_mlp(features).view(span.shape[0], -1, self.channels)
         frame_mask = mask.transpose(1, 2)
         # Full precision in, which also keeps the residual stream in FP32: at
         # late t the leftover noise is smaller than BF16's step on x_t.
@@ -292,8 +344,14 @@ class LYNXNet2Backbone(nn.Module):
         if self.voice is not None:
             embedding = time + self.voice(voice)[:, None, :]
         for layer in self.layers:
-            h = layer(h, frame_mask, embedding)
-        return (self.output(self.norm(h)) * frame_mask).transpose(1, 2)
+            h = layer(h, frame_mask, embedding, fused=span is None)
+        if span is None:
+            h = self.norm(h)
+        else:
+            # The affine applied apart: Dynamo cannot trace the forward-mode
+            # derivative of a layer norm with weights.
+            h = F.layer_norm(h, (self.channels,), eps=self.norm.eps) * self.norm.weight + self.norm.bias
+        return (self.output(h) * frame_mask).transpose(1, 2)
 
 
 class AuxDecoder(nn.Module):
@@ -323,6 +381,10 @@ class RectifiedFlow(nn.Module):
     With an ``aux_decoder`` the flow is shallow, as in DiffSinger: it is
     trained on ``t >= t_start`` only, and sampling starts at ``t_start`` from
     the aux decoder's mel mixed with noise, so fewer steps cover the rest.
+
+    With ``mean_flow`` the backbone also learns the mean velocity over a step
+    (MeanFlow), which the "mean" sampler takes in one or two steps; the
+    velocity at a time is still the same network at a zero span.
     """
 
     def __init__(
@@ -345,12 +407,17 @@ class RectifiedFlow(nn.Module):
         aux_decoder: Optional[dict] = None,
         t_start: float = 0.0,
         aux_grad: float = 0.1,
+        tension: bool = False,
+        dual_timestep: bool = False,
+        mean_flow: bool = False,
     ):
         """``harmonic_prior`` is the mel's ``sample_rate``, ``n_fft``, ``fmin``
         and ``fmax``, or None for no prior. ``aux_decoder`` is its
         ``channels`` and ``layers``, or None for a flow from pure noise;
         ``aux_grad`` scales its gradient into the encoder. ``backbone`` is kept
-        because configs and exports name it; LYNXNet2 is the only one."""
+        because configs and exports name it; LYNXNet2 is the only one.
+        ``dual_timestep`` trains a share of each item's frames at a second
+        time, as DiffSinger does."""
         super().__init__()
         if backbone != "lynxnet2":
             raise ValueError(f"Only the lynxnet2 backbone is supported, not {backbone!r}.")
@@ -369,12 +436,16 @@ class RectifiedFlow(nn.Module):
             key_shift,
             content_bottleneck_noise,
             speed,
+            tension,
         )
-        self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
+        self.backbone = LYNXNet2Backbone(
+            n_mels, hidden_channels, span=bool(mean_flow), **(backbone_args or {})
+        )
         # Time and speaker reach the network through these; on AdamW, where
         # gradient clipping bounds the step, since Muon's step ignores the
         # gradient's size.
-        conditioning = [self.backbone.time_mlp, self.encoder.speaker_proj, self.backbone.voice]
+        conditioning = [self.backbone.time_mlp, self.backbone.span_mlp, self.encoder.speaker_proj,
+                        self.backbone.voice]
         conditioning += [layer.modulation for layer in self.backbone.layers]
         for module in filter(None, conditioning):
             for child in module.modules():
@@ -382,6 +453,7 @@ class RectifiedFlow(nn.Module):
         self.aux = AuxDecoder(hidden_channels, n_mels, **aux_decoder) if aux_decoder else None
         self.t_start = float(t_start) if self.aux is not None else 0.0
         self.aux_grad = float(aux_grad)
+        self.dual_timestep = bool(dual_timestep)
 
     @property
     def speaker_count(self) -> int:
@@ -393,19 +465,56 @@ class RectifiedFlow(nn.Module):
         dropped = torch.rand(speaker.shape, device=speaker.device) < speaker_dropout
         return torch.where(dropped, torch.full_like(speaker, self.speaker_count), speaker)
 
-    def _losses(self, mel, cond, voice, mask, t, noise, backbone):
-        """Flow loss per item [B] and the aux decoder's L1 (None without one)."""
-        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
+    def _flow_error(self, mel, cond, voice, mask, t, noise, backbone):
+        """Flow loss per item [B]; ``t`` is [B], or [B, T] for a time per frame."""
+        mix = t[:, None, None] if t.dim() == 1 else t[:, None, :]
+        x_t = (1.0 - mix) * noise + mix * mel
         prediction = backbone(x_t, t, cond, mask, voice)
         error = (prediction.float() - (mel - noise).float()).square() * mask
+        return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
+
+    def _aux_loss(self, mel, cond, mask):
+        """The aux decoder's L1, or None without one."""
+        if self.aux is None:
+            return None
+        aux_cond = cond * self.aux_grad + cond.detach() * (1.0 - self.aux_grad)
+        error = (self.aux(aux_cond, mask).float() - mel.float()).abs() * mask
+        return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
+
+    def mean_velocity(self, x, t, span, velocity, cond, mask, voice):
+        """The mean velocity over ``span`` from ``t``, and its derivative along
+        the path ``velocity`` with the step's end held, detached."""
+
+        def field(x, t, span):
+            return self.backbone(x, t, cond, mask, voice, span)
+
+        tangents = (velocity, torch.ones_like(t), -torch.ones_like(span))
+        mean, derivative = torch.func.jvp(field, (x, t, span), tangents)
+        # Detached here: a compiled graph cannot take the empty gradient the
+        # derivative would otherwise get.
+        return mean, derivative.detach()
+
+    def _mean_error(self, mel, cond, voice, mask, noise, mean_field, bootstrap=1.0):
+        """MeanFlow loss per item [B], over steps between two drawn times, and
+        how large the bootstrapped part of the target is against the velocity,
+        [B]. ``bootstrap`` scales that part: 0 is plain flow matching."""
+        first, second = (self._times(mel.shape[0], mel.device) for _ in range(2))
+        t, span = torch.minimum(first, second), (first - second).abs()
+        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
+        velocity = mel - noise
+        mean, derivative = mean_field(x_t, t, span, velocity, cond, mask, voice)
+        # The mean over [t, t + span] is the velocity at t plus span times its
+        # own derivative in t; the network's derivative stands in as a target.
+        correction = span[:, None, None] * derivative.float() * mask
         count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-        flow = error.sum((1, 2)) / count
-        aux = None
-        if self.aux is not None:
-            aux_cond = cond * self.aux_grad + cond.detach() * (1.0 - self.aux_grad)
-            aux_error = (self.aux(aux_cond, mask).float() - mel.float()).abs() * mask
-            aux = aux_error.sum() / count.sum()
-        return flow, aux
+        size = (correction.square().sum((1, 2)) / count).sqrt()
+        ratio = size / ((velocity.square() * mask).sum((1, 2)) / count).sqrt().clamp_min(1e-8)
+        # A path's curvature keeps it well under the velocity; past that the
+        # target is feeding on itself, and is held there.
+        correction = correction * (1.0 / ratio.clamp_min(1.0))[:, None, None]
+        target = velocity + bootstrap * correction
+        error = (mean.float() - target).square() * mask
+        return error.sum((1, 2)) / count, ratio
 
     def _times(self, batch, device):
         """Logit-normal times, stratified across the batch so every batch spans
@@ -417,32 +526,78 @@ class RectifiedFlow(nn.Module):
         return self.t_start + (1.0 - self.t_start) * t
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None):
-        """Flow-matching loss for normalised ``mel`` [B, n_mels, T] and the aux
-        decoder's L1 (None without one). ``backbone`` stands in for
-        ``self.backbone``, as its compiled wrapper does."""
+                breathiness=None, key_shift=None, speed=None, backbone=None, tension=None,
+                mean_ratio=0.0, mean_field=None, tension_dropout=0.0, mean_bootstrap=1.0):
+        """Flow-matching loss for normalised ``mel`` [B, n_mels, T], the aux
+        decoder's L1 (None without one) and the MeanFlow losses (None when
+        off). ``backbone`` stands in for ``self.backbone``, as its compiled
+        wrapper does, and ``mean_field`` for ``self.mean_velocity``.
+
+        The first ``mean_ratio`` of the batch trains the mean velocity instead
+        of the flow. Every item's loss then takes ``adaptive_weight``, as in
+        MeanFlow, and the third value is [mean loss to optimise, plain flow
+        loss, plain mean loss, bootstrap ratio], the last three to read.
+        ``mean_bootstrap`` is ``_mean_error``'s, ramped up from 0 early in
+        training.
+
+        ``tension_dropout`` is the share of items trained with a flat tension,
+        so the input can be turned down at inference."""
         speaker = self._drop_speakers(speaker, speaker_dropout)
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed)
+        if tension is not None and tension_dropout > 0:
+            kept = torch.rand(tension.shape[0], 1, device=tension.device) >= tension_dropout
+            tension = tension * kept
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, tension)
         voice = self.encoder.voice(speaker)
-        t = self._times(mel.shape[0], mel.device)
+        noise = torch.randn_like(mel)
+        batch = mel.shape[0]
+        mean_items = 0
+        if self.backbone.span_mlp is not None:
+            mean_items = min(batch - 1, int(round(mean_ratio * batch)))
+        rest = slice(mean_items, None)
+        t = self._times(batch - mean_items, mel.device)
+        if self.dual_timestep:
+            other = self._times(batch - mean_items, mel.device)
+            swap = torch.rand(batch - mean_items, mel.shape[-1], device=mel.device) < DUAL_TIMESTEP_SHARE
+            t = torch.where(swap, other[:, None], t[:, None])
         # Not ``backbone or ...``: a compiled module's truth test calls len().
         backbone = self.backbone if backbone is None else backbone
-        flow, aux = self._losses(mel, cond, voice, mask, t, torch.randn_like(mel), backbone)
-        return (flow * mask.sum((1, 2))).sum() / mask.sum().clamp_min(1.0), aux
+        error = self._flow_error(mel[rest], cond[rest], voice[rest], mask[rest], t, noise[rest], backbone)
+
+        def pooled(error, frames, weighted=False):
+            weight = adaptive_weight(error) if weighted else 1.0
+            return (weight * error * frames).sum() / frames.sum().clamp_min(1.0)
+
+        frames = mask[rest].sum((1, 2))
+        flow = pooled(error, frames)
+        mean = None
+        if mean_items:
+            head = slice(0, mean_items)
+            mean_field = self.mean_velocity if mean_field is None else mean_field
+            mean_error, bootstrap_ratio = self._mean_error(
+                mel[head], cond[head], voice[head], mask[head], noise[head], mean_field, mean_bootstrap
+            )
+            mean_frames = mask[head].sum((1, 2))
+            mean = torch.stack((
+                pooled(mean_error, mean_frames, True), flow.detach(),
+                pooled(mean_error, mean_frames).detach(), bootstrap_ratio.mean(),
+            ))
+            flow = pooled(error, frames, True)
+        return flow, self._aux_loss(mel, cond, mask), mean
 
     @torch.no_grad()
     def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
-                          speed, noise, fractions):
+                          speed, noise, fractions, tension=None):
         """Flow loss at each of ``fractions`` of the trained time range, [len],
         from fixed ``noise``, and the aux decoder's L1 (None without one)."""
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed)
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, tension)
         voice = self.encoder.voice(speaker)
-        losses, aux = [], None
+        frames = mask.sum((1, 2))
+        losses = []
         for fraction in fractions:
             t = torch.full((mel.shape[0],), self.t_start + (1.0 - self.t_start) * fraction, device=mel.device)
-            flow, aux = self._losses(mel, cond, voice, mask, t, noise, self.backbone)
-            losses.append((flow * mask.sum((1, 2))).sum() / mask.sum().clamp_min(1.0))
-        return torch.stack(losses), aux
+            error = self._flow_error(mel, cond, voice, mask, t, noise, self.backbone)
+            losses.append((error * frames).sum() / frames.sum().clamp_min(1.0))
+        return torch.stack(losses), self._aux_loss(mel, cond, mask)
 
     @torch.no_grad()
     def sample(
@@ -468,6 +623,7 @@ class RectifiedFlow(nn.Module):
         schedule: str = "uniform",
         churn: float = 0.0,
         churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
+        tension: Optional[torch.Tensor] = None,
     ):
         """Integrate the ODE from ``noise`` (drawn when None) to a normalised
         mel, [B, n_mels, T]; from ``t_start`` on the aux decoder's mel when the
@@ -485,7 +641,9 @@ class RectifiedFlow(nn.Module):
         ``temperature`` scales the starting noise. ``start`` is the flow time
         sampling begins at, from the aux decoder's mel; None, or anything
         before ``t_start``, is ``t_start``, and it is ignored without an aux
-        decoder. ``schedule`` is one of ``SCHEDULES``.
+        decoder. ``schedule`` is one of ``SCHEDULES``. The "mean" ``method``
+        is meant for one or two steps; the guidances apply to it as they are,
+        though it was not trained under them.
 
         ``churn`` makes the sampler stochastic, as EDM's: before each step the
         state is re-noised back ``churn`` times that step's length (never
@@ -495,6 +653,8 @@ class RectifiedFlow(nn.Module):
         """
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
+        if method == "mean" and self.backbone.span_mlp is None:
+            raise ValueError("The mean sampler needs a model trained with mean flow.")
         if rescale_mode not in RESCALE_MODES:
             raise ValueError(f"rescale_mode must be one of {RESCALE_MODES}, not {rescale_mode!r}.")
         batch = content.shape[0]
@@ -516,6 +676,7 @@ class RectifiedFlow(nn.Module):
         cond = self.encoder(
             torch.cat([c for c, _ in variants]), repeat(f0), repeat(energy),
             torch.cat([s for _, s in variants]), repeat(mask), repeat(breathiness), repeat(key_shift),
+            tension=repeat(tension),
         )
         voice = self.encoder.voice(torch.cat([s for _, s in variants]))
         masks = repeat(mask)
@@ -527,12 +688,12 @@ class RectifiedFlow(nn.Module):
             frames = mask.sum((1, 2)).clamp_min(1.0) * self.n_mels
             return ((y.square() * mask).sum((1, 2)) / frames).sqrt()[:, None, None]
 
-        def field(x, t):
+        def field(x, t, span=None):
             now = float(t[0])
             # An interval reaching 1 includes it, where Heun's last evaluation lands.
             if count == 1 or not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
-                return self.backbone(x, t, cond[:batch], mask, voice[:batch])
-            v = self.backbone(repeat(x), repeat(t), cond, masks, voice).chunk(count)
+                return self.backbone(x, t, cond[:batch], mask, voice[:batch], span)
+            v = self.backbone(repeat(x), repeat(t), cond, masks, voice, repeat(span)).chunk(count)
             guided, index = v[0], 1
             if cfg_scale != 1.0:
                 guided = guided + (cfg_scale - 1.0) * (v[0] - v[index])
@@ -568,7 +729,7 @@ class RectifiedFlow(nn.Module):
                 now = back
             t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
             dt = times[index + 1] - now
-            v = field(x, t)
+            v = field(x, t, dt.expand(batch) if method == "mean" else None)
             if method == "heun":
                 v_next = field(x + dt * v, times[index + 1].expand(batch))
                 v = 0.5 * (v + v_next)
@@ -592,6 +753,25 @@ def resize_speakers(state_dict: dict, speaker_count: int) -> dict:
     rows = trained.mean(0, keepdim=True).expand(speaker_count, -1).clone()
     state_dict = dict(state_dict)
     state_dict[key] = torch.cat((rows, null), dim=0)
+    return state_dict
+
+
+#: Inputs that start at zero, so a checkpoint from before them loads unchanged.
+ZERO_INPUTS = ("encoder.tension.", "backbone.span_mlp.")
+
+
+def match_inputs(state_dict: dict, model: RectifiedFlow) -> dict:
+    """Fit a pretrain's weights to ``model``'s optional inputs: the ones it
+    lacks keep ``model``'s zero start, and a span input ``model`` does not
+    have is dropped, which leaves the plain flow."""
+    own = model.state_dict()
+    state_dict = {
+        key: value for key, value in state_dict.items()
+        if key in own or not key.startswith("backbone.span_mlp.")
+    }
+    for key, value in own.items():
+        if key not in state_dict and key.startswith(ZERO_INPUTS):
+            state_dict[key] = value
     return state_dict
 
 

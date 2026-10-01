@@ -595,6 +595,7 @@ def run_rectified_infer_script(
     content_context: float = 2.0,
     flow_submodel: str = "",
     match_level: bool = True,
+    tension_strength: float = 1.0,
 ):
     if not flow_path or not vocoder_path:
         problem = "Pick a flow model and a vocoder model."
@@ -647,6 +648,7 @@ def run_rectified_infer_script(
         content_context=float(content_context),
         flow_submodel=flow_submodel or "",
         match_level=bool(match_level),
+        tension_strength=float(tension_strength),
     )
     if written is None:
         return "Conversion failed; see the terminal for the error.", None
@@ -720,6 +722,7 @@ def run_rectified_flow_train_script(
     precision: str = "fp32",
     compile: bool = False,
     torch_compile_mode: str = "default",
+    mean_flow: bool = False,
 ):
     if not vocoder:
         # The newest pretrained vocoder, as every interface picks when left empty.
@@ -744,6 +747,7 @@ def run_rectified_flow_train_script(
             "precision": str(precision).lower(),
             "compile": bool(compile),
             "torch_compile_mode": str(torch_compile_mode),
+            "mean_flow": bool(mean_flow),
         },
     )
 

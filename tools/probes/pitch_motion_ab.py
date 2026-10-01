@@ -127,7 +127,7 @@ def main():
     reference = dataset.reference()
     if reference is None:
         raise SystemExit("No preview clip.")
-    ref_mel, content, f0, energy, breathiness, audio, sid, source = reference
+    ref_mel, content, f0, energy, breathiness, audio, sid, source, _ = reference
     print(f"Clip: {source}, speaker {sid}")
     content, f0, energy, breathiness = (x.to(device) for x in (content, f0, energy, breathiness))
     ref_mel = ref_mel.to(device)

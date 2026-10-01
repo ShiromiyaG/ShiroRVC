@@ -10,11 +10,13 @@ import math
 import os
 import sys
 import time
+from contextlib import nullcontext
 from functools import partial
 
 sys.path.append(os.getcwd())
 
 import torch
+from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -43,7 +45,7 @@ from rvc.rectified.common import (
     split_holdout,
 )
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
-from rvc.rectified.flow_model import build_flow, resize_speakers
+from rvc.rectified.flow_model import build_flow, match_inputs, resize_speakers
 from rvc.rectified.mel import denormalize_mel, normalize_mel
 from rvc.rectified.muon import MuonAdamW
 from rvc.rectified.previews import RectifiedPreviews
@@ -86,6 +88,16 @@ def freeze_voice(model) -> int:
     return frozen
 
 
+def pretrain_time_scale(path: str):
+    """The time scale a flow export was trained with; None for a checkpoint,
+    which records no config."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    model = checkpoint.get("config", {}).get("flow", {}).get("model")
+    if model is None:
+        return None
+    return float((model.get("backbone_args") or {}).get("time_scale", 1000.0))
+
+
 def conditioning_norms(model) -> dict:
     """Weight norms of the time and speaker paths, for TensorBoard: a norm
     that keeps climbing is the conditioning running away."""
@@ -101,15 +113,17 @@ def conditioning_norms(model) -> dict:
     return norms
 
 
-def compiled_backbone(model, enabled: bool, mode: str, device):
-    """``torch.compile`` of the backbone for training, or None. Evaluation and
+def compiled_backbone(model, enabled: bool, mode: str, device, mean_flow: bool = False):
+    """``torch.compile`` of the backbone for training, and of the mean
+    velocity with ``mean_flow``; None for each left eager. Evaluation and
     sampling keep the eager module, whose shapes vary."""
     if not enabled:
-        return None
+        return None, None
     if device.type != "cuda" or importlib.util.find_spec("triton") is None:
         warning("torch.compile needs CUDA and Triton; training uncompiled.", tag=TAG)
-        return None
-    return torch.compile(model.backbone, mode=mode)
+        return None, None
+    mean_field = torch.compile(model.mean_velocity, mode=mode) if mean_flow else None
+    return torch.compile(model.backbone, mode=mode), mean_field
 
 
 def load_preview_vocoder(path: str, config: dict, device):
@@ -152,6 +166,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
     device = ranks.device
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    # Training batches are one shape; evaluation and previews are not.
+    torch.backends.cudnn.benchmark = bool(settings.get("cudnn_benchmark", False))
 
     entries = read_filelist(name)
     speakers = speaker_count(entries)
@@ -189,9 +205,30 @@ def train(ranks: Ranks, spec_path: str) -> None:
             collate_fn=collate,
         )
 
-    model = build_flow(config, speakers).to(device)
+    resume = None if spec.get("fresh") else latest_checkpoint(out_dir, "F")
+    state = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
+    # The run's choice, not the config's; a resumed run keeps what it started with.
+    mean_flow = bool(spec.get("mean_flow", False))
+    if state is not None:
+        started_with = any(key.startswith("backbone.span_mlp.") for key in state["model"])
+        if started_with != mean_flow and main_rank:
+            warning(f"This run was started {'with' if started_with else 'without'} mean flow "
+                    f"and resumes that way; start fresh to change it.", tag=TAG)
+        mean_flow = started_with
+    settings["model"]["mean_flow"] = mean_flow
     finetune = bool(spec.get("pretrained_flow"))
+    backbone_args = settings["model"].setdefault("backbone_args", {})
+    if finetune:
+        # Not in the weights, and a network reads another scale's times as noise.
+        time_scale = pretrain_time_scale(spec["pretrained_flow"])
+        if time_scale is not None:
+            backbone_args["time_scale"] = time_scale
+    if mean_flow and float(backbone_args.get("time_scale", 1000.0)) > 10 and main_rank:
+        warning("Mean flow with a time scale over 10 has diverged: its target is the network's own "
+                "derivative in time. Set flow.model.backbone_args.time_scale to 1 for a new pretrain.", tag=TAG)
+    model = build_flow(config, speakers).to(device)
     speaker_dropout = float(settings["speaker_dropout"])
+    tension_dropout = float(settings.get("tension_dropout", 0.0)) if model.encoder.tension is not None else 0.0
     voice_frozen = finetune and speakers == 1 and settings.get("finetune_freeze_voice", True)
     if voice_frozen:
         freeze_voice(model)
@@ -217,9 +254,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     ema_decay = settings.get("finetune_ema_decay", settings["ema_decay"]) if finetune else settings["ema_decay"]
     ema = WeightEMA(model, ema_decay)
     starting_point = "scratch"
-    resume = None if spec.get("fresh") else latest_checkpoint(out_dir, "F")
     if resume:
-        state = torch.load(resume, map_location="cpu", weights_only=True)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         if "ema" in state:
@@ -232,7 +267,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     elif finetune:
         check_pretrain_embedder(spec["pretrained_flow"], embedder_of(name))
         weights = resize_speakers(pretrained_weights(spec["pretrained_flow"]), speakers)
-        model.load_state_dict(weights)
+        model.load_state_dict(match_inputs(weights, model))
         ema.reseed(model)
         starting_point = f"fine-tune from {os.path.basename(spec['pretrained_flow'])}"
 
@@ -252,8 +287,17 @@ def train(ranks: Ranks, spec_path: str) -> None:
     final_ratio = float(settings.get("lr_final_ratio", 1.0))
     aux_weight = float(settings.get("aux_mel_weight", 0.0))
     eval_interval = int(settings.get("eval_interval", 0))
-    backbone = compiled_backbone(
-        model, bool(spec.get("compile", False)), spec.get("torch_compile_mode", "default"), device
+    mean_ratio = float(settings.get("mean_flow_ratio", 0.25)) if mean_flow else 0.0
+    # The bootstrapped target comes in once the network has a field to differentiate.
+    mean_warmup = 0 if finetune else int(settings.get("mean_flow_warmup_steps", 0))
+    backbone, mean_field = compiled_backbone(
+        model, bool(spec.get("compile", False)), spec.get("torch_compile_mode", "default"), device,
+        mean_flow=mean_ratio > 0,
+    )
+    # The backward runs outside autocast here, and a compiled graph's would
+    # otherwise run under the forward's.
+    backward_context = (
+        partial(aot_config.patch, backward_pass_autocast="off") if backbone is not None else nullcontext
     )
     # Frozen parameters are left out of the gradient sync. Sampling, previews
     # and evaluation go through ``model`` itself.
@@ -273,6 +317,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Backbone", "LYNXNet2"
                              + (" with adaLN" if model.backbone.voice is not None else "")
                              + (f", shallow from t={model.t_start:g}" if model.t_start > 0 else "")
+                             + (", dual timestep" if model.dual_timestep else "")
+                             + (f", mean flow on {100 * mean_ratio:g}%" if mean_ratio > 0 else "")
                              + (", compiled" if backbone is not None else "")),
                 ("Training", f"{'Muon + AdamW' if optimizer_name == 'muon' else 'AdamW'}, lr {base_lr:g}, "
                              f"cosine to {final_ratio:g}x at step {total_steps}, {precision_label(amp_dtype)} on "
@@ -282,7 +328,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                             f"({100 * settings.get('key_shift_prob', 0):g}%), "
                             "stretch x{:g}-{:g} ({:g}%), ".format(
                                 *settings.get("time_stretch_range", (1, 1)), 100 * settings.get("time_stretch_prob", 0))
-                            + f"speaker dropout {speaker_dropout:g}"),
+                            + f"speaker dropout {speaker_dropout:g}"
+                            + (f", tension dropout {tension_dropout:g}" if tension_dropout > 0 else "")),
                 ("Vocoder", os.path.basename(vocoder_path) if vocoder is not None else "none (previews without audio)"),
             ],
             title="Rectified flow",
@@ -324,16 +371,17 @@ def train(ranks: Ranks, spec_path: str) -> None:
         """The reference clip through the flow's EMA weights. With a vocoder,
         also its real mel through the vocoder alone, which separates the two
         models' errors; without one, the mel figure only."""
-        ref_mel, content, f0, energy, breathiness, audio, sid, path = reference
+        ref_mel, content, f0, energy, breathiness, audio, sid, path, tension = reference
         content, f0, energy = content.to(device), f0.to(device), energy.to(device)
         mask = torch.ones(1, 1, f0.shape[1], device=device)
         speaker = torch.tensor([sid], device=device)
+        inputs = dict(breathiness=breathiness.to(device), tension=tension.to(device))
+        one_step = None
         with ema.applied(model):
             model.eval()
-            generated = model.sample(
-                content, f0, energy, speaker, mask, steps=PREVIEW_STEPS,
-                breathiness=breathiness.to(device),
-            )
+            generated = model.sample(content, f0, energy, speaker, mask, steps=PREVIEW_STEPS, **inputs)
+            if mean_ratio > 0:
+                one_step = model.sample(content, f0, energy, speaker, mask, steps=1, method="mean", **inputs)
             model.train()
         if vocoder is None:
             previews.log(
@@ -346,7 +394,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
             generated_audio=vocoder(generated, f0),
             reference_audio=audio.to(device),
             extra_audio={
-                "vocoder_on_real_mel": vocoder(normalize_mel(ref_mel.to(device), config["data"]), f0)
+                "vocoder_on_real_mel": vocoder(normalize_mel(ref_mel.to(device), config["data"]), f0),
+                **({} if one_step is None else {"mean_flow_1_step": vocoder(one_step, f0)}),
             },
         )
 
@@ -359,7 +408,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         with ema.applied(model):
             model.eval()
             for index, batch in enumerate(holdout):
-                mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = (
+                mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, tension = (
                     item.to(device) for item in batch
                 )
                 mel = normalize_mel(mel, config["data"]) * mask
@@ -368,7 +417,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
                     losses, aux = model.validation_losses(
                         mel, content, f0, energy, speaker, mask, breathiness, key_shift, speed,
-                        noise, EVAL_FRACTIONS,
+                        noise, EVAL_FRACTIONS, tension,
                     )
                 totals += losses.float() * mel.shape[0]
                 aux_total += (aux.item() if aux is not None else 0.0) * mel.shape[0]
@@ -393,7 +442,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         ) as (progress, task):
             fetch_started = time.perf_counter()
             for batch_index, batch in enumerate(loader):
-                mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = batch
+                mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, tension = batch
                 step_started = time.perf_counter()
                 data_wait += step_started - fetch_started
                 mel = normalize_mel(mel.to(device, non_blocking=True), config["data"])
@@ -405,17 +454,27 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 speed = speed.to(device, non_blocking=True)
                 speaker = speaker.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
+                tension = tension.to(device, non_blocking=True)
 
                 lr = learning_rate(base_lr, step, warmup, total_steps, final_ratio)
                 for group in optimizer.param_groups:
                     group["lr"] = lr
-                with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
-                    flow_loss, aux_loss = train_model(
+                with backward_context(), torch.autocast(
+                    device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None
+                ):
+                    flow_loss, aux_loss, mean_loss = train_model(
                         mel * mask, content, f0, energy, speaker, mask,
                         speaker_dropout=speaker_dropout,
                         breathiness=breathiness, key_shift=key_shift, speed=speed, backbone=backbone,
+                        tension=tension, mean_ratio=mean_ratio, mean_field=mean_field,
+                        tension_dropout=tension_dropout,
+                        mean_bootstrap=min(1.0, step / mean_warmup) if mean_warmup else 1.0,
                     )
-                    loss = flow_loss if aux_loss is None else flow_loss + aux_weight * aux_loss
+                    loss = flow_loss
+                    if mean_loss is not None:
+                        loss = (1.0 - mean_ratio) * flow_loss + mean_ratio * mean_loss[0]
+                    if aux_loss is not None:
+                        loss = loss + aux_weight * aux_loss
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is None:
                     loss.backward()
@@ -436,18 +495,24 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
                 if main_rank:
                     if not metrics or (batch_index + 1) % METRICS_INTERVAL == 0:
-                        metrics = f"loss={flow_loss.item():.4f}"
+                        shown = flow_loss if mean_loss is None else mean_loss[1]
+                        metrics = f"loss={shown.item():.4f}"
                     progress.update(task, advance=1, metrics=metrics)
                     emit_machine_progress(epoch, total_epochs, batch_index + 1, len(loader), step, metrics, 0)
 
                 if step % LOG_INTERVAL == 0:
                     # Collective, so outside the rank check.
-                    logged_flow = ranks.mean(flow_loss)
+                    logged_flow = ranks.mean(flow_loss if mean_loss is None else mean_loss[1])
                     logged_aux = ranks.mean(aux_loss) if aux_loss is not None else None
+                    logged_mean = ranks.mean(mean_loss[2:]) if mean_loss is not None else None
                 if step % LOG_INTERVAL == 0 and main_rank:
                     writer.add_scalar("loss/flow", logged_flow.item(), step)
                     if logged_aux is not None:
                         writer.add_scalar("loss/aux_mel_l1", logged_aux.item(), step)
+                    if logged_mean is not None:
+                        writer.add_scalar("loss/mean_flow", logged_mean[0].item(), step)
+                        # Over 1 the target is feeding on itself and is being held.
+                        writer.add_scalar("diag/mean_flow_bootstrap", logged_mean[1].item(), step)
                     # Time the loop spent waiting on the loader; near zero when
                     # the workers keep up.
                     writer.add_scalar("perf/data_wait_ms", 1000 * data_wait / LOG_INTERVAL, step)

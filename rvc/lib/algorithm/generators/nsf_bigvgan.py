@@ -302,19 +302,31 @@ class PCPHSource(nn.Module):
     closed form; the ones above fade out one by one, as ``SineGenerator``'s do,
     so f0 crossing a harmonic boundary does not click. Noise as the sine
     source's: ``noise_std`` in voiced samples, ``sine_amp / 3`` in unvoiced.
-    Owns no state-dict key.
+    ``noise_eq``, ``(hz, db)`` points interpolated linearly, shapes the voiced
+    noise's spectrum; the stages' filters pass it unevenly. Owns no state-dict
+    key.
     """
 
     NYQUIST_TAPER = SineGenerator.NYQUIST_TAPER
 
     def __init__(self, samp_rate, sine_amp=0.1, noise_std=0.003, voiced_threshold=0,
-                 random_start_phase=False):
+                 random_start_phase=False, noise_eq=None):
         super().__init__()
         self.sampling_rate = samp_rate
         self.sine_amp = sine_amp
         self.noise_std = noise_std
         self.voiced_threshold = voiced_threshold
         self.random_start_phase = bool(random_start_phase)
+        self.noise_eq = None
+        if noise_eq:
+            points = sorted((float(hz), float(db)) for hz, db in noise_eq)
+            self.noise_eq = (np.array([p[0] for p in points]), np.array([p[1] for p in points]))
+
+    def _equalize(self, noise: torch.Tensor) -> torch.Tensor:
+        hz, db = self.noise_eq
+        freqs = np.fft.rfftfreq(noise.shape[-1], 1.0 / self.sampling_rate)
+        gain = torch.from_numpy(10.0 ** (np.interp(freqs, hz, db) / 20.0)).to(noise.device, torch.float32)
+        return torch.fft.irfft(torch.fft.rfft(noise.float(), dim=-1) * gain, n=noise.shape[-1])
 
     @torch.compiler.disable  # the sample-axis cumsum, as ``SineGenerator._phase``
     def _phase(self, f0):
@@ -361,8 +373,75 @@ class PCPHSource(nn.Module):
                 power = power + fade.square()
 
             harmonics = harmonics * self.sine_amp * torch.sqrt(2.0 / power.clamp(min=1.0)) * uv
-            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-            return (harmonics + noise_amp * torch.randn_like(uv)).unsqueeze(-1)
+            noise = torch.randn_like(uv)
+            voiced = self._equalize(noise) if self.noise_eq is not None else noise
+            noise = uv * self.noise_std * voiced + (1 - uv) * self.sine_amp / 3 * noise
+            return (harmonics + noise).unsqueeze(-1)
+
+
+def exp_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """DDSP's positive, bounded gain: 2 at most, 1e-7 at least."""
+    return 2.0 * torch.sigmoid(x) ** np.log(10.0) + 1e-7
+
+
+class NoiseBranch(nn.Module):
+    """Filtered noise added at the output, and gains on the excitation, both
+    per frame and per band, read from the mel by one small head.
+
+    The excitation's noise reaches the output through every stage's filters,
+    which pass little of it above ~8 kHz and leave a dip at the next-to-last
+    stage's Nyquist; this noise bypasses them. The excitation gains let the
+    mel scale the harmonics too, which the PCPH source puts at full power up
+    to Nyquist. ``bands`` are spaced on the mel scale up to Nyquist, and the
+    gains between their centres interpolated linearly. The noise starts at
+    about -80 dB and the excitation gains at 1.
+    """
+
+    HIDDEN = 128
+    #: exp_sigmoid(-4.3) ~ 1e-4.
+    NOISE_START = -4.3
+
+    def __init__(self, num_mels: int, bands: int, sample_rate: int, hop: int):
+        super().__init__()
+        self.bands, self.hop, self.n_fft = int(bands), int(hop), 4 * int(hop)
+        self.head = nn.Sequential(
+            nn.Conv1d(num_mels, self.HIDDEN, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(self.HIDDEN, self.HIDDEN, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(self.HIDDEN, 2 * self.bands, 3, padding=1),
+        )
+        last = self.head[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.constant_(last.bias[: self.bands], self.NOISE_START)
+        nn.init.zeros_(last.bias[self.bands :])
+
+        top = 2595.0 * np.log10(1.0 + sample_rate / 2.0 / 700.0)
+        centres = 700.0 * (10.0 ** (np.linspace(0.0, top, self.bands) / 2595.0) - 1.0)
+        freqs = np.fft.rfftfreq(self.n_fft, 1.0 / sample_rate)
+        interp = np.stack([np.interp(freqs, centres, row) for row in np.eye(self.bands)], axis=1)
+        self.register_buffer("interp", torch.from_numpy(interp).float(), persistent=False)
+        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+
+    def gains(self, mel: torch.Tensor):
+        """(noise, excitation) gains, each (batch, bands, frames)."""
+        noise, excitation = self.head(mel).float().chunk(2, dim=1)
+        return exp_sigmoid(noise), 2.0 * torch.sigmoid(excitation)
+
+    def shape(self, signal: torch.Tensor, gains: torch.Tensor) -> torch.Tensor:
+        """``signal`` (batch, samples) through ``gains`` (batch, bands,
+        frames), frame t centred on sample t * hop."""
+        with torch.autocast(signal.device.type, enabled=False):
+            spectrum = torch.stft(
+                signal.float(), self.n_fft, self.hop, window=self.window, return_complex=True
+            )
+            frames = spectrum.shape[-1]
+            if gains.shape[-1] < frames:
+                gains = F.pad(gains, (0, frames - gains.shape[-1]), mode="replicate")
+            per_bin = torch.einsum("fk,bkt->bft", self.interp, gains[..., :frames].float())
+            return torch.istft(
+                spectrum * per_bin, self.n_fft, self.hop, window=self.window, length=signal.shape[-1]
+            )
 
 
 class NSFBigVGANGenerator(nn.Module):
@@ -404,6 +483,11 @@ class NSFBigVGANGenerator(nn.Module):
         source_random_start_phase (bool, optional): Start the excitation's
             fundamental at a random phase on every training call; see
             ``SineGenerator``. Inference is unaffected.
+        source_noise_eq (sequence of (hz, db), optional): Shape of the PCPH
+            source's voiced noise; see ``PCPHSource``.
+        noise_branch_bands (int, optional): With more than 0, a
+            ``NoiseBranch`` of that many bands: mel-driven noise added at the
+            output and band gains on the excitation.
         output_gain (bool, optional): A learned output level ``exp(s)`` on the
             unit-norm ``conv_post``, as in RefineGAN2.
         resblock (str, optional): ``"1"`` for AMPBlock1, ``"2"`` for AMPBlock2,
@@ -445,6 +529,8 @@ class NSFBigVGANGenerator(nn.Module):
         source_branch: str = "linear",
         source_type: str = "sine",
         source_random_start_phase: bool = False,
+        source_noise_eq: "Sequence[Sequence[float]] | None" = None,
+        noise_branch_bands: int = 0,
         output_gain: bool = False,
         stage_channels: "Sequence[int] | None" = None,
         prenet_blocks: int = 0,
@@ -507,7 +593,10 @@ class NSFBigVGANGenerator(nn.Module):
                 self.sample_rate,
                 noise_std=float(source_noise_std),
                 random_start_phase=source_random_start_phase,
+                noise_eq=source_noise_eq,
             )
+        elif source_noise_eq:
+            raise ValueError("source_noise_eq shapes the PCPH source's noise; source_type is 'sine'.")
         elif self.source_type == "sine":
             self.m_source = SineGenerator(
                 self.sample_rate,
@@ -586,6 +675,12 @@ class NSFBigVGANGenerator(nn.Module):
                     for stage, rate in enumerate(self.upsample_rates)
                 ]
             )
+
+        self.noise_branch = (
+            NoiseBranch(num_mels, noise_branch_bands, self.sample_rate, self.upp)
+            if int(noise_branch_bands) > 0
+            else None
+        )
 
         channels = int(upsample_initial_channel)
         self.conv_pre = weight_norm(nn.Conv1d(num_mels, channels, 7, 1, padding=3))
@@ -678,12 +773,15 @@ class NSFBigVGANGenerator(nn.Module):
             gain = ups(gain)
         return F.softplus(gain).transpose(1, 2)
 
-    def _excitation(self, z, f0, g):
-        """The excitation at every stage's output rate, first stage first."""
+    def _excitation(self, z, f0, g, band_gains=None):
+        """The excitation at every stage's output rate, first stage first;
+        ``band_gains`` are the noise branch's on the excitation."""
         f0 = expand_f0(f0, z.shape[-1] * self.upp)
         with self._fp32_region(z):
             gain = self._source_gain(self._fp32(z), None if g is None else self._fp32(g))
             source = self.m_source(f0.transpose(1, 2), gain).transpose(1, 2)
+            if band_gains is not None:
+                source = self.noise_branch.shape(source[:, 0], band_gains).unsqueeze(1)
             if self.source_branch == "rectified":
                 sources = [self.source_act(self.source_pre(source))]
                 for down, block in zip(self.source_downs, self.source_blocks):
@@ -709,7 +807,10 @@ class NSFBigVGANGenerator(nn.Module):
     def forward(self, x: torch.Tensor, f0: torch.Tensor, g: torch.Tensor = None):
         if f0.dim() == 2:
             f0 = f0.unsqueeze(1)
-        sources = self._excitation(x, f0, g)
+        noise_gains = excitation_gains = None
+        if self.noise_branch is not None:
+            noise_gains, excitation_gains = self.noise_branch.gains(x)
+        sources = self._excitation(x, f0, g, excitation_gains)
 
         x = self.conv_pre(x)
         if g is not None:
@@ -739,6 +840,9 @@ class NSFBigVGANGenerator(nn.Module):
             x = self.conv_post(x)
             if self.has_output_gain:
                 x = x * self.output_log_gain.exp()
+            if noise_gains is not None:
+                noise = torch.randn(x.shape[0], x.shape[-1], device=x.device)
+                x = x + self.noise_branch.shape(noise, noise_gains).unsqueeze(1)
             # SnakeBeta's features all have a positive mean, and the waveform
             # discriminators push the output's DC around: summed over every
             # sample, that coherent term was ~99% of conv_post's gradient.

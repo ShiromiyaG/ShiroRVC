@@ -21,8 +21,15 @@ from rvc.lib.model_bundle import (
 )
 from rvc.lib.terminal import info, print_error_panel, print_settings_panel, progress_task, success
 from rvc.lib.utils import extract_features, load_audio_infer, load_embedder_model
-from rvc.rectified.aperiodicity import aperiodicity
-from rvc.rectified.common import clean_f0, f0_to_mel_rate, mel_frames, smooth_curve, to_mel_rate
+from rvc.rectified.aperiodicity import aperiodicity, tension
+from rvc.rectified.common import (
+    TENSION_SMOOTH_SECONDS,
+    clean_f0,
+    f0_to_mel_rate,
+    mel_frames,
+    smooth_curve,
+    to_mel_rate,
+)
 from rvc.rectified.flow_model import build_flow
 from rvc.rectified.vocoder import load_vocoder, mel_mismatch
 
@@ -192,7 +199,7 @@ class RectifiedConverter:
         return torch.cat(parts, 1)
 
     @torch.no_grad()
-    def _sample_mel(self, content, f0, energy, breathiness, key_shift, sid, steps, sampler, guidance):
+    def _sample_mel(self, content, f0, energy, breathiness, strain, key_shift, sid, steps, sampler, guidance):
         """Normalised mel [1, n_mels, T], in overlapping passes crossfaded."""
         frames = content.shape[1]
         noise = torch.randn(1, self.flow.n_mels, frames, device=self.device)
@@ -205,7 +212,7 @@ class RectifiedConverter:
             start = 0
             while start < frames:
                 stop = self._flow_pass(
-                    content, f0, energy, breathiness, key_shift, speaker, noise, mel, weight, start,
+                    content, f0, energy, breathiness, strain, key_shift, speaker, noise, mel, weight, start,
                     steps, sampler, guidance, lambda: progress.advance(task), churn_seed,
                 )
                 if stop == frames:
@@ -213,7 +220,7 @@ class RectifiedConverter:
                 start = stop - FLOW_OVERLAP
         return mel / weight.clamp_min(1e-4)
 
-    def _flow_pass(self, content, f0, energy, breathiness, key_shift, speaker, noise, mel, weight, start,
+    def _flow_pass(self, content, f0, energy, breathiness, strain, key_shift, speaker, noise, mel, weight, start,
                    steps, sampler, guidance, callback, churn_seed):
         """One flow pass from ``start``, added into ``mel`` and ``weight`` with
         its crossfade ramps; returns where it stopped."""
@@ -230,6 +237,7 @@ class RectifiedConverter:
             content[:, start:stop], f0[:, start:stop], energy[:, start:stop],
             speaker, mask, steps=steps, method=sampler, **guidance,
             breathiness=breathiness[:, start:stop], key_shift=key_shift,
+            tension=None if strain is None else strain[:, start:stop],
             noise=noise[..., start:stop], callback=callback, churn_noise=churn_noise,
         )
         ramp = torch.ones(stop - start, device=self.device)
@@ -312,6 +320,7 @@ class RectifiedConverter:
         content_context: float = 2.0,
         flow_submodel: str = "",
         match_level: bool = True,
+        tension_strength: float = 1.0,
     ):
         """Convert one file; returns the path written, or None on failure.
 
@@ -336,7 +345,11 @@ class RectifiedConverter:
 
         ``match_level`` peak-normalises the input as the training data was, since
         the energy input is absolute, and scales the output back to the input's
-        level; off, the input is only attenuated when it would clip."""
+        level; off, the input is only attenuated when it would clip.
+
+        ``tension_strength`` scales how far the input's tension, its departure
+        from its own usual tilt, carries over; 0 leaves the voice at its own.
+        Ignored by a model without the input."""
         try:
             started = time.time()
             self._load_flow(flow_path, flow_submodel)
@@ -368,6 +381,7 @@ class RectifiedConverter:
                                  f"t in [{guidance_from:g}, {guidance_until:g})"),
                     ("Content context", f"{content_context:g} s"),
                     ("Formant shift", f"{formant_shift:+g} st"),
+                    ("Tension", f"{tension_strength:g}" if self.flow.encoder.tension is not None else "not in this model"),
                     ("Index", "off" if index_rate <= 0
                      else f"bundled, rate {index_rate:g}, protect {protect:g}" if self.flow_index is not None
                      else f"{os.path.basename(index_path)}, rate {index_rate:g}, protect {protect:g}"
@@ -411,11 +425,15 @@ class RectifiedConverter:
                 source_f0, f0 = self._pitch(
                     audio, frames, f0_method, pitch, f0_autotune, f0_autotune_strength, f0_median, f0_octave_fix
                 )
+                source_f0 = torch.from_numpy(source_f0).view(1, -1).to(self.device)
                 f0 = torch.from_numpy(f0).view(1, -1).to(self.device)
                 energy = smooth_curve(frame_energy(source, INPUT_RATE, frames))
-                breathiness = smooth_curve(aperiodicity(
-                    source, INPUT_RATE, torch.from_numpy(source_f0).view(1, -1).to(self.device), frames
-                ))
+                breathiness = smooth_curve(aperiodicity(source, INPUT_RATE, source_f0, frames))
+                strain = None
+                if self.flow.encoder.tension is not None and tension_strength > 0:
+                    strain = float(tension_strength) * smooth_curve(
+                        tension(source, INPUT_RATE, source_f0, frames), TENSION_SMOOTH_SECONDS
+                    )
 
                 # Everything above is at 100 frames per second; the mel has its own rate.
                 rate, hop = data["sample_rate"], data["hop_length"]
@@ -425,13 +443,15 @@ class RectifiedConverter:
                 f0 = f0_to_mel_rate(f0, frames, rate, hop)
                 energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
                 breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
+                if strain is not None:
+                    strain = to_mel_rate(strain.unsqueeze(-1), frames, rate, hop)[..., 0]
                 key_shift = torch.full((1,), float(formant_shift), device=self.device)
                 if retriever is not None and protect < 0.5:
                     keep = torch.where(f0 > 0, 1.0, float(protect)).unsqueeze(-1)
                     content = content * keep + original * (1.0 - keep)
 
                 mel = self._sample_mel(
-                    content, f0, energy, breathiness, key_shift, int(sid), int(steps), sampler,
+                    content, f0, energy, breathiness, strain, key_shift, int(sid), int(steps), sampler,
                     dict(cfg_scale=float(cfg_scale), content_guidance=float(content_guidance),
                          guidance_rescale=float(guidance_rescale), rescale_mode=rescale_mode,
                          guidance_interval=(float(guidance_from), float(guidance_until)),

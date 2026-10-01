@@ -179,6 +179,15 @@ def rectified_inference_tab():
                 value=0,
                 interactive=True,
             )
+            tension_strength = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                label=_("Tension"),
+                info=_("How far the input's tension (pressed or soft phonation, relative to its own usual) carries over. 0 leaves the voice at its own. Only for models trained with the tension input."),
+                value=1.0,
+                interactive=True,
+            )
             with gr.Row():
                 f0_median = gr.Slider(
                     minimum=0,
@@ -209,7 +218,7 @@ def rectified_inference_tab():
                 )
                 sampler = gr.Radio(
                     label=_("Sampler"),
-                    info=_("Heun costs two model passes per step and is more accurate per step."),
+                    info=_("Heun costs two model passes per step and is more accurate per step. Mean takes one or two steps and needs a model trained with mean flow."),
                     choices=list(SAMPLERS),
                     value="euler",
                     interactive=True,
@@ -436,6 +445,7 @@ def rectified_inference_tab():
         formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
         noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
         f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
+        tension_strength,
     ):
         if not flow_model or not vocoder_model:
             return _("Pick a flow model and a vocoder model."), None
@@ -489,6 +499,7 @@ def rectified_inference_tab():
             flow_submodel=flow_submodel if is_model_bundle(flow_model) else "",
             match_level=match_level,
             churn=churn,
+            tension_strength=tension_strength,
         )
 
     def refresh():
@@ -546,6 +557,7 @@ def rectified_inference_tab():
             formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
             noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
             f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
+            tension_strength,
         ],
         outputs=[output_info, output_audio],
     )
@@ -895,13 +907,20 @@ def rectified_training_tab():
             outputs=[flow_compile_mode],
             show_progress="hidden",
         )
+        flow_mean = gr.Checkbox(
+            label=_("Mean flow"),
+            info=_("Also train the mean velocity (MeanFlow), which the Mean sampler takes in one or two steps. The other samplers work as before. A resumed run keeps what it started with."),
+            value=False,
+            interactive=True,
+        )
 
         gr.Markdown(f"#### {_('Checkpoints')}")
         with gr.Row():
             flow_checkpoints = _checkpoint_mode()
 
         def start_flow(name, epochs, save, batch, gpu_ids, pretrained, custom,
-                       flow_path, vocoder_path, checkpoints, fresh, compile_backbone, compile_mode):
+                       flow_path, vocoder_path, checkpoints, fresh, compile_backbone, compile_mode,
+                       mean_flow):
             if pretrained and not custom:
                 # The pretrain has to match the features the experiment was extracted with.
                 embedder = catalog.experiment_embedder(name)
@@ -928,13 +947,14 @@ def rectified_training_tab():
                 precision=get_training_precision(),
                 compile=compile_backbone,
                 torch_compile_mode=compile_mode,
+                mean_flow=mean_flow,
             )
 
         _start_stop(
             start_flow,
             [model_name, flow_epochs, flow_save, flow_batch, gpu, flow_pretrained,
              flow_custom, custom_flow, custom_vocoder, flow_checkpoints,
-             flow_fresh, flow_compile, flow_compile_mode],
+             flow_fresh, flow_compile, flow_compile_mode, flow_mean],
         )
 
     with gr.Tab(f"4. {_('Index')}"):

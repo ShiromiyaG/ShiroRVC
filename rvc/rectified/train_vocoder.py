@@ -36,6 +36,7 @@ from rvc.rectified.common import (
     read_filelist,
     run_dir,
     remove_older,
+    split_holdout,
 )
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
 from rvc.rectified.mel import normalize_mel
@@ -44,7 +45,14 @@ from rvc.rectified.vocoder import build_discriminator, build_vocoder
 from rvc.train.balance import FamilyReducer, head_accuracies
 from rvc.train.diagnostics import branch_separation, clip_or_sample_grad_norm
 from rvc.train.ema import WeightEMA
-from rvc.train.losses import discriminator_loss, feature_loss, generator_loss, loud_crop, r1_penalty
+from rvc.train.losses import (
+    MultiScaleSTFTLoss,
+    discriminator_loss,
+    feature_loss,
+    generator_loss,
+    loud_crop,
+    r1_penalty,
+)
 from rvc.train.mel_processing import build_ms_mel_loss
 from rvc.train.progress import EpochRecorder, emit_machine_progress
 from rvc.train.schedules import prepare_schedulers
@@ -80,6 +88,39 @@ def generator_gradient_metrics(net_g):
     return metrics
 
 
+class PlateauScale:
+    """A factor on the scheduled LR, cut by ``factor`` whenever the monitored
+    mean fails to beat its best by ``threshold`` (relative) for ``patience``
+    evaluations in a row; never below ``min_scale``."""
+
+    def __init__(self, factor: float, patience: int, threshold: float, min_scale: float):
+        self.factor = factor
+        self.patience = max(1, patience)
+        self.threshold = threshold
+        self.min_scale = min_scale
+        self.scale = 1.0
+        self.best = math.inf
+        self.bad = 0
+
+    def update(self, value: float) -> bool:
+        """Record one evaluation; returns whether the scale was cut."""
+        if value < self.best * (1.0 - self.threshold):
+            self.best, self.bad = value, 0
+            return False
+        self.bad += 1
+        if self.bad < self.patience or self.scale <= self.min_scale:
+            return False
+        self.scale = max(self.min_scale, self.scale * self.factor)
+        self.bad = 0
+        return True
+
+    def state_dict(self) -> dict:
+        return {"scale": self.scale, "best": self.best, "bad": self.bad}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.scale, self.best, self.bad = state["scale"], state["best"], state["bad"]
+
+
 def main(spec_path: str) -> None:
     with open(spec_path, encoding="utf-8") as handle:
         spec = json.load(handle)
@@ -112,9 +153,20 @@ def train(ranks: Ranks, spec_path: str) -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    dataset = RectifiedDataset(
-        read_filelist(name), config, "vocoder", settings["segment_size"] // hop
-    )
+    entries, holdout_entries = split_holdout(read_filelist(name), int(settings.get("holdout_clips", 0)))
+    dataset = RectifiedDataset(entries, config, "vocoder", settings["segment_size"] // hop)
+    # Loaded once: fixed middle crops, the same on every rank and every call.
+    holdout = list(
+        DataLoader(
+            RectifiedDataset(
+                holdout_entries, config, "vocoder",
+                int(settings.get("eval_segment_size", 131072)) // hop, augment=False,
+            ),
+            batch_size=min(int(spec["batch_size"]), len(holdout_entries)),
+            collate_fn=collate_vocoder,
+        )
+    ) if holdout_entries else []
+    eval_interval = int(settings.get("eval_interval", 0)) if holdout else 0
     # Per GPU, as in the RVC trainer.
     batch_size = int(spec["batch_size"])
     if len(dataset) // ranks.world < batch_size:
@@ -141,6 +193,22 @@ def train(ranks: Ranks, spec_path: str) -> None:
     optim_g = torch.optim.AdamW(net_g.parameters(), settings["learning_rate"], betas=betas, eps=1e-9)
     optim_d = torch.optim.AdamW(net_d.parameters(), settings["learning_rate"], betas=betas, eps=1e-9)
     amp_dtype, scaler = amp_setup(spec.get("precision", "fp32"), device, TAG)
+
+    # Reduce on plateau of a spectral loss, the only non-adversarial one: the
+    # training mean over ``plateau_interval`` steps, or with ``plateau_metric``
+    # "val", the held-out one at each evaluation.
+    plateau_metric = str(settings.get("plateau_metric", "train"))
+    if plateau_metric not in ("train", "val"):
+        raise ValueError(f"plateau_metric must be 'train' or 'val', not {plateau_metric!r}.")
+    if plateau_metric == "val" and not eval_interval:
+        raise ValueError("plateau_metric 'val' needs holdout_clips and eval_interval.")
+    plateau_interval = eval_interval if plateau_metric == "val" else int(settings.get("plateau_interval", 0))
+    plateau = PlateauScale(
+        float(settings.get("plateau_factor", 0.5)),
+        int(settings.get("plateau_patience", 3)),
+        float(settings.get("plateau_threshold", 0.005)),
+        float(settings.get("plateau_min_scale", 0.1)),
+    )
 
     epoch, step, skipped = 1, 0, 0
     # Step at which the discriminator started taking the mel.
@@ -170,6 +238,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
         saved_since = None if upgraded_d else state_d.get("mel_cond_since")
         mel_cond_since = step if saved_since is None else saved_since
         skipped = int(state_g.get("amp_skipped_steps", 0))
+        # A best from the other metric is on another scale; that one restarts.
+        if state_g.get("plateau") and state_g["plateau"].get("metric", "train") == plateau_metric:
+            plateau.load_state_dict(state_g["plateau"])
         starting_point = f"resumed from {os.path.basename(resume_g)}"
     else:
         if spec.get("pretrained_g"):
@@ -195,6 +266,13 @@ def train(ranks: Ranks, spec_path: str) -> None:
         lr_final_ratio=None if lr_final_ratio is None else float(lr_final_ratio),
     )
     step_schedulers = lr_scheduler == "exp decay step"
+    # Linear ramps from the first step: the LR of both optimizers, and the
+    # generator's adversarial weight. The early phase explodes without them.
+    lr_warmup = int(settings.get("warmup_steps", 0))
+    adv_warmup = int(settings.get("adv_warmup_steps", 0))
+
+    def ramp(length: int) -> float:
+        return 1.0 if length <= 0 else min(1.0, (step + 1) / length)
 
     apply_precision_policy(net_g, amp_dtype)
     compile_d = bool(settings.get("compile_discriminator", False))
@@ -220,6 +298,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         return torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None)
 
     mel_loss = build_ms_mel_loss(sample_rate).to(device)
+    stft_distance = MultiScaleSTFTLoss().to(device)
     san = bool(getattr(net_d, "supports_san", False))
     mel_cond_d = bool(getattr(net_d, "cond_branches", None))
     mel_cond_warmup = int(settings["discriminator"].get("d_mrd_mel_cond_warmup", 0))
@@ -250,7 +329,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
         print_settings_panel(
             [
                 ("Model", name),
-                ("Clips", f"{len(dataset)} ({len(loader)} steps per epoch)"),
+                ("Clips", f"{len(dataset)} ({len(loader)} steps per epoch)"
+                 + (f", {len(holdout_entries)} held out" if holdout_entries else "")),
                 ("Batch size", batch_size),
                 ("Epochs", f"{epoch} -> {total_epochs}, saving every {save_every}"),
                 ("Starting point", starting_point),
@@ -259,8 +339,12 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Device", (torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU")
                            + (f" x {ranks.world} GPUs" if ranks.world > 1 else "")),
                 ("Optimizer", f"AdamW, lr {settings['learning_rate']:g}, {lr_scheduler} {settings['lr_decay']}"
-                 + (f", final ratio {lr_final_ratio}" if lr_final_ratio is not None else "")),
-                ("Losses", f"multi-scale mel x{settings['c_mel']:g}, FM x{settings['c_fm']:g}, adversarial"),
+                 + (f", final ratio {lr_final_ratio}" if lr_final_ratio is not None else "")
+                 + (f", warmup {lr_warmup} steps" if lr_warmup > 0 else "")
+                 + (f", {plateau_metric} plateau x{plateau.factor:g} after {plateau.patience} x"
+                    f" {plateau_interval} steps (at x{plateau.scale:g})" if plateau_interval > 0 else "")),
+                ("Losses", f"multi-scale mel x{settings['c_mel']:g}, FM x{settings['c_fm']:g}, adversarial"
+                 + (f" ramped over {adv_warmup} steps" if adv_warmup > 0 else "")),
                 ("Discriminator", f"{settings['discriminator'].get('d_version', 'v4')}, R1 gamma {r1_gamma:g}"
                  + (", mel-conditioned MRD" if mel_cond_d else "")
                  + (", compiled" if getattr(net_d, "_compile_enabled", False) else "")),
@@ -284,7 +368,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     {"model": net_g.state_dict(), "optimizer": optim_g.state_dict(),
                      "ema": ema.state_dict(), "epoch": current_epoch, "step": step,
                      "scaler": scaler.state_dict() if scaler is not None else None,
-                     "amp_skipped_steps": skipped},
+                     "amp_skipped_steps": skipped, "plateau": {**plateau.state_dict(), "metric": plateau_metric}},
                     g_path,
                 )
                 torch.save(
@@ -306,6 +390,19 @@ def train(ranks: Ranks, spec_path: str) -> None:
         saved.append(os.path.basename(export))
         success(f"Saved {' and '.join(saved)}.", tag=TAG)
 
+    def optimizer_step(optimizer):
+        """Step at the warmed-up, plateau-scaled LR, then put the scheduler's
+        back: the exponential schedulers scale whatever LR the group holds."""
+        scheduled = [group["lr"] for group in optimizer.param_groups]
+        for group in optimizer.param_groups:
+            group["lr"] *= ramp(lr_warmup) * plateau.scale
+        if scaler is None:
+            optimizer.step()
+        else:
+            scaler.step(optimizer)
+        for group, lr in zip(optimizer.param_groups, scheduled):
+            group["lr"] = lr
+
     def backward(loss, optimizer, parameters):
         """Backward and step; returns the gradient norm on sampled steps."""
         if scaler is None:
@@ -314,10 +411,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
         norm = clip_or_sample_grad_norm(parameters, float("inf"), step, METRICS_INTERVAL)
-        if scaler is None:
-            optimizer.step()
-        else:
-            scaler.step(optimizer)
+        optimizer_step(optimizer)
         return norm
 
     # The same series, names and windows as the RVC trainer's.
@@ -331,9 +425,14 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
     def log_rolling():
         scalars = {
-            "learning_rate/lr_d": optim_d.param_groups[0]["lr"],
-            "learning_rate/lr_g": optim_g.param_groups[0]["lr"],
+            "learning_rate/lr_d": optim_d.param_groups[0]["lr"] * plateau.scale,
+            "learning_rate/lr_g": optim_g.param_groups[0]["lr"] * plateau.scale,
         }
+        if plateau_interval > 0:
+            scalars["learning_rate/plateau_scale"] = plateau.scale
+        if lr_warmup > 0 or adv_warmup > 0:
+            scalars["learning_rate/warmup"] = ramp(lr_warmup)
+            scalars["diag/adv_weight"] = ramp(adv_warmup)
         if accuracy_cache:
             for family, value in zip(families.names, torch.stack(list(accuracy_cache)).mean(0).tolist()):
                 scalars[f"balance_accuracy_{rolling}/{family}"] = value
@@ -376,10 +475,42 @@ def train(ranks: Ranks, spec_path: str) -> None:
     def render_preview():
         if reference is None:
             return
-        ref_mel, _, ref_f0, _, _, ref_audio, _, ref_path = reference
+        ref_mel, _, ref_f0, _, _, ref_audio, _, ref_path, _ = reference
         with ema.applied(net_g), torch.no_grad():
             generated = net_g(normalize_mel(ref_mel.to(device), config["data"]), ref_f0.to(device))
         previews.log(epoch, step, ref_path, generated, ref_audio.to(device))
+
+    @torch.no_grad()
+    def evaluate():
+        """Held-out mel loss (at the ``c_mel`` scale of ``loss_spectral``) and
+        MR-STFT distance through the EMA weights, with the source drawn from
+        the same seeds on every call. Every rank must call it."""
+        totals = torch.zeros(2, device=device)
+        items = 0
+        with ema.applied(net_g):
+            for index, (mel, f0, y) in enumerate(holdout):
+                mel = normalize_mel(mel.to(device), config["data"])
+                y = y.to(device)
+                with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                    torch.manual_seed(index)
+                    y_hat = net_g(mel, f0.to(device)).float()
+                totals[0] += mel_loss(y, y_hat) * settings["c_mel"] * y.shape[0]
+                totals[1] += stft_distance(y_hat, y) * y.shape[0]
+                items += y.shape[0]
+        return ranks.mean(totals / max(1, items)).tolist()
+
+    def plateau_update(value: float):
+        if plateau.update(value) and main_rank:
+            info(f"{plateau_metric.capitalize()} spectral loss plateaued at {plateau.best:.3f}; "
+                 f"LR scale now x{plateau.scale:g}.", tag=TAG)
+        if main_rank:
+            writer.add_scalar("learning_rate/plateau_metric", value, step)
+
+    # Held off until both warmups end: the adversarial ramp raises the spectral
+    # loss by itself.
+    plateau_start = max(lr_warmup, adv_warmup)
+    plateau_sum = torch.zeros((), device=device)
+    plateau_count = 0
 
     recorder = EpochRecorder()
     net_g.train()
@@ -441,7 +572,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         y_d_g, san_direction_weight=SAN_DIRECTION_WEIGHT, use_softplus=san,
                         branch_weights=branch_weights, per_branch=True,
                     )
-                    loss_g = loss_mel + loss_fm + loss_adv
+                    loss_g = loss_mel + loss_fm + loss_adv * ramp(adv_warmup)
                 del fmap_r, fmap_g
                 optim_g.zero_grad(set_to_none=True)
                 if scaler is None:
@@ -451,10 +582,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     scaler.unscale_(optim_g)
                 module_metrics = generator_gradient_metrics(net_g) if step % METRICS_INTERVAL == 0 else {}
                 grad_norm_g = clip_or_sample_grad_norm(net_g.parameters(), float("inf"), step, METRICS_INTERVAL)
-                if scaler is None:
-                    optim_g.step()
-                else:
-                    scaler.step(optim_g)
+                optimizer_step(optim_g)
                 net_d.requires_grad_(True)
                 if scaler is not None:
                     scale = scaler.get_scale()
@@ -477,6 +605,24 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     caches[key].append(value.detach().float())
                     epoch_sums[key] += value.detach().float()
                 epoch_steps += 1
+                if plateau_metric == "train" and plateau_interval > 0 and step > plateau_start:
+                    plateau_sum += loss_mel.detach().float()
+                    plateau_count += 1
+                    # Counted rather than ``step % interval``, so every rank
+                    # reaches the reduction together and a resume starts a
+                    # whole interval.
+                    if plateau_count == plateau_interval:
+                        value = ranks.mean(plateau_sum / plateau_count).item()
+                        plateau_sum.zero_()
+                        plateau_count = 0
+                        plateau_update(value)
+                if eval_interval and step % eval_interval == 0:
+                    val_mel, val_stft = evaluate()
+                    if main_rank:
+                        writer.add_scalar("val/mel", val_mel, step)
+                        writer.add_scalar("val/mrstft", val_stft, step)
+                    if plateau_metric == "val" and step > plateau_start:
+                        plateau_update(val_mel)
                 adv_cache.append(branch_adv)
                 for key, value in (("grad_norm_d", grad_norm_d), ("grad_norm_g", grad_norm_g)):
                     if value is None:
@@ -509,8 +655,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
             if epoch_steps:
                 for key, mean in epoch_means.items():
                     writer.add_scalar(f"loss_avg/{key}", mean.item(), step)
-                writer.add_scalar("learning_rate/lr_d", optim_d.param_groups[0]["lr"], step)
-                writer.add_scalar("learning_rate/lr_g", optim_g.param_groups[0]["lr"], step)
+                writer.add_scalar("learning_rate/lr_d", optim_d.param_groups[0]["lr"] * plateau.scale, step)
+                writer.add_scalar("learning_rate/lr_g", optim_g.param_groups[0]["lr"] * plateau.scale, step)
         if not step_schedulers:
             for scheduler in (scheduler_g, scheduler_d):
                 if scheduler is not None:

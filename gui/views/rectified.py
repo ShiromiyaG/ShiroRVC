@@ -225,6 +225,7 @@ class RectifiedPage(Page):
         self.autotune_strength = SliderSpin(0, 1, 0.01, decimals=2, value=1.0)
         self.formant_shift = SliderSpin(-5, 5, 0.5, decimals=1, value=0.0)
         self.f0_median = SliderSpin(0, 10, 1, decimals=0, value=0)
+        self.tension_strength = SliderSpin(0, 1, 0.05, decimals=2, value=1.0)
         self.f0_octave_fix = Toggle(
             _("Fix octave errors"),
             _("Folds pitch that jumps an octave away from its surroundings back into place."),
@@ -236,7 +237,12 @@ class RectifiedPage(Page):
             Field(_("Pitch median filter"), self.f0_median,
                   _("10 ms frames either side of each voiced frame, against jitter. 0 turns it off.")),
         )
-        advanced.add(self.f0_octave_fix)
+        advanced.add(
+            Field(_("Tension"), self.tension_strength,
+                  _("How far the input's tension carries over. 0 leaves the voice at its own. "
+                    "Only for models trained with the tension input.")),
+            self.f0_octave_fix,
+        )
 
         advanced.add_group(_("Sampling"))
         self.sampler = _combo(catalog.RECTIFIED_SAMPLERS)
@@ -342,6 +348,7 @@ class RectifiedPage(Page):
             "f0_median": int(self.f0_median.value()),
             "f0_octave_fix": self.f0_octave_fix.isChecked(),
             "content_context": self.content_context.value(),
+            "tension_strength": self.tension_strength.value(),
         }
 
     def _refresh_inference(self) -> None:
@@ -610,7 +617,7 @@ class RectifiedPage(Page):
                   _("Renders the previews and is paired with the exports. Empty uses the newest pretrained one.")),
         )
 
-        advanced = Collapsible(_("Advanced settings"), _("learning rate, compilation, checkpoints"))
+        advanced = Collapsible(_("Advanced settings"), _("learning rate, compilation, mean flow, checkpoints"))
         card.add(advanced)
         self.flow_learning_rate = SliderSpin(0, 0.01, 0.00001, decimals=5, value=0)
         advanced.add(Field(_("Learning rate"), self.flow_learning_rate, _("0 uses the config's rate.")))
@@ -622,7 +629,13 @@ class RectifiedPage(Page):
         self.flow_compile_mode_field = Field(_("Compile mode"), self.flow_compile_mode, "")
         self.flow_checkpoints, flow_checkpoints_field = _checkpoint_field()
         self.flow_fresh = Toggle(_("Fresh training"), _("Ignore this run's checkpoints and start over."))
-        advanced.add(self.flow_compile, self.flow_compile_mode_field, flow_checkpoints_field, self.flow_fresh)
+        self.flow_mean = Toggle(
+            _("Mean flow"),
+            _("Also train the mean velocity (MeanFlow), which the mean sampler takes in one or two "
+              "steps. The other samplers work as before. A resumed run keeps what it started with."),
+        )
+        advanced.add(self.flow_compile, self.flow_compile_mode_field, self.flow_mean,
+                     flow_checkpoints_field, self.flow_fresh)
 
         self.flow_compile_mode_field.setVisible(False)
         self.flow_compile.toggled.connect(self.flow_compile_mode_field.setVisible)
@@ -815,6 +828,7 @@ class RectifiedPage(Page):
             "precision": self.precision.value(),
             "compile": self.flow_compile.isChecked(),
             "torch_compile_mode": self.flow_compile_mode.text(),
+            "mean_flow": self.flow_mean.isChecked(),
         }
 
     def vocoder_train_args(self) -> dict | None:

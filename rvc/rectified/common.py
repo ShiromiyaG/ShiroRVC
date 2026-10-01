@@ -15,7 +15,7 @@ from torch.utils.data import Dataset
 from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
 from rvc.lib.paths import LOGS_DIR, MODELS_DIR, ROOT
-from rvc.rectified.aperiodicity import aperiodicity
+from rvc.rectified.aperiodicity import aperiodicity, tension
 from rvc.rectified.mel import LogMel
 
 DEFAULT_CONFIG = os.path.join(ROOT, "rvc", "configs", "rectified", "44100.json")
@@ -77,11 +77,14 @@ def speaker_count(entries) -> int:
 #: Width of the sine window the loudness and breathiness curves are smoothed
 #: with, as DiffSinger smooths its variance curves.
 SMOOTH_SECONDS = 0.06
+#: The tension's: long enough to follow the phrase and not each vowel, whose
+#: formants also move the harmonics' tilt.
+TENSION_SMOOTH_SECONDS = 0.18
 
 
-def smooth_curve(curve: torch.Tensor) -> torch.Tensor:
-    """``curve`` [batch, time] at ``FEATURE_RATE``, smoothed over ``SMOOTH_SECONDS``."""
-    width = int(round(SMOOTH_SECONDS * FEATURE_RATE))
+def smooth_curve(curve: torch.Tensor, seconds: float = SMOOTH_SECONDS) -> torch.Tensor:
+    """``curve`` [batch, time] at ``FEATURE_RATE``, smoothed over ``seconds``."""
+    width = int(round(seconds * FEATURE_RATE))
     kernel = torch.sin(torch.linspace(0, 1, width + 2, device=curve.device)[1:-1] * math.pi)
     kernel = (kernel / kernel.sum()).view(1, 1, -1)
     padded = F.pad(curve.unsqueeze(1), ((width - 1) // 2, width // 2), mode="replicate")
@@ -222,11 +225,12 @@ class RectifiedDataset(Dataset):
     """Clips from an extracted RVC experiment.
 
     ``vocoder`` items are fixed-length (mel, f0, audio) crops; ``flow`` items
-    are (mel, content, f0, energy, breathiness, key_shift, speed, speaker)
-    crops of up to ``segment_frames``. The mel is taken over the whole clip
+    are (mel, content, f0, energy, breathiness, key_shift, speed, speaker,
+    tension) crops of up to ``segment_frames``. The mel is taken over the whole clip
     before cropping, as at inference. Flow items are pitch-shifted and
-    time-stretched at random with the config's probabilities; without
-    ``augment``, they are neither, nor randomly cropped.
+    time-stretched at random with the config's probabilities. Without
+    ``augment``, neither mode is randomly cropped (vocoder items take the
+    middle), and flow items are not shifted or stretched.
     """
 
     def __init__(self, entries, config: dict, mode: str, segment_frames: int, augment: bool = True):
@@ -245,6 +249,7 @@ class RectifiedDataset(Dataset):
         self.stretch_range = tuple(config["flow"].get("time_stretch_range", (1.0, 1.0)))
         self.stretch_prob = float(config["flow"].get("time_stretch_prob", 0.0))
         self.augment = augment
+        self.tension = bool(config["flow"]["model"].get("tension", False))
 
     def __len__(self):
         return len(self.entries)
@@ -274,6 +279,15 @@ class RectifiedDataset(Dataset):
         share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
         return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
 
+    def _tension(self, audio, f0, frames, hop):
+        """Smoothed tension per mel frame, as ``_breathiness``; zeros for a
+        model without the input."""
+        if not self.tension:
+            return torch.zeros(audio.shape[0], frames)
+        feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
+        curve = smooth_curve(tension(audio, self.sample_rate, f0, feature_frames), TENSION_SMOOTH_SECONDS)
+        return to_mel_rate(curve.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+
     def __getitem__(self, index):
         wav_path, content_path, _, f0_path, sid = self.entries[index]
         audio = self._audio(wav_path)
@@ -296,7 +310,10 @@ class RectifiedDataset(Dataset):
         audio = audio[: frames * self.hop]
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[0, :, :frames]
-        start = random.randint(0, frames - self.segment_frames)
+        if self.augment:
+            start = random.randint(0, frames - self.segment_frames)
+        else:
+            start = (frames - self.segment_frames) // 2
         stop = start + self.segment_frames
         return mel[:, start:stop], f0[start:stop], audio[start * self.hop : stop * self.hop]
 
@@ -324,13 +341,14 @@ class RectifiedDataset(Dataset):
             mel = self.mel(audio.unsqueeze(0), key_shift, hop)[0, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, hop)[0]
         breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
+        strain = self._tension(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
 
         length = min(frames, self.segment_frames)
         start = random.randint(0, frames - length) if self.augment else 0
         stop = start + length
         return (
             mel[:, start:stop], content[start:stop], f0[start:stop], energy[start:stop],
-            breathiness[start:stop], key_shift, speed, sid,
+            breathiness[start:stop], key_shift, speed, sid, strain[start:stop],
         )
 
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
@@ -344,13 +362,14 @@ class RectifiedDataset(Dataset):
         audio = audio[: frames * self.hop]
         content = to_mel_rate(content, frames, self.sample_rate, self.hop)
         breathiness = self._breathiness(audio.unsqueeze(0), f0.unsqueeze(0), frames, self.hop)
+        strain = self._tension(audio.unsqueeze(0), f0.unsqueeze(0), frames, self.hop)
         f0 = f0_to_mel_rate(f0, frames, self.sample_rate, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)
         return (
             mel, content.unsqueeze(0), f0.unsqueeze(0), energy, breathiness,
-            audio.unsqueeze(0), int(sid), path,
+            audio.unsqueeze(0), int(sid), path, strain,
         )
 
     def _custom_reference(self):
@@ -390,7 +409,7 @@ class RectifiedDataset(Dataset):
 
     def reference(self, max_seconds: float = 10.0):
         """The preview clip, (mel, content, f0, energy, breathiness, audio, sid,
-        path) with a leading batch axis, or None.
+        path, tension) with a leading batch axis, or None.
 
         ``logs/reference`` when it is usable, as in the RVC trainer; otherwise
         the first non-mute dataset clip of at least two seconds, in path order,
@@ -436,7 +455,8 @@ def collate_flow(batch, frames=None):
     speed = torch.ones(size)
     mask = torch.zeros(size, 1, frames)
     speaker = torch.zeros(size, dtype=torch.long)
-    for i, (m, c, p, e, b, k, v, s) in enumerate(batch):
+    strain = torch.zeros(size, frames)
+    for i, (m, c, p, e, b, k, v, s, x) in enumerate(batch):
         n = m.shape[-1]
         mel[i, :, :n] = m
         content[i, :n] = c
@@ -447,7 +467,8 @@ def collate_flow(batch, frames=None):
         speed[i] = v
         mask[i, :, :n] = 1.0
         speaker[i] = s
-    return mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask
+        strain[i, :n] = x
+    return mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, strain
 
 
 def _pretrained_exports(kind: str) -> list:

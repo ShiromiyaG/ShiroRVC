@@ -49,6 +49,8 @@ def build_vocoder(config: dict) -> NSFBigVGANGenerator:
         source_branch=model["source_branch"],
         source_type=model.get("source_type", "sine"),
         source_random_start_phase=model.get("source_random_start_phase", True),
+        source_noise_eq=model.get("source_noise_eq"),
+        noise_branch_bands=model.get("noise_branch_bands", 0),
         output_gain=model["output_gain"],
         stage_channels=model.get("stage_channels"),
         prenet_blocks=model.get("prenet_blocks", 0),
