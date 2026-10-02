@@ -11,6 +11,18 @@ the input (clamped reads, and its adjoint on the two edge samples) and reflect
 on the upsampled signal (mirrored reads, and its adjoint on the edge lanes).
 ``FusedResidualSnakeBeta`` also takes the residual add in front of the
 activation.
+
+Every kernel sees the tensors as ``B * C`` rows of ``T`` samples; a program is
+one ``BLOCK`` of one row, but for the edge pass.  Names, with ``g`` in front for a gradient:
+
+    x, r, xn    input, residual and their sum
+    w           upsampler weights, (2, TAPS): one row per output phase
+    la, lb      log alpha and log beta, per channel; ``ib`` is 1 / beta
+    v0, v1      upsampled signal at 2k and 2k + 1, before SnakeBeta
+    u0, u1      the same after it
+    d           the lowpass: even taps read phase 0 (33), odd ones phase 1 (32)
+    y           output
+    dla, dlb    gradients of log alpha and log beta, per row
 """
 
 import torch
@@ -41,6 +53,8 @@ def _preact(x_row, r_row, w_ptr, k, T, PAD_L, mask, TAPS: tl.constexpr,
 @triton.jit
 def _fwd_up(x_ptr, r_ptr, w_ptr, la_ptr, lb_ptr, u_ptr, xn_ptr, T, C, PAD_L,
             TAPS: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr):
+    """Upsample and activate: ``x`` (plus ``r``) -> the padded scratch ``u``.
+    With ``HAS_RES`` also writes ``x + r`` to ``xn``."""
     row = tl.program_id(0)
     ch = row % C
     alpha = tl.exp(tl.load(la_ptr + ch).to(tl.float32))
@@ -54,6 +68,7 @@ def _fwd_up(x_ptr, r_ptr, w_ptr, la_ptr, lb_ptr, u_ptr, xn_ptr, T, C, PAD_L,
         xn = (tl.load(x_row + k, mask=mask, other=0.0).to(tl.float32)
               + tl.load(r_row + k, mask=mask, other=0.0).to(tl.float32))
         tl.store(xn_ptr + row.to(tl.int64) * T + k, xn.to(xn_ptr.dtype.element_ty), mask=mask)
+    # SnakeBeta: v + sin^2(alpha * v) / beta.
     s0 = tl.sin(v0 * alpha)
     s1 = tl.sin(v1 * alpha)
     u0 = v0 + ib * s0 * s0
@@ -80,6 +95,7 @@ def _fwd_down(u_ptr, d_ptr, y_ptr, T, BLOCK: tl.constexpr):
     mask = n < T
     u_row = u_ptr + row.to(tl.int64) * 2 * KP
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    # Stride 2 over the interleaved signal: each phase is read at stride 1.
     for i in tl.static_range(33):
         acc += tl.load(d_ptr + 2 * i) * tl.load(u_row + n + i, mask=mask, other=0.0)
     for i in tl.static_range(32):
@@ -96,10 +112,12 @@ def _snake_bwd(v0, v1, g0, g1, alpha, ib, gv_row, k, T, mask, dla_ptr, dlb_ptr, 
     a1 = v1 * alpha
     s0 = tl.sin(a0)
     s1 = tl.sin(a1)
+    # d/da sin^2(a) = 2 sin(a) cos(a)
     t0 = 2.0 * s0 * tl.cos(a0)
     t1 = 2.0 * s1 * tl.cos(a1)
     gv0 = g0 * (1.0 + ib * alpha * t0)
     gv1 = g1 * (1.0 + ib * alpha * t1)
+    # The edge pass adds to what the main pass stored.
     if ACCUMULATE:
         tl.atomic_add(gv_row + k, gv0, mask=mask)
         tl.atomic_add(gv_row + T + k, gv1, mask=mask)
@@ -115,6 +133,8 @@ def _snake_bwd(v0, v1, g0, g1, alpha, ib, gv_row, k, T, mask, dla_ptr, dlb_ptr, 
 @triton.jit
 def _bwd_snake(gy_ptr, x_ptr, w_ptr, d_ptr, la_ptr, lb_ptr, gv_ptr, dla_ptr, dlb_ptr,
                T, C, PAD_L, TAPS: tl.constexpr, BLOCK: tl.constexpr):
+    """Backward through the lowpass and SnakeBeta: ``gy`` -> ``gv``, the
+    gradient at the upsampled signal, (rows, 2, T), and ``dla``/``dlb``."""
     row = tl.program_id(0)
     ch = row % C
     alpha = tl.exp(tl.load(la_ptr + ch).to(tl.float32))
@@ -122,6 +142,7 @@ def _bwd_snake(gy_ptr, x_ptr, w_ptr, d_ptr, la_ptr, lb_ptr, gv_ptr, dla_ptr, dlb
     k = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK))[None, :]
     mask = k < T
     x_row = x_ptr + row.to(tl.int64) * T
+    # Recomputed rather than saved by the forward.
     v0, v1 = _preact(x_row, x_row, w_ptr, k, T, PAD_L, mask, TAPS, False)
     gy_row = gy_ptr + row.to(tl.int64) * T
     # The lowpass's adjoint at padded position 2k + e + 32.
@@ -157,6 +178,7 @@ def _bwd_snake_edges(gy_ptr, x_ptr, w_ptr, d_ptr, la_ptr, lb_ptr, gv_ptr, dla_pt
     gy_row = gy_ptr + rows.to(tl.int64)[:, None] * T
     g0 = tl.zeros((ROWS, 32), dtype=tl.float32)
     g1 = tl.zeros((ROWS, 32), dtype=tl.float32)
+    # The lowpass's adjoint at each sample's mirrored position.
     if right == 0:
         for i in tl.static_range(33):
             n = 16 - k - i
@@ -183,12 +205,16 @@ def _bwd_snake_edges(gy_ptr, x_ptr, w_ptr, d_ptr, la_ptr, lb_ptr, gv_ptr, dla_pt
 @triton.jit
 def _bwd_up(gv_ptr, w_ptr, gxn_ptr, gx_ptr, gr_ptr, T, PAD_L, PAD_R, TAPS: tl.constexpr,
             HAS_RES: tl.constexpr, EDGE: tl.constexpr, BLOCK: tl.constexpr):
+    """Backward through the upsampler: ``gv`` -> ``gx``.  With ``HAS_RES``,
+    ``gxn`` (the gradient of the returned ``x + r``) is added and the result
+    also written to ``gr``."""
     row = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
     j = start + tl.arange(0, BLOCK)
     mask = j < T
     gv_row = gv_ptr + row.to(tl.int64) * 2 * T
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    # The upsampler's adjoint: both phases, every tap that read x[j].
     for b in tl.static_range(2):
         for t in tl.static_range(TAPS):
             a = j + PAD_L - t
@@ -221,13 +247,17 @@ def _bwd_up(gv_ptr, w_ptr, gxn_ptr, gx_ptr, gr_ptr, T, PAD_L, PAD_R, TAPS: tl.co
 
 
 def _grid(rows, length):
+    """Launch grid: one program per row and per ``BLOCK`` samples."""
     return (rows, triton.cdiv(length, BLOCK))
 
 
 def _forward(x, r, log_alpha, log_beta, up_w, down_w, pad, dtype):
+    """``(y, x + r)``, or ``(y, None)`` without a residual ``r``."""
     B, C, T = x.shape
+    # The activated 2x signal: two phases, each reflect-padded by 16.
     u = torch.empty(B * C, 2, T + 32, device=x.device, dtype=torch.float32)
     xn = None if r is None else torch.empty_like(x, dtype=torch.promote_types(x.dtype, r.dtype))
+    # Pointers the kernel does not use without a residual still need a tensor.
     _fwd_up[_grid(B * C, T)](x, x if r is None else r, up_w, log_alpha, log_beta, u,
                              x if xn is None else xn, T, C, pad[0], TAPS=up_w.shape[1],
                              HAS_RES=r is not None, BLOCK=BLOCK)
@@ -237,23 +267,28 @@ def _forward(x, r, log_alpha, log_beta, up_w, down_w, pad, dtype):
 
 
 def _backward(gy, x, gxn, log_alpha, log_beta, up_w, down_w, pad, x_dtype, r_dtype):
-    """``x`` is what the activation read: the input, or ``x + r`` when fused."""
+    """``x`` is what the activation read: the input, or ``x + r`` when fused.
+    Returns ``(gx, gr, dla, dlb)``; ``gr`` is None without a residual."""
     B, C, T = x.shape
     taps = up_w.shape[1]
     gv = torch.empty(B * C, 2, T, device=x.device, dtype=torch.float32)
     dla = torch.zeros(B * C, device=x.device, dtype=torch.float32)
     dlb = torch.zeros(B * C, device=x.device, dtype=torch.float32)
     gy = gy.contiguous()
+    # Lowpass and SnakeBeta: the main pass stores ``gv``, the edge pass adds
+    # the reflect padding's share to it.
     args = (gy, x, up_w, down_w, log_alpha, log_beta, gv, dla, dlb)
     _bwd_snake[_grid(B * C, T)](*args, T, C, pad[0], TAPS=taps, BLOCK=BLOCK)
     _bwd_snake_edges[(triton.cdiv(B * C, EDGE_ROWS), 2)](*args, B * C, T, C, pad[0], TAPS=taps,
                                                          ROWS=EDGE_ROWS)
+    # Upsampler, and the residual's gradient when there is one.
     res = r_dtype is not None
     gx = torch.empty(B, C, T, device=x.device, dtype=x_dtype)
     gr = torch.empty(B, C, T, device=x.device, dtype=r_dtype) if res else None
     _bwd_up[_grid(B * C, T)](gv, up_w, gxn.contiguous() if res else gv, gx,
                              gr if res else gx, T, pad[0], pad[1], TAPS=taps, HAS_RES=res,
                              EDGE=triton.next_power_of_2(max(pad[0], pad[1], 1)), BLOCK=BLOCK)
+    # Per-row sums -> per-channel gradients.
     return gx, gr, dla.view(B, C).sum(0), dlb.view(B, C).sum(0)
 
 
