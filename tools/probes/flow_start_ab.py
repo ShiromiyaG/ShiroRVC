@@ -75,13 +75,11 @@ def integrate(model, x, cond, voice, mask, steps):
 @torch.no_grad()
 def render(model, item, data, device, steps, seed):
     """Normalised mels {variant: [1, n_mels, T]} and the real one."""
-    mel, content, f0, energy, breathiness, _, sid, _, _ = item
-    content, f0, energy, breathiness = (x.to(device) for x in (content, f0, energy, breathiness))
-    mask = torch.ones(1, 1, f0.shape[1], device=device)
-    speaker = torch.tensor([sid], device=device)
-    cond = model.encoder(content, f0, energy, speaker, mask, breathiness)
-    voice = model.encoder.voice(speaker)
-    real = normalize_mel(mel.to(device), data)
+    inputs = item.inputs._replace(tension=None).to(device)
+    f0, mask = inputs.f0, inputs.mask
+    cond = model.encoder(inputs)
+    voice = model.encoder.voice(inputs.speaker)
+    real = normalize_mel(item.mel.to(device), data)
     generator = torch.Generator(device=device).manual_seed(seed)
     noise = torch.randn(real.shape, device=device, generator=generator)
     aux = model.aux(cond, mask)
@@ -167,7 +165,7 @@ def main():
             audio = vocoder(mel, f0.to(device)).float().squeeze().cpu().numpy()
             sf.write(os.path.join(out, name.replace(" ", "_").replace(",", "") + ".wav"), audio, sr)
     with open(os.path.join(out, "source.json"), "w", encoding="utf-8") as handle:
-        json.dump({"export": export, "clip": items[0][1][7]}, handle, indent=2)
+        json.dump({"export": export, "clip": items[0][1].path}, handle, indent=2)
     print(f"\nPreview clip audio in {out}")
 
 

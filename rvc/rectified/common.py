@@ -5,6 +5,7 @@ import os
 import random
 import re
 import shutil
+from typing import NamedTuple
 
 import numpy as np
 import soundfile as sf
@@ -16,6 +17,7 @@ from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
 from rvc.lib.paths import LOGS_DIR, MODELS_DIR, ROOT
 from rvc.rectified.aperiodicity import aperiodicity, tension
+from rvc.rectified.flow_model import Conditioning
 from rvc.rectified.mel import LogMel
 
 DEFAULT_CONFIG = os.path.join(ROOT, "rvc", "configs", "rectified", "44100.json")
@@ -121,6 +123,11 @@ def to_mel_rate(features: torch.Tensor, frames: int, sample_rate: int, hop: int)
     return features[..., left, :] * (1 - weight) + features[..., right, :] * weight
 
 
+def curve_to_mel_rate(curve: torch.Tensor, frames: int, sample_rate: int, hop: int) -> torch.Tensor:
+    """``to_mel_rate`` of a curve, [batch, time] -> [batch, frames]."""
+    return to_mel_rate(curve.unsqueeze(-1), frames, sample_rate, hop)[..., 0]
+
+
 #: Half-width, in frames, of the median an octave error is judged against.
 OCTAVE_RADIUS = 25
 
@@ -221,12 +228,37 @@ def check_pretrain_embedder(path: str, embedder: str) -> None:
         )
 
 
+class FlowItem(NamedTuple):
+    """One flow training crop, without a batch axis: ``mel`` [n_mels, T],
+    ``content`` [T, C], the curves [T], and the rest one number each."""
+
+    mel: torch.Tensor
+    content: torch.Tensor
+    f0: torch.Tensor
+    energy: torch.Tensor
+    breathiness: torch.Tensor
+    tension: torch.Tensor
+    key_shift: float
+    speed: float
+    speaker: int
+
+
+class Reference(NamedTuple):
+    """The preview clip, as a batch of one: its ``mel`` [1, n_mels, T], not
+    normalised, its ``audio`` [1, samples], the ``path`` it came from and the
+    flow's ``inputs`` for it."""
+
+    mel: torch.Tensor
+    audio: torch.Tensor
+    path: str
+    inputs: Conditioning
+
+
 class RectifiedDataset(Dataset):
     """Clips from an extracted RVC experiment.
 
     ``vocoder`` items are fixed-length (mel, f0, audio) crops; ``flow`` items
-    are (mel, content, f0, energy, breathiness, key_shift, speed, speaker,
-    tension) crops of up to ``segment_frames``. The mel is taken over the whole clip
+    are ``FlowItem`` crops of up to ``segment_frames``. The mel is taken over the whole clip
     before cropping, as at inference. Flow items are pitch-shifted and
     time-stretched at random with the config's probabilities. Without
     ``augment``, neither mode is randomly cropped (vocoder items take the
@@ -269,7 +301,7 @@ class RectifiedDataset(Dataset):
         from ``audio`` [batch, samples]."""
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         energy = smooth_curve(frame_energy(audio, self.sample_rate, feature_frames))
-        return to_mel_rate(energy.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+        return curve_to_mel_rate(energy, frames, self.sample_rate, hop)
 
     def _breathiness(self, audio, f0, frames, hop):
         """Smoothed aperiodic share per mel frame of ``hop`` samples, [batch,
@@ -277,7 +309,7 @@ class RectifiedDataset(Dataset):
         time] at ``FEATURE_RATE``."""
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
-        return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+        return curve_to_mel_rate(share, frames, self.sample_rate, hop)
 
     def _tension(self, audio, f0, frames, hop):
         """Smoothed tension per mel frame, as ``_breathiness``; zeros for a
@@ -286,7 +318,7 @@ class RectifiedDataset(Dataset):
             return torch.zeros(audio.shape[0], frames)
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         curve = smooth_curve(tension(audio, self.sample_rate, f0, feature_frames), TENSION_SMOOTH_SECONDS)
-        return to_mel_rate(curve.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+        return curve_to_mel_rate(curve, frames, self.sample_rate, hop)
 
     def __getitem__(self, index):
         wav_path, content_path, _, f0_path, sid = self.entries[index]
@@ -346,9 +378,10 @@ class RectifiedDataset(Dataset):
         length = min(frames, self.segment_frames)
         start = random.randint(0, frames - length) if self.augment else 0
         stop = start + length
-        return (
-            mel[:, start:stop], content[start:stop], f0[start:stop], energy[start:stop],
-            breathiness[start:stop], key_shift, speed, sid, strain[start:stop],
+        return FlowItem(
+            mel=mel[:, start:stop], content=content[start:stop], f0=f0[start:stop],
+            energy=energy[start:stop], breathiness=breathiness[start:stop], tension=strain[start:stop],
+            key_shift=key_shift, speed=speed, speaker=sid,
         )
 
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
@@ -367,10 +400,12 @@ class RectifiedDataset(Dataset):
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)
-        return (
-            mel, content.unsqueeze(0), f0.unsqueeze(0), energy, breathiness,
-            audio.unsqueeze(0), int(sid), path, strain,
+        inputs = Conditioning(
+            content=content.unsqueeze(0), f0=f0.unsqueeze(0), energy=energy,
+            speaker=torch.tensor([int(sid)]), mask=torch.ones(1, 1, frames),
+            breathiness=breathiness, tension=strain,
         )
+        return Reference(mel, audio.unsqueeze(0), path, inputs)
 
     def _custom_reference(self):
         """``logs/reference`` as the RVC trainer reads it, speaker 0, or None.
@@ -408,8 +443,7 @@ class RectifiedDataset(Dataset):
         return self._reference_item(audio, content, f0, 0, folder)
 
     def reference(self, max_seconds: float = 10.0):
-        """The preview clip, (mel, content, f0, energy, breathiness, audio, sid,
-        path, tension) with a leading batch axis, or None.
+        """The preview clip as a ``Reference``, or None.
 
         ``logs/reference`` when it is usable, as in the RVC trainer; otherwise
         the first non-mute dataset clip of at least two seconds, in path order,
@@ -442,33 +476,34 @@ def collate_vocoder(batch):
 
 
 def collate_flow(batch, frames=None):
-    """Pads to ``frames``, or to the longest item; returns a [B, 1, T] mask.
-    A fixed length keeps every batch one shape for ``torch.compile``."""
-    frames = frames or max(item[0].shape[-1] for item in batch)
+    """``FlowItem``s -> the mel [B, n_mels, T] and its ``Conditioning``, padded
+    to ``frames``, or to the longest item. A fixed length keeps every batch
+    one shape for ``torch.compile``."""
+    frames = frames or max(item.mel.shape[-1] for item in batch)
     size = len(batch)
-    mel = torch.zeros(size, batch[0][0].shape[0], frames)
-    content = torch.zeros(size, frames, batch[0][1].shape[-1])
-    f0 = torch.zeros(size, frames)
-    energy = torch.full((size, frames), -1.0)
-    breathiness = torch.ones(size, frames)
-    key_shift = torch.zeros(size)
-    speed = torch.ones(size)
-    mask = torch.zeros(size, 1, frames)
-    speaker = torch.zeros(size, dtype=torch.long)
-    strain = torch.zeros(size, frames)
-    for i, (m, c, p, e, b, k, v, s, x) in enumerate(batch):
-        n = m.shape[-1]
-        mel[i, :, :n] = m
-        content[i, :n] = c
-        f0[i, :n] = p
-        energy[i, :n] = e
-        breathiness[i, :n] = b
-        key_shift[i] = k
-        speed[i] = v
-        mask[i, :, :n] = 1.0
-        speaker[i] = s
-        strain[i, :n] = x
-    return mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, strain
+    mel = torch.zeros(size, batch[0].mel.shape[0], frames)
+    # Padding reads as silence: no pitch, the energy floor, fully aperiodic.
+    inputs = Conditioning(
+        content=torch.zeros(size, frames, batch[0].content.shape[-1]),
+        f0=torch.zeros(size, frames),
+        energy=torch.full((size, frames), -1.0),
+        speaker=torch.tensor([item.speaker for item in batch], dtype=torch.long),
+        mask=torch.zeros(size, 1, frames),
+        breathiness=torch.ones(size, frames),
+        key_shift=torch.tensor([item.key_shift for item in batch], dtype=torch.float32),
+        speed=torch.tensor([item.speed for item in batch], dtype=torch.float32),
+        tension=torch.zeros(size, frames),
+    )
+    for i, item in enumerate(batch):
+        n = item.mel.shape[-1]
+        mel[i, :, :n] = item.mel
+        inputs.content[i, :n] = item.content
+        inputs.f0[i, :n] = item.f0
+        inputs.energy[i, :n] = item.energy
+        inputs.breathiness[i, :n] = item.breathiness
+        inputs.tension[i, :n] = item.tension
+        inputs.mask[i, :, :n] = 1.0
+    return mel, inputs
 
 
 def _pretrained_exports(kind: str) -> list:

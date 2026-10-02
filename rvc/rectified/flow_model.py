@@ -1,6 +1,7 @@
 import math
 from contextlib import nullcontext
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Callable, NamedTuple, Optional
 
 import torch
 from librosa.filters import mel as librosa_mel_fn
@@ -17,6 +18,69 @@ LOG_F0_SCALE = 0.7
 SAMPLERS = ("euler", "heun", "mean")
 #: Share of the frames that get the second time under ``dual_timestep``.
 DUAL_TIMESTEP_SHARE = 0.25
+#: Step spacing over the sampled time range: even; sway (F5-TTS), denser near
+#: the start; logit-normal, the density training draws its times from.
+SCHEDULES = ("uniform", "sway", "logit-normal")
+#: Where guidance rescale measures the output's spread.
+RESCALE_MODES = ("global", "frame")
+#: Inputs that start at zero, so a checkpoint from before them loads unchanged.
+ZERO_INPUTS = ("encoder.tension.", "backbone.span_mlp.")
+
+
+class Conditioning(NamedTuple):
+    """What the flow is conditioned on: ``content`` [B, T, C]; ``f0`` in Hz,
+    ``energy``, ``breathiness`` and ``tension`` [B, T]; ``speaker``,
+    ``key_shift`` and ``speed`` [B]; ``mask`` [B, 1, T].
+
+    ``key_shift`` is the formant shift in semitones: training shifts the mel's
+    whole spectrum with the pitch, so 0 keeps the voice's own formants at any
+    pitch. ``speed`` is the time stretch training applied, 1 at inference.
+    Missing ``breathiness``, ``tension``, ``key_shift`` and ``speed`` read as
+    fully aperiodic, 0, 0 and 1.
+    """
+
+    content: torch.Tensor
+    f0: torch.Tensor
+    energy: torch.Tensor
+    speaker: torch.Tensor
+    mask: torch.Tensor
+    breathiness: Optional[torch.Tensor] = None
+    key_shift: Optional[torch.Tensor] = None
+    speed: Optional[torch.Tensor] = None
+    tension: Optional[torch.Tensor] = None
+
+    def map(self, function) -> "Conditioning":
+        """``function`` of every input that is there."""
+        return Conditioning(*(None if value is None else function(value) for value in self))
+
+    def to(self, device, non_blocking: bool = False) -> "Conditioning":
+        return self.map(lambda value: value.to(device, non_blocking=non_blocking))
+
+    def crop(self, start: int, stop: int) -> "Conditioning":
+        """Frames ``start`` to ``stop`` of the per-frame inputs."""
+
+        def cut(value):
+            return None if value is None else value[:, start:stop]
+
+        return self._replace(
+            content=cut(self.content), f0=cut(self.f0), energy=cut(self.energy),
+            mask=self.mask[..., start:stop],
+            breathiness=cut(self.breathiness), tension=cut(self.tension),
+        )
+
+
+class MeanFlowLosses(NamedTuple):
+    """The losses of the share of a batch that trains the mean velocity.
+    Only ``objective`` is optimised; the rest are detached, to read."""
+
+    #: Mean-flow loss under ``adaptive_weight``.
+    objective: torch.Tensor
+    #: The rest of the batch's flow loss, unweighted.
+    flow: torch.Tensor
+    #: Mean-flow loss, unweighted.
+    mean: torch.Tensor
+    #: Size of the bootstrapped part of the target against the velocity.
+    bootstrap_ratio: torch.Tensor
 
 
 def adaptive_weight(error: torch.Tensor) -> torch.Tensor:
@@ -24,11 +88,6 @@ def adaptive_weight(error: torch.Tensor) -> torch.Tensor:
     whatever its error, which a bootstrapped target far off would otherwise
     dominate."""
     return (error.detach() + 1e-3).reciprocal()
-#: Step spacing over the sampled time range: even; sway (F5-TTS), denser near
-#: the start; logit-normal, the density training draws its times from.
-SCHEDULES = ("uniform", "sway", "logit-normal")
-#: Where guidance rescale measures the output's spread.
-RESCALE_MODES = ("global", "frame")
 
 
 def time_grid(schedule: str, steps: int, start: float, device) -> torch.Tensor:
@@ -120,10 +179,8 @@ class ConditionEncoder(nn.Module):
     -> per-frame conditioning.
 
     Speaker row ``speaker_count`` is the null speaker used for classifier-free
-    guidance. ``key_shift`` is the formant shift in semitones: training shifts
-    the mel's whole spectrum with the pitch, so 0 keeps the voice's own
-    formants at any pitch. ``speed`` is the time stretch training applied, 1
-    at inference.
+    guidance. The boolean arguments say which of ``Conditioning``'s optional
+    inputs the model takes; the others are ignored.
     """
 
     def __init__(
@@ -173,13 +230,9 @@ class ConditionEncoder(nn.Module):
         """The speaker's embedding, [B, hidden]; the null row for guidance."""
         return self.speaker_proj(self.speaker(speaker))
 
-    def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None,
-                tension=None):
-        """``content`` [B, T, C], ``f0``, ``energy``, ``breathiness`` and
-        ``tension`` [B, T], ``speaker``, ``key_shift`` and ``speed`` [B],
-        ``mask`` [B, 1, T] -> [B, hidden, T]. Missing ``breathiness``,
-        ``tension``, ``key_shift`` and ``speed`` read as fully aperiodic, 0, 0
-        and 1."""
+    def forward(self, inputs: Conditioning) -> torch.Tensor:
+        """The per-frame conditioning, [B, hidden, T]."""
+        content, f0, energy, speaker, mask, breathiness, key_shift, speed, tension = inputs
         if self.bottleneck is not None:
             content = self.bottleneck(content)
         x = self.content(content).transpose(1, 2)
@@ -375,6 +428,58 @@ class AuxDecoder(nn.Module):
         return self.output(x) * mask
 
 
+@dataclass(frozen=True)
+class _Guidance:
+    """``RectifiedFlow.sample``'s guidance options, and what they make of the
+    passes' velocities."""
+
+    cfg_scale: float = 1.0
+    content_guidance: float = 0.0
+    rescale: float = 0.0
+    rescale_mode: str = "global"
+    interval: tuple = (0.0, 1.0)
+
+    def variants(self, inputs: Conditioning, null_speaker: int) -> list:
+        """(content, speaker) of each pass: the plain one, then the null
+        speaker's and the blurred content's when their guidance is on."""
+        variants = [(inputs.content, inputs.speaker)]
+        if self.cfg_scale != 1.0:
+            variants.append((inputs.content, torch.full_like(inputs.speaker, null_speaker)))
+        if self.content_guidance > 0:
+            frames = inputs.content.shape[1]
+            blurred = F.interpolate(inputs.content.transpose(1, 2), size=max(1, frames // 4), mode="linear")
+            blurred = F.interpolate(blurred, size=frames, mode="linear").transpose(1, 2)
+            variants.append((blurred, inputs.speaker))
+        return variants
+
+    def active(self, now: float) -> bool:
+        """Whether the guidances apply at the flow time ``now``."""
+        start, until = self.interval
+        # An interval reaching 1 includes it, where Heun's last evaluation lands.
+        return start <= now and (now < until or until >= 1.0)
+
+    def combine(self, passes, mask: torch.Tensor) -> torch.Tensor:
+        """The guided velocity, from the passes' in ``variants``' order."""
+        plain = passes[0]
+        guided, index = plain, 1
+        if self.cfg_scale != 1.0:
+            guided = guided + (self.cfg_scale - 1.0) * (plain - passes[index])
+            index += 1
+        if self.content_guidance > 0:
+            guided = guided + self.content_guidance * (plain - passes[index])
+        if self.rescale > 0:
+            rescaled = guided * self._spread(plain, mask) / self._spread(guided, mask).clamp_min(1e-6)
+            guided = self.rescale * rescaled + (1.0 - self.rescale) * guided
+        return guided
+
+    def _spread(self, velocity: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """RMS of ``velocity`` [B, n_mels, T], per frame or over each item."""
+        if self.rescale_mode == "frame":
+            return velocity.square().mean(1, keepdim=True).sqrt()
+        count = mask.sum((1, 2)).clamp_min(1.0) * velocity.shape[1]
+        return ((velocity.square() * mask).sum((1, 2)) / count).sqrt()[:, None, None]
+
+
 class RectifiedFlow(nn.Module):
     """Velocity field from Gaussian noise (t = 0) to the normalised log mel
     (t = 1), conditioned per frame.
@@ -532,72 +637,84 @@ class RectifiedFlow(nn.Module):
         t = torch.sigmoid(math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0))
         return self.t_start + (1.0 - self.t_start) * t
 
-    def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None, tension=None,
+    def _train_times(self, batch, frames, device):
+        """A time per item, [B]; under ``dual_timestep`` a share of each
+        item's frames gets a second one, [B, T]."""
+        t = self._times(batch, device)
+        if not self.dual_timestep:
+            return t
+        other = self._times(batch, device)
+        swap = torch.rand(batch, frames, device=device) < DUAL_TIMESTEP_SHARE
+        return torch.where(swap, other[:, None], t[:, None])
+
+    @staticmethod
+    def _pooled(error, frames, weighted=False):
+        """Per-item ``error`` averaged over the batch's frames; ``weighted``
+        applies ``adaptive_weight``."""
+        weight = adaptive_weight(error) if weighted else 1.0
+        return (weight * error * frames).sum() / frames.sum().clamp_min(1.0)
+
+    def forward(self, mel, inputs: Conditioning, speaker_dropout=0.0, backbone=None,
                 mean_ratio=0.0, mean_field=None, tension_dropout=0.0, mean_bootstrap=1.0):
         """Flow-matching loss for normalised ``mel`` [B, n_mels, T], the aux
-        decoder's L1 (None without one) and the MeanFlow losses (None when
+        decoder's L1 (None without one) and the ``MeanFlowLosses`` (None when
         off). ``backbone`` stands in for ``self.backbone``, as its compiled
         wrapper does, and ``mean_field`` for ``self.mean_velocity``.
 
         The first ``mean_ratio`` of the batch trains the mean velocity instead
         of the flow. Every item's loss then takes ``adaptive_weight``, as in
-        MeanFlow, and the third value is [mean loss to optimise, plain flow
-        loss, plain mean loss, bootstrap ratio], the last three to read.
-        ``mean_bootstrap`` is ``_mean_error``'s, ramped up from 0 early in
-        training.
+        MeanFlow. ``mean_bootstrap`` is ``_mean_error``'s, ramped up from 0
+        early in training.
 
-        ``tension_dropout`` is the share of items trained with a flat tension,
-        so the input can be turned down at inference."""
-        speaker = self._drop_speakers(speaker, speaker_dropout)
+        ``speaker_dropout`` is the share of items trained on the null speaker,
+        and ``tension_dropout`` the share trained with a flat tension, so the
+        input can be turned down at inference."""
+        speaker = self._drop_speakers(inputs.speaker, speaker_dropout)
+        tension = inputs.tension
         if tension is not None and tension_dropout > 0:
             kept = torch.rand(tension.shape[0], 1, device=tension.device) >= tension_dropout
             tension = tension * kept
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, tension)
+        mask = inputs.mask
+        cond = self.encoder(inputs._replace(speaker=speaker, tension=tension))
         voice = self.encoder.voice(speaker)
         noise = torch.randn_like(mel)
+
+        # The batch's head trains the mean velocity, the rest the flow.
         batch = mel.shape[0]
         mean_items = 0
         if self.backbone.span_mlp is not None:
             mean_items = min(batch - 1, int(round(mean_ratio * batch)))
-        rest = slice(mean_items, None)
-        t = self._times(batch - mean_items, mel.device)
-        if self.dual_timestep:
-            other = self._times(batch - mean_items, mel.device)
-            swap = torch.rand(batch - mean_items, mel.shape[-1], device=mel.device) < DUAL_TIMESTEP_SHARE
-            t = torch.where(swap, other[:, None], t[:, None])
+        head, rest = slice(0, mean_items), slice(mean_items, None)
+
+        t = self._train_times(batch - mean_items, mel.shape[-1], mel.device)
         # Not ``backbone or ...``: a compiled module's truth test calls len().
         backbone = self.backbone if backbone is None else backbone
         error = self._flow_error(mel[rest], cond[rest], voice[rest], mask[rest], t, noise[rest], backbone)
-
-        def pooled(error, frames, weighted=False):
-            weight = adaptive_weight(error) if weighted else 1.0
-            return (weight * error * frames).sum() / frames.sum().clamp_min(1.0)
-
         frames = mask[rest].sum((1, 2))
-        flow = pooled(error, frames)
+        flow = self._pooled(error, frames)
         mean = None
         if mean_items:
-            head = slice(0, mean_items)
             mean_field = self.mean_velocity if mean_field is None else mean_field
             mean_error, bootstrap_ratio = self._mean_error(
                 mel[head], cond[head], voice[head], mask[head], noise[head], mean_field, mean_bootstrap
             )
             mean_frames = mask[head].sum((1, 2))
-            mean = torch.stack((
-                pooled(mean_error, mean_frames, True), flow.detach(),
-                pooled(mean_error, mean_frames).detach(), bootstrap_ratio.mean(),
-            ))
-            flow = pooled(error, frames, True)
+            mean = MeanFlowLosses(
+                objective=self._pooled(mean_error, mean_frames, True),
+                flow=flow.detach(),
+                mean=self._pooled(mean_error, mean_frames).detach(),
+                bootstrap_ratio=bootstrap_ratio.mean(),
+            )
+            flow = self._pooled(error, frames, True)
         return flow, self._aux_loss(mel, cond, mask), mean
 
     @torch.no_grad()
-    def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
-                          speed, noise, fractions, tension=None):
+    def validation_losses(self, mel, inputs: Conditioning, noise, fractions):
         """Flow loss at each of ``fractions`` of the trained time range, [len],
         from fixed ``noise``, and the aux decoder's L1 (None without one)."""
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, tension)
-        voice = self.encoder.voice(speaker)
+        mask = inputs.mask
+        cond = self.encoder(inputs)
+        voice = self.encoder.voice(inputs.speaker)
         frames = mask.sum((1, 2))
         losses = []
         for fraction in fractions:
@@ -606,21 +723,32 @@ class RectifiedFlow(nn.Module):
             losses.append((error * frames).sum() / frames.sum().clamp_min(1.0))
         return torch.stack(losses), self._aux_loss(mel, cond, mask)
 
+    def _start(self, noise, cond, mask, start):
+        """Where sampling begins, as (state, flow time): noise at 0, or with
+        an aux decoder its mel mixed with noise at ``start``."""
+        if self.t_start <= 0:
+            return noise * mask, 0.0
+        t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
+        return ((1.0 - t0) * noise + t0 * self.aux(cond, mask)) * mask, t0
+
+    @staticmethod
+    def _renoise(x, now, back, fresh, temperature):
+        """``x`` taken from the time ``now`` back to ``back`` with ``fresh`` noise."""
+        # Keeps x on the path (1 - t) noise + t mel: the kept noise shrinks
+        # with the data and fresh noise tops it up to (1 - back).
+        scale = back / now
+        top_up = math.sqrt(max((1.0 - back) ** 2 - (scale * (1.0 - now)) ** 2, 0.0))
+        return scale * x + temperature * top_up * fresh
+
     @torch.no_grad()
     def sample(
         self,
-        content,
-        f0,
-        energy,
-        speaker,
-        mask,
+        inputs: Conditioning,
         steps: int = 16,
         method: str = "euler",
         cfg_scale: float = 1.0,
         noise: Optional[torch.Tensor] = None,
         callback: Optional[Callable[[], None]] = None,
-        breathiness: Optional[torch.Tensor] = None,
-        key_shift: Optional[torch.Tensor] = None,
         content_guidance: float = 0.0,
         guidance_rescale: float = 0.0,
         temperature: float = 1.0,
@@ -630,7 +758,6 @@ class RectifiedFlow(nn.Module):
         schedule: str = "uniform",
         churn: float = 0.0,
         churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
-        tension: Optional[torch.Tensor] = None,
     ):
         """Integrate the ODE from ``noise`` (drawn when None) to a normalised
         mel, [B, n_mels, T]; from ``t_start`` on the aux decoder's mel when the
@@ -664,81 +791,50 @@ class RectifiedFlow(nn.Module):
             raise ValueError("The mean sampler needs a model trained with mean flow.")
         if rescale_mode not in RESCALE_MODES:
             raise ValueError(f"rescale_mode must be one of {RESCALE_MODES}, not {rescale_mode!r}.")
-        batch = content.shape[0]
-        null = torch.full_like(speaker, self.speaker_count)
-        # Each guided variant rides along in the batch: (content, speaker) pairs.
-        variants = [(content, speaker)]
-        if cfg_scale != 1.0:
-            variants.append((content, null))
-        if content_guidance > 0:
-            frames = content.shape[1]
-            blurred = F.interpolate(content.transpose(1, 2), size=max(1, frames // 4), mode="linear")
-            blurred = F.interpolate(blurred, size=frames, mode="linear").transpose(1, 2)
-            variants.append((blurred, speaker))
+        guidance = _Guidance(
+            cfg_scale, content_guidance, guidance_rescale, rescale_mode,
+            tuple(float(value) for value in guidance_interval),
+        )
+        batch, frames = inputs.content.shape[:2]
+        mask = inputs.mask
+
+        # Each guided variant rides along in the batch, after the plain pass.
+        variants = guidance.variants(inputs, self.speaker_count)
         count = len(variants)
 
         def repeat(value):
             return None if value is None else value.repeat(count, *([1] * (value.dim() - 1)))
 
-        cond = self.encoder(
-            torch.cat([c for c, _ in variants]), repeat(f0), repeat(energy),
-            torch.cat([s for _, s in variants]), repeat(mask), repeat(breathiness), repeat(key_shift),
-            tension=repeat(tension),
+        stacked = inputs.map(repeat)._replace(
+            content=torch.cat([content for content, _ in variants]),
+            speaker=torch.cat([speaker for _, speaker in variants]),
         )
-        voice = self.encoder.voice(torch.cat([s for _, s in variants]))
-        masks = repeat(mask)
-        guide_from, guide_until = (float(value) for value in guidance_interval)
+        cond = self.encoder(stacked)
+        voice = self.encoder.voice(stacked.speaker)
 
-        def spread(y):
-            if rescale_mode == "frame":
-                return y.square().mean(1, keepdim=True).sqrt()
-            frames = mask.sum((1, 2)).clamp_min(1.0) * self.n_mels
-            return ((y.square() * mask).sum((1, 2)) / frames).sqrt()[:, None, None]
-
-        def field(x, t, span=None):
-            now = float(t[0])
-            # An interval reaching 1 includes it, where Heun's last evaluation lands.
-            if count == 1 or not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
+        def velocity(x, t, span=None):
+            if count == 1 or not guidance.active(float(t[0])):
                 return self.backbone(x, t, cond[:batch], mask, voice[:batch], span)
-            v = self.backbone(repeat(x), repeat(t), cond, masks, voice, repeat(span)).chunk(count)
-            guided, index = v[0], 1
-            if cfg_scale != 1.0:
-                guided = guided + (cfg_scale - 1.0) * (v[0] - v[index])
-                index += 1
-            if content_guidance > 0:
-                guided = guided + content_guidance * (v[0] - v[index])
-            if guidance_rescale > 0:
-                rescaled = guided * spread(v[0]) / spread(guided).clamp_min(1e-6)
-                guided = guidance_rescale * rescaled + (1.0 - guidance_rescale) * guided
-            return guided
+            passes = self.backbone(repeat(x), repeat(t), cond, stacked.mask, voice, repeat(span))
+            return guidance.combine(passes.chunk(count), mask)
 
-        shape = (batch, self.n_mels, content.shape[1])
         if noise is None:
-            noise = torch.randn(shape, device=content.device)
+            noise = torch.randn((batch, self.n_mels, frames), device=inputs.content.device)
         noise = noise * float(temperature)
-        t0 = 0.0
-        if self.t_start > 0:
-            t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
-            x = ((1.0 - t0) * noise + t0 * self.aux(cond[:batch], mask)) * mask
-        else:
-            x = noise * mask
+        x, t0 = self._start(noise, cond[:batch], mask, start)
         times = time_grid(schedule, max(1, int(steps)), t0, x.device)
         for index in range(times.shape[0] - 1):
             now = float(times[index])
             back = max(self.t_start, now - float(churn) * float(times[index + 1] - times[index]))
             if churn > 0 and 0 < back < now:
-                # Keeps x on the path (1 - t) noise + t mel: the kept noise shrinks
-                # with the data and fresh noise tops it up to (1 - back).
                 fresh = torch.randn_like(x) if churn_noise is None else churn_noise(index)
-                scale = back / now
-                top_up = math.sqrt(max((1.0 - back) ** 2 - (scale * (1.0 - now)) ** 2, 0.0))
-                x = (scale * x + float(temperature) * top_up * fresh) * mask
+                x = self._renoise(x, now, back, fresh, float(temperature)) * mask
                 now = back
             t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
             dt = times[index + 1] - now
-            v = field(x, t, dt.expand(batch) if method == "mean" else None)
+            v = velocity(x, t, dt.expand(batch) if method == "mean" else None)
             if method == "heun":
-                v_next = field(x + dt * v, times[index + 1].expand(batch))
+                v_next = velocity(x + dt * v, times[index + 1].expand(batch))
                 v = 0.5 * (v + v_next)
             x = x + dt * v
             if callback is not None:
@@ -761,10 +857,6 @@ def resize_speakers(state_dict: dict, speaker_count: int) -> dict:
     state_dict = dict(state_dict)
     state_dict[key] = torch.cat((rows, null), dim=0)
     return state_dict
-
-
-#: Inputs that start at zero, so a checkpoint from before them loads unchanged.
-ZERO_INPUTS = ("encoder.tension.", "backbone.span_mlp.")
 
 
 def match_inputs(state_dict: dict, model: RectifiedFlow) -> dict:

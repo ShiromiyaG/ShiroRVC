@@ -482,10 +482,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
     def render_preview():
         if reference is None:
             return
-        ref_mel, _, ref_f0, _, _, ref_audio, _, ref_path, _ = reference
+        mel = normalize_mel(reference.mel.to(device), config["data"])
         with ema.applied(net_g), torch.no_grad():
-            generated = net_g(normalize_mel(ref_mel.to(device), config["data"]), ref_f0.to(device))
-        previews.log(epoch, step, ref_path, generated, ref_audio.to(device))
+            generated = net_g(mel, reference.inputs.f0.to(device))
+        previews.log(epoch, step, reference.path, generated, reference.audio.to(device))
 
     @torch.no_grad()
     def evaluate():

@@ -127,10 +127,10 @@ def main():
     reference = dataset.reference()
     if reference is None:
         raise SystemExit("No preview clip.")
-    ref_mel, content, f0, energy, breathiness, audio, sid, source, _ = reference
-    print(f"Clip: {source}, speaker {sid}")
-    content, f0, energy, breathiness = (x.to(device) for x in (content, f0, energy, breathiness))
-    ref_mel = ref_mel.to(device)
+    inputs = reference.inputs._replace(tension=None).to(device)
+    print(f"Clip: {reference.path}, speaker {int(inputs.speaker)}")
+    f0, audio = inputs.f0, reference.audio
+    ref_mel = reference.mel.to(device)
     frames = f0.shape[1]
     fps = int(data["sample_rate"]) / int(data["hop_length"])
 
@@ -146,16 +146,12 @@ def main():
             f"{cents_spread(pitch, fps, args.flatten_span):14.1f}"
         )
 
-    mask = torch.ones(1, 1, frames, device=device)
-    speaker = torch.tensor([sid], device=device)
     generator = torch.Generator(device=device).manual_seed(args.seed)
     noise = torch.randn(1, model.n_mels, frames, device=device, generator=generator)
     mels = {}
     with torch.no_grad():
         for name, pitch in variants.items():
-            generated = model.sample(
-                content, pitch, energy, speaker, mask, steps=args.steps, noise=noise, breathiness=breathiness
-            )
+            generated = model.sample(inputs._replace(f0=pitch), steps=args.steps, noise=noise)
             mels[name] = denormalize_mel(generated, data)
 
     freqs = torch.from_numpy(
