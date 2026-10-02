@@ -260,6 +260,14 @@ do not say is read from a `config.json` beside the file, and the 44.1 kHz releas
 defaults fill in the rest. `python rvc/rectified/openvpi.py <checkpoint> <out.pth>`
 converts one to a rectified vocoder export.
 
+OpenVPI's vocoder weights are licensed
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), not MIT:
+non-commercial use only, with attribution, and anything derived from them
+(a converted export, a fine-tune) stays under the same license. That covers
+`pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth`, which the prerequisites
+download fetches and which is a converted OpenVPI checkpoint. A PCPH-BigVGAN
+trained here from scratch is not derived from them.
+
 </details>
 
 <details>
@@ -358,4 +366,10 @@ catalog falls back to English silently rather than raising.
 
 ## License
 
-Released under the [MIT License](LICENSE).
+The code is released under the [MIT License](LICENSE).
+
+The OpenVPI NSF-HiFiGAN vocoder weights are not: they are © Team OpenVPI under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), which
+also applies to the converted `pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth`
+this project downloads. Audio rendered with them is for non-commercial use;
+see [SingingVocoders](https://github.com/openvpi/SingingVocoders).
