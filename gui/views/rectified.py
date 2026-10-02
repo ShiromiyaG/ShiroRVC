@@ -163,7 +163,7 @@ class RectifiedPage(Page):
         models.add(
             self.flow_submodel_field,
             Field(_("Vocoder model"), self.vocoder_model,
-                  _("Rectified NSF-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint. "
+                  _("Rectified PCPH-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint. "
                     "Follows the vocoder the flow was trained with when a file of that name is here.")),
             Field(_("Index"), self.index_file,
                   _("Optional RVC index over the voice model's training features. "
@@ -675,7 +675,7 @@ class RectifiedPage(Page):
     def _build_vocoder_card(self) -> Card:
         card = Card(
             _("Vocoder Pretrain"),
-            _("Builds the NSF-BigVGAN vocoder pretrain, on a large multi-speaker dataset. Not needed "
+            _("Builds the PCPH-BigVGAN vocoder pretrain, on a large multi-speaker dataset. Not needed "
               "to fine-tune a voice: the vocoder has no speaker input, so one pretrain renders every voice."),
             icon="volume",
         )
@@ -686,6 +686,12 @@ class RectifiedPage(Page):
             Field(_("Pretrained generator"), self.pretrained_g, _("Optional checkpoint or export to fine-tune from.")),
             Field(_("Pretrained discriminator"), self.pretrained_d, _("Optional. The matching D checkpoint.")),
         )
+        self.voc_degradation = SliderSpin(0, 1, 0.05, decimals=2, value=0.0)
+        card.add(Field(
+            _("Mel degradation"), self.voc_degradation,
+            _("Trains on mels slightly blurred, duller in the highs and noisy, like a flow model's, "
+              "with the real audio as target. 0 is off; 0.5 is a moderate start."),
+        ))
         self.voc_checkpoints, voc_checkpoints_field = _checkpoint_field()
         self.voc_fresh = Toggle(_("Fresh training"), _("Ignore this run's checkpoints and start over."))
         card.add(voc_checkpoints_field, self.voc_fresh)
@@ -847,6 +853,7 @@ class RectifiedPage(Page):
             "checkpoints": self.voc_checkpoints.value(),
             "fresh": self.voc_fresh.isChecked(),
             "precision": self.precision.value(),
+            "mel_degradation": self.voc_degradation.value(),
         }
 
     def _start_flow(self) -> None:

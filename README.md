@@ -173,7 +173,7 @@ multi-speaker dataset in the **Vocoder Pretrain** tab, or:
 python core.py rectified_train_vocoder --model_name big-dataset --gpu 0-1 --batch_size 16
 ```
 
-It trains NSF-BigVGAN against the same 44.1 kHz mel and writes
+It trains PCPH-BigVGAN against the same 44.1 kHz mel and writes
 `logs/<name>/vocoder/<name>_vocoder_<epoch>e_<step>s.pth`.
 
 ### Watching it learn
@@ -249,7 +249,7 @@ shallow diffusion, trained as a rectified flow.
 <details>
 <summary><b>The vocoders</b></summary>
 
-| | **NSF-BigVGAN** (trained here) | **OpenVPI NSF-HiFiGAN** |
+| | **PCPH-BigVGAN** (trained here) | **OpenVPI NSF-HiFiGAN** |
 | --- | --- | --- |
 | Where it comes from | Vocoder Pretrain (`rectified_train_vocoder`) | [SingingVocoders](https://github.com/openvpi/SingingVocoders) releases, `pc-nsf-hifigan` included |
 | Generator | SnakeBeta, anti-aliased AMP blocks, `[4, 4, 4, 4, 2]` upsampling, rectified harmonic source | NSF-HiFiGAN, loaded as-is |
@@ -345,7 +345,7 @@ catalog falls back to English silently rather than raising.
   44.1 kHz mel the rectified pipeline uses and the NSF-HiFiGAN generator ported
   to render it, including the pc-nsf-hifigan release.
 - **[BigVGAN](https://github.com/NVIDIA/BigVGAN)** (NVIDIA) — SnakeBeta and the
-  anti-aliased AMP blocks behind the NSF-BigVGAN vocoder.
+  anti-aliased AMP blocks behind the PCPH-BigVGAN vocoder.
 - **[Muon](https://kellerjordan.github.io/posts/muon/)** (Keller Jordan) — the
   Newton-Schulz orthogonalised optimizer.
 - **[Applio](https://github.com/IAHispano/Applio)** — the base for this fork.

@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from typing import Callable, Optional
 
 import torch
@@ -502,7 +503,13 @@ class RectifiedFlow(nn.Module):
         t, span = torch.minimum(first, second), (first - second).abs()
         x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
         velocity = mel - noise
-        mean, derivative = mean_field(x_t, t, span, velocity, cond, mask, voice)
+        # The time derivative passes FP16's range, so it is taken in FP32 there.
+        kind = mel.device.type
+        fp16 = torch.is_autocast_enabled(kind) and torch.get_autocast_dtype(kind) == torch.float16
+        if fp16:
+            cond, voice = cond.float(), voice.float()
+        with torch.autocast(kind, enabled=False) if fp16 else nullcontext():
+            mean, derivative = mean_field(x_t, t, span, velocity, cond, mask, voice)
         # The mean over [t, t + span] is the velocity at t plus span times its
         # own derivative in t; the network's derivative stands in as a target.
         correction = span[:, None, None] * derivative.float() * mask

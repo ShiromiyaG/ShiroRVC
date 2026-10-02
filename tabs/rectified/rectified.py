@@ -104,7 +104,7 @@ def rectified_inference_tab():
             )
             vocoder_model = gr.Dropdown(
                 label=_("Vocoder Model"),
-                info=_("Rectified NSF-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint that renders the mel."),
+                info=_("Rectified PCPH-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint that renders the mel."),
                 choices=vocoders,
                 value=_first(vocoders),
                 interactive=True,
@@ -1010,7 +1010,7 @@ def rectified_training_tab():
 
     with gr.Tab(_("Vocoder Pretrain")):
         gr.Markdown(
-            _("Builds the NSF-BigVGAN vocoder pretrain, on a large multi-speaker "
+            _("Builds the PCPH-BigVGAN vocoder pretrain, on a large multi-speaker "
               "dataset. Not needed to fine-tune a voice: the vocoder has no "
               "speaker input, so one pretrain renders every voice model.")
         )
@@ -1033,9 +1033,20 @@ def rectified_training_tab():
                 interactive=True,
                 allow_custom_value=True,
             )
+        gr.Markdown(f"#### {_('Robustness')}")
+        voc_degradation = gr.Slider(
+            minimum=0.0,
+            maximum=1.0,
+            step=0.05,
+            label=_("Mel Degradation"),
+            info=_("Trains the vocoder on mels that are slightly blurred, duller in the highs and noisy, like the ones a flow model generates, while the target stays the real audio. Makes it more forgiving of generated mels. 0 is off; 0.5 is a moderate start. Half of each batch always stays clean."),
+            value=0.0,
+            interactive=True,
+        )
         voc_checkpoints, voc_fresh = _checkpoint_controls("vocoder")
 
-        def start_vocoder(name, epochs, save, batch, gpu_ids, g_path, d_path, checkpoints, fresh):
+        def start_vocoder(name, epochs, save, batch, gpu_ids, g_path, d_path, checkpoints, fresh,
+                          degradation):
             return run_rectified_vocoder_train_script(
                 model_name=name,
                 total_epochs=epochs,
@@ -1047,12 +1058,13 @@ def rectified_training_tab():
                 checkpoints=checkpoints,
                 fresh=fresh,
                 precision=get_training_precision(),
+                mel_degradation=degradation,
             )
 
         _start_stop(
             start_vocoder,
             [model_name, voc_epochs, voc_save, voc_batch, gpu, pretrained_g,
-             pretrained_d, voc_checkpoints, voc_fresh],
+             pretrained_d, voc_checkpoints, voc_fresh, voc_degradation],
         )
 
     def refresh():

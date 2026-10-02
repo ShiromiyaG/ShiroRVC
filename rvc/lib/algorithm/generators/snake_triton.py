@@ -1,4 +1,4 @@
-"""Triton kernels for NSF-BigVGAN's anti-aliased SnakeBeta.
+"""Triton kernels for PCPH-BigVGAN's anti-aliased SnakeBeta.
 
 One op for ``AntiAliasedActivation(SnakeBeta)`` at factor 2, width 16: the
 2x polyphase upsampler, SnakeBeta and the 65-tap stride-2 lowpass.  The

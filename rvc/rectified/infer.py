@@ -53,7 +53,7 @@ VOCODER_CROSSFADE = 4
 
 
 class RectifiedConverter:
-    """Audio -> content and f0 -> rectified flow -> mel -> NSF-BigVGAN."""
+    """Audio -> content and f0 -> rectified flow -> mel -> PCPH-BigVGAN."""
 
     def __init__(self):
         from rvc.configs.config import Config

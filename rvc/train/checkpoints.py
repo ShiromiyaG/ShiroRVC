@@ -296,7 +296,7 @@ def decoder_layout(model):
         # activations gone it is the last signal-path choice in this decoder
         # that no weight records.
         "upsample_filter": upsample_filter(decoder),
-        # NSF-BigVGAN's resblock type and per-stage oversampling.  The plain
+        # PCPH-BigVGAN's resblock type and per-stage oversampling.  The plain
         # and oversampled activations share their keys.
         "snake_layout": getattr(decoder, "snake_layout", None),
     }

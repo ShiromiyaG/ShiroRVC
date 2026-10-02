@@ -444,7 +444,7 @@ class NoiseBranch(nn.Module):
             )
 
 
-class NSFBigVGANGenerator(nn.Module):
+class PCPHBigVGANGenerator(nn.Module):
     """BigVGAN v2 at voice scale, driven by a harmonic-plus-noise excitation.
 
     Against BigVGAN v2: RefineGAN2's width (``upsample_initial_channel`` 512

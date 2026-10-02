@@ -52,7 +52,7 @@
         ]
     },
     "nsf-bigvgan": {
-        "label": "NSF-BigVGAN",
+        "label": "PCPH-BigVGAN",
         "enabled": false,
         "description": "BigVGAN v2's anti-aliased SnakeBeta generator at RefineGAN v2's size, driven by the same multi-harmonic excitation at every stage and trained against RefineGAN v2's discriminators. Needs its own pretrain. 32 kHz only.",
         "architecture": "nsf-bigvgan",
@@ -66,7 +66,10 @@
         "architecture_id": "nsf_bigvgan_v1",
         "aliases": [
             "bigvgan",
-            "nsf_bigvgan"
+            "nsf_bigvgan",
+            "NSF-BigVGAN",
+            "pcph-bigvgan",
+            "pcph_bigvgan"
         ]
     }
 }

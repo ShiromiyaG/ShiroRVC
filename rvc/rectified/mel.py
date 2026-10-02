@@ -51,6 +51,11 @@ class LogMel(nn.Module):
         if win_length != self.win_length:
             window = torch.hann_window(win_length, device=audio.device)
         pad = win_length - hop_length
+        # Reflection needs more samples than it pads: a shorter clip gets
+        # trailing silence, and its extra frames are the caller's to drop.
+        short = (pad + 1) // 2 + 1 - audio.shape[-1]
+        if short > 0:
+            audio = F.pad(audio, (0, short))
         audio = F.pad(
             audio.float().unsqueeze(1), (pad // 2, (pad + 1) // 2), mode="reflect"
         ).squeeze(1)
@@ -76,3 +81,33 @@ def normalize_mel(mel: torch.Tensor, data: dict) -> torch.Tensor:
 
 def denormalize_mel(mel: torch.Tensor, data: dict) -> torch.Tensor:
     return mel * data["mel_std"] + data["mel_mean"]
+
+
+#: At full strength: how far the top band drops and the noise's spread, in
+#: normalised mel units.
+DEGRADE_HIGH_BAND = 0.5
+DEGRADE_NOISE = 0.3
+
+
+def degrade_mel(mel: torch.Tensor, strength: float) -> torch.Tensor:
+    """Normalised ``mel`` [batch, n_mels, frames] with the kinds of error a
+    generated mel carries, so a vocoder trained on it tolerates them: blur
+    along time and along frequency, a duller top band and noise. Each is drawn
+    per item up to ``strength`` (0 to 1) of its full amount; half the items
+    stay clean, which keeps the vocoder exact on a real mel.
+    """
+    batch, bands = mel.shape[0], mel.shape[1]
+
+    def amount():
+        return torch.rand(batch, 1, 1, device=mel.device) * strength
+
+    out = torch.lerp(mel, F.avg_pool1d(F.pad(mel, (1, 1), mode="replicate"), 3, 1), amount())
+    across = F.avg_pool1d(F.pad(out.transpose(1, 2), (1, 1), mode="replicate"), 3, 1).transpose(1, 2)
+    out = torch.lerp(out, across, amount())
+    # A ramp down from a band drawn in the upper two thirds to the top.
+    start = 0.3 + 0.6 * torch.rand(batch, 1, 1, device=mel.device)
+    position = torch.linspace(0.0, 1.0, bands, device=mel.device).view(1, -1, 1)
+    out = out - DEGRADE_HIGH_BAND * amount() * ((position - start) / (1.0 - start)).clamp(0.0, 1.0)
+    out = out + DEGRADE_NOISE * amount() * torch.randn_like(out)
+    clean = torch.rand(batch, 1, 1, device=mel.device) < 0.5
+    return torch.where(clean, mel, out)

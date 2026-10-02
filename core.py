@@ -690,6 +690,7 @@ def run_rectified_vocoder_train_script(
     checkpoints: str = "latest",
     fresh: bool = False,
     precision: str = "fp32",
+    mel_degradation: float = 0.0,
 ):
     return _run_rectified_trainer(
         "train_vocoder",
@@ -704,6 +705,7 @@ def run_rectified_vocoder_train_script(
             "checkpoints": str(checkpoints),
             "fresh": bool(fresh),
             "precision": str(precision).lower(),
+            "mel_degradation": float(mel_degradation or 0.0),
         },
     )
 
@@ -974,7 +976,7 @@ def rectified_train_flow(**kwargs):
 @cli.command("rectified_train_vocoder")
 @apply_options(RECTIFIED_TRAIN_VOCODER_OWN)
 def rectified_train_vocoder(**kwargs):
-    """Pretrain the rectified-flow NSF-BigVGAN vocoder on an extracted experiment."""
+    """Pretrain the rectified-flow PCPH-BigVGAN vocoder on an extracted experiment."""
     run_rectified_vocoder_train_script(**kwargs)
 
 

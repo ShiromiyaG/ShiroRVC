@@ -193,7 +193,7 @@ class Synthesizer(torch.nn.Module):
             )
         elif generator_id == "nsf_bigvgan":
             self._assert_rate_supported(vocoder_spec, sr)
-            self.dec = generators.NSFBigVGANGenerator(
+            self.dec = generators.PCPHBigVGANGenerator(
                 sample_rate=int(sr),
                 upsample_rates=tuple(dec_kwargs["upsample_rates"]),
                 upsample_initial_channel=dec_kwargs["upsample_initial_channel"],

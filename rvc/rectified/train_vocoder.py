@@ -1,4 +1,4 @@
-"""Train the NSF-BigVGAN mel vocoder of the rectified pipeline.
+"""Train the PCPH-BigVGAN mel vocoder of the rectified pipeline.
 
 Usage: python rvc/rectified/train_vocoder.py <spec.json>
 """
@@ -39,7 +39,7 @@ from rvc.rectified.common import (
     split_holdout,
 )
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
-from rvc.rectified.mel import normalize_mel
+from rvc.rectified.mel import degrade_mel, normalize_mel
 from rvc.rectified.previews import RectifiedPreviews
 from rvc.rectified.vocoder import build_discriminator, build_vocoder
 from rvc.train.balance import FamilyReducer, head_accuracies
@@ -68,6 +68,9 @@ TAG = "[VOCODER]"
 METRICS_INTERVAL = 8
 ACCURACY_SAMPLE_EVERY = 4
 SAN_DIRECTION_WEIGHT = 0.25
+#: Ceiling of the FP16 GradScaler's scale: left to grow, it doubles until a
+#: gradient overflows and a step is skipped.
+MAX_GRAD_SCALE = 2.0**16
 
 
 def generator_gradient_metrics(net_g):
@@ -320,6 +323,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     reference = dataset.reference() if main_rank else None
     total_epochs = int(spec["total_epochs"])
     save_every = max(1, int(spec["save_every"]))
+    # Only the generator's input: the target, the losses, D's mel and the
+    # held-out evaluation stay on the real mel.
+    degradation = min(1.0, max(0.0, float(spec.get("mel_degradation", 0.0))))
 
     if main_rank:
         print_model_summary(
@@ -332,6 +338,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Clips", f"{len(dataset)} ({len(loader)} steps per epoch)"
                  + (f", {len(holdout_entries)} held out" if holdout_entries else "")),
                 ("Batch size", batch_size),
+                ("Mel degradation", f"{degradation:g}" if degradation > 0 else "off"),
                 ("Epochs", f"{epoch} -> {total_epochs}, saving every {save_every}"),
                 ("Starting point", starting_point),
                 ("PRECISION", precision_label(amp_dtype)),
@@ -533,7 +540,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     net_d.set_mel_cond_scale(mel_cond_scale())
 
                 with autocast():
-                    y_hat = train_g(mel, f0)
+                    y_hat = train_g(degrade_mel(mel, degradation) if degradation > 0 else mel, f0)
                     y_d_r, y_d_g, _, _ = train_d(
                         y, y_hat.detach(), san_training=san, combine_inputs=True, cond=d_cond
                     )
@@ -590,6 +597,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     overflowed = scaler.get_scale() < scale
                     skipped += int(overflowed)
                     skip_cache.append(float(overflowed))
+                    if not overflowed and scaler.get_scale() > MAX_GRAD_SCALE:
+                        scaler.update(MAX_GRAD_SCALE)
                 ema.update(net_g)
                 if step_schedulers:
                     for scheduler in (scheduler_g, scheduler_d):

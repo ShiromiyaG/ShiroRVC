@@ -61,6 +61,9 @@ METRICS_INTERVAL = 8
 PREVIEW_STEPS = 16
 #: Where in the trained time range the validation loss is taken.
 EVAL_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
+#: Ceiling of the FP16 GradScaler's scale: left to grow, it reaches ~2^22,
+#: where the weight gradients overflow and a step is skipped.
+MAX_GRAD_SCALE = 2.0**16
 
 
 def learning_rate(base, step, warmup, total, final_ratio):
@@ -270,6 +273,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
         model.load_state_dict(match_inputs(weights, model))
         ema.reseed(model)
         starting_point = f"fine-tune from {os.path.basename(spec['pretrained_flow'])}"
+    # Its CPU copy would otherwise stay in RAM for the whole run.
+    state = None
 
     writer = SummaryWriter(os.path.join(out_dir, "eval")) if main_rank else None
     previews = RectifiedPreviews(out_dir, config, step, device) if main_rank else None
@@ -489,6 +494,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     scaler.update()
                     if scaler.get_scale() < scale:
                         skipped += 1
+                    elif scaler.get_scale() > MAX_GRAD_SCALE:
+                        scaler.update(MAX_GRAD_SCALE)
                 ema.update(model)
                 step += 1
                 step_time += time.perf_counter() - step_started

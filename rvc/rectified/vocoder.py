@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from rvc.lib.algorithm.generators.nsf_bigvgan import NSFBigVGANGenerator
+from rvc.lib.algorithm.generators.pcph_bigvgan import PCPHBigVGANGenerator
 
 #: Mel settings a vocoder must share with the flow to render its output.
 MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax")
@@ -13,7 +13,7 @@ MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_f
 #: RefineGAN2's four-stage widths extended on their own reasoning: the first
 #: stage short, where a long kernel reaches furthest into the padded edge, the
 #: later ones long; the last repeats the one before it. Rolloffs as
-#: ``nsf_bigvgan.UPSAMPLE_ROLLOFF``, with no image above Nyquist. The config's
+#: ``pcph_bigvgan.UPSAMPLE_ROLLOFF``, with no image above Nyquist. The config's
 #: ``filter_width``, ``rolloff`` and ``filter_beta`` override them, and another
 #: stage count keeps the generator's own (the older ``[5, 4, 4, 4]`` exports).
 FILTER_WIDTH = (12, 24, 32, 48, 48)
@@ -21,8 +21,8 @@ ROLLOFF = (0.84, 0.92, 0.94, 0.94, 0.94)
 FILTER_BETA = (6.0, 6.0, 6.0, 9.0, 9.0)
 
 
-def build_vocoder(config: dict) -> NSFBigVGANGenerator:
-    """NSF-BigVGAN from f0 and the *normalised* log mel (``normalize_mel``),
+def build_vocoder(config: dict) -> PCPHBigVGANGenerator:
+    """PCPH-BigVGAN from f0 and the *normalised* log mel (``normalize_mel``),
     with no speaker input. The raw log mel sits around -5 with a spread of
     ~3, several times the scale the trunk's init expects."""
     model = config["vocoder"]["model"]
@@ -34,7 +34,7 @@ def build_vocoder(config: dict) -> NSFBigVGANGenerator:
                              ("filter_beta", FILTER_BETA))
         if key in model or len(default) == stages
     }
-    return NSFBigVGANGenerator(
+    return PCPHBigVGANGenerator(
         sample_rate=data["sample_rate"],
         upsample_rates=tuple(model["upsample_rates"]),
         upsample_initial_channel=model["upsample_initial_channel"],
@@ -60,7 +60,7 @@ def build_vocoder(config: dict) -> NSFBigVGANGenerator:
 
 
 def build_discriminator(config: dict, use_checkpointing: bool = False):
-    """The NSF-BigVGAN recipe's discriminator (v4 + UnivHD + SAN).
+    """The PCPH-BigVGAN recipe's discriminator (v4 + UnivHD + SAN).
 
     ``d_mrd_mel_cond`` conditions its spectrogram branches on the normalised
     mel the vocoder is given; the discriminator then takes it as ``cond``."""
@@ -107,7 +107,7 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict):
-    """A rectified vocoder export (NSF-BigVGAN or converted OpenVPI) or an
+    """A rectified vocoder export (PCPH-BigVGAN or converted OpenVPI) or an
     OpenVPI NSF-HiFiGAN checkpoint as a module taking the normalised mel of ``data`` and f0, and its mel settings.
 
     Raises ``ValueError`` when ``path`` is neither or renders another mel."""
