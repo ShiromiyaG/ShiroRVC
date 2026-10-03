@@ -377,7 +377,9 @@ catalog falls back to English silently rather than raising.
 
 ## License
 
-The code is released under the [MIT License](LICENSE).
+The code is released under the [MIT License](LICENSE). Code ported from other
+projects keeps their licenses, listed in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
 The OpenVPI NSF-HiFiGAN vocoder weights are not: they are © Team OpenVPI under
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), which
