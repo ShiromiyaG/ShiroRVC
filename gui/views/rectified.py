@@ -601,7 +601,7 @@ class RectifiedPage(Page):
         self.flow_pretrained = Toggle(
             _("Start from a pretrained flow"),
             _("The default pretrain for the embedder the experiment was extracted with "
-              "(pretrain_flow_contentvec.pth or pretrain_flow_spin_v2.pth). Off trains from scratch."),
+              "(pretrain_flow_contentvec_cc_by_nc_sa.pth or pretrain_flow_spin_v2.pth). Off trains from scratch."),
             checked=True,
         )
         self.flow_custom = Toggle(_("Use my own pretrained flow"), "")

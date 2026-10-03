@@ -43,7 +43,10 @@
             "source_random_start_phase": true,
             "source_noise_eq": [[0, 0], [1000, 1.5], [1500, 5], [2000, 7], [4000, 8], [5000, 11], [7000, 13],
                                 [8000, 14], [9000, 15], [10000, 19], [11000, 16], [12000, 18], [14000, 0]],
+            "source_max_frequency": 16000,
+            "source_pulsed_noise": false,
             "noise_branch_bands": 32,
+            "noise_branch_split_source": true,
             "output_gain": true
         },
         "discriminator": {

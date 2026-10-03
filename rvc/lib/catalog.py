@@ -26,7 +26,7 @@ RECTIFIED_PRETRAINED_DIR = MODELS_DIR / "pretraineds" / "rectified"
 #: ``RECTIFIED_PRETRAINED_DIR``; a pretrain only fits the features it was
 #: trained on.
 RECTIFIED_FLOW_PRETRAINS = {
-    "contentvec": "pretrain_flow_contentvec.pth",
+    "contentvec": "pretrain_flow_contentvec_cc_by_nc_sa.pth",
     "spin_v2": "pretrain_flow_spin_v2.pth",
 }
 

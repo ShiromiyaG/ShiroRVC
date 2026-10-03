@@ -134,7 +134,7 @@ Then run the steps in order. In the apps they are numbered; on the command line:
 python core.py rectified_preprocess --model_name my-voice --dataset_path assets/datasets/my-voice
 python core.py rectified_extract    --model_name my-voice --gpu 0
 python core.py rectified_train_flow --model_name my-voice --gpu 0 \
-    --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec.pth \
+    --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec_cc_by_nc_sa.pth \
     --vocoder rvc/models/pretraineds/rectified/<vocoder>.pth
 python core.py index                --model_name my-voice   # optional
 ```
@@ -142,7 +142,7 @@ python core.py index                --model_name my-voice   # optional
 - **The starting point.** Fine-tuning from a pretrained flow is the normal way
   to train a voice. A pretrain only fits the content features it was trained on,
   so in the apps **Pretrained** picks the one for the embedder you extracted with:
-  `pretrain_flow_contentvec.pth` (downloaded on first launch) or
+  `pretrain_flow_contentvec_cc_by_nc_sa.pth` (downloaded on first launch) or
   `pretrain_flow_spin_v2.pth`, in `rvc/models/pretraineds/rectified/`. A pretrain
   of the other embedder is refused. Its speakers are replaced by your dataset's.
   On a single-speaker fine-tune, the time and speaker conditioning stays frozen,

@@ -831,7 +831,7 @@ def rectified_training_tab():
                 flow_pretrained = gr.Checkbox(
                     label=_("Pretrained"),
                     info=_("Fine-tune the default pretrained flow for the embedder the experiment "
-                           "was extracted with: pretrain_flow_contentvec.pth or pretrain_flow_spin_v2.pth "
+                           "was extracted with: pretrain_flow_contentvec_cc_by_nc_sa.pth or pretrain_flow_spin_v2.pth "
                            "in rvc/models/pretraineds/rectified."),
                     value=True,
                     interactive=True,
