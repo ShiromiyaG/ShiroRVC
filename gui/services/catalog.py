@@ -221,9 +221,9 @@ def list_rectified_exports(kind: str) -> list[str]:
     """``rvc.rectified.common.list_exports``, without its torch import."""
     shared = _shared()
     found = list(paths.LOGS_DIR.glob(f"*/{kind}/*_{kind}_*.pth"))
-    found += _rectified_pretrained_exports(kind)
     if kind == "vocoder":
-        found += paths.RECTIFIED_PRETRAINED_DIR.glob("*.ckpt")
+        found += paths.RECTIFIED_VOCODER_DIR.glob("*.pth")
+        found += paths.RECTIFIED_VOCODER_DIR.glob("*.ckpt")
     listed = sorted((shared.relative(path) for path in found), key=shared.sort_key)
     if kind == "flow":
         listed += shared.list_bundles(paths.LOGS_DIR, "rectified_flow")
@@ -239,11 +239,12 @@ def list_rectified_pretrained(kind: str) -> list[str]:
         "flow": ["F_*.pth", "*_flow_*.pth", "*_flow.pth"],
     }[kind]
     folder = "flow" if kind == "flow" else "vocoder"
+    shared_dir = paths.RECTIFIED_PRETRAINED_DIR if kind == "flow" else paths.RECTIFIED_VOCODER_DIR
     found = []
     for pattern in patterns:
         found += paths.LOGS_DIR.glob(f"*/{folder}/{pattern}")
         if not pattern.endswith(("G_*.pth", "D_*.pth", "F_*.pth")):
-            found += paths.RECTIFIED_PRETRAINED_DIR.glob(pattern)
+            found += shared_dir.glob(pattern)
     letter = {"vocoder_g": "G", "vocoder_d": "D", "flow": "F"}[kind]
     return sorted(shared.relative(path) for path in found) + list_custom_pretraineds(letter)
 
@@ -260,9 +261,11 @@ def default_flow_pretrain(model_name: str) -> tuple[str, str, str]:
 def default_rectified_pretrained(kind: str) -> str:
     """``rvc.rectified.common.default_pretrained``, relative, or ``""``."""
     shared = _shared()
-    found = [str(path) for path in _rectified_pretrained_exports(kind)]
-    if not found and kind == "vocoder":
-        found = [str(path) for path in paths.RECTIFIED_PRETRAINED_DIR.glob("*.ckpt")]
+    if kind == "vocoder":
+        folder = paths.RECTIFIED_VOCODER_DIR
+        found = [str(path) for path in folder.glob("*.pth")] or [str(path) for path in folder.glob("*.ckpt")]
+    else:
+        found = [str(path) for path in _rectified_pretrained_exports(kind)]
     return shared.relative(max(found, key=shared.sort_key)) if found else ""
 
 

@@ -135,7 +135,7 @@ python core.py rectified_preprocess --model_name my-voice --dataset_path assets/
 python core.py rectified_extract    --model_name my-voice --gpu 0
 python core.py rectified_train_flow --model_name my-voice --gpu 0 \
     --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec_cc_by_nc_sa.pth \
-    --vocoder rvc/models/pretraineds/rectified/<vocoder>.pth
+    --vocoder rvc/models/vocoders/<vocoder>.pth
 python core.py index                --model_name my-voice   # optional
 ```
 
@@ -198,7 +198,7 @@ Pick a flow model, a vocoder and optionally an index, then an input file:
 ```bash
 python core.py rectified_infer --input_path in.wav --output_path out.wav \
     --flow_path logs/my-voice/flow/my-voice_flow_100e_8400s.pth \
-    --vocoder_path rvc/models/pretraineds/rectified/<vocoder>.pth
+    --vocoder_path rvc/models/vocoders/<vocoder>.pth
 ```
 
 Everything else has a working default. The controls worth knowing:
@@ -218,7 +218,7 @@ they need no splitting.
 A flow can also come from a model bundle (`.srvc`, made in *Utilities → Model
 Bundles*), with its index inside. The bundle only names the flow's vocoder,
 without storing it. The vocoder is picked for you when a file of that name is
-in `rvc/models/pretraineds/rectified/` or `logs/`.
+in `rvc/models/vocoders/` or `logs/`.
 
 ## Under the hood
 

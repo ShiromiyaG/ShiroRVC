@@ -46,6 +46,7 @@ temp/
 !logs/mute_spin_v2/
 !logs/mute_spin_wavlm_512/
 rvc/models/pretraineds/
+rvc/models/vocoders/
 rvc/models/predictors/fcpe.pt
 rvc/models/predictors/fcpe_ddsp.pt
 rvc/models/predictors/rmvpe.pt

@@ -95,7 +95,7 @@ folder_mapping_list = {
     "predictors/": "rvc/models/predictors/",
     "fireredvad/VAD/": "rvc/models/fireredvad/VAD/",
     "formant/": "rvc/models/formant/",
-    "vocoders/": "rvc/models/pretraineds/rectified/",
+    "vocoders/": "rvc/models/vocoders/",
     "Rectified_pretrains/": "rvc/models/pretraineds/rectified/",
 }
 

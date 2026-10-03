@@ -24,8 +24,10 @@ DEFAULT_CONFIG = os.path.join(ROOT, "rvc", "configs", "rectified", "44100.json")
 #: Frame rate of the extracted pitch, of the content once ``upsample_content``
 #: has doubled it, and of ``frame_energy``.
 FEATURE_RATE = 100
-#: Where downloaded rectified pretrains (flow and vocoder exports) go.
+#: Where downloaded rectified flow pretrains go.
 PRETRAINED_DIR = os.path.join(MODELS_DIR, "pretraineds", "rectified")
+#: Where the vocoders the flows render through go.
+VOCODER_DIR = os.path.join(MODELS_DIR, "vocoders")
 
 
 #: The trainers' folders inside an experiment, one per model.
@@ -513,17 +515,21 @@ def _pretrained_exports(kind: str) -> list:
             + glob.glob(os.path.join(PRETRAINED_DIR, f"*_{kind}.pth")))
 
 
+def _vocoder_files(pattern: str) -> list:
+    return glob.glob(os.path.join(VOCODER_DIR, pattern))
+
+
 def list_exports(kind: str) -> list:
-    """Exported ``kind`` models (``flow`` or ``vocoder``) under
-    ``logs/*/<kind>`` and ``PRETRAINED_DIR``; for flows, also the bundles
-    holding one; for vocoders, the OpenVPI checkpoints (``*.ckpt``)."""
+    """Models to render with: exported ``kind`` models (``flow`` or
+    ``vocoder``) under ``logs/*/<kind>``; for flows, also the bundles holding
+    one; for vocoders, also ``VOCODER_DIR``'s exports and OpenVPI checkpoints
+    (``*.ckpt``). The flow pretrains are starting points and are left out."""
     from rvc.lib.catalog import list_bundles, relative, sort_key
     from rvc.lib.model_bundle import RECTIFIED_KIND
 
     paths = glob.glob(os.path.join(LOGS_DIR, "*", kind, f"*_{kind}_*.pth"))
-    paths += _pretrained_exports(kind)
     if kind == "vocoder":
-        paths += glob.glob(os.path.join(PRETRAINED_DIR, "*.ckpt"))
+        paths += _vocoder_files("*.pth") + _vocoder_files("*.ckpt")
     found = sorted((relative(path) for path in paths), key=sort_key)
     if kind == "flow":
         found += list_bundles(LOGS_DIR, RECTIFIED_KIND)
@@ -582,11 +588,12 @@ def list_pretrained(kind: str) -> list:
         "flow": ["F_*.pth", "*_flow_*.pth", "*_flow.pth"],
     }[kind]
     folder = "flow" if kind == "flow" else "vocoder"
+    shared = PRETRAINED_DIR if kind == "flow" else VOCODER_DIR
     found = []
     for pattern in patterns:
         found += glob.glob(os.path.join(LOGS_DIR, "*", folder, pattern))
         if not pattern.endswith(("G_*.pth", "D_*.pth", "F_*.pth")):
-            found += glob.glob(os.path.join(PRETRAINED_DIR, pattern))
+            found += glob.glob(os.path.join(shared, pattern))
     custom = list_custom_pretraineds({"vocoder_g": "G", "vocoder_d": "D", "flow": "F"}[kind])
     return sorted(relative(path) for path in found) + custom
 
@@ -621,11 +628,13 @@ def precision_label(amp_dtype) -> str:
 
 
 def default_pretrained(kind: str):
-    """The newest ``kind`` export (``flow`` or ``vocoder``) in ``PRETRAINED_DIR``,
-    else for vocoders the newest OpenVPI checkpoint there, or None."""
+    """The newest ``flow`` pretrain in ``PRETRAINED_DIR``, or the newest
+    ``vocoder`` export in ``VOCODER_DIR``, else the newest OpenVPI checkpoint
+    there; None when there is none."""
     from rvc.lib.catalog import sort_key
 
-    paths = _pretrained_exports(kind)
-    if not paths and kind == "vocoder":
-        paths = glob.glob(os.path.join(PRETRAINED_DIR, "*.ckpt"))
+    if kind == "vocoder":
+        paths = _vocoder_files("*.pth") or _vocoder_files("*.ckpt")
+    else:
+        paths = _pretrained_exports(kind)
     return max(paths, key=sort_key) if paths else None

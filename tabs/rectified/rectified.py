@@ -26,7 +26,14 @@ from rvc.lib import catalog
 from rvc.lib.i18n import _
 from rvc.lib.model_bundle import is_model_bundle
 from rvc.lib.terminal import DEFAULT_CPU_THREADS
-from rvc.rectified.common import PRETRAINED_DIR, default_pretrained, describe_flow, list_exports, list_pretrained
+from rvc.rectified.common import (
+    PRETRAINED_DIR,
+    VOCODER_DIR,
+    default_pretrained,
+    describe_flow,
+    list_exports,
+    list_pretrained,
+)
 from rvc.rectified.flow_model import RESCALE_MODES, SAMPLERS, SCHEDULES
 from tabs.inference.inference import F0_METHODS, EXPORT_FORMATS, save_to_wav, save_to_wav2
 from tabs.train.descs import (
@@ -59,12 +66,14 @@ def flow_info(flow_path, submodel=None):
 
 
 def save_uploaded_pretrained(path):
-    """Copy an uploaded .pth into the rectified pretrain folder."""
+    """Copy an uploaded .pth into the rectified pretrain folder, or into the
+    vocoder folder when its name says it is one."""
     if not path or not path.endswith(".pth"):
         gr.Info(_("Invalid pretrained file."))
         return
-    os.makedirs(PRETRAINED_DIR, exist_ok=True)
-    shutil.copy(path, os.path.join(PRETRAINED_DIR, os.path.basename(path)))
+    folder = VOCODER_DIR if "_vocoder" in os.path.basename(path) else PRETRAINED_DIR
+    os.makedirs(folder, exist_ok=True)
+    shutil.copy(path, os.path.join(folder, os.path.basename(path)))
     gr.Info(_("Pretrained file added."))
 
 
@@ -876,7 +885,7 @@ def rectified_training_tab():
             custom_vocoder = gr.Dropdown(
                 label=_("Vocoder"),
                 info=_("Renders the audio previews and is paired with the exported model. "
-                       "Empty uses the newest in rvc/models/pretraineds/rectified."),
+                       "Empty uses the newest in rvc/models/vocoders."),
                 choices=list_exports("vocoder"),
                 value=catalog.relative(default_vocoder) if default_vocoder else None,
                 interactive=True,

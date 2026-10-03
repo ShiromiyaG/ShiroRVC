@@ -29,8 +29,10 @@ FORMANT_DIR = ASSETS_DIR / "formant_shift"
 #: where the native interface has to look for them too -- the two must offer
 #: the same files or "the one I downloaded" is missing from one of them.
 CUSTOM_PRETRAINED_DIR = ROOT / "rvc" / "models" / "pretraineds" / "custom"
-#: ``rvc.rectified.common.PRETRAINED_DIR``: rectified flow and vocoder exports.
+#: ``rvc.rectified.common.PRETRAINED_DIR``: rectified flow pretrains.
 RECTIFIED_PRETRAINED_DIR = ROOT / "rvc" / "models" / "pretraineds" / "rectified"
+#: ``rvc.rectified.common.VOCODER_DIR``: the vocoders the flows render through.
+RECTIFIED_VOCODER_DIR = ROOT / "rvc" / "models" / "vocoders"
 RESOURCE_DIR = PACKAGE_DIR / "resources"
 
 #: Where the GUI keeps its own state.  Deliberately outside ``assets/`` so that
