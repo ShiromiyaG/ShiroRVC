@@ -7,6 +7,8 @@ architecture comes from the weights; what they cannot tell (rates, dilations,
 the mel) from a ``config.json`` beside the file, else the 44.1 kHz, hop 512,
 128-bin release defaults.
 
+The generator is ported from SingingVocoders (MIT, see THIRD_PARTY_NOTICES).
+
 Usage: python rvc/rectified/openvpi.py <checkpoint> <output.pth>
 """
 

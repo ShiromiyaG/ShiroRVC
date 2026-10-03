@@ -273,7 +273,8 @@ def timestep_embedding(t: torch.Tensor, channels: int, scale: float = 1000.0) ->
 
 
 class _ATanGLU(torch.autograd.Function):
-    """``out * atan(gate)``, keeping two tensors for backward instead of three."""
+    """``out * atan(gate)``, keeping two tensors for backward instead of three.
+    Adapted from DiffSinger (Apache 2.0, see THIRD_PARTY_NOTICES)."""
 
     @staticmethod
     def forward(ctx, out, gate):
