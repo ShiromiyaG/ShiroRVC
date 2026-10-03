@@ -154,10 +154,11 @@ R1_GAMMA_BY_VERSION = {}
 #: ``d_univhd_weight`` overrides it on any version, and ``disc_sep_50/univhd``
 #: against the other branches is the series that says whether it landed.
 #:
-#: Only ``v4`` is listed.  ``v1``-``v3`` predate UnivHD here and nothing has
-#: been trained with it on them, so there is no measurement behind a number for
-#: them and they keep the paper's 1.0.
+#: ``v3`` takes the same weight: the rectified vocoder runs it with UnivHD,
+#: which separates several times more than its other branches there too.
+#: ``v1`` and ``v2`` predate UnivHD here and keep the paper's 1.0.
 UNIVHD_WEIGHT_BY_VERSION = {
+    "v3": 0.15,
     "v4": 0.15,
 }
 

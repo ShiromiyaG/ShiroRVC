@@ -353,6 +353,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Losses", f"multi-scale mel x{settings['c_mel']:g}, FM x{settings['c_fm']:g}, adversarial"
                  + (f" ramped over {adv_warmup} steps" if adv_warmup > 0 else "")),
                 ("Discriminator", f"{settings['discriminator'].get('d_version', 'v4')}, R1 gamma {r1_gamma:g}"
+                 + (f", UnivHD x{net_d.univhd_weight:g}" if getattr(net_d, "use_univhd", False) else "")
                  + (", mel-conditioned MRD" if mel_cond_d else "")
                  + (", compiled" if getattr(net_d, "_compile_enabled", False) else "")),
             ],

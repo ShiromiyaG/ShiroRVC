@@ -77,10 +77,10 @@ def test_the_pinned_versions_land_on_the_univhd_branch(version):
 
 
 def test_an_unpinned_version_keeps_the_papers_additive_weight():
-    """``v3`` predates UnivHD here, so there is no measurement behind a number."""
+    """``v2`` predates UnivHD here, so there is no measurement behind a number."""
 
-    assert univhd_weight_for("v3") == DEFAULT_BRANCH_WEIGHT
-    model = _build("v3")
+    assert univhd_weight_for("v2") == DEFAULT_BRANCH_WEIGHT
+    model = _build("v2")
     assert model.branch_weights[-1] == DEFAULT_BRANCH_WEIGHT
     assert model.uses_branch_weights is False
 
