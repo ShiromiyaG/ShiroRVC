@@ -8,7 +8,6 @@ from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from torch.nn import functional as F
 
-from rvc.lib.algorithm.content_bottleneck import ContentBottleneck
 
 #: Centre and spread of log f0, so the normalised pitch sits roughly in [-2, 2].
 LOG_F0_CENTER = math.log(200.0)
@@ -207,22 +206,15 @@ class ConditionEncoder(nn.Module):
         speaker_count: int,
         speaker_channels: int,
         layers: int,
-        content_bottleneck: int = 0,
         pitch_fourier: int = 0,
         harmonic_prior: Optional[HarmonicPrior] = None,
         breathiness: bool = False,
         key_shift: bool = False,
-        content_bottleneck_noise: float = 0.0,
         speed: bool = False,
         tension: bool = False,
     ):
         super().__init__()
         self.speaker_count = int(speaker_count)
-        self.bottleneck = (
-            ContentBottleneck(content_channels, content_bottleneck, content_bottleneck_noise)
-            if content_bottleneck > 0
-            else None
-        )
         self.content = nn.Linear(content_channels, hidden_channels)
         self.pitch_fourier = int(pitch_fourier)
         self.pitch = nn.Conv1d(2 + 2 * self.pitch_fourier, hidden_channels, 3, padding=1)
@@ -250,8 +242,6 @@ class ConditionEncoder(nn.Module):
     def forward(self, inputs: Conditioning) -> torch.Tensor:
         """The per-frame conditioning, [B, hidden, T]."""
         content, f0, energy, speaker, mask, breathiness, key_shift, speed, tension = inputs
-        if self.bottleneck is not None:
-            content = self.bottleneck(content)
         x = self.content(content).transpose(1, 2)
         x = x + self.pitch(pitch_features(f0, self.pitch_fourier))
         if self.harmonic_prior is not None:
@@ -520,8 +510,6 @@ class RectifiedFlow(nn.Module):
         content_channels: int = 768,
         hidden_channels: int = 384,
         encoder_layers: int = 4,
-        content_bottleneck: int = 0,
-        content_bottleneck_noise: float = 0.0,
         speaker_channels: int = 256,
         pitch_fourier: int = 0,
         harmonic_prior: Optional[dict] = None,
@@ -560,12 +548,10 @@ class RectifiedFlow(nn.Module):
             speaker_count,
             speaker_channels,
             encoder_layers,
-            content_bottleneck,
             pitch_fourier,
             HarmonicPrior(n_mels=n_mels, **harmonic_prior) if harmonic_prior else None,
             breathiness,
             key_shift,
-            content_bottleneck_noise,
             speed,
             tension,
         )

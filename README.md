@@ -228,8 +228,7 @@ in `rvc/models/vocoders/` or `logs/`.
 The design follows [OpenVPI DiffSinger](https://github.com/openvpi/DiffSinger)'s
 shallow diffusion, trained as a rectified flow.
 
-- **Conditioning.** ContentVec or SPIN v2 content through a 64-dim noisy
-  bottleneck, which keeps the source speaker out. Pitch as Fourier features,
+- **Conditioning.** ContentVec or SPIN v2 content. Pitch as Fourier features,
   plus a harmonic prior drawn from it on the mel grid. Frame loudness,
   breathiness from aperiodicity, a 256-dim speaker embedding, and the key shift
   and speed of the augmentation.
