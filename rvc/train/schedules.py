@@ -55,6 +55,23 @@ def fit_eval_interval(configured: int, planned_steps: int, patience: int) -> int
     return max(1, min(configured, wanted)) if wanted else configured
 
 
+def decay_progress(scale: float, final_ratio: float) -> float:
+    """How far along the exponential decay to ``final_ratio`` a LR at
+    ``scale`` of its base is, 0 to 1."""
+    if final_ratio >= 1.0 or scale >= 1.0:
+        return 0.0
+    return min(1.0, math.log(max(scale, 1e-12)) / math.log(final_ratio))
+
+
+def cosine_progress(scale: float, final_ratio: float) -> float:
+    """How far along the cosine anneal to ``final_ratio`` a LR at ``scale``
+    of its base is, 0 to 1."""
+    if final_ratio >= 1.0:
+        return 0.0
+    height = (scale - final_ratio) / (1.0 - final_ratio)
+    return math.acos(min(1.0, max(-1.0, 2.0 * height - 1.0))) / math.pi
+
+
 def prepare_schedulers(
     optim_g, optim_d,
     lr_scheduler_g, lr_scheduler_d, exp_decay_gamma,
@@ -72,35 +89,46 @@ def prepare_schedulers(
     ``horizon_start_*`` move the start of the ``lr_final_ratio`` horizon
     from the beginning of training to the beginning of a stage, in the same
     units as ``epoch_str - 1`` and ``global_step``.
+
+    A resumed run continues the horizon from the LR its optimizer carries: a
+    changed ``total_epoch_count`` stretches or compresses what is left of the
+    curve instead of moving the LR.
     """
-    def _horizon_decay(final_ratio, total_units):
+    def _progress(unit, total_units, anchor_unit, anchor_progress):
+        """Progress along the curve, the remainder of it spread over the units
+        left after the anchor. Clamped at 1.0 so a run extended past its
+        horizon holds the final LR."""
+        left = max(1, int(total_units) - anchor_unit)
+        done = min(1.0, max(0, unit - anchor_unit) / left)
+        return anchor_progress + (1.0 - anchor_progress) * done
+
+    def _horizon_decay(final_ratio, total_units, anchor_unit=0, anchor_scale=1.0):
         """Exponential decay reaching ``final_ratio`` at the end of the run,
-        so the same config gives the same endpoint at any run length. Progress
-        is clamped at 1.0 so a run extended past its horizon holds the final
-        LR instead of decaying straight through it.
+        so the same config gives the same endpoint at any run length.
         """
-        ratio = min(1.0, max(1e-6, float(final_ratio)))
-        total = max(1, int(total_units))
+        # A LR already under the endpoint is held, not raised to it.
+        ratio = min(1.0, max(1e-6, float(final_ratio)), anchor_scale)
+        anchor_progress = decay_progress(anchor_scale, ratio)
 
         def scale(unit):
-            return ratio ** min(1.0, max(0, unit) / total)
+            return ratio ** _progress(unit, total_units, anchor_unit, anchor_progress)
 
         return scale
 
-    def _horizon_cosine(final_ratio, total_units):
+    def _horizon_cosine(final_ratio, total_units, anchor_unit=0, anchor_scale=1.0):
         """Cosine anneal from the starting LR to ``final_ratio`` of it.
 
         Unlike stock ``CosineAnnealingLR``'s shared absolute ``eta_min``,
         the endpoint here is a fraction of each group's own base LR -- G and D
         start at different rates, and a shared floor would drive their ratio
         to 1.0 by the end of the run, which is what keeps the discriminator
-        alive. Clamped past the horizon like ``_horizon_decay``.
+        alive.
         """
-        ratio = min(1.0, max(1e-6, float(final_ratio)))
-        total = max(1, int(total_units))
+        ratio = min(1.0, max(1e-6, float(final_ratio)), anchor_scale)
+        anchor_progress = cosine_progress(anchor_scale, ratio)
 
         def scale(unit):
-            progress = min(1.0, max(0, unit) / total)
+            progress = _progress(unit, total_units, anchor_unit, anchor_progress)
             return ratio + (1.0 - ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
         return scale
@@ -139,13 +167,23 @@ def prepare_schedulers(
             per_epoch = scheduler_name != "exp decay step"
             span_epochs = max(1, total_epoch_count - horizon_start_epoch)
             total_units = span_epochs * (1 if per_epoch else num_batches_per_epoch)
-            shape = horizon_shapes[scheduler_name](lr_final_ratio, total_units)
             resume_at = scheduler_resume_epoch if per_epoch else scheduler_resume_step
             if resume_at >= 0:
                 start = horizon_start_epoch if per_epoch else horizon_start_step
                 resume_at = max(-1, resume_at - start)
+            # The scheduler's first unit is resume_at + 1; anchoring there
+            # makes a resumed run start at exactly the LR it stopped with.
+            shapes = [
+                horizon_shapes[scheduler_name](
+                    lr_final_ratio, total_units, resume_at + 1,
+                    min(1.0, group["lr"] / group["initial_lr"]),
+                )
+                if resume_at >= 0 and group["initial_lr"] > 0
+                else horizon_shapes[scheduler_name](lr_final_ratio, total_units)
+                for group in optim.param_groups
+            ]
             return torch.optim.lr_scheduler.LambdaLR(
-                optim, shape, last_epoch=resume_at
+                optim, shapes, last_epoch=resume_at
             )
         if scheduler_name == "exp decay epoch":
             return torch.optim.lr_scheduler.ExponentialLR(

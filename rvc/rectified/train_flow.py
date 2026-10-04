@@ -52,6 +52,7 @@ from rvc.rectified.previews import RectifiedPreviews
 from rvc.rectified.vocoder import load_vocoder
 from rvc.train.ema import WeightEMA
 from rvc.train.progress import EpochRecorder, emit_machine_progress
+from rvc.train.schedules import cosine_progress
 from rvc.train.setup import loader_workers
 from rvc.train.stop import finish_stop, install_stop_handlers, uninterruptible_save
 
@@ -72,11 +73,16 @@ MAX_GRAD_SCALE = 2.0**16
 MAX_SKIPPED_IN_A_ROW = 10
 
 
-def learning_rate(base, step, warmup, total, final_ratio):
-    """Linear warmup, then cosine decay to ``final_ratio`` of ``base`` at ``total``."""
+def learning_rate(base, step, warmup, total, final_ratio, anchor=(0, 0.0)):
+    """Linear warmup, then cosine decay to ``final_ratio`` of ``base`` at ``total``.
+
+    ``anchor`` is the (step, progress along the cosine) a resumed run continues
+    from, so a changed ``total`` stretches or compresses what is left of it.
+    """
     if warmup and step < warmup:
         return base * (step + 1) / warmup
-    progress = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup)))
+    start, done = max(anchor[0], warmup), anchor[1]
+    progress = done + (1.0 - done) * min(1.0, max(0.0, (step - start) / max(1, total - start)))
     return base * (final_ratio + (1.0 - final_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
@@ -375,6 +381,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     warmup = 0 if finetune else int(settings["warmup_steps"])
     total_steps = total_epochs * len(loader)
     final_ratio = float(settings.get("lr_final_ratio", 1.0))
+    lr_anchor = (0, 0.0)
+    if resume and step >= warmup:
+        lr_anchor = (step, cosine_progress(optimizer.param_groups[0]["lr"] / base_lr, final_ratio))
     aux_weight = float(settings.get("aux_mel_weight", 0.0))
     eval_interval = int(settings.get("eval_interval", 0))
     mean_ratio = float(settings.get("mean_flow_ratio", 0.25)) if mean_flow else 0.0
@@ -543,7 +552,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 mel = normalize_mel(mel.to(device, non_blocking=True), config["data"])
                 inputs = inputs.to(device, non_blocking=True)
 
-                lr = learning_rate(base_lr, step, warmup, total_steps, final_ratio)
+                lr = learning_rate(base_lr, step, warmup, total_steps, final_ratio, lr_anchor)
                 for group in optimizer.param_groups:
                     group["lr"] = lr
                 with backward_context(), torch.autocast(
