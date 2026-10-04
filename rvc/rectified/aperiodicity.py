@@ -2,8 +2,8 @@
 flow's breathiness and tension inputs.
 
 Measured between and on the harmonics of the audio's own pitch track, in Hz rather
-than bins, so the 44.1 kHz training audio and the 16 kHz inference input read
-alike. A ratio, so the input gain does not move it.
+than bins and over a fixed band, so audio at any sample rate reads alike. A
+ratio, so the input gain does not move it.
 """
 
 import torch
@@ -13,7 +13,7 @@ from torch.nn import functional as F
 FRAME_RATE = 100
 #: Three periods of an 80 Hz note, so its harmonics are resolved.
 WINDOW_SECONDS = 0.04
-#: The band the inference input (16 kHz) has.
+#: The measured band: what a 16 kHz input has.
 MIN_HZ = 50.0
 MAX_HZ = 8000.0
 #: Spread of the band around each harmonic counted as periodic.

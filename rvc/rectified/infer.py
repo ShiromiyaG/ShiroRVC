@@ -5,6 +5,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Optional
 
+import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -271,12 +272,17 @@ class RectifiedConverter:
         return torch.cat(parts, 1)
 
     @torch.no_grad()
-    def _inputs(self, audio, sid, pitch: PitchOptions, index: IndexOptions, retriever, content_context,
+    def _inputs(self, audio, full, sid, pitch: PitchOptions, index: IndexOptions, retriever, content_context,
                 formant_shift, tension_strength) -> Conditioning:
         """The flow's inputs for ``audio``, a NumPy array at ``INPUT_RATE``, at
-        the mel frame rate. ``retriever`` is the loaded index, or None."""
+        the mel frame rate. ``full`` is the same input at the mel's sample
+        rate: training measures the loudness, breathiness and tension there,
+        and a 16 kHz copy has lost what a sibilant carries above 8 kHz.
+        ``retriever`` is the loaded index, or None."""
         data = self.flow_meta["config"]["data"]
+        rate, hop = data["sample_rate"], data["hop_length"]
         source = torch.from_numpy(audio).view(1, -1).to(self.device)
+        full = torch.from_numpy(full).view(1, -1).to(self.device)
         content = self._content(source, content_context)
         original = content
         if retriever is not None:
@@ -292,16 +298,15 @@ class RectifiedConverter:
         source_f0, f0 = self._pitch(audio, frames, pitch)
         source_f0 = torch.from_numpy(source_f0).view(1, -1).to(self.device)
         f0 = torch.from_numpy(f0).view(1, -1).to(self.device)
-        energy = smooth_curve(frame_energy(source, INPUT_RATE, frames))
-        breathiness = smooth_curve(aperiodicity(source, INPUT_RATE, source_f0, frames))
+        energy = smooth_curve(frame_energy(full, rate, frames))
+        breathiness = smooth_curve(aperiodicity(full, rate, source_f0, frames))
         strain = None
         if self.flow.encoder.tension is not None and tension_strength > 0:
             strain = float(tension_strength) * smooth_curve(
-                tension(source, INPUT_RATE, source_f0, frames), TENSION_SMOOTH_SECONDS
+                tension(full, rate, source_f0, frames), TENSION_SMOOTH_SECONDS
             )
 
         # Everything above is at 100 frames per second; the mel has its own rate.
-        rate, hop = data["sample_rate"], data["hop_length"]
         frames = mel_frames(frames, rate, hop)
         content = to_mel_rate(content, frames, rate, hop)
         original = to_mel_rate(original, frames, rate, hop)
@@ -515,23 +520,26 @@ class RectifiedConverter:
                 title="Rectified conversion",
             )
 
-            audio = load_audio_infer(audio_input_path, INPUT_RATE)
+            sample_rate = self.vocoder_config["data"]["sample_rate"]
+            # Decoded once, at the mel's rate; content and pitch read a copy of it.
+            full = load_audio_infer(audio_input_path, sample_rate)
+            audio = librosa.resample(full, orig_sr=sample_rate, target_sr=INPUT_RATE, res_type="soxr_vhq")
             peak = float(np.abs(audio).max())
             gain = 0.95 / peak if peak > 0 else 1.0
             if not match_level:
                 gain = min(gain, 1.0)
             audio = (audio * gain).astype(np.float32)
+            full = (full * gain).astype(np.float32)
             # Only the boost is undone; a hot input stays attenuated.
             restore = 1.0 / max(gain, 1.0)
-            sample_rate = self.vocoder_config["data"]["sample_rate"]
             retriever = self._load_retriever(index_path) if index.rate > 0 else None
             from rvc.infer.pipeline import AudioProcessor
 
-            def convert_segment(audio):
+            def convert_segment(audio, full):
                 if audio.shape[0] < EMBEDDER_FIELD + INPUT_HOP:
                     return np.zeros(round(audio.shape[0] * sample_rate / INPUT_RATE), dtype=np.float32)
                 inputs = self._inputs(
-                    audio, int(sid), pitch_options, index, retriever, content_context,
+                    audio, full, int(sid), pitch_options, index, retriever, content_context,
                     formant_shift, tension_strength,
                 )
                 mel = self._sample_mel(inputs, sampling)
@@ -544,10 +552,14 @@ class RectifiedConverter:
             if split_audio:
                 segments, intervals = process_audio(audio, INPUT_RATE)
                 info(f"Audio split into {len(segments)} segments.", tag="[RECTIFIED]")
-                converted = [convert_segment(segment) for segment in segments]
+                scale = sample_rate / INPUT_RATE
+                converted = [
+                    convert_segment(segment, full[round(start * scale) : round(stop * scale)])
+                    for segment, (start, stop) in zip(segments, intervals)
+                ]
                 output = merge_audio(segments, converted, intervals, INPUT_RATE, sample_rate)
             else:
-                output = convert_segment(audio)
+                output = convert_segment(audio, full)
 
             os.makedirs(os.path.dirname(os.path.abspath(audio_output_path)), exist_ok=True)
             sf.write(audio_output_path, output, sample_rate, format="WAV")
