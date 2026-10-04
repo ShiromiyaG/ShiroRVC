@@ -59,11 +59,17 @@ TAG = "[FLOW]"
 LOG_INTERVAL = 50
 METRICS_INTERVAL = 8
 PREVIEW_STEPS = 16
+#: Held-out clips a preview renders beside the reference clip, of different
+#: speakers.
+PREVIEW_CLIPS = 3
 #: Where in the trained time range the validation loss is taken.
 EVAL_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 #: Ceiling of the FP16 GradScaler's scale: left to grow, it reaches ~2^22,
 #: where the weight gradients overflow and a step is skipped.
 MAX_GRAD_SCALE = 2.0**16
+#: Steps skipped in a row over a non-finite gradient before the run stops: by
+#: then it is the weights or the data, not one batch.
+MAX_SKIPPED_IN_A_ROW = 10
 
 
 def learning_rate(base, step, warmup, total, final_ratio):
@@ -75,16 +81,14 @@ def learning_rate(base, step, warmup, total, final_ratio):
 
 
 def freeze_voice(model) -> int:
-    """Freeze what maps time and speaker into the network: the time MLP, the
-    adaLN modulation and both speaker projections. The speaker's own row still
-    trains; the null row gets no gradient without speaker dropout. Keeps the
-    pretrain's speaker space, so speaker guidance still separates the voice
-    from the null speaker after a one-speaker fine-tune (RIFT-SVC's recipe).
-    Returns the number of tensors frozen."""
-    modules = [model.backbone.time_mlp, model.encoder.speaker_proj, model.backbone.voice]
-    modules += [layer.modulation for layer in model.backbone.layers]
+    """Freeze what maps time and speaker into the network: the time MLP and
+    ``speaker_layers``. The speaker's own row still trains; the null row gets
+    no gradient without speaker dropout. Keeps the pretrain's speaker space,
+    so speaker guidance still separates the voice from the null speaker after
+    a one-speaker fine-tune (RIFT-SVC's recipe). Returns the number of tensors
+    frozen."""
     frozen = 0
-    for module in filter(None, modules):
+    for module in filter(None, [model.backbone.time_mlp, *model.speaker_layers()]):
         for param in module.parameters():
             param.requires_grad_(False)
             frozen += 1
@@ -233,7 +237,7 @@ def restore(spec: dict, name: str, resume, state, model, optimizer, ema, scaler)
             ema.load_state_dict(state["ema"], model)
         if scaler is not None and state.get("scaler"):
             scaler.load_state_dict(state["scaler"])
-        skipped = int(state.get("amp_skipped_steps", 0))
+        skipped = int(state.get("skipped_steps", 0))
         return state["epoch"] + 1, state["step"], skipped, f"resumed from {os.path.basename(resume)}"
     pretrain = spec.get("pretrained_flow")
     if pretrain:
@@ -246,12 +250,15 @@ def restore(spec: dict, name: str, resume, state, model, optimizer, ema, scaler)
 
 
 def optimizer_step(loss, model, optimizer, scaler, grad_clip: float):
-    """Backward, clip and step. Returns the gradient norm and whether the FP16
-    scaler skipped the step over a non-finite gradient."""
+    """Backward, clip and step. Returns the gradient norm and whether the step
+    was skipped over a non-finite gradient, which would otherwise reach every
+    weight."""
     optimizer.zero_grad(set_to_none=True)
     if scaler is None:
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if not torch.isfinite(grad_norm):
+            return grad_norm, True
         optimizer.step()
         return grad_norm, False
     scaler.scale(loss).backward()
@@ -264,6 +271,17 @@ def optimizer_step(loss, model, optimizer, scaler, grad_clip: float):
     if not skipped and scaler.get_scale() > MAX_GRAD_SCALE:
         scaler.update(MAX_GRAD_SCALE)
     return grad_norm, skipped
+
+
+def nonfinite_names(mel, inputs, model) -> str:
+    """What holds a non-finite value among a batch and the weights, in words."""
+    found = [
+        name for name, value in (("mel", mel), *zip(inputs._fields, inputs))
+        if value is not None and not torch.isfinite(value).all()
+    ]
+    if any(not torch.isfinite(param).all() for param in model.parameters()):
+        found.append("model weights")
+    return ", ".join(found) or "neither the batch nor the weights, so the loss or a gradient overflowed"
 
 
 def loss_scalars(ranks: Ranks, flow_loss, aux_loss, mean_losses) -> dict:
@@ -338,7 +356,14 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
     writer = SummaryWriter(os.path.join(out_dir, "eval")) if main_rank else None
     previews = RectifiedPreviews(out_dir, config, step, device) if main_rank else None
-    reference = dataset.reference() if main_rank else None
+    # The preview clips, each with whether it is held out: the reference clip
+    # may be another voice's, so only those are sure to be reconstructions.
+    clips = []
+    if main_rank:
+        reference = dataset.reference()
+        clips = [] if reference is None else [(reference, False)]
+        if holdout is not None:
+            clips += [(clip, True) for clip in holdout.dataset.speaker_clips(PREVIEW_CLIPS)]
     # A fine-tune is short, so it previews more often; experiments whose config
     # predates the key get the same.
     preview_interval = int(
@@ -401,6 +426,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
         )
 
     def save(current_epoch: int):
+        if any(not torch.isfinite(param).all() for param in model.parameters()):
+            raise FloatingPointError(
+                "The flow has non-finite weights. Nothing was saved, so the last checkpoint stands."
+            )
         keep = spec.get("checkpoints", "latest")
         saved = []
         with uninterruptible_save("Flow checkpoint"):
@@ -414,7 +443,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                      "ema": ema.state_dict(), "epoch": current_epoch, "step": step,
                      "scaler": scaler.state_dict() if scaler is not None else None,
-                     "amp_skipped_steps": skipped},
+                     "skipped_steps": skipped},
                     path,
                 )
                 if keep == "latest":
@@ -433,33 +462,42 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
     @torch.no_grad()
     def preview():
-        """The reference clip through the flow's EMA weights. With a vocoder,
-        also its real mel through the vocoder alone, which separates the two
-        models' errors; without one, the mel figure only."""
-        inputs = reference.inputs.to(device)
-        f0 = inputs.f0
-        one_step = None
-        with ema.applied(model):
+        """Every preview clip through the flow's EMA weights. With a vocoder,
+        also its real mel through the vocoder alone and the aux decoder's mel,
+        and for a held-out clip the flow started from the real mel instead of
+        the aux decoder's, on the same noise: together they tell the vocoder's,
+        the aux decoder's and the flow's errors apart. Without one, the mel
+        figure only."""
+        with previews.media.writer(step) as media, ema.applied(model):
             model.eval()
-            generated = model.sample(inputs, steps=PREVIEW_STEPS)
-            if mean_ratio > 0:
-                one_step = model.sample(inputs, steps=1, method="mean")
+            for index, (clip, held_out) in enumerate(clips):
+                inputs = clip.inputs.to(device)
+                real = normalize_mel(clip.mel.to(device), config["data"])
+                noise = torch.randn_like(real)
+                generated = model.sample(inputs, steps=PREVIEW_STEPS, noise=noise)
+                if vocoder is None:
+                    previews.log(
+                        epoch, step, clip.path, generated_mel=denormalize_mel(generated, config["data"]),
+                        reference_mel=clip.mel, sample_index=index, writer=media,
+                    )
+                    continue
+                mels = {"vocoder_on_real_mel": real}
+                if model.aux is not None:
+                    mels["aux_decoder"] = model.aux_mel(inputs)
+                if model.t_start > 0 and held_out:
+                    mels["flow_from_real_mel"] = model.sample(
+                        inputs, steps=PREVIEW_STEPS, noise=noise, start_mel=real
+                    )
+                if mean_ratio > 0:
+                    mels["mean_flow_1_step"] = model.sample(inputs, steps=1, method="mean", noise=noise)
+                previews.log(
+                    epoch, step, clip.path,
+                    generated_audio=vocoder(generated, inputs.f0),
+                    reference_audio=clip.audio.to(device),
+                    extra_audio={name: vocoder(mel, inputs.f0) for name, mel in mels.items()},
+                    sample_index=index, writer=media,
+                )
             model.train()
-        if vocoder is None:
-            previews.log(
-                epoch, step, reference.path,
-                generated_mel=denormalize_mel(generated, config["data"]), reference_mel=reference.mel,
-            )
-            return
-        previews.log(
-            epoch, step, reference.path,
-            generated_audio=vocoder(generated, f0),
-            reference_audio=reference.audio.to(device),
-            extra_audio={
-                "vocoder_on_real_mel": vocoder(normalize_mel(reference.mel.to(device), config["data"]), f0),
-                **({} if one_step is None else {"mean_flow_1_step": vocoder(one_step, f0)}),
-            },
-        )
 
     @torch.no_grad()
     def evaluate():
@@ -490,6 +528,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     recorder = EpochRecorder()
     model.train()
     data_wait = step_time = 0.0
+    skipped_in_a_row = 0
     while epoch <= total_epochs:
         metrics = ""
         if sampler is not None:
@@ -522,8 +561,19 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     if aux_loss is not None:
                         loss = loss + aux_weight * aux_loss
                 grad_norm, step_skipped = optimizer_step(loss, model, optimizer, scaler, settings["grad_clip"])
-                skipped += int(step_skipped)
-                ema.update(model)
+                if step_skipped:
+                    skipped += 1
+                    skipped_in_a_row += 1
+                    culprit = nonfinite_names(mel, inputs, model)
+                    if skipped_in_a_row >= MAX_SKIPPED_IN_A_ROW:
+                        raise FloatingPointError(
+                            f"{skipped_in_a_row} steps in a row had a non-finite gradient. Non-finite: {culprit}."
+                        )
+                    if main_rank:
+                        warning(f"Step {step + 1} skipped over a non-finite gradient. Non-finite: {culprit}.", tag=TAG)
+                else:
+                    skipped_in_a_row = 0
+                    ema.update(model)
                 step += 1
                 step_time += time.perf_counter() - step_started
 
@@ -546,12 +596,12 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     scalars["grad_norm"] = grad_norm.item()
                     scalars.update(conditioning_norms(model))
                     scalars["lr"] = lr
+                    scalars["diag/skipped_steps"] = skipped
                     if scaler is not None:
                         scalars["amp/scale"] = scaler.get_scale()
-                        scalars["amp/skipped_steps"] = skipped
                     for tag, value in scalars.items():
                         writer.add_scalar(tag, value, step)
-                if reference is not None and step % preview_interval == 0:
+                if clips and step % preview_interval == 0:
                     preview()
                 if holdout is not None and eval_interval and step % eval_interval == 0:
                     evaluate()
@@ -562,11 +612,12 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
         if main_rank:
             print(f"{name} | epoch={epoch} | step={step} | {recorder.record()}")
-            if skipped and scaler is not None:
-                info(f"GradScaler at {scaler.get_scale():.0f}; {skipped} step(s) skipped so far.", tag=TAG)
+            if skipped:
+                scale = "" if scaler is None else f" GradScaler at {scaler.get_scale():.0f}."
+                info(f"{skipped} step(s) skipped so far.{scale}", tag=TAG)
             if epoch % save_every == 0 or epoch == total_epochs:
                 save(epoch)
-                if reference is not None:
+                if clips:
                     preview()
             writer.flush()
         epoch += 1

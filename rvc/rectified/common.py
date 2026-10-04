@@ -95,12 +95,46 @@ def smooth_curve(curve: torch.Tensor, seconds: float = SMOOTH_SECONDS) -> torch.
     return F.conv1d(padded, kernel.to(curve.dtype)).squeeze(1)
 
 
+def _slice_number(path: str):
+    """(recording, slice number) of a preprocessed slice, named
+    ``{sid}_{idx0}_{idx1}``; None for any other name."""
+    parts = os.path.splitext(os.path.basename(path))[0].split("_")
+    if len(parts) != 3 or not parts[2].isdigit():
+        return None
+    return "_".join(parts[:2]), int(parts[2])
+
+
 def split_holdout(entries, count: int, seed: int = 1234):
-    """``(train, holdout)``: ``count`` non-mute clips drawn with ``seed``, kept
-    out of training for the validation loss."""
+    """``(train, holdout)``: non-mute clips drawn with ``seed``, kept out of
+    training for the validation loss. Drawn from the speakers in turn, so each
+    has one and there are ``count`` or more, up to a tenth of the clips.
+
+    Preprocessing cuts a recording into slices that overlap the next one, so
+    the slices before and after a held one are left out of both lists."""
     candidates = [i for i, entry in enumerate(entries) if "mute" not in os.path.basename(entry[0])]
-    held = set(random.Random(seed).sample(candidates, min(count, len(candidates) // 10)))
-    train = [entry for i, entry in enumerate(entries) if i not in held]
+    by_speaker = {}
+    for index in sorted(candidates, key=lambda i: entries[i][0]):
+        by_speaker.setdefault(entries[index][4], []).append(index)
+    rng = random.Random(seed)
+    pools = [by_speaker[sid] for sid in sorted(by_speaker)]
+    for pool in pools:
+        rng.shuffle(pool)
+    rng.shuffle(pools)
+    target = min(max(count, len(pools)), len(candidates) // 10) if count > 0 else 0
+    held = set()
+    while len(held) < target:
+        for pool in pools:
+            if pool and len(held) < target:
+                held.add(pool.pop())
+
+    slices = {_slice_number(entry[0]): i for i, entry in enumerate(entries)}
+    overlapping = set()
+    for index in held:
+        key = _slice_number(entries[index][0])
+        if key is not None:
+            recording, number = key
+            overlapping.update(slices.get((recording, number + step), index) for step in (-1, 1))
+    train = [entry for i, entry in enumerate(entries) if i not in held and i not in overlapping]
     return train, [entries[i] for i in sorted(held)]
 
 
@@ -210,7 +244,7 @@ def pretrained_weights(path: str) -> dict:
     if checkpoint.get("architecture"):
         raise ValueError(
             f"{path} is a {checkpoint['architecture']} vocoder; it renders previews "
-            f"and audio but cannot start a rectified training run."
+            f"and audio but cannot start a PCPH-BigVGAN training run."
         )
     ema = checkpoint.get("ema")
     return ema["shadow"] if ema else checkpoint["model"]
@@ -455,21 +489,43 @@ class RectifiedDataset(Dataset):
         if custom is not None:
             return custom
         ordered = sorted(range(len(self.entries)), key=lambda i: self.entries[i][0])
-        for index in ordered:
-            wav_path, content_path, _, f0_path, sid = self.entries[index]
-            if "mute" in os.path.basename(wav_path):
-                continue
-            audio = self._audio(wav_path)
-            if audio.shape[0] < 2 * self.sample_rate:
-                continue
-            f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
-            content = upsample_content(
-                torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
-                self.data["content_interpolation"],
-            )
-            max_frames = int(max_seconds * self.sample_rate) // self.hop
-            return self._reference_item(audio, content, f0, sid, wav_path, max_frames)
-        return None
+        return next(filter(None, (self._clip(index, max_seconds) for index in ordered)), None)
+
+    def _clip(self, index: int, max_seconds: float):
+        """Clip ``index`` as a ``Reference`` cut to ``max_seconds``; None for
+        a mute one or one under two seconds."""
+        wav_path, content_path, _, f0_path, sid = self.entries[index]
+        if "mute" in os.path.basename(wav_path):
+            return None
+        audio = self._audio(wav_path)
+        if audio.shape[0] < 2 * self.sample_rate:
+            return None
+        f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
+        content = upsample_content(
+            torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
+            self.data["content_interpolation"],
+        )
+        max_frames = int(max_seconds * self.sample_rate) // self.hop
+        return self._reference_item(audio, content, f0, sid, wav_path, max_frames)
+
+    def speaker_clips(self, count: int, max_seconds: float = 10.0) -> list:
+        """Up to ``count`` clips as ``Reference``s, of speakers spread over the
+        dataset's; a speaker gives a second one only once each has given one."""
+        by_speaker = {}
+        for index in sorted(range(len(self.entries)), key=lambda i: self.entries[i][0]):
+            by_speaker.setdefault(int(self.entries[index][4]), []).append(index)
+        speakers = sorted(by_speaker)
+        speakers = speakers[:: max(1, len(speakers) // max(1, count))]
+        clips = []
+        for turn in range(max(map(len, by_speaker.values()), default=0)):
+            for speaker in speakers:
+                if len(clips) == count:
+                    return clips
+                if turn < len(by_speaker[speaker]):
+                    clip = self._clip(by_speaker[speaker][turn], max_seconds)
+                    if clip is not None:
+                        clips.append(clip)
+        return clips
 
 
 def collate_vocoder(batch):
@@ -583,7 +639,7 @@ def list_pretrained(kind: str) -> list:
     from rvc.lib.catalog import list_custom_pretraineds, relative
 
     patterns = {
-        "vocoder_g": ["G_*.pth", "*_vocoder_*.pth", "*_vocoder.pth"],
+        "vocoder_g": ["G_*.pth", "*_vocoder_*.pth", "*_vocoder.pth", "*.ckpt"],
         "vocoder_d": ["D_*.pth"],
         "flow": ["F_*.pth", "*_flow_*.pth", "*_flow.pth"],
     }[kind]

@@ -1,0 +1,42 @@
+{
+    "architecture": "nsf-univnet",
+    "learning_rate": 0.0002,
+    "betas": [0.8, 0.99],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "lr_scheduler": "exp decay step",
+    "lr_decay": 1.0,
+    "lr_final_ratio": 0.1,
+    "warmup_steps": 0,
+    "adv_warmup_steps": 0,
+    "ema_decay": 0.999,
+    "segment_size": 10240,
+    "c_stft": 2.5,
+    "aux_steps": 400000,
+    "loss_fft_sizes": [2048, 2048, 4096, 1024, 512, 256, 128],
+    "loss_hop_sizes": [512, 240, 480, 100, 50, 25, 12],
+    "loss_win_lengths": [2048, 1200, 2400, 480, 240, 120, 60],
+    "volume_aug_prob": 0.5,
+    "seed": 1234,
+    "rolling_loss_steps": 50,
+    "preview_interval": 500,
+    "holdout_clips": 0,
+    "eval_interval": 0,
+    "model": {
+        "upsample_rates": [8, 8, 4],
+        "upmel": 2,
+        "channels": 32,
+        "noise_channels": 128,
+        "lvc_layers": 4,
+        "lvc_kernel_size": 5,
+        "kpnet_hidden_channels": 96,
+        "kpnet_conv_size": 3,
+        "dropout": 0.0
+    },
+    "discriminator": {
+        "periods": [3, 5, 7, 11, 17, 23, 37],
+        "mrd_fft_sizes": [1024, 2048, 512],
+        "mrd_hop_sizes": [120, 240, 50],
+        "mrd_win_lengths": [600, 1200, 240]
+    }
+}

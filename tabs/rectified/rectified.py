@@ -36,6 +36,7 @@ from rvc.rectified.common import (
 )
 from rvc.rectified.flow_model import RESCALE_MODES, SAMPLERS, SCHEDULES
 from tabs.inference.inference import F0_METHODS, EXPORT_FORMATS, save_to_wav, save_to_wav2
+from tabs.rectified.vocoder_config import vocoder_config_tab
 from tabs.train.descs import (
     AUDIO_FILE_SLICING_INFO,
     DATASET_FORMAT_INFO,
@@ -51,6 +52,15 @@ from tabs.train.descs import (
 
 #: The rectified recipe ships one configuration, at 44.1 kHz: SingingVocoders' mel.
 SAMPLE_RATE = 44100
+
+#: Vocoders the Vocoder tab trains: label and ``architecture`` of the run.
+VOCODER_ARCHITECTURES = [
+    ("PCPH-BigVGAN", "pcph-bigvgan"),
+    ("PC-NSF-HiFiGAN", "pc-nsf-hifigan"),
+    ("NSF-HiFiGAN", "nsf-hifigan"),
+    ("NSF-UnivNet", "nsf-univnet"),
+    ("Wavehax", "wavehax"),
+]
 
 TRAINING_STARTED = (
     "Training started. Epoch, step and loss progress is shown in the terminal window."
@@ -113,7 +123,7 @@ def rectified_inference_tab():
             )
             vocoder_model = gr.Dropdown(
                 label=_("Vocoder Model"),
-                info=_("Rectified PCPH-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint that renders the mel."),
+                info=_("Rectified vocoder export or OpenVPI NSF-HiFiGAN checkpoint that renders the mel."),
                 choices=vocoders,
                 value=_first(vocoders),
                 interactive=True,
@@ -235,7 +245,7 @@ def rectified_inference_tab():
             with gr.Row():
                 schedule = gr.Radio(
                     label=_("Step Schedule"),
-                    info=_("Spacing of the steps. Sway puts more of them early, where the mel's structure is decided; logit-normal matches the times the model was trained on most."),
+                    info=_("Spacing of the steps. Sway puts more of them early, where the mel's structure is decided; logit-normal puts more of them mid-way."),
                     choices=list(SCHEDULES),
                     value="uniform",
                     interactive=True,
@@ -657,13 +667,14 @@ def _start_stop(start_fn, inputs):
     ).then(fn=stop_rectified_train_script, inputs=[], outputs=[output], show_progress="hidden")
 
 
-def rectified_training_tab():
+def _experiment(default_name: str):
+    """Model name, refresh button and the CPU / GPU settings of a training tab."""
     with gr.Row(equal_height=True):
         model_name = gr.Dropdown(
             label=_("Model Name"),
             info=_("Name of the new model. Its data lives in logs/<name>, like an RVC model."),
             choices=catalog.list_training_models(),
-            value="example-rectified-model",
+            value=default_name,
             interactive=True,
             allow_custom_value=True,
             scale=4,
@@ -697,7 +708,11 @@ def rectified_training_tab():
                     value=get_gpu_info(),
                     interactive=False,
                 )
+    return model_name, refresh_button, cpu_threads, gpu
 
+
+def _preprocess_tab(model_name, cpu_threads):
+    """The preprocessing step; returns the dataset dropdown, for refreshing."""
     with gr.Tab(f"1. {_('Preprocessing')}"):
         dataset_path = gr.Dropdown(
             label=_("Dataset Path"),
@@ -789,6 +804,32 @@ def rectified_training_tab():
             interactive=False,
         )
 
+    for checkbox, target in ((noise_reduction, clean_strength),):
+        checkbox.change(
+            fn=lambda enabled: gr.update(visible=bool(enabled)),
+            inputs=[checkbox],
+            outputs=[target],
+            show_progress="hidden",
+        )
+    normalization_mode.change(
+        fn=lambda mode: gr.update(visible=mode == "pre_loudness"),
+        inputs=[normalization_mode],
+        outputs=[rms_norm_db],
+    )
+    preprocess_button.click(
+        fn=lambda *args: run_preprocess_script(args[0], args[1], SAMPLE_RATE, *args[2:]),
+        inputs=[
+            model_name, dataset_path, cpu_threads, cut_preprocess, process_effects,
+            noise_reduction, clean_strength, chunk_len, overlap_len,
+            normalization_mode, loading_resampling, dataset_format, rms_norm_db,
+        ],
+        outputs=[preprocess_output],
+    )
+    return dataset_path
+
+
+def _extraction_tab(model_name, cpu_threads, gpu):
+    """The extraction step."""
     with gr.Tab(f"2. {_('Extraction')}"):
         with gr.Row():
             f0_method = gr.Radio(
@@ -827,6 +868,20 @@ def rectified_training_tab():
             interactive=False,
         )
 
+    extract_button.click(
+        fn=lambda name, method, threads, gpu_ids, embedder, mutes, precision: run_extract_script(
+            name, method, threads, gpu_ids, SAMPLE_RATE, RECTIFIED_EXTRACTION, embedder, mutes, precision
+        ),
+        inputs=[model_name, f0_method, cpu_threads, gpu, embedder_model, include_mutes, feature_precision],
+        outputs=[extract_output],
+    )
+
+
+def rectified_training_tab():
+    model_name, refresh_button, cpu_threads, gpu = _experiment("example-rectified-model")
+    dataset_path = _preprocess_tab(model_name, cpu_threads)
+    _extraction_tab(model_name, cpu_threads, gpu)
+
     with gr.Tab(f"3. {_('Voice Model')}"):
         gr.Markdown(
             _("The rectified-flow voice model: content, pitch, loudness and "
@@ -859,25 +914,28 @@ def rectified_training_tab():
                     value=False,
                     interactive=True,
                 )
-        # A Column, not a Group: a hidden Group keeps its border as a stray line.
-        with gr.Column(visible=False) as flow_custom_settings:
-            with gr.Row():
-                custom_flow = gr.Dropdown(
-                    label=_("Custom Pretrained Flow"),
-                    info=_("Flow to fine-tune. Its speakers are replaced by this dataset's."),
-                    choices=list_pretrained("flow"),
-                    interactive=True,
-                    allow_custom_value=True,
-                )
-            with gr.Row():
-                upload_pretrained = gr.UploadButton(
-                    _("Upload Pretrained Model"),
-                    file_types=[".pth"],
-                    type="filepath",
-                    size="sm",
-                    scale=0,
-                    elem_classes=["rvc-fit-button"],
-                )
+        # Hidden one by one, and "hidden" rather than False: a container does
+        # not hide its children that way, and an unmounted component does not
+        # show on its first update.
+        with gr.Row():
+            custom_flow = gr.Dropdown(
+                label=_("Custom Pretrained Flow"),
+                info=_("Flow to fine-tune. Its speakers are replaced by this dataset's."),
+                choices=list_pretrained("flow"),
+                interactive=True,
+                allow_custom_value=True,
+                visible="hidden",
+            )
+        with gr.Row():
+            upload_pretrained = gr.UploadButton(
+                _("Upload Pretrained Model"),
+                file_types=[".pth"],
+                type="filepath",
+                size="sm",
+                scale=0,
+                elem_classes=["rvc-fit-button"],
+                visible="hidden",
+            )
 
         gr.Markdown(f"#### {_('Vocoder')}")
         with gr.Row():
@@ -1017,18 +1075,92 @@ def rectified_training_tab():
             interactive=False,
         )
 
-    with gr.Tab(_("Vocoder Pretrain")):
+    def refresh():
+        return (
+            gr.update(choices=catalog.list_training_models()),
+            gr.update(choices=catalog.list_dataset_folders()),
+            gr.update(choices=list_pretrained("flow")),
+            gr.update(choices=list_exports("vocoder")),
+        )
+
+    list_outputs = [model_name, dataset_path, custom_flow, custom_vocoder]
+    refresh_button.click(fn=refresh, inputs=[], outputs=list_outputs)
+
+    def custom_flow_visibility(shown):
+        return [gr.update(visible=True if shown else "hidden")] * 2
+
+    flow_custom.change(
+        fn=custom_flow_visibility,
+        inputs=[flow_custom],
+        outputs=[custom_flow, upload_pretrained],
+        show_progress="hidden",
+    )
+    flow_pretrained.change(
+        fn=lambda pretrained, custom: (
+            gr.update(visible=bool(pretrained)),
+            *custom_flow_visibility(pretrained and custom),
+        ),
+        inputs=[flow_pretrained, flow_custom],
+        outputs=[flow_custom, custom_flow, upload_pretrained],
+        show_progress="hidden",
+    )
+    upload_pretrained.upload(
+        fn=save_uploaded_pretrained, inputs=[upload_pretrained], outputs=[]
+    ).then(fn=refresh, inputs=[], outputs=list_outputs, show_progress="hidden")
+
+    def fill_index_speakers(name):
+        speakers = [str(sid) for sid in list_experiment_speakers(name)] if name else []
+        return gr.update(choices=speakers, value=speakers[0] if speakers else None)
+
+    def generate_index(name, algorithm, metric, single, speaker):
+        if not single:
+            return run_index_script(name, algorithm, metric, "all")
+        if speaker in (None, ""):
+            return _("Pick a speaker, or turn off 'Index one speaker only'.")
+        return run_index_script(name, algorithm, metric, speaker)
+
+    index_single_speaker.change(
+        fn=lambda enabled: gr.update(visible=bool(enabled)),
+        inputs=[index_single_speaker],
+        outputs=[index_speaker_row],
+    ).then(fn=fill_index_speakers, inputs=[model_name], outputs=[index_speaker])
+    model_name.change(fn=fill_index_speakers, inputs=[model_name], outputs=[index_speaker])
+    index_button.click(
+        fn=generate_index,
+        inputs=[model_name, index_algorithm, index_metric, index_single_speaker, index_speaker],
+        outputs=[index_output],
+    )
+    return refresh, list_outputs
+
+
+def rectified_vocoder_tab():
+    model_name, refresh_button, cpu_threads, gpu = _experiment("example-rectified-vocoder")
+    dataset_path = _preprocess_tab(model_name, cpu_threads)
+    _extraction_tab(model_name, cpu_threads, gpu)
+
+    with gr.Tab(f"3. {_('Vocoder')}"):
         gr.Markdown(
-            _("Builds the PCPH-BigVGAN vocoder pretrain, on a large multi-speaker "
-              "dataset. Not needed to fine-tune a voice: the vocoder has no "
-              "speaker input, so one pretrain renders every voice model.")
+            _("Trains the mel vocoder, on a large multi-speaker dataset. Not "
+              "needed to fine-tune a voice: the vocoder has no speaker input, "
+              "so one vocoder renders every voice model.")
+        )
+        voc_architecture = gr.Radio(
+            label=_("Vocoder Architecture"),
+            info=_("PCPH-BigVGAN is this fork's vocoder. The next three are OpenVPI SingingVocoders', and "
+                   "Wavehax estimates the spectrogram from a harmonic prior, with no upsampling; they train by "
+                   "their own recipes (discriminators, losses, augmentation and learning rate). Each "
+                   "architecture's settings are in the Config tab. A run resumes only its own architecture."),
+            choices=VOCODER_ARCHITECTURES,
+            value="pcph-bigvgan",
+            interactive=True,
         )
         voc_batch, voc_save, voc_epochs = _run_controls("vocoder")
         gr.Markdown(f"#### {_('Starting point')}")
         with gr.Row():
             pretrained_g = gr.Dropdown(
                 label=_("Pretrained Generator"),
-                info=_("Optional. A vocoder checkpoint or export to fine-tune from."),
+                info=_("Optional. A vocoder checkpoint or export of the same architecture to fine-tune from; "
+                       "for the NSF-HiFiGANs, also an OpenVPI checkpoint, whose discriminator is loaded with it."),
                 choices=list_pretrained("vocoder_g"),
                 value=None,
                 interactive=True,
@@ -1055,7 +1187,7 @@ def rectified_training_tab():
         voc_checkpoints, voc_fresh = _checkpoint_controls("vocoder")
 
         def start_vocoder(name, epochs, save, batch, gpu_ids, g_path, d_path, checkpoints, fresh,
-                          degradation):
+                          degradation, architecture):
             return run_rectified_vocoder_train_script(
                 model_name=name,
                 total_epochs=epochs,
@@ -1068,13 +1200,17 @@ def rectified_training_tab():
                 fresh=fresh,
                 precision=get_training_precision(),
                 mel_degradation=degradation,
+                architecture=architecture,
             )
 
         _start_stop(
             start_vocoder,
             [model_name, voc_epochs, voc_save, voc_batch, gpu, pretrained_g,
-             pretrained_d, voc_checkpoints, voc_fresh, voc_degradation],
+             pretrained_d, voc_checkpoints, voc_fresh, voc_degradation, voc_architecture],
         )
+
+    with gr.Tab(f"{_('Config')}") as config_tab:
+        vocoder_config_tab(model_name, VOCODER_ARCHITECTURES, config_tab)
 
     def refresh():
         return (
@@ -1082,82 +1218,10 @@ def rectified_training_tab():
             gr.update(choices=catalog.list_dataset_folders()),
             gr.update(choices=list_pretrained("vocoder_g")),
             gr.update(choices=list_pretrained("vocoder_d")),
-            gr.update(choices=list_pretrained("flow")),
-            gr.update(choices=list_exports("vocoder")),
         )
 
-    list_outputs = [model_name, dataset_path, pretrained_g, pretrained_d, custom_flow, custom_vocoder]
+    list_outputs = [model_name, dataset_path, pretrained_g, pretrained_d]
     refresh_button.click(fn=refresh, inputs=[], outputs=list_outputs)
-
-    flow_custom.change(
-        fn=lambda enabled: gr.update(visible=bool(enabled)),
-        inputs=[flow_custom],
-        outputs=[flow_custom_settings],
-        show_progress="hidden",
-    )
-    flow_pretrained.change(
-        fn=lambda pretrained, custom: (
-            gr.update(visible=bool(pretrained)),
-            gr.update(visible=bool(pretrained and custom)),
-        ),
-        inputs=[flow_pretrained, flow_custom],
-        outputs=[flow_custom, flow_custom_settings],
-        show_progress="hidden",
-    )
-    upload_pretrained.upload(
-        fn=save_uploaded_pretrained, inputs=[upload_pretrained], outputs=[]
-    ).then(fn=refresh, inputs=[], outputs=list_outputs, show_progress="hidden")
-
-    for checkbox, target in ((noise_reduction, clean_strength),):
-        checkbox.change(
-            fn=lambda enabled: gr.update(visible=bool(enabled)),
-            inputs=[checkbox],
-            outputs=[target],
-            show_progress="hidden",
-        )
-    normalization_mode.change(
-        fn=lambda mode: gr.update(visible=mode == "pre_loudness"),
-        inputs=[normalization_mode],
-        outputs=[rms_norm_db],
-    )
-    def fill_index_speakers(name):
-        speakers = [str(sid) for sid in list_experiment_speakers(name)] if name else []
-        return gr.update(choices=speakers, value=speakers[0] if speakers else None)
-
-    def generate_index(name, algorithm, metric, single, speaker):
-        if not single:
-            return run_index_script(name, algorithm, metric, "all")
-        if speaker in (None, ""):
-            return _("Pick a speaker, or turn off 'Index one speaker only'.")
-        return run_index_script(name, algorithm, metric, speaker)
-
-    index_single_speaker.change(
-        fn=lambda enabled: gr.update(visible=bool(enabled)),
-        inputs=[index_single_speaker],
-        outputs=[index_speaker_row],
-    ).then(fn=fill_index_speakers, inputs=[model_name], outputs=[index_speaker])
-    model_name.change(fn=fill_index_speakers, inputs=[model_name], outputs=[index_speaker])
-    index_button.click(
-        fn=generate_index,
-        inputs=[model_name, index_algorithm, index_metric, index_single_speaker, index_speaker],
-        outputs=[index_output],
-    )
-    preprocess_button.click(
-        fn=lambda *args: run_preprocess_script(args[0], args[1], SAMPLE_RATE, *args[2:]),
-        inputs=[
-            model_name, dataset_path, cpu_threads, cut_preprocess, process_effects,
-            noise_reduction, clean_strength, chunk_len, overlap_len,
-            normalization_mode, loading_resampling, dataset_format, rms_norm_db,
-        ],
-        outputs=[preprocess_output],
-    )
-    extract_button.click(
-        fn=lambda name, method, threads, gpu_ids, embedder, mutes, precision: run_extract_script(
-            name, method, threads, gpu_ids, SAMPLE_RATE, RECTIFIED_EXTRACTION, embedder, mutes, precision
-        ),
-        inputs=[model_name, f0_method, cpu_threads, gpu, embedder_model, include_mutes, feature_precision],
-        outputs=[extract_output],
-    )
     return refresh, list_outputs
 
 
@@ -1167,10 +1231,12 @@ def rectified_tab(tab=None):
         refresh_inference, inference_lists = rectified_inference_tab()
     with gr.Tab(_("Training")):
         refresh_training, training_lists = rectified_training_tab()
+    with gr.Tab(_("Vocoder")):
+        refresh_vocoder, vocoder_lists = rectified_vocoder_tab()
     if tab is not None:
         tab.select(
-            fn=lambda: (*refresh_inference(), *refresh_training()),
+            fn=lambda: (*refresh_inference(), *refresh_training(), *refresh_vocoder()),
             inputs=[],
-            outputs=[*inference_lists, *training_lists],
+            outputs=[*inference_lists, *training_lists, *vocoder_lists],
             show_progress="hidden",
         )

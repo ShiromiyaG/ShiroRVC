@@ -19,8 +19,12 @@ SAMPLERS = ("euler", "heun", "mean")
 #: Share of the frames that get the second time under ``dual_timestep``.
 DUAL_TIMESTEP_SHARE = 0.25
 #: Step spacing over the sampled time range: even; sway (F5-TTS), denser near
-#: the start; logit-normal, the density training draws its times from.
+#: the start; logit-normal, denser in the middle.
 SCHEDULES = ("uniform", "sway", "logit-normal")
+#: How training draws its times over the trained range: evenly, as DiffSinger's
+#: shallow flow does, or logit-normal, which hardly trains the range's ends,
+#: where a shallow flow's sampling starts.
+TIME_SAMPLINGS = ("uniform", "logit-normal")
 #: Where guidance rescale measures the output's spread.
 RESCALE_MODES = ("global", "frame")
 #: Inputs that start at zero, so a checkpoint from before them loads unchanged.
@@ -155,9 +159,11 @@ class HarmonicPrior(nn.Module):
 
 class ConvNeXtBlock(nn.Module):
     """``layer_scale`` > 0 starts the branch that small, as DiffSinger's aux
-    decoder does."""
+    decoder does. With ``speaker_channels`` the speaker's embedding shifts and
+    scales the norm, from zero."""
 
-    def __init__(self, channels: int, layer_scale: float = 0.0, dropout: float = 0.0):
+    def __init__(self, channels: int, layer_scale: float = 0.0, dropout: float = 0.0,
+                 speaker_channels: int = 0):
         super().__init__()
         self.depthwise = nn.Conv1d(channels, channels, 7, padding=3, groups=channels)
         self.norm = nn.LayerNorm(channels)
@@ -165,10 +171,21 @@ class ConvNeXtBlock(nn.Module):
         self.down = nn.Linear(channels * 4, channels)
         self.gamma = nn.Parameter(torch.full((channels,), layer_scale)) if layer_scale > 0 else None
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.speaker = None
+        if speaker_channels > 0:
+            self.speaker = nn.Linear(speaker_channels, channels * 2)
+            nn.init.zeros_(self.speaker.weight)
+            nn.init.zeros_(self.speaker.bias)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        y = self.depthwise(x * mask).transpose(1, 2)
-        y = self.down(F.gelu(self.up(self.norm(y))))
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, voice: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """``voice`` [B, speaker_channels] is the speaker's embedding, for a
+        block that takes one."""
+        y = self.norm(self.depthwise(x * mask).transpose(1, 2))
+        if self.speaker is not None:
+            shift, scale = self.speaker(voice)[:, None, :].chunk(2, dim=-1)
+            # Not ``1 + scale``, as in ``LYNXNet2Block``.
+            y = y + y * scale + shift
+        y = self.down(F.gelu(self.up(y)))
         if self.gamma is not None:
             y = y * self.gamma
         return (x + self.dropout(y.transpose(1, 2))) * mask
@@ -411,21 +428,23 @@ class LYNXNet2Backbone(nn.Module):
 
 class AuxDecoder(nn.Module):
     """A deterministic mel from the conditioning, where shallow sampling
-    starts. DiffSinger's ConvNeXt aux decoder."""
+    starts. DiffSinger's ConvNeXt aux decoder; with ``speaker`` every block is
+    also modulated by the speaker's embedding, [B, cond_channels]."""
 
-    def __init__(self, cond_channels, n_mels, channels=512, layers=6, dropout=0.1):
+    def __init__(self, cond_channels, n_mels, channels=512, layers=6, dropout=0.1, speaker=False):
         super().__init__()
         self.input = nn.Conv1d(cond_channels, channels, 7, padding=3)
         self.blocks = nn.ModuleList(
-            [ConvNeXtBlock(channels, layer_scale=1e-6, dropout=dropout) for _ in range(layers)]
+            [ConvNeXtBlock(channels, layer_scale=1e-6, dropout=dropout,
+                           speaker_channels=cond_channels if speaker else 0) for _ in range(layers)]
         )
         self.output = nn.Conv1d(channels, n_mels, 7, padding=3)
         self.output.use_adamw = True
 
-    def forward(self, cond, mask):
+    def forward(self, cond, mask, voice=None):
         x = self.input(cond) * mask
         for block in self.blocks:
-            x = block(x, mask)
+            x = block(x, mask, voice)
         return self.output(x) * mask
 
 
@@ -517,17 +536,22 @@ class RectifiedFlow(nn.Module):
         tension: bool = False,
         dual_timestep: bool = False,
         mean_flow: bool = False,
+        time_sampling: str = "logit-normal",
     ):
         """``harmonic_prior`` is the mel's ``sample_rate``, ``n_fft``, ``fmin``
-        and ``fmax``, or None for no prior. ``aux_decoder`` is its
-        ``channels`` and ``layers``, or None for a flow from pure noise;
-        ``aux_grad`` scales its gradient into the encoder. ``backbone`` is kept
+        and ``fmax``, or None for no prior. ``aux_decoder`` is ``AuxDecoder``'s
+        arguments, or None for a flow from pure noise; ``aux_grad`` scales its
+        gradient into the encoder and the speaker table. ``backbone`` is kept
         because configs and exports name it; LYNXNet2 is the only one.
         ``dual_timestep`` trains a share of each item's frames at a second
-        time, as DiffSinger does."""
+        time, as DiffSinger does. ``time_sampling`` is one of
+        ``TIME_SAMPLINGS``."""
         super().__init__()
         if backbone != "lynxnet2":
             raise ValueError(f"Only the lynxnet2 backbone is supported, not {backbone!r}.")
+        if time_sampling not in TIME_SAMPLINGS:
+            raise ValueError(f"time_sampling must be one of {TIME_SAMPLINGS}, not {time_sampling!r}.")
+        self.time_sampling = time_sampling
         self.n_mels = int(n_mels)
         self.hidden_channels = int(hidden_channels)
         self.encoder = ConditionEncoder(
@@ -548,16 +572,14 @@ class RectifiedFlow(nn.Module):
         self.backbone = LYNXNet2Backbone(
             n_mels, hidden_channels, span=bool(mean_flow), **(backbone_args or {})
         )
+        self.aux = AuxDecoder(hidden_channels, n_mels, **aux_decoder) if aux_decoder else None
         # Time and speaker reach the network through these; on AdamW, where
         # gradient clipping bounds the step, since Muon's step ignores the
         # gradient's size.
-        conditioning = [self.backbone.time_mlp, self.backbone.span_mlp, self.encoder.speaker_proj,
-                        self.backbone.voice]
-        conditioning += [layer.modulation for layer in self.backbone.layers]
+        conditioning = [self.backbone.time_mlp, self.backbone.span_mlp, *self.speaker_layers()]
         for module in filter(None, conditioning):
             for child in module.modules():
                 child.use_adamw = True
-        self.aux = AuxDecoder(hidden_channels, n_mels, **aux_decoder) if aux_decoder else None
         self.t_start = float(t_start) if self.aux is not None else 0.0
         self.aux_grad = float(aux_grad)
         self.dual_timestep = bool(dual_timestep)
@@ -565,6 +587,15 @@ class RectifiedFlow(nn.Module):
     @property
     def speaker_count(self) -> int:
         return self.encoder.speaker_count
+
+    def speaker_layers(self) -> list:
+        """The layers the speaker's embedding reaches the network through,
+        None for one the model lacks. The adaLN ones take the time as well."""
+        layers = [self.encoder.speaker_proj, self.backbone.voice]
+        layers += [layer.modulation for layer in self.backbone.layers]
+        if self.aux is not None:
+            layers += [block.speaker for block in self.aux.blocks]
+        return layers
 
     def _drop_speakers(self, speaker, speaker_dropout):
         if speaker_dropout <= 0:
@@ -580,12 +611,14 @@ class RectifiedFlow(nn.Module):
         error = (prediction.float() - (mel - noise).float()).square() * mask
         return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
 
-    def _aux_loss(self, mel, cond, mask):
+    def _aux_loss(self, mel, cond, voice, mask):
         """The aux decoder's L1, or None without one."""
         if self.aux is None:
             return None
-        aux_cond = cond * self.aux_grad + cond.detach() * (1.0 - self.aux_grad)
-        error = (self.aux(aux_cond, mask).float() - mel.float()).abs() * mask
+        cond, voice = (
+            value * self.aux_grad + value.detach() * (1.0 - self.aux_grad) for value in (cond, voice)
+        )
+        error = (self.aux(cond, mask, voice).float() - mel.float()).abs() * mask
         return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
 
     def mean_velocity(self, x, t, span, velocity, cond, mask, voice):
@@ -630,13 +663,13 @@ class RectifiedFlow(nn.Module):
         return error.sum((1, 2)) / count, ratio
 
     def _times(self, batch, device):
-        """Logit-normal times, stratified across the batch so every batch spans
-        the distribution, over the trained range. Logit-normal puts more steps
-        mid-trajectory, where the velocity is hardest to predict."""
+        """Times over the trained range under ``time_sampling``, stratified
+        across the batch so every batch spans the range."""
         u = (torch.arange(batch, device=device) + torch.rand(batch, device=device)) / batch
-        u = u[torch.randperm(batch, device=device)].clamp(1e-6, 1.0 - 1e-6)
-        t = torch.sigmoid(math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0))
-        return self.t_start + (1.0 - self.t_start) * t
+        u = u[torch.randperm(batch, device=device)]
+        if self.time_sampling == "logit-normal":
+            u = torch.sigmoid(math.sqrt(2.0) * torch.erfinv(2.0 * u.clamp(1e-6, 1.0 - 1e-6) - 1.0))
+        return self.t_start + (1.0 - self.t_start) * u
 
     def _train_times(self, batch, frames, device):
         """A time per item, [B]; under ``dual_timestep`` a share of each
@@ -707,7 +740,7 @@ class RectifiedFlow(nn.Module):
                 bootstrap_ratio=bootstrap_ratio.mean(),
             )
             flow = self._pooled(error, frames, True)
-        return flow, self._aux_loss(mel, cond, mask), mean
+        return flow, self._aux_loss(mel, cond, voice, mask), mean
 
     @torch.no_grad()
     def validation_losses(self, mel, inputs: Conditioning, noise, fractions):
@@ -722,15 +755,21 @@ class RectifiedFlow(nn.Module):
             t = torch.full((mel.shape[0],), self.t_start + (1.0 - self.t_start) * fraction, device=mel.device)
             error = self._flow_error(mel, cond, voice, mask, t, noise, self.backbone)
             losses.append((error * frames).sum() / frames.sum().clamp_min(1.0))
-        return torch.stack(losses), self._aux_loss(mel, cond, mask)
+        return torch.stack(losses), self._aux_loss(mel, cond, voice, mask)
 
-    def _start(self, noise, cond, mask, start):
-        """Where sampling begins, as (state, flow time): noise at 0, or with
-        an aux decoder its mel mixed with noise at ``start``."""
+    @torch.no_grad()
+    def aux_mel(self, inputs: Conditioning) -> torch.Tensor:
+        """The aux decoder's normalised mel, [B, n_mels, T], where a shallow
+        flow's sampling starts."""
+        return self.aux(self.encoder(inputs), inputs.mask, self.encoder.voice(inputs.speaker))
+
+    def _start(self, noise, mel, mask, start):
+        """Where sampling begins, as (state, flow time): noise at 0, or for a
+        shallow flow ``mel`` mixed with noise at ``start``."""
         if self.t_start <= 0:
             return noise * mask, 0.0
         t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
-        return ((1.0 - t0) * noise + t0 * self.aux(cond, mask)) * mask, t0
+        return ((1.0 - t0) * noise + t0 * mel) * mask, t0
 
     @staticmethod
     def _renoise(x, now, back, fresh, temperature):
@@ -759,6 +798,7 @@ class RectifiedFlow(nn.Module):
         schedule: str = "uniform",
         churn: float = 0.0,
         churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
+        start_mel: Optional[torch.Tensor] = None,
     ):
         """Integrate the ODE from ``noise`` (drawn when None) to a normalised
         mel, [B, n_mels, T]; from ``t_start`` on the aux decoder's mel when the
@@ -776,7 +816,9 @@ class RectifiedFlow(nn.Module):
         ``temperature`` scales the starting noise. ``start`` is the flow time
         sampling begins at, from the aux decoder's mel; None, or anything
         before ``t_start``, is ``t_start``, and it is ignored without an aux
-        decoder. ``schedule`` is one of ``SCHEDULES``. The "mean" ``method``
+        decoder. ``start_mel`` [B, n_mels, T] stands in for the aux decoder's
+        mel there, as the real mel does to tell the flow's error from the aux
+        decoder's. ``schedule`` is one of ``SCHEDULES``. The "mean" ``method``
         is meant for one or two steps; the guidances apply to it as they are,
         though it was not trained under them.
 
@@ -822,7 +864,9 @@ class RectifiedFlow(nn.Module):
         if noise is None:
             noise = torch.randn((batch, self.n_mels, frames), device=inputs.content.device)
         noise = noise * float(temperature)
-        x, t0 = self._start(noise, cond[:batch], mask, start)
+        if start_mel is None and self.t_start > 0:
+            start_mel = self.aux(cond[:batch], mask, voice[:batch])
+        x, t0 = self._start(noise, start_mel, mask, start)
         times = time_grid(schedule, max(1, int(steps)), t0, x.device)
         for index in range(times.shape[0] - 1):
             now = float(times[index])

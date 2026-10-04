@@ -82,7 +82,7 @@ def render(model, item, data, device, steps, seed):
     real = normalize_mel(item.mel.to(device), data)
     generator = torch.Generator(device=device).manual_seed(seed)
     noise = torch.randn(real.shape, device=device, generator=generator)
-    aux = model.aux(cond, mask)
+    aux = model.aux(cond, mask, voice)
     ts = model.t_start
     return real, {
         "aux only": aux,

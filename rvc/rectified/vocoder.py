@@ -52,8 +52,10 @@ def build_vocoder(config: dict) -> PCPHBigVGANGenerator:
         source_noise_eq=model.get("source_noise_eq"),
         source_max_frequency=model.get("source_max_frequency"),
         source_pulsed_noise=model.get("source_pulsed_noise", False),
+        source_stage=model.get("source_stage"),
         noise_branch_bands=model.get("noise_branch_bands", 0),
         noise_branch_split_source=model.get("noise_branch_split_source", False),
+        noise_branch_f0=model.get("noise_branch_f0", False),
         output_gain=model["output_gain"],
         stage_channels=model.get("stage_channels"),
         prenet_blocks=model.get("prenet_blocks", 0),
@@ -110,17 +112,19 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict):
-    """A rectified vocoder export (PCPH-BigVGAN or converted OpenVPI) or an
-    OpenVPI NSF-HiFiGAN checkpoint as a module taking the normalised mel of ``data`` and f0, and its mel settings.
+    """A rectified vocoder export (PCPH-BigVGAN, NSF-HiFiGAN, NSF-UnivNet or Wavehax) or
+    an OpenVPI NSF-HiFiGAN checkpoint as a module taking the normalised mel of
+    ``data`` and f0, and its mel settings.
 
     Raises ``ValueError`` when ``path`` is neither or renders another mel."""
-    from rvc.rectified.openvpi import ARCHITECTURE, NSFHiFiGAN, generator_state, openvpi_spec
+    from rvc.rectified.openvpi import NSFHiFiGAN, generator_state, openvpi_spec
+    from rvc.rectified.singing_vocoders import GENERATORS, RAW_MEL_EXPORTS
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("kind") == "rectified_vocoder" and checkpoint.get("architecture") == ARCHITECTURE:
-        generator = NSFHiFiGAN(**checkpoint["config"]["vocoder"]["model"])
+    if checkpoint.get("kind") == "rectified_vocoder" and checkpoint.get("architecture") in GENERATORS:
+        generator = GENERATORS[checkpoint["architecture"]](**checkpoint["config"]["vocoder"]["model"])
         generator.load_state_dict(checkpoint["model"])
-        model = RawMelVocoder(generator, data)
+        model = RawMelVocoder(generator, data) if checkpoint["architecture"] in RAW_MEL_EXPORTS else generator
         vocoder_data = checkpoint["config"]["data"]
     elif checkpoint.get("kind") == "rectified_vocoder":
         model = build_vocoder(checkpoint["config"])

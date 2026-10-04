@@ -252,7 +252,7 @@ class RectifiedPage(Page):
         advanced.add_row(
             Field(_("Sampler"), self.sampler, _("Heun costs two model passes per step.")),
             Field(_("Step schedule"), self.schedule,
-                  _("Sway puts more steps early; logit-normal matches the times trained on most.")),
+                  _("Sway puts more steps early; logit-normal puts more mid-way.")),
         )
         advanced.add_row(
             Field(_("Noise temperature"), self.noise_temperature,

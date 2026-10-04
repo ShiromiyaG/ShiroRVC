@@ -691,11 +691,15 @@ def run_rectified_vocoder_train_script(
     fresh: bool = False,
     precision: str = "fp32",
     mel_degradation: float = 0.0,
+    architecture: str = "pcph-bigvgan",
+    discriminator: str = "",
 ):
     return _run_rectified_trainer(
         "train_vocoder",
         {
             "model_name": model_name,
+            "architecture": str(architecture),
+            "discriminator": str(discriminator or ""),
             "total_epochs": int(total_epochs),
             "save_every": int(save_every),
             "batch_size": int(batch_size),
@@ -976,7 +980,7 @@ def rectified_train_flow(**kwargs):
 @cli.command("rectified_train_vocoder")
 @apply_options(RECTIFIED_TRAIN_VOCODER_OWN)
 def rectified_train_vocoder(**kwargs):
-    """Pretrain the rectified-flow PCPH-BigVGAN vocoder on an extracted experiment."""
+    """Train a rectified-flow vocoder on an extracted experiment."""
     run_rectified_vocoder_train_script(**kwargs)
 
 

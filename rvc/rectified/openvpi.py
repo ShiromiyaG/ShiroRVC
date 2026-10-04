@@ -51,9 +51,42 @@ def _padding(kernel_size, dilation=1):
     return (kernel_size * dilation - dilation) // 2
 
 
-class ResBlock1(nn.Module):
-    def __init__(self, channels, kernel_size, dilation):
+def activation_factory(activation: str, antialias: bool):
+    """``channels -> module`` for the generator's activations: HiFi-GAN's leaky
+    ReLU, or BigVGAN's SnakeBeta, oversampled 2x with ``antialias``."""
+    if activation == "leaky_relu":
+        return lambda channels: nn.LeakyReLU(LRELU_SLOPE)
+    if activation == "snakebeta":
+        from rvc.lib.algorithm.generators.pcph_bigvgan import snake_activation
+
+        return lambda channels: snake_activation(channels, antialias)
+    raise ValueError(f"activation must be 'leaky_relu' or 'snakebeta', not {activation!r}.")
+
+
+class FilteredUpsample(nn.Module):
+    """A conv at the input rate, then a fixed windowed-sinc upsampler, in
+    place of the transposed conv: that one has to learn to filter the images
+    of its own zero-stuffing, with a kernel only two input samples long."""
+
+    def __init__(self, in_channels, out_channels, rate, filter_width, rolloff, filter_beta):
         super().__init__()
+        from rvc.lib.algorithm.resampling import AntiAliasedUpsample1d
+
+        self.conv = nn.Conv1d(in_channels, out_channels, 7, padding=3)
+        self.up = AntiAliasedUpsample1d(rate, filter_width=filter_width, rolloff=rolloff, filter_beta=filter_beta)
+
+    def forward(self, x):
+        x = self.conv(x)
+        # The filter in FP32, as PCPH-BigVGAN runs its own under autocast.
+        with torch.autocast(x.device.type, enabled=False):
+            return self.up(x.float())
+
+
+class ResBlock1(nn.Module):
+    def __init__(self, channels, kernel_size, dilation, activation):
+        super().__init__()
+        self.acts1 = nn.ModuleList(activation(channels) for _ in dilation)
+        self.acts2 = nn.ModuleList(activation(channels) for _ in dilation)
         self.convs1 = nn.ModuleList(
             [nn.Conv1d(channels, channels, kernel_size, dilation=d, padding=_padding(kernel_size, d))
              for d in dilation]
@@ -64,22 +97,23 @@ class ResBlock1(nn.Module):
         )
 
     def forward(self, x):
-        for c1, c2 in zip(self.convs1, self.convs2):
-            x = c2(F.leaky_relu(c1(F.leaky_relu(x, LRELU_SLOPE)), LRELU_SLOPE)) + x
+        for c1, c2, a1, a2 in zip(self.convs1, self.convs2, self.acts1, self.acts2):
+            x = c2(a2(c1(a1(x)))) + x
         return x
 
 
 class ResBlock2(nn.Module):
-    def __init__(self, channels, kernel_size, dilation):
+    def __init__(self, channels, kernel_size, dilation, activation):
         super().__init__()
+        self.acts = nn.ModuleList(activation(channels) for _ in dilation)
         self.convs = nn.ModuleList(
             [nn.Conv1d(channels, channels, kernel_size, dilation=d, padding=_padding(kernel_size, d))
              for d in dilation]
         )
 
     def forward(self, x):
-        for c in self.convs:
-            x = c(F.leaky_relu(x, LRELU_SLOPE)) + x
+        for c, a in zip(self.convs, self.acts):
+            x = c(a(x)) + x
         return x
 
 
@@ -110,12 +144,24 @@ class SourceModuleHnNSF(nn.Module):
 
 
 class NSFHiFiGAN(nn.Module):
-    """OpenVPI's ``Generator``: log mel [B, n_mels, T] and f0 [B, T] -> [B, 1, T * hop]."""
+    """OpenVPI's ``Generator``: log mel [B, n_mels, T] and f0 [B, T] -> [B, 1, T * hop].
+
+    ``activation`` "snakebeta" puts SnakeBeta in the residual blocks and before
+    the output conv, oversampled 2x with ``antialias``; the leaky ReLU before
+    each upsampler stays. ``upsampling`` "filtered" replaces the transposed
+    convs with ``FilteredUpsample``, by ``upsample_filters``: each stage's
+    (filter width, rolloff, beta). Neither is OpenVPI's, whose checkpoints hold
+    no such weights."""
 
     def __init__(self, sample_rate, num_mels, upsample_initial_channel, upsample_rates,
                  upsample_kernel_sizes, resblock, resblock_kernel_sizes,
-                 resblock_dilation_sizes, mini_nsf, harmonic_num=8, noise_sigma=0.0):
+                 resblock_dilation_sizes, mini_nsf, harmonic_num=8, noise_sigma=0.0,
+                 activation="leaky_relu", antialias=False, upsampling="transposed",
+                 upsample_filters=None):
         super().__init__()
+        if upsampling not in ("transposed", "filtered"):
+            raise ValueError(f"upsampling must be 'transposed' or 'filtered', not {upsampling!r}.")
+        make_activation = activation_factory(activation, antialias)
         self.num_kernels = len(resblock_kernel_sizes)
         self.mini_nsf = mini_nsf
         self.noise_sigma = noise_sigma
@@ -135,9 +181,12 @@ class NSFHiFiGAN(nn.Module):
         ch = upsample_initial_channel
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             ch //= 2
-            self.ups.append(nn.ConvTranspose1d(2 * ch, ch, k, u, padding=(k - u) // 2))
+            if upsampling == "filtered":
+                self.ups.append(FilteredUpsample(2 * ch, ch, u, *upsample_filters[i]))
+            else:
+                self.ups.append(nn.ConvTranspose1d(2 * ch, ch, k, u, padding=(k - u) // 2))
             for kernel, dilation in zip(resblock_kernel_sizes, resblock_dilation_sizes):
-                self.resblocks.append(block(ch, kernel, dilation))
+                self.resblocks.append(block(ch, kernel, dilation, make_activation))
             if not mini_nsf:
                 if i + 1 < len(upsample_rates):
                     stride = int(np.prod(upsample_rates[i + 1:]))
@@ -149,6 +198,8 @@ class NSFHiFiGAN(nn.Module):
             elif i == 1:
                 self.source_conv = nn.Conv1d(1, ch, 1)
         self.conv_post = nn.Conv1d(ch, 1, 7, 1, padding=3)
+        # HiFi-GAN's last leaky ReLU is at PyTorch's default slope.
+        self.act_post = nn.LeakyReLU() if activation == "leaky_relu" else make_activation(ch)
 
     def _fast_sine(self, f0):
         n = torch.arange(1, self.upp + 1, device=f0.device)
@@ -174,7 +225,7 @@ class NSFHiFiGAN(nn.Module):
                 x = x + self.source_conv(source)
             blocks = self.resblocks[i * self.num_kernels:(i + 1) * self.num_kernels]
             x = sum(block(x) for block in blocks) / self.num_kernels
-        return torch.tanh(self.conv_post(F.leaky_relu(x)))
+        return torch.tanh(self.conv_post(self.act_post(x)))
 
 
 def generator_state(checkpoint: dict):
@@ -187,7 +238,7 @@ def generator_state(checkpoint: dict):
     return None
 
 
-def _fold_weight_norm(state: dict) -> dict:
+def fold_weight_norm(state: dict) -> dict:
     """``weight_g``/``weight_v`` pairs -> plain ``weight`` (weight norm over dim 0)."""
     folded = {}
     for key, value in state.items():
@@ -216,7 +267,7 @@ def openvpi_spec(path: str, state: dict):
     ``NSFHiFiGAN`` arguments, the mel in this repo's key names, and the
     weights with weight norm folded."""
     config = _read_config(path)
-    state = _fold_weight_norm(state)
+    state = fold_weight_norm(state)
     mel = dict(DEFAULT_MEL)
     for source, target in CONFIG_MEL_KEYS.items():
         if source in config:

@@ -1,0 +1,40 @@
+{
+    "architecture": "wavehax",
+    "learning_rate": 0.0002,
+    "betas": [0.8, 0.9],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "lr_scheduler": "cosine annealing epoch",
+    "lr_decay": 1.0,
+    "lr_final_ratio": 0.1,
+    "warmup_steps": 0,
+    "adv_warmup_steps": 0,
+    "ema_decay": 0.999,
+    "grad_clip": 10.0,
+    "compile_generator": true,
+    "gan_loss": "hinge",
+    "segment_size": 16384,
+    "c_mel": 45.0,
+    "loss_n_mels": 120,
+    "loss_fmin": 0.0,
+    "volume_aug_prob": 0.0,
+    "seed": 1234,
+    "rolling_loss_steps": 50,
+    "preview_interval": 500,
+    "holdout_clips": 0,
+    "eval_interval": 0,
+    "model": {
+        "n_fft": 1024,
+        "channels": 32,
+        "mult_channels": 2,
+        "kernel_size": [15, 7],
+        "num_blocks": 8,
+        "prior_noise": 0.01
+    },
+    "discriminator": {
+        "periods": [2, 3, 5, 7, 11, 13, 17],
+        "mrd_fft_sizes": [1024, 2048, 4096],
+        "mrd_hop_sizes": [256, 512, 1024],
+        "mrd_win_lengths": [1024, 2048, 4096]
+    }
+}

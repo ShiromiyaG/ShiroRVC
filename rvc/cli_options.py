@@ -696,6 +696,19 @@ RECTIFIED_TRAIN_VOCODER_OWN = [
     ),
     click.option("--fresh", type=click.BOOL, default=False, show_default=True, help="Ignore this run's checkpoints and start over."),
     click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
+    click.option(
+        "--architecture",
+        type=click.Choice(["pcph-bigvgan", "pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax"]),
+        default="pcph-bigvgan",
+        show_default=True,
+        help="Vocoder to train. OpenVPI SingingVocoders' three and Wavehax train by their own recipes (rvc/configs/rectified/vocoders).",
+    ),
+    click.option(
+        "--discriminator",
+        type=click.Choice(["original", "v3"]),
+        default=None,
+        help="For the SingingVocoders architectures: their recipe's own discriminator, or this repo's v3 with its adversarial and feature losses. Empty uses the recipe's discriminator_choice. PCPH-BigVGAN always uses its config's.",
+    ),
     click.option("--mel_degradation", type=click.FloatRange(0, 1), default=0.0, show_default=True, help="Trains on mels blurred, dulled and noised up to this strength, so the vocoder tolerates a flow's imperfect mels. 0 is off; 0.5 is a moderate start."),
 ]
 
@@ -707,7 +720,7 @@ RECTIFIED_INFER_OWN = [
     click.option("--output_path", type=str, required=True, help="Full path to the output audio file."),
     click.option("--flow_path", type=str, required=True, help="Exported rectified-flow model (.pth), or a model bundle (.srvc) holding one."),
     click.option("--flow_submodel", type=str, default="", help="The flow to use inside a bundle; empty uses its first. A bundled index replaces --index_path."),
-    click.option("--vocoder_path", type=str, required=True, help="Rectified PCPH-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint."),
+    click.option("--vocoder_path", type=str, required=True, help="Rectified vocoder export or OpenVPI NSF-HiFiGAN checkpoint."),
     click.option("--index_path", type=str, default="", help="Optional RVC index over the voice model's training features."),
     click.option("--sid", type=int, default=0, show_default=True, help="Speaker ID for multi-speaker models."),
     click.option("--pitch", type=click.IntRange(-24, 24), default=0, show_default=True, help="Pitch shift in semitones."),

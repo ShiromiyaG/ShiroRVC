@@ -69,6 +69,10 @@ SOURCE_BRANCH_SLOPE = 0.1
 #: straddles it, and with the PCPH source's energy there training diverged.
 DEEP_SOURCE_ACTIVATION = dict(filter_width=64, rolloff=0.97)
 
+#: The ``fundamental`` source joins the last stage at or below this rate, Hz:
+#: its sine then reaches a 3 kHz f0, and the stages after it make the harmonics.
+FUNDAMENTAL_SOURCE_RATE = 6000.0
+
 #: Bias that starts a ``softplus`` gain at 1: ``log(e - 1)``.
 UNIT_SOFTPLUS_BIAS = 0.5413248546129181
 
@@ -399,30 +403,40 @@ class PCPHSource(nn.Module):
         safe = denominator.abs() > 1e-6
         return torch.where(safe, numerator / torch.where(safe, denominator, 1.0), 0.0)
 
-    def _harmonics(self, f0, voiced, phase):
-        """The pulse train, (batch, length); silent in unvoiced samples."""
-        limit = self.max_frequency
+    def _band(self, safe_f0, phase, limit, lowest_f0):
+        """(sum, power) of the harmonics up to ``limit``: their sines summed,
+        and their squared amplitudes. Without ``phase``, the power alone."""
         taper = limit * self.NYQUIST_TAPER
-        # Unvoiced samples take an f0 that leaves them no harmonic.
-        safe_f0 = torch.where(voiced > 0, f0, limit).double()
-
         # Harmonics below the taper band, all at full amplitude.
         full_count = torch.floor((limit - taper) / safe_f0)
-        harmonics = self._sine_sum(phase, full_count)
-        # Sum of the squared amplitudes, which sets the level below.
+        harmonics = None if phase is None else self._sine_sum(phase, full_count)
         power = full_count.float()
         # Harmonics in the top band, faded by their own frequency. The lowest
         # f0 has the most of them.
-        voiced_f0 = f0[voiced > 0]
-        fading_count = (
-            int(np.ceil(taper / voiced_f0.min().item())) + 1 if voiced_f0.numel() else 0
-        )
+        fading_count = int(np.ceil(taper / lowest_f0)) + 1 if lowest_f0 else 0
         for offset in range(1, fading_count + 1):
             order = full_count + offset
             fade = ((limit - order * safe_f0) / taper).clamp(0.0, 1.0).float()
-            harmonics = harmonics + fade * torch.sin(2 * np.pi * ((order * phase) % 1.0)).float()
+            if phase is not None:
+                harmonics = harmonics + fade * torch.sin(2 * np.pi * ((order * phase) % 1.0)).float()
             power = power + fade.square()
+        return harmonics, power
 
+    def _harmonics(self, f0, voiced, phase, limit=None):
+        """The pulse train, (batch, length); silent in unvoiced samples. A
+        ``limit`` below ``max_frequency`` ends the harmonics there at the level
+        they have in the whole train: the same pulses, band-limited."""
+        top = self.max_frequency
+        limit = top if limit is None else min(float(limit), top)
+        # Unvoiced samples take an f0 that leaves them no harmonic.
+        safe_f0 = torch.where(voiced > 0, f0, top).double()
+        voiced_f0 = f0[voiced > 0]
+        lowest_f0 = voiced_f0.min().item() if voiced_f0.numel() else None
+
+        harmonics, power = self._band(safe_f0, phase, limit, lowest_f0)
+        if limit < top:
+            # The sum of the whole train's squared amplitudes sets the level.
+            power = self._band(safe_f0, None, top, lowest_f0)[1]
         return harmonics * self.sine_amp * torch.sqrt(2.0 / power.clamp(min=1.0)) * voiced
 
     def _pulsed_noise(self, voiced, phase):
@@ -467,9 +481,49 @@ class PCPHSource(nn.Module):
         return (pulses + noise).unsqueeze(-1)
 
 
+class FundamentalSource(nn.Module):
+    """A sine at the fundamental alone, at the power ``PCPHSource``'s pulses
+    have, made at the rate of the one stage it is added to: an anchor for the
+    phase, with the harmonics and the noise left to the trunk and the noise
+    branch. Nothing to band-limit, decimate or equalise. Silent in unvoiced
+    samples and where f0 passes that rate's Nyquist. Owns no state-dict key.
+    """
+
+    def __init__(self, samp_rate, sine_amp=0.1, voiced_threshold=0, random_start_phase=False):
+        super().__init__()
+        self.sampling_rate = samp_rate
+        self.sine_amp = sine_amp
+        self.voiced_threshold = voiced_threshold
+        self.random_start_phase = bool(random_start_phase)
+
+    @torch.compiler.disable  # the sample-axis cumsum, as ``PCPHSource._phase``
+    def forward(self, f0):
+        """f0: (batch, length) in Hz at this source's rate. Returns (batch, 1, length)."""
+        with torch.no_grad():
+            voiced = ((f0 > self.voiced_threshold) & (f0 < self.sampling_rate / 2.0)).float()
+            phase = torch.cumsum((f0 * voiced).double() / self.sampling_rate, dim=-1)
+            if self.random_start_phase and self.training:
+                phase = phase + torch.rand(phase.shape[0], 1, device=phase.device, dtype=phase.dtype)
+            sine = torch.sin(2 * np.pi * (phase % 1.0)).float()
+            return (sine * voiced * self.sine_amp * 2.0**0.5).unsqueeze(1)
+
+
 def exp_sigmoid(x: torch.Tensor) -> torch.Tensor:
     """DDSP's positive, bounded gain: 2 at most, 1e-7 at least."""
     return 2.0 * torch.sigmoid(x) ** np.log(10.0) + 1e-7
+
+
+def _widen_noise_head(
+    module, state_dict, prefix, local_metadata, strict, missing_keys,
+    unexpected_keys, error_msgs,
+):
+    """Load hook: a head saved without ``f0_input`` takes zero weights on the
+    two new inputs, which leaves its gains as they were."""
+    key = prefix + "head.0.weight"
+    saved = state_dict.get(key)
+    extra = module.head[0].in_channels - saved.shape[1] if saved is not None else 0
+    if extra > 0:
+        state_dict[key] = F.pad(saved, (0, 0, 0, extra))
 
 
 class NoiseBranch(nn.Module):
@@ -484,23 +538,30 @@ class NoiseBranch(nn.Module):
     gains between their centres interpolated linearly. The noise starts at
     about -80 dB and the excitation gains at 1. With ``split_source`` the
     excitation's pulses and its noise take separate gains, so the mel sets
-    their ratio in each band.
+    their ratio in each band. With ``f0_input`` the head also reads each
+    frame's pitch and whether it is voiced: the mel alone does not say whether
+    a high band holds harmonics or noise.
     """
 
     HIDDEN = 128
     #: exp_sigmoid(-4.3) ~ 1e-4.
     NOISE_START = -4.3
+    #: The head's pitch input is ``log2(f0 / F0_REFERENCE)``, 0 when unvoiced.
+    F0_REFERENCE = 220.0
 
     def __init__(self, num_mels: int, bands: int, sample_rate: int, hop: int,
-                 split_source: bool = False):
+                 split_source: bool = False, f0_input: bool = False):
         super().__init__()
         self.bands, self.hop, self.n_fft = int(bands), int(hop), 4 * int(hop)
+        self.sample_rate = int(sample_rate)
         self.split_source = bool(split_source)
+        self.f0_input = bool(f0_input)
         # Outputs ``bands`` noise gains, then ``bands`` excitation gains, or
         # with ``split_source`` the pulses' and then the excitation noise's.
         groups = 3 if self.split_source else 2
         self.head = nn.Sequential(
-            nn.Conv1d(num_mels, self.HIDDEN, 3, padding=1),
+            # The pitch and the voiced flag come after the mel's channels.
+            nn.Conv1d(num_mels + (2 if self.f0_input else 0), self.HIDDEN, 3, padding=1),
             nn.LeakyReLU(0.1),
             nn.Conv1d(self.HIDDEN, self.HIDDEN, 3, padding=1),
             nn.LeakyReLU(0.1),
@@ -514,35 +575,61 @@ class NoiseBranch(nn.Module):
 
         # Band centres evenly spaced on the mel scale, from 0 Hz to Nyquist.
         top_mel = 2595.0 * np.log10(1.0 + sample_rate / 2.0 / 700.0)
-        centres = 700.0 * (10.0 ** (np.linspace(0.0, top_mel, self.bands) / 2595.0) - 1.0)
-        # (bins, bands): the weight of each band's gain in each STFT bin.
-        freqs = np.fft.rfftfreq(self.n_fft, 1.0 / sample_rate)
-        interp = np.stack([np.interp(freqs, centres, row) for row in np.eye(self.bands)], axis=1)
-        self.register_buffer("interp", torch.from_numpy(interp).float(), persistent=False)
+        self.centres = 700.0 * (10.0 ** (np.linspace(0.0, top_mel, self.bands) / 2595.0) - 1.0)
+        self.register_buffer("interp", self._interp(self.n_fft, 1), persistent=False)
         self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+        # ``_tables`` of the rates below the output's, by (decimation, device).
+        self._decimated = {}
+        self.register_load_state_dict_pre_hook(_widen_noise_head)
 
-    def gains(self, mel: torch.Tensor):
+    def _interp(self, n_fft: int, decimation: int) -> torch.Tensor:
+        """(bins, bands): the weight of each band's gain in each STFT bin of a
+        signal at ``1 / decimation`` of the output rate."""
+        freqs = np.fft.rfftfreq(n_fft, decimation / self.sample_rate)
+        interp = np.stack([np.interp(freqs, self.centres, row) for row in np.eye(self.bands)], axis=1)
+        return torch.from_numpy(interp).float()
+
+    def _tables(self, decimation: int, device):
+        """(hop, n_fft, window, interp) for a signal at ``1 / decimation`` of
+        the output rate, with the same frames."""
+        if decimation == 1:
+            return self.hop, self.n_fft, self.window, self.interp
+        key = (decimation, device)
+        if key not in self._decimated:
+            hop = self.hop // decimation
+            self._decimated[key] = (
+                hop, 4 * hop, torch.hann_window(4 * hop, device=device),
+                self._interp(4 * hop, decimation).to(device),
+            )
+        return self._decimated[key]
+
+    def gains(self, mel: torch.Tensor, f0: torch.Tensor = None):
         """(noise, excitation) gains, each (batch, bands, frames); with
-        ``split_source`` the excitation's are a (pulses, noise) pair."""
+        ``split_source`` the excitation's are a (pulses, noise) pair. ``f0``
+        is Hz per frame, (batch, 1, frames), read with ``f0_input``."""
+        if self.f0_input:
+            if f0.shape[-1] != mel.shape[-1]:
+                f0 = F.interpolate(f0, size=mel.shape[-1], mode="nearest")
+            voiced = (f0 > 0).to(mel.dtype)
+            pitch = torch.log2(f0.clamp_min(1.0) / self.F0_REFERENCE).to(mel.dtype) * voiced
+            mel = torch.cat((mel, pitch, voiced), dim=1)
         noise, *excitation = self.head(mel).float().split(self.bands, dim=1)
         excitation = [2.0 * torch.sigmoid(gain) for gain in excitation]
         return exp_sigmoid(noise), excitation if self.split_source else excitation[0]
 
-    def shape(self, signal: torch.Tensor, gains: torch.Tensor) -> torch.Tensor:
+    def shape(self, signal: torch.Tensor, gains: torch.Tensor, decimation: int = 1) -> torch.Tensor:
         """``signal`` (batch, samples) through ``gains`` (batch, bands,
-        frames), frame t centred on sample t * hop."""
+        frames), frame t centred on sample t * hop. ``decimation`` is how far
+        below the output rate the signal is."""
+        hop, n_fft, window, interp = self._tables(decimation, signal.device)
         with torch.autocast(signal.device.type, enabled=False):
-            spectrum = torch.stft(
-                signal.float(), self.n_fft, self.hop, window=self.window, return_complex=True
-            )
+            spectrum = torch.stft(signal.float(), n_fft, hop, window=window, return_complex=True)
             # The centred STFT has one frame more than the mel.
             frames = spectrum.shape[-1]
             if gains.shape[-1] < frames:
                 gains = F.pad(gains, (0, frames - gains.shape[-1]), mode="replicate")
-            per_bin = torch.einsum("fk,bkt->bft", self.interp, gains[..., :frames].float())
-            return torch.istft(
-                spectrum * per_bin, self.n_fft, self.hop, window=self.window, length=signal.shape[-1]
-            )
+            per_bin = torch.einsum("fk,bkt->bft", interp, gains[..., :frames].float())
+            return torch.istft(spectrum * per_bin, n_fft, hop, window=window, length=signal.shape[-1])
 
 
 class PCPHBigVGANGenerator(nn.Module):
@@ -573,7 +660,15 @@ class PCPHBigVGANGenerator(nn.Module):
             ``source_harmonics``/``source_tilt``/``source_phase`` options
             shape, or ``pcph``, ``PCPHSource``: every harmonic to Nyquist,
             phase-locked, at constant power. PCPH takes none of those options
-            nor ``source_gain``.
+            nor ``source_gain``. ``pcph_staged`` is the same pulses made at
+            each stage's own rate from one phase track, with the harmonics
+            that fit under that rate's Nyquist, instead of made at the output
+            rate and filtered down; its noise is still filtered down.
+            ``fundamental`` is ``FundamentalSource``: one sine, added at one
+            stage, and no source noise. The last two need ``source_branch``
+            ``linear``.
+        source_stage (int, optional): The stage ``fundamental`` is added
+            after; ``None`` takes the last one below ``FUNDAMENTAL_SOURCE_RATE``.
         source_max_frequency (float, optional): Hz where the PCPH source's
             harmonics end, and over which its power is normalised; Nyquist
             when ``None``.
@@ -598,6 +693,10 @@ class PCPHBigVGANGenerator(nn.Module):
         noise_branch_split_source (bool, optional): Separate band gains for
             the PCPH source's pulses and its noise. Sizes
             ``noise_branch.head.4.weight``.
+        noise_branch_f0 (bool, optional): The ``NoiseBranch`` head reads the
+            pitch and the voiced flag beside the mel. Sizes
+            ``noise_branch.head.0.weight``; a checkpoint saved without it
+            loads, with zeros on the new inputs.
         output_gain (bool, optional): A learned output level ``exp(s)`` on the
             unit-norm ``conv_post``, as in RefineGAN2.
         resblock (str, optional): ``"1"`` for AMPBlock1, ``"2"`` for AMPBlock2,
@@ -642,8 +741,10 @@ class PCPHBigVGANGenerator(nn.Module):
         source_noise_eq: "Sequence[Sequence[float]] | None" = None,
         source_max_frequency: "float | None" = None,
         source_pulsed_noise: bool = False,
+        source_stage: "int | None" = None,
         noise_branch_bands: int = 0,
         noise_branch_split_source: bool = False,
+        noise_branch_f0: bool = False,
         output_gain: bool = False,
         stage_channels: "Sequence[int] | None" = None,
         prenet_blocks: int = 0,
@@ -703,16 +804,39 @@ class PCPHBigVGANGenerator(nn.Module):
             max_frequency=source_max_frequency,
             pulsed_noise=bool(source_pulsed_noise),
         )
+        # Output samples per sample of each stage's output, first stage first.
+        self.stage_steps = [
+            int(np.prod(self.upsample_rates[stage + 1 :])) for stage in range(count)
+        ]
+        # The stages that take the excitation: all, or ``fundamental``'s one.
+        self.source_stages = tuple(range(count))
+        if self.source_type == "fundamental":
+            if source_stage is None:
+                below = [
+                    stage for stage, step in enumerate(self.stage_steps)
+                    if self.sample_rate / step <= FUNDAMENTAL_SOURCE_RATE
+                ]
+                source_stage = below[-1] if below else 0
+            if not 0 <= int(source_stage) < count:
+                raise ValueError(f"source_stage must be between 0 and {count - 1}, received {source_stage}.")
+            self.source_stages = (int(source_stage),)
+        elif source_stage is not None:
+            raise ValueError("source_stage is the 'fundamental' source's.")
+        if self.source_type in ("pcph_staged", "fundamental") and source_branch != "linear":
+            raise ValueError(f"source_type {self.source_type!r} needs source_branch 'linear'.")
         self.m_source = self._build_source(
             source_gain, float(source_noise_std), source_random_start_phase, pcph_options
         )
 
-        # Output-rate excitation -> each earlier stage's rate, last stage first.
+        # Output-rate excitation -> each earlier stage's rate, last stage
+        # first. ``fundamental`` is made at its stage's rate.
         self.source_downs = nn.ModuleList(
             [
                 FixedLowPass1d(rate, stride=rate, **SOURCE_DECIMATION)
                 for rate in reversed(self.upsample_rates[1:])
             ]
+            if self.source_type != "fundamental"
+            else []
         )
 
         if source_branch not in ("linear", "rectified"):
@@ -728,14 +852,18 @@ class PCPHBigVGANGenerator(nn.Module):
 
         self.split_source_gains = bool(noise_branch_split_source)
         if self.split_source_gains and (
-            self.source_type != "pcph" or int(noise_branch_bands) <= 0
+            self.source_type not in ("pcph", "pcph_staged") or int(noise_branch_bands) <= 0
         ):
             raise ValueError(
-                "noise_branch_split_source needs source_type 'pcph' and noise_branch_bands."
+                "noise_branch_split_source needs source_type 'pcph' or 'pcph_staged' and "
+                "noise_branch_bands."
             )
+        if noise_branch_f0 and int(noise_branch_bands) <= 0:
+            raise ValueError("noise_branch_f0 needs noise_branch_bands.")
         self.noise_branch = (
             NoiseBranch(
-                num_mels, noise_branch_bands, self.sample_rate, self.upp, self.split_source_gains
+                num_mels, noise_branch_bands, self.sample_rate, self.upp,
+                self.split_source_gains, noise_branch_f0,
             )
             if int(noise_branch_bands) > 0
             else None
@@ -775,13 +903,14 @@ class PCPHBigVGANGenerator(nn.Module):
                     filter_beta=self.filter_beta[stage],
                 )
             )
-            self.source_convs.append(
-                source_conv(
-                    source_channels[stage],
-                    new_channels,
-                    deep=stage >= self.deep_source_from,
+            if stage in self.source_stages:
+                self.source_convs.append(
+                    source_conv(
+                        source_channels[stage],
+                        new_channels,
+                        deep=stage >= self.deep_source_from,
+                    )
                 )
-            )
             for kernel, dilation in zip(resblock_kernel_sizes, resblock_dilation_sizes):
                 self.resblocks.append(
                     AMPBlock(
@@ -818,14 +947,28 @@ class PCPHBigVGANGenerator(nn.Module):
     def _build_source(self, source_gain, noise_std, random_start_phase, pcph_options) -> nn.Module:
         """The excitation generator ``source_type`` names; ``pcph_options``
         are ``PCPHSource``'s own."""
-        if self.source_type == "pcph":
-            if source_gain or self.source_harmonics or self.source_phase != "random" \
-                    or self.source_phase_jitter:
+        if self.source_type in ("pcph", "pcph_staged", "fundamental") and (
+            source_gain or self.source_harmonics or self.source_phase != "random"
+            or self.source_phase_jitter
+        ):
+            raise ValueError(
+                f"source_type {self.source_type!r} sets its own harmonics, phases and "
+                "level; source_gain, source_harmonics, source_phase and "
+                "source_phase_jitter are the sine source's."
+            )
+        if self.source_type == "fundamental":
+            if any(pcph_options.values()):
                 raise ValueError(
-                    "source_type 'pcph' has every harmonic, phase-locked, at a fixed "
-                    "level; source_gain, source_harmonics, source_phase and "
-                    "source_phase_jitter are the sine source's."
+                    "source_noise_eq, source_max_frequency and source_pulsed_noise are the "
+                    "PCPH sources'; 'fundamental' has neither harmonics nor noise."
                 )
+            stage = self.source_stages[0]
+            return FundamentalSource(
+                self.sample_rate / self.stage_steps[stage], random_start_phase=random_start_phase
+            )
+        if self.source_type in ("pcph", "pcph_staged"):
+            if self.source_type == "pcph_staged" and pcph_options["pulsed_noise"]:
+                raise ValueError("source_pulsed_noise is not made per stage; use source_type 'pcph'.")
             return PCPHSource(
                 self.sample_rate,
                 noise_std=noise_std,
@@ -847,7 +990,10 @@ class PCPHBigVGANGenerator(nn.Module):
                 phase_jitter=self.source_phase_jitter,
                 random_start_phase=random_start_phase,
             )
-        raise ValueError(f"source_type must be 'sine' or 'pcph', not {self.source_type!r}.")
+        raise ValueError(
+            "source_type must be 'sine', 'pcph', 'pcph_staged' or 'fundamental', "
+            f"not {self.source_type!r}."
+        )
 
     def _build_source_branch(self, count: int) -> list:
         """Adds the ``rectified`` branch's layers. Returns the excitation's
@@ -929,7 +1075,17 @@ class PCPHBigVGANGenerator(nn.Module):
     def _excitation(self, z, f0, g, band_gains=None):
         """The excitation at every stage's output rate, first stage first;
         ``band_gains`` are the noise branch's on the excitation."""
+        if self.source_type == "fundamental":
+            stage = self.source_stages[0]
+            f0 = expand_f0(f0, z.shape[-1] * self.upp // self.stage_steps[stage])
+            sources = [None] * len(self.upsample_rates)
+            with self._fp32_region(z):
+                sources[stage] = self.m_source(f0[:, 0])
+            return sources
         f0 = expand_f0(f0, z.shape[-1] * self.upp)
+        if self.source_type == "pcph_staged":
+            with self._fp32_region(z):
+                return self._staged_excitation(f0[:, 0], band_gains)
         with self._fp32_region(z):
             gain = self._source_gain(self._fp32(z), None if g is None else self._fp32(g))
             if self.split_source_gains:
@@ -953,6 +1109,37 @@ class PCPHBigVGANGenerator(nn.Module):
                     sources.append(down(sources[-1]))
         return sources[::-1]
 
+    def _staged_excitation(self, f0, band_gains):
+        """``pcph_staged``: the pulses made at each stage's rate from the
+        output-rate phase track, so the stages' pulses line up, and the
+        output-rate noise filtered down. f0: (batch, samples) in Hz."""
+        source = self.m_source
+        with torch.no_grad():
+            voiced = (f0 > source.voiced_threshold).float()
+            phase = source._phase(torch.where(voiced > 0, f0, 0.0))
+            noise = source._noise(voiced)
+        pulse_gains = noise_gains = band_gains
+        if self.split_source_gains:
+            pulse_gains, noise_gains = band_gains
+        shape = None if self.noise_branch is None else self.noise_branch.shape
+        if noise_gains is not None:
+            noise = shape(noise, noise_gains)
+        # From the output rate down, as ``source_downs``.
+        noises = [noise.unsqueeze(1)]
+        for down in self.source_downs:
+            noises.append(down(noises[-1]))
+        sources = []
+        for step, noise in zip(self.stage_steps, noises[::-1]):
+            with torch.no_grad():
+                pulses = source._harmonics(
+                    f0[:, ::step], voiced[:, ::step], phase[:, ::step],
+                    limit=self.sample_rate / step / 2.0,
+                )
+            if pulse_gains is not None:
+                pulses = shape(pulses, pulse_gains, step)
+            sources.append(pulses.unsqueeze(1) + noise)
+        return sources
+
     def _upsample(self, stage: int, x: torch.Tensor) -> torch.Tensor:
         x = self.projections[stage](x)
         with self._fp32_region(x):
@@ -961,10 +1148,11 @@ class PCPHBigVGANGenerator(nn.Module):
     def _add_source(self, stage: int, source: torch.Tensor) -> torch.Tensor:
         """The stage's excitation, in the trunk's channels."""
         # A deep source filters in its rectifiers, and the filters stay in FP32.
+        conv = self.source_convs[self.source_stages.index(stage)]
         if stage < self.deep_source_from:
-            return self.source_convs[stage](source)
+            return conv(source)
         with self._fp32_region(source):
-            return self.source_convs[stage](self._fp32(source))
+            return conv(self._fp32(source))
 
     def _resblocks(self, stage: int, x: torch.Tensor, checkpointed: bool) -> torch.Tensor:
         """The mean of the stage's AMP blocks, one per kernel size, each on ``x``."""
@@ -1004,7 +1192,7 @@ class PCPHBigVGANGenerator(nn.Module):
             f0 = f0.unsqueeze(1)
         noise_gains = excitation_gains = None
         if self.noise_branch is not None:
-            noise_gains, excitation_gains = self.noise_branch.gains(x)
+            noise_gains, excitation_gains = self.noise_branch.gains(x, f0)
         sources = self._excitation(x, f0, g, excitation_gains)
 
         x = self.conv_pre(x)
@@ -1019,7 +1207,8 @@ class PCPHBigVGANGenerator(nn.Module):
                 x = checkpoint(self._upsample, stage, x, use_reentrant=False)
             else:
                 x = self._upsample(stage, x)
-            x = x + self._add_source(stage, sources[stage])
+            if sources[stage] is not None:
+                x = x + self._add_source(stage, sources[stage])
             x = self._resblocks(stage, x, checkpointed)
 
         return self._output(x, noise_gains)
