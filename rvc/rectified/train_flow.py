@@ -396,6 +396,12 @@ def main(spec_path: str) -> None:
     config = load_run_config(spec["model_name"])
     settings = config["flow"]
     apply_spec(spec, settings)
+    speakers = speaker_count(read_filelist(spec["model_name"]))
+    if spec.get("pretrained_flow") and speakers > 1:
+        raise ValueError(
+            f"A pretrained flow does not fine-tune to {speakers} speakers. Use a dataset of one speaker, "
+            "or train without a pretrained flow."
+        )
     if settings.get("feature_cache", False):
         # Before the ranks start, which then only read it.
         # Sorted: every extraction shuffles the filelist anew, and the cache is keyed by its order.
