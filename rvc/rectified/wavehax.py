@@ -3,11 +3,14 @@ spectrogram with 2D convs over the STFT of a harmonic prior, then inverts it.
 It has no upsampling layers and no activation at the audio rate, so nothing
 of its own aliases.
 
-Generator and discriminators ported from https://github.com/chomeyama/wavehax
-(MIT, see THIRD_PARTY_NOTICES); the prior is this repo's ``PCPHSource``.
-Trained by ``train_vocoder.py`` with the recipe in
-``rvc/configs/rectified/vocoders/wavehax.json``.
+Generator, discriminators and the closed-form prior ported from
+https://github.com/chomeyama/wavehax (MIT, see THIRD_PARTY_NOTICES); the
+default prior is this repo's ``PCPHSource``. Trained by ``train_vocoder.py``
+with the recipes in ``rvc/configs/rectified/vocoders``: ``wavehax.json`` is
+the original's fullband layout, ``wavehax-v2.json`` its lighter v2.
 """
+
+import math
 
 import torch
 from torch import nn
@@ -24,6 +27,32 @@ except ImportError:
 
 #: ``architecture`` of a Wavehax rectified vocoder export, and of its runs.
 ARCHITECTURE = "wavehax"
+#: The run that trains the v2 layout; its export is a ``wavehax`` one.
+V2 = "wavehax-v2"
+#: The harmonic priors: this repo's ``PCPHSource``, or the original's.
+PRIORS = ("pcph", "pcph_closed_form")
+#: Power of the closed-form prior's harmonics.
+CLOSED_FORM_POWER = 0.1
+
+
+def pcph_closed_form(f0, hop_length, sample_rate, noise_std=0.01, max_frequency=None):
+    """Wavehax's ``generate_pcph_closed_form``: f0 [B, 1, T] in Hz -> the
+    prior, [B, T * hop_length]. Every harmonic under ``max_frequency`` (Nyquist
+    when None), summed by the Dirichlet kernel's closed form at constant
+    power, plus white noise. As there, f0 is interpolated linearly and the
+    starting phase is random on every call."""
+    f0 = F.interpolate(f0.float(), scale_factor=hop_length, mode="linear", align_corners=False)
+    increment = (f0 / sample_rate).double()
+    increment[:, :, :1] += torch.rand(f0.shape[0], 1, 1, device=f0.device, dtype=torch.float64)
+    phase = torch.fmod(torch.cumsum(increment, dim=2) * 2.0 * math.pi, 2.0 * math.pi).float()
+    count = torch.floor((max_frequency or sample_rate / 2.0) / f0.clamp_min(1e-5))
+    # sum_k sin(k x) = (cos(x / 2) - cos((N + 1 / 2) x)) / (2 sin(x / 2)), and 0 where that is 0 / 0.
+    denominator = 2.0 * torch.sin(phase / 2.0)
+    regular = denominator.abs() > 1e-6
+    harmonics = (torch.cos(phase / 2.0) - torch.cos((count + 0.5) * phase)) / torch.where(regular, denominator, 1.0)
+    amplitude = CLOSED_FORM_POWER * torch.sqrt(2.0 / count.clamp_min(1.0))
+    harmonics = harmonics * amplitude * regular * (f0 > 0)
+    return (harmonics + noise_std * torch.randn_like(harmonics))[:, 0]
 
 
 class STFT(nn.Module):
@@ -108,18 +137,25 @@ class ConvNeXtBlock2d(nn.Module):
 class WavehaxGenerator(nn.Module):
     """Normalised mel [B, n_mels, T] and f0 [B, T] -> [B, 1, T * hop_length].
 
-    The prior is the PCPH pulse train plus white noise at ``prior_noise``; its
+    The prior is the PCPH pulse train plus white noise at ``prior_noise``,
+    made by ``prior_type``, one of ``PRIORS``; its
     spectrogram, a projection of it and the projected mel are the input
     channels of a ConvNeXt stack over (bins, frames), which outputs the real
     and imaginary parts of the waveform's spectrogram. The first frames have
     to be at least ``kernel_size[1] // 2 + 1`` for the reflect padding."""
 
     def __init__(self, sample_rate, num_mels, hop_length, n_fft, channels, mult_channels, kernel_size,
-                 num_blocks, prior_noise=0.01, prior_max_frequency=None):
+                 num_blocks, prior_noise=0.01, prior_max_frequency=None, prior_type="pcph"):
         super().__init__()
+        if prior_type not in PRIORS:
+            raise ValueError(f"prior_type must be one of {PRIORS}, not {prior_type!r}.")
+        self.sample_rate = int(sample_rate)
         self.hop_length = int(hop_length)
         self.prior_noise = float(prior_noise)
-        self.prior = PCPHSource(sample_rate, random_start_phase=True, max_frequency=prior_max_frequency)
+        self.prior_max_frequency = prior_max_frequency
+        self.prior = None
+        if prior_type == "pcph":
+            self.prior = PCPHSource(sample_rate, random_start_phase=True, max_frequency=prior_max_frequency)
         self.stft = STFT(n_fft, hop_length)
         n_bins = n_fft // 2 + 1
         self.prior_proj = nn.Conv1d(n_bins, n_bins, 7, padding=3, padding_mode="reflect")
@@ -146,14 +182,21 @@ class WavehaxGenerator(nn.Module):
         for block in self.blocks:
             block.compile()
 
+    def _prior(self, f0):
+        """The prior waveform, [B, T * hop_length], from f0 [B, 1, T]."""
+        if self.prior is None:
+            return pcph_closed_form(
+                f0, self.hop_length, self.sample_rate, self.prior_noise, self.prior_max_frequency
+            )
+        pulses, _ = self.prior.components(expand_f0(f0.float(), f0.shape[-1] * self.hop_length)[:, 0])
+        return pulses + self.prior_noise * torch.randn_like(pulses)
+
     def forward(self, mel, f0):
         if f0.dim() == 2:
             f0 = f0.unsqueeze(1)
         # The prior and both transforms in FP32, whatever the autocast.
         with torch.no_grad(), torch.autocast(mel.device.type, enabled=False):
-            f0 = expand_f0(f0.float(), mel.shape[-1] * self.hop_length)
-            pulses, _ = self.prior.components(f0[:, 0])
-            real, imag = self.stft(pulses + self.prior_noise * torch.randn_like(pulses))
+            real, imag = self.stft(self._prior(f0))
         x = torch.stack(
             [real, imag, self.prior_proj(real), self.prior_proj(imag), self.cond_proj(mel)], dim=1
         )

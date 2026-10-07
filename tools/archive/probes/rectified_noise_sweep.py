@@ -12,7 +12,7 @@ and compares against the original audio:
 
 Usage::
 
-    python tools/probes/rectified_noise_sweep.py \
+    python archive/probes/rectified_noise_sweep.py \
         --vocoder logs/pretrain/vocoder/pretrain_vocoder_3e_64680s.pth \
         --experiments andre-rectified edu-rebirth-rectified
 """

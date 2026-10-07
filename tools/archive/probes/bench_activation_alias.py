@@ -31,8 +31,8 @@ so the two separate by position alone.
 
 Usage::
 
-    python tools/probes/bench_activation_alias.py
-    python tools/probes/bench_activation_alias.py --table cascade --depth 8
+    python archive/probes/bench_activation_alias.py
+    python archive/probes/bench_activation_alias.py --table cascade --depth 8
 """
 
 from __future__ import annotations

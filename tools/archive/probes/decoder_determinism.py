@@ -19,8 +19,8 @@ them: whatever is left over at ``noise_std=0`` is the AdaIN's.
 
 Usage::
 
-    python tools/probes/decoder_determinism.py
-    python tools/probes/decoder_determinism.py --f0 220
+    python archive/probes/decoder_determinism.py
+    python archive/probes/decoder_determinism.py --f0 220
 """
 
 from __future__ import annotations

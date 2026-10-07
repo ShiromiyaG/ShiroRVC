@@ -34,7 +34,7 @@ from rvc.rectified.common import (
     list_exports,
     list_pretrained,
 )
-from rvc.rectified.flow_model import RESCALE_MODES, SAMPLERS, SCHEDULES
+from rvc.rectified.flow import RESCALE_MODES, SAMPLERS, SCHEDULES
 from tabs.inference.inference import F0_METHODS, EXPORT_FORMATS, save_to_wav, save_to_wav2
 from tabs.rectified.vocoder_config import vocoder_config_tab
 from tabs.train.descs import (
@@ -60,6 +60,7 @@ VOCODER_ARCHITECTURES = [
     ("NSF-HiFiGAN", "nsf-hifigan"),
     ("NSF-UnivNet", "nsf-univnet"),
     ("Wavehax", "wavehax"),
+    ("Wavehax v2", "wavehax-v2"),
 ]
 
 TRAINING_STARTED = (
@@ -237,7 +238,7 @@ def rectified_inference_tab():
                 )
                 sampler = gr.Radio(
                     label=_("Sampler"),
-                    info=_("Heun costs two model passes per step and is more accurate per step. Mean takes one or two steps and needs a model trained with mean flow."),
+                    info=_("Heun costs two model passes per step and is more accurate per step."),
                     choices=list(SAMPLERS),
                     value="euler",
                     interactive=True,
@@ -429,8 +430,14 @@ def rectified_inference_tab():
                 )
                 match_level = gr.Checkbox(
                     label=_("Match Training Level"),
-                    info=_("Peak-normalise the input as the training data was, then bring the output back to the input's level. The model reads loudness as timbre, so a quiet input otherwise sounds darker."),
+                    info=_("Peak-normalise the input as the training data was. The model reads loudness as timbre, so a quiet input otherwise sounds darker."),
                     value=True,
+                    interactive=True,
+                )
+                restore_level = gr.Checkbox(
+                    label=_("Restore Input Level"),
+                    info=_("Bring the output back to the input's level. Off leaves it at the model's, as an RVC model's output is."),
+                    value=False,
                     interactive=True,
                 )
                 silence_gate_db = gr.Slider(
@@ -464,7 +471,7 @@ def rectified_inference_tab():
         formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
         noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
         f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
-        tension_strength,
+        tension_strength, restore_level,
     ):
         if not flow_model or not vocoder_model:
             return _("Pick a flow model and a vocoder model."), None
@@ -517,6 +524,7 @@ def rectified_inference_tab():
             content_context=content_context,
             flow_submodel=flow_submodel if is_model_bundle(flow_model) else "",
             match_level=match_level,
+            restore_level=restore_level,
             churn=churn,
             tension_strength=tension_strength,
         )
@@ -576,7 +584,7 @@ def rectified_inference_tab():
             formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
             noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
             f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
-            tension_strength,
+            tension_strength, restore_level,
         ],
         outputs=[output_info, output_audio],
     )
@@ -974,9 +982,15 @@ def rectified_training_tab():
             outputs=[flow_compile_mode],
             show_progress="hidden",
         )
-        flow_mean = gr.Checkbox(
-            label=_("Mean flow"),
-            info=_("Also train the mean velocity (MeanFlow), which the Mean sampler takes in one or two steps. The other samplers work as before. A resumed run keeps what it started with."),
+        flow_cache = gr.Checkbox(
+            label=_("Feature cache"),
+            info=_("Write the features and the augmented copies to disk once and train from them, in batches of whole clips. Off augments as it goes, in fixed segments, and writes nothing."),
+            value=True,
+            interactive=True,
+        )
+        flow_shortcut = gr.Checkbox(
+            label=_("Shortcut flow"),
+            info=_("Also learn to sample in 1, 2, 4 or 8 steps, for low latency. Slower to train. Any pretrained flow serves with it on or off."),
             value=False,
             interactive=True,
         )
@@ -987,7 +1001,7 @@ def rectified_training_tab():
 
         def start_flow(name, epochs, save, batch, gpu_ids, pretrained, custom,
                        flow_path, vocoder_path, checkpoints, fresh, compile_backbone, compile_mode,
-                       mean_flow):
+                       feature_cache, shortcut):
             if pretrained and not custom:
                 # The pretrain has to match the features the experiment was extracted with.
                 embedder = catalog.experiment_embedder(name)
@@ -1014,14 +1028,15 @@ def rectified_training_tab():
                 precision=get_training_precision(),
                 compile=compile_backbone,
                 torch_compile_mode=compile_mode,
-                mean_flow=mean_flow,
+                feature_cache=feature_cache,
+                shortcut=shortcut,
             )
 
         _start_stop(
             start_flow,
             [model_name, flow_epochs, flow_save, flow_batch, gpu, flow_pretrained,
              flow_custom, custom_flow, custom_vocoder, flow_checkpoints,
-             flow_fresh, flow_compile, flow_compile_mode, flow_mean],
+             flow_fresh, flow_compile, flow_compile_mode, flow_cache, flow_shortcut],
         )
 
     with gr.Tab(f"4. {_('Index')}"):

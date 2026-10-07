@@ -10,7 +10,7 @@ of band energy; the reference audio gets the same measurement, as the floor.
 
 Usage::
 
-    python tools/probes/energy_ab.py --log-dir logs/pretrain_bigvgan_teste
+    python archive/probes/energy_ab.py --log-dir logs/pretrain_bigvgan_teste
 """
 
 from __future__ import annotations

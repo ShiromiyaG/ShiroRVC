@@ -8,8 +8,8 @@ the decoder's own.
 
 Usage::
 
-    python tools/probes/render_constant_f0.py --f0 220
-    python tools/probes/render_constant_f0.py --f0 110 220 440 --seconds 3 --ema
+    python archive/probes/render_constant_f0.py --f0 220
+    python archive/probes/render_constant_f0.py --f0 110 220 440 --seconds 3 --ema
 """
 
 from __future__ import annotations

@@ -23,7 +23,7 @@ giving 2x the contribution means the decoder passes it through linearly.
 
 Usage::
 
-    python tools/probes/noise_render.py --log-dir logs/pretrain_bigvgan_teste
+    python archive/probes/noise_render.py --log-dir logs/pretrain_bigvgan_teste
 """
 
 from __future__ import annotations

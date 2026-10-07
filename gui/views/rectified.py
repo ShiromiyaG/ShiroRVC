@@ -629,12 +629,18 @@ class RectifiedPage(Page):
         self.flow_compile_mode_field = Field(_("Compile mode"), self.flow_compile_mode, "")
         self.flow_checkpoints, flow_checkpoints_field = _checkpoint_field()
         self.flow_fresh = Toggle(_("Fresh training"), _("Ignore this run's checkpoints and start over."))
-        self.flow_mean = Toggle(
-            _("Mean flow"),
-            _("Also train the mean velocity (MeanFlow), which the mean sampler takes in one or two "
-              "steps. The other samplers work as before. A resumed run keeps what it started with."),
+        self.flow_cache = Toggle(
+            _("Feature cache"),
+            _("Write the features and the augmented copies to disk once and train from them, in batches of "
+              "whole clips. Off augments as it goes, in fixed segments, and writes nothing."),
         )
-        advanced.add(self.flow_compile, self.flow_compile_mode_field, self.flow_mean,
+        self.flow_cache.setChecked(True)
+        self.flow_shortcut = Toggle(
+            _("Shortcut flow"),
+            _("Also learn to sample in 1, 2, 4 or 8 steps, for low latency. Slower to train. "
+              "Any pretrained flow serves with it on or off."),
+        )
+        advanced.add(self.flow_compile, self.flow_compile_mode_field, self.flow_cache, self.flow_shortcut,
                      flow_checkpoints_field, self.flow_fresh)
 
         self.flow_compile_mode_field.setVisible(False)
@@ -834,7 +840,8 @@ class RectifiedPage(Page):
             "precision": self.precision.value(),
             "compile": self.flow_compile.isChecked(),
             "torch_compile_mode": self.flow_compile_mode.text(),
-            "mean_flow": self.flow_mean.isChecked(),
+            "feature_cache": self.flow_cache.isChecked(),
+            "shortcut": self.flow_shortcut.isChecked(),
         }
 
     def vocoder_train_args(self) -> dict | None:

@@ -146,8 +146,18 @@ python core.py index                --model_name my-voice   # optional
   `pretrain_flow_spin_v2.pth`, in `rvc/models/pretraineds/rectified/`. A pretrain
   of the other embedder is refused. Its speakers are replaced by your dataset's.
   On a single-speaker fine-tune, the time and speaker conditioning stays frozen,
-  so speaker guidance keeps working. Without a pretrained flow, the model trains
+  so speaker guidance keeps working. A fine-tune warms its learning rate up over
+  `finetune_warmup_steps` and shifts and stretches less of the data than a
+  pretrain (`finetune_key_shift_prob`, `finetune_time_stretch_prob`, and the
+  `_scale` pair for the feature cache). Without a pretrained flow, the model trains
   from scratch, which needs far more data.
+- **Shortcut flow** (off by default) also teaches the flow to sample in 1, 2, 4
+  or 8 Euler steps, for low latency: part of every batch (`shortcut_share`)
+  learns that one long jump lands where two half as long do, taken by a lagging
+  copy of the model, which costs two more forward passes on that part. The
+  plain flow is untouched inside it, so any pretrain can be fine-tuned with the
+  option on or off, and a shortcut model sampled any other way (Heun, another
+  schedule or start, a step count that is not a power of two) is the plain flow.
 - **The vocoder** you pick renders the audio previews in TensorBoard and is
   stored in every export, so the inference screens select it for you.
 - **Several GPUs.** Pass them as `0-1` (or `0-1-2-3`), as in the RVC trainer.
@@ -232,16 +242,20 @@ shallow diffusion, trained as a rectified flow.
   plus a harmonic prior drawn from it on the mel grid. Frame loudness,
   breathiness from aperiodicity, a 256-dim speaker embedding, and the key shift
   and speed of the augmentation.
-- **Aux decoder.** A ConvNeXt stack (512 ch × 6) predicts the mel directly. The
-  flow only covers `t ≥ 0.4`, starting from that prediction mixed with noise,
-  so a few steps are enough.
+- **Aux decoder.** A ConvNeXt stack (512 ch × 6) predicts the mel directly. That
+  prediction plus noise is where the flow starts, in training as in sampling
+  (as PriorGrad's prior), and training degrades it so the flow also corrects a
+  worse one.
 - **Backbone.** LYNXNet2: 6 depthwise-separable blocks at 1024 channels with a
   31-tap kernel and ATanGLU. Time and speaker modulate every block (adaLN-Zero,
   as in RIFT-SVC's DiT).
 - **Training.** Muon for the matrices and AdamW for the rest. Cosine decay to
-  0.1× after a 2k-step warmup, and weight EMA. Key shift of ±5 semitones and
-  time stretch of 0.5–2×, each on 43 % of clips. Speaker dropout for guidance,
-  and 32 held-out clips for the validation curves.
+  0.1× after a 2k-step warmup, and weight EMA. The mel is normalised per bin.
+  Key shift of ±5 semitones and time stretch of 0.5–2× are made ahead of
+  training, 0.75× the dataset each (DiffSinger's plan), into a feature cache
+  under `logs/<model>/flow_cache`; batches are whole clips of similar length.
+  Speaker dropout and blurred content on a tenth of the items for the two
+  guidances, and 32 held-out clips for the validation curves.
 
 </details>
 

@@ -14,7 +14,7 @@ and, separately, on ``z`` itself, which is what the decoder receives.
 
 Usage::
 
-    python tools/probes/latent_autocorr.py --clips 64
+    python archive/probes/latent_autocorr.py --clips 64
 """
 
 from __future__ import annotations

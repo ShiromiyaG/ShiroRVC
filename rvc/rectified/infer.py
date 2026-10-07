@@ -34,7 +34,7 @@ from rvc.rectified.common import (
     smooth_curve,
     to_mel_rate,
 )
-from rvc.rectified.flow_model import Conditioning, build_flow
+from rvc.rectified.flow import Conditioning, build_flow, match_inputs
 from rvc.rectified.vocoder import load_vocoder, mel_mismatch
 
 INPUT_RATE = 16000
@@ -171,7 +171,7 @@ class RectifiedConverter:
         if checkpoint.get("kind") != "rectified_flow":
             raise ValueError(f"{path} is not an exported rectified-flow model.")
         model = build_flow(checkpoint["config"], checkpoint["speaker_count"])
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(match_inputs(checkpoint["model"], model))
         self.flow = model.to(self.device).eval()
         self.flow_path = key
         self.flow_meta = checkpoint
@@ -409,69 +409,41 @@ class RectifiedConverter:
         flow_path: str,
         vocoder_path: str,
         sid: int = 0,
-        pitch: int = 0,
-        f0_method: str = "rmvpe",
-        steps: int = 16,
-        sampler: str = "euler",
-        cfg_scale: float = 2.0,
-        f0_autotune: bool = False,
-        f0_autotune_strength: float = 1.0,
+        pitch: PitchOptions = PitchOptions(),
+        sampling: SamplingOptions = SamplingOptions(),
+        index: IndexOptions = IndexOptions(),
+        index_path: str = "",
         seed: int = 0,
         export_format: str = "WAV",
-        index_path: str = "",
-        index_rate: float = 0.5,
-        index_k: int = 8,
-        index_power: float = 2.0,
-        index_continuity: float = 0.5,
-        protect: float = 0.33,
         formant_shift: float = 0.0,
-        content_guidance: float = 0.1,
-        guidance_rescale: float = 0.7,
+        tension_strength: float = 1.0,
         split_audio: bool = False,
         silence_gate_db: float = -60.0,
-        noise_temperature: float = 1.0,
-        flow_start: float = 0.0,
-        guidance_from: float = 0.0,
-        guidance_until: float = 1.0,
-        rescale_mode: str = "global",
-        schedule: str = "uniform",
-        churn: float = 0.0,
-        f0_median: int = 0,
-        f0_octave_fix: bool = False,
         content_context: float = 2.0,
         flow_submodel: str = "",
         match_level: bool = True,
-        tension_strength: float = 1.0,
+        restore_level: bool = False,
     ):
         """Convert one file; returns the path written, or None on failure.
 
         ``flow_submodel`` picks the flow when ``flow_path`` is a bundle; a
-        bundled index, when the flow has one, is used in place of ``index_path``.
+        bundled index, when the flow has one, is used in place of
+        ``index_path``, an RVC retrieval index over this experiment's content
+        features. ``seed`` 0 draws one.
 
-        ``index_path`` is an RVC retrieval index over this experiment's content
-        features; ``protect`` below 0.5 keeps the unretrieved features in
-        unvoiced frames, as the RVC pipeline does. ``formant_shift`` moves the
-        formants by that many semitones, apart from the pitch.
-        ``content_guidance`` and ``guidance_rescale`` are ``RectifiedFlow.sample``'s.
+        ``formant_shift`` moves the formants by that many semitones, apart
+        from the pitch. ``tension_strength`` scales how far the input's
+        tension, its departure from its own usual, carries over; ignored by a
+        model without the input. ``content_context`` is the seconds of audio
+        each content pass sees either side.
+
         ``split_audio`` converts each non-silent segment on its own and puts
         the silences back. ``silence_gate_db`` fades the output out where the
         input is quieter than that, as ``AudioProcessor.gate_to_source`` does.
-
-        ``noise_temperature``, ``flow_start`` (0 keeps the model's own),
-        ``guidance_from``/``guidance_until``, ``rescale_mode``, ``schedule``
-        and ``churn`` are ``RectifiedFlow.sample``'s ``temperature``,
-        ``start``, ``guidance_interval``, ``rescale_mode``, ``schedule`` and
-        ``churn``; ``f0_median`` and ``f0_octave_fix`` clean the input's pitch;
-        ``content_context`` is the seconds of audio each content pass sees
-        either side.
-
-        ``match_level`` peak-normalises the input as the training data was, since
-        the energy input is absolute, and scales the output back to the input's
-        level; off, the input is only attenuated when it would clip.
-
-        ``tension_strength`` scales how far the input's tension, its departure
-        from its own usual tilt, carries over; 0 leaves the voice at its own.
-        Ignored by a model without the input."""
+        ``match_level`` peak-normalises the input as the training data was,
+        since the energy input is absolute; off, the input is only attenuated
+        when it would clip. ``restore_level`` puts the output back at the
+        input's level instead of the model's."""
         try:
             started = time.time()
             self._load_flow(flow_path, flow_submodel)
@@ -485,18 +457,6 @@ class RectifiedConverter:
                 raise ValueError(f"Speaker {sid} is not in this model.")
             seed = int(seed) or random.randint(1, 2**31 - 1)
             torch.manual_seed(seed)
-            pitch_options = PitchOptions(
-                f0_method, int(pitch), bool(f0_autotune), f0_autotune_strength,
-                int(f0_median), bool(f0_octave_fix),
-            )
-            index = IndexOptions(index_rate, index_k, index_power, index_continuity, protect)
-            sampling = SamplingOptions(
-                steps=int(steps), method=sampler, cfg_scale=float(cfg_scale),
-                content_guidance=float(content_guidance), guidance_rescale=float(guidance_rescale),
-                rescale_mode=rescale_mode, guidance_interval=(float(guidance_from), float(guidance_until)),
-                temperature=float(noise_temperature), schedule=schedule, churn=float(churn),
-                start=float(flow_start) or None,
-            )
             index_source = "bundled" if self.flow_index is not None else os.path.basename(index_path)
             print_settings_panel(
                 [
@@ -504,15 +464,16 @@ class RectifiedConverter:
                     ("Flow", os.path.basename(flow_path) + (f" [{flow_submodel}]" if flow_submodel else "")),
                     ("Vocoder", os.path.basename(vocoder_path)),
                     ("Speaker", sid),
-                    ("Pitch", pitch_options.describe()),
-                    ("Pitch cleanup", pitch_options.describe_cleanup()),
+                    ("Pitch", pitch.describe()),
+                    ("Pitch cleanup", pitch.describe_cleanup()),
                     ("Sampling", sampling.describe()),
                     ("Guidance", sampling.describe_guidance()),
                     ("Content context", f"{content_context:g} s"),
                     ("Formant shift", f"{formant_shift:+g} st"),
                     ("Tension", f"{tension_strength:g}" if self.flow.encoder.tension is not None else "not in this model"),
                     ("Index", index.describe(index_source)),
-                    ("Match level", "on" if match_level else "off"),
+                    ("Match level", ("on" if match_level else "off")
+                     + (", output at the input's level" if restore_level else ", output at the model's level")),
                     ("Split audio", "on" if split_audio else "off"),
                     ("Silence gate", f"{silence_gate_db:g} dBFS"),
                     ("Seed", seed),
@@ -539,12 +500,12 @@ class RectifiedConverter:
                 if audio.shape[0] < EMBEDDER_FIELD + INPUT_HOP:
                     return np.zeros(round(audio.shape[0] * sample_rate / INPUT_RATE), dtype=np.float32)
                 inputs = self._inputs(
-                    audio, full, int(sid), pitch_options, index, retriever, content_context,
+                    audio, full, int(sid), pitch, index, retriever, content_context,
                     formant_shift, tension_strength,
                 )
                 mel = self._sample_mel(inputs, sampling)
                 # The vocoder takes the normalised mel the flow produces.
-                output = self._render(mel, inputs.f0) * restore
+                output = self._render(mel, inputs.f0) * (restore if restore_level else 1.0)
                 return AudioProcessor.gate_to_source(
                     audio * restore, INPUT_RATE, output, sample_rate, silence_gate_db
                 )
@@ -561,6 +522,8 @@ class RectifiedConverter:
             else:
                 output = convert_segment(audio, full)
 
+            # At the model's level a loud passage can pass full scale.
+            output = output / max(1.0, float(np.abs(output).max()))
             os.makedirs(os.path.dirname(os.path.abspath(audio_output_path)), exist_ok=True)
             sf.write(audio_output_path, output, sample_rate, format="WAV")
             if export_format != "WAV":

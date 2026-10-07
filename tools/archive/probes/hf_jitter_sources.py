@@ -18,7 +18,7 @@ Two parts, on the ``logs/reference`` clip, in the direct path:
 
 Usage::
 
-    python tools/probes/hf_jitter_sources.py --log-dir logs/pretrain_bigvgan_teste
+    python archive/probes/hf_jitter_sources.py --log-dir logs/pretrain_bigvgan_teste
 """
 
 from __future__ import annotations

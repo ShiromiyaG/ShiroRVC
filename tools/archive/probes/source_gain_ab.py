@@ -34,8 +34,8 @@ frames and 250 Hz - 4 kHz.
 
 Usage::
 
-    python tools/probes/source_gain_ab.py
-    python tools/probes/source_gain_ab.py --log-dir logs/my-model --posterior
+    python archive/probes/source_gain_ab.py
+    python archive/probes/source_gain_ab.py --log-dir logs/my-model --posterior
 """
 
 from __future__ import annotations

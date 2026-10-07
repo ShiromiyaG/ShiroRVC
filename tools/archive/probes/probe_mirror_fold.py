@@ -12,9 +12,9 @@ is measured here is the prediction against a control the same distance from the
 harmonic grid on the *other* side of it -- same frame, same band, same skirt of
 the same partials, and no fold can live there.  Louder harmonics move both.
 
-    python tools/probes/probe_mirror_fold.py render.wav
-    python tools/probes/probe_mirror_fold.py a.wav b.wav --band 3000 5000
-    python tools/probes/probe_mirror_fold.py render.wav --rate 8000 --rate 32000
+    python archive/probes/probe_mirror_fold.py render.wav
+    python archive/probes/probe_mirror_fold.py a.wav b.wav --band 3000 5000
+    python archive/probes/probe_mirror_fold.py render.wav --rate 8000 --rate 32000
 
 ``--rate`` is the *stage rate*, not the mirror: a stage running at 8000 Hz
 mirrors around 4000.  At ``[5, 4, 4, 4]`` and 32 kHz the trunk's stages read

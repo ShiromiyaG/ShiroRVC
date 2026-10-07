@@ -100,8 +100,8 @@ and this decoder puts it in the picture as broadband flutter, so a preview at
 
 What a preview still cannot settle: anything that depends on *render length*
 beyond the reference clip, and whether an inharmonic line is a fold.  Render a
-long continuous file and look at that -- ``tools/probes/render_constant_f0.py``,
-``tools/probes/probe_mirror_fold.py``, and ``tools/probes/source_gain_ab.py`` when
+long continuous file and look at that -- ``archive/probes/render_constant_f0.py``,
+``archive/probes/probe_mirror_fold.py``, and ``archive/probes/source_gain_ab.py`` when
 ``refinegan2_source_gain`` is on.
 
 When it is done, go to ``tools/pretrain/pretrain_stage2_encoders.py``.

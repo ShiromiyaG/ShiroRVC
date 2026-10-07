@@ -595,6 +595,7 @@ def run_rectified_infer_script(
     content_context: float = 2.0,
     flow_submodel: str = "",
     match_level: bool = True,
+    restore_level: bool = False,
     tension_strength: float = 1.0,
 ):
     if not flow_path or not vocoder_path:
@@ -610,45 +611,39 @@ def run_rectified_infer_script(
     )
     if problem:
         return problem, None
+    from rvc.rectified.infer import IndexOptions, PitchOptions, SamplingOptions
+
     written = import_rectified_converter().convert(
-        audio_input_path=input_path,
-        audio_output_path=output_path,
-        flow_path=flow_path,
-        vocoder_path=vocoder_path,
+        input_path,
+        output_path,
+        flow_path,
+        vocoder_path,
         sid=int(sid),
-        pitch=int(pitch),
-        f0_method=f0_method,
-        steps=int(steps),
-        sampler=sampler,
-        cfg_scale=float(cfg_scale),
-        f0_autotune=bool(f0_autotune),
-        f0_autotune_strength=float(f0_autotune_strength),
+        pitch=PitchOptions(
+            f0_method, int(pitch), bool(f0_autotune), float(f0_autotune_strength),
+            int(f0_median), bool(f0_octave_fix),
+        ),
+        sampling=SamplingOptions(
+            steps=int(steps), method=sampler, cfg_scale=float(cfg_scale),
+            content_guidance=float(content_guidance), guidance_rescale=float(guidance_rescale),
+            rescale_mode=rescale_mode, guidance_interval=(float(guidance_from), float(guidance_until)),
+            temperature=float(noise_temperature), schedule=schedule, churn=float(churn),
+            start=float(flow_start) or None,
+        ),
+        index=IndexOptions(
+            float(index_rate), int(index_k), float(index_power), float(index_continuity), float(protect)
+        ),
+        index_path=index_path or "",
         seed=int(seed),
         export_format=export_format,
-        index_path=index_path or "",
-        index_rate=float(index_rate),
-        index_k=int(index_k),
-        index_power=float(index_power),
-        index_continuity=float(index_continuity),
-        protect=float(protect),
         formant_shift=float(formant_shift),
-        content_guidance=float(content_guidance),
-        guidance_rescale=float(guidance_rescale),
+        tension_strength=float(tension_strength),
         split_audio=bool(split_audio),
         silence_gate_db=float(silence_gate_db),
-        noise_temperature=float(noise_temperature),
-        flow_start=float(flow_start),
-        guidance_from=float(guidance_from),
-        guidance_until=float(guidance_until),
-        rescale_mode=rescale_mode,
-        schedule=schedule,
-        churn=float(churn),
-        f0_median=int(f0_median),
-        f0_octave_fix=bool(f0_octave_fix),
         content_context=float(content_context),
         flow_submodel=flow_submodel or "",
         match_level=bool(match_level),
-        tension_strength=float(tension_strength),
+        restore_level=bool(restore_level),
     )
     if written is None:
         return "Conversion failed; see the terminal for the error.", None
@@ -728,7 +723,8 @@ def run_rectified_flow_train_script(
     precision: str = "fp32",
     compile: bool = False,
     torch_compile_mode: str = "default",
-    mean_flow: bool = False,
+    feature_cache: bool = True,
+    shortcut: bool = False,
 ):
     if not vocoder:
         # The newest pretrained vocoder, as every interface picks when left empty.
@@ -753,7 +749,8 @@ def run_rectified_flow_train_script(
             "precision": str(precision).lower(),
             "compile": bool(compile),
             "torch_compile_mode": str(torch_compile_mode),
-            "mean_flow": bool(mean_flow),
+            "feature_cache": bool(feature_cache),
+            "shortcut": bool(shortcut),
         },
     )
 

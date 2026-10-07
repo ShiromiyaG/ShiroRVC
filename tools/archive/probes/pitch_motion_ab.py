@@ -13,7 +13,7 @@ each half second, and writes the vocoded audio and a figure to ``--out``.
 
 Usage::
 
-    python tools/probes/pitch_motion_ab.py --model pretrain
+    python archive/probes/pitch_motion_ab.py --model pretrain
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from rvc.rectified.common import RectifiedDataset, read_filelist, run_dir  # noqa: E402
-from rvc.rectified.flow_model import build_flow  # noqa: E402
+from rvc.rectified.flow import build_flow, match_inputs  # noqa: E402
 from rvc.rectified.mel import denormalize_mel, normalize_mel  # noqa: E402
 from rvc.rectified.vocoder import load_vocoder  # noqa: E402
 
@@ -117,7 +117,7 @@ def main():
     config = checkpoint["config"]
     data = config["data"]
     model = build_flow(config, checkpoint["speaker_count"])
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(match_inputs(checkpoint["model"], model))
     model = model.to(device).eval()
     print(f"{os.path.basename(export)}, {args.steps} Euler steps, seed {args.seed}")
 

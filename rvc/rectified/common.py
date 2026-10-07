@@ -17,7 +17,7 @@ from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
 from rvc.lib.paths import LOGS_DIR, MODELS_DIR, ROOT
 from rvc.rectified.aperiodicity import aperiodicity, tension
-from rvc.rectified.flow_model import Conditioning
+from rvc.rectified.flow import Conditioning
 from rvc.rectified.mel import LogMel
 
 DEFAULT_CONFIG = os.path.join(ROOT, "rvc", "configs", "rectified", "44100.json")
@@ -296,7 +296,8 @@ class RectifiedDataset(Dataset):
     ``vocoder`` items are fixed-length (mel, f0, audio) crops; ``flow`` items
     are ``FlowItem`` crops of up to ``segment_frames``. The mel is taken over the whole clip
     before cropping, as at inference. Flow items are pitch-shifted and
-    time-stretched at random with the config's probabilities. Without
+    time-stretched at random with the config's probabilities; ``feature_cache``
+    holds the same items made ahead of training. Without
     ``augment``, neither mode is randomly cropped (vocoder items take the
     middle), and flow items are not shifted or stretched.
     """
@@ -356,17 +357,26 @@ class RectifiedDataset(Dataset):
         curve = smooth_curve(tension(audio, self.sample_rate, f0, feature_frames), TENSION_SMOOTH_SECONDS)
         return curve_to_mel_rate(curve, frames, self.sample_rate, hop)
 
-    def __getitem__(self, index):
-        wav_path, content_path, _, f0_path, sid = self.entries[index]
-        audio = self._audio(wav_path)
-        source_f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
-        if self.mode == "vocoder":
-            return self._vocoder_item(audio, source_f0)
-        content = upsample_content(
-            torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
+    def content(self, index):
+        """Clip ``index``'s content at ``FEATURE_RATE``, [time, channels]."""
+        return upsample_content(
+            torch.from_numpy(np.load(self.entries[index][1], allow_pickle=False).astype(np.float32)),
             self.data["content_interpolation"],
         )
-        return self._flow_item(audio, source_f0, content, int(sid))
+
+    def source(self, index):
+        """What ``features`` takes of clip ``index``: its audio, its pitch
+        and content at ``FEATURE_RATE``, and its speaker."""
+        wav_path, _, _, f0_path, sid = self.entries[index]
+        f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
+        return self._audio(wav_path), f0, self.content(index), int(sid)
+
+    def __getitem__(self, index):
+        if self.mode == "flow":
+            return self._flow_item(*self.source(index))
+        wav_path, _, _, f0_path, _ = self.entries[index]
+        source_f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
+        return self._vocoder_item(self._audio(wav_path), source_f0)
 
     def _vocoder_item(self, audio, f0):
         frames = min(audio.shape[0] // self.hop, mel_frames(f0.shape[0], self.sample_rate, self.hop))
@@ -386,17 +396,30 @@ class RectifiedDataset(Dataset):
         return mel[:, start:stop], f0[start:stop], audio[start * self.hop : stop * self.hop]
 
     def _flow_item(self, audio, source_f0, content, sid):
-        """A crop shifted by ``key_shift`` semitones (pitch and formants) and
-        stretched by ``speed`` (a longer hop reads the clip faster), both drawn
-        when augmenting."""
+        """A crop shifted and stretched as ``features`` does, both drawn when
+        augmenting."""
         key_shift, hop = 0.0, self.hop
         if self.augment and self.key_shift_range > 0 and random.random() < self.key_shift_prob:
             key_shift = random.uniform(-self.key_shift_range, self.key_shift_range)
         if self.augment and self.stretch_prob > 0 and random.random() < self.stretch_prob:
             low, high = self.stretch_range
             hop = int(round(self.hop * low * (high / low) ** random.random()))
-        speed = hop / self.hop
+        item = self.features(audio, source_f0, content, sid, key_shift, hop)
+        frames = item.mel.shape[-1]
+        length = min(frames, self.segment_frames)
+        start = random.randint(0, frames - length) if self.augment else 0
+        stop = start + length
+        return item._replace(
+            mel=item.mel[:, start:stop], content=item.content[start:stop], f0=item.f0[start:stop],
+            energy=item.energy[start:stop], breathiness=item.breathiness[start:stop],
+            tension=item.tension[start:stop],
+        )
 
+    def features(self, audio, source_f0, content, sid, key_shift=0.0, hop=None):
+        """The whole clip as a ``FlowItem``, shifted by ``key_shift`` semitones
+        (pitch and formants) and stretched by reading it at ``hop`` samples a
+        frame (a longer hop reads the clip faster)."""
+        hop = hop or self.hop
         frames = min(
             audio.shape[0] // hop,
             mel_frames(source_f0.shape[0], self.sample_rate, hop),
@@ -407,17 +430,12 @@ class RectifiedDataset(Dataset):
         f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, hop) * 2.0 ** (key_shift / 12.0)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), key_shift, hop)[0, :, :frames]
-        energy = self._energy(audio.unsqueeze(0), frames, hop)[0]
-        breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
-        strain = self._tension(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
-
-        length = min(frames, self.segment_frames)
-        start = random.randint(0, frames - length) if self.augment else 0
-        stop = start + length
         return FlowItem(
-            mel=mel[:, start:stop], content=content[start:stop], f0=f0[start:stop],
-            energy=energy[start:stop], breathiness=breathiness[start:stop], tension=strain[start:stop],
-            key_shift=key_shift, speed=speed, speaker=sid,
+            mel=mel, content=content, f0=f0,
+            energy=self._energy(audio.unsqueeze(0), frames, hop)[0],
+            breathiness=self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0],
+            tension=self._tension(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0],
+            key_shift=key_shift, speed=hop / self.hop, speaker=sid,
         )
 
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):

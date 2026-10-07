@@ -134,8 +134,8 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
     },
 }
 
-#: Mirror rvc.rectified.flow_model, which imports torch.
-RECTIFIED_SAMPLERS = ["euler", "heun", "mean"]
+#: Mirror rvc.rectified.flow.sampling, which imports torch.
+RECTIFIED_SAMPLERS = ["euler", "heun"]
 RECTIFIED_SCHEDULES = ["uniform", "sway", "logit-normal"]
 RECTIFIED_RESCALE_MODES = ["global", "frame"]
 #: The rectified recipe ships one configuration; extraction's vocoder id for it.

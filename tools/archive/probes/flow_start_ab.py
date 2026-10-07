@@ -2,14 +2,14 @@
 
 For each clip, renders the mel four ways with the export's EMA weights: the
 aux decoder alone, the flow from the aux mel (what inference does), the flow
-from the real mel mixed with noise at ``t_start`` (the state it was trained
-on), and the flow from the aux mel with four times the steps. Reports, per
+started from the real mel instead, and the flow from the aux mel with four
+times the steps. Reports, per
 band, the mean log-mel error against the real mel (negative is too dark) and
 the L1. The first clip is also rendered through the vocoder to ``--out``.
 
 Usage::
 
-    python tools/probes/flow_start_ab.py --model pretrain
+    python archive/probes/flow_start_ab.py --model pretrain
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from rvc.rectified.common import (  # noqa: E402
     speaker_count,
     split_holdout,
 )
-from rvc.rectified.flow_model import build_flow  # noqa: E402
+from rvc.rectified.flow import build_flow, match_inputs  # noqa: E402
 from rvc.rectified.mel import normalize_mel  # noqa: E402
 from rvc.rectified.vocoder import load_vocoder  # noqa: E402
 
@@ -63,35 +63,19 @@ def clip(dataset, entry, max_seconds):
     return dataset._reference_item(audio, content, f0, sid, wav_path, max_frames)
 
 
-def integrate(model, x, cond, voice, mask, steps):
-    """Euler from ``t_start`` to 1, as ``RectifiedFlow.sample`` without guidance."""
-    dt = (1.0 - model.t_start) / steps
-    for index in range(steps):
-        t = torch.full((x.shape[0],), model.t_start + index * dt, device=x.device)
-        x = x + dt * model.backbone(x, t, cond, mask, voice)
-    return x * mask
-
-
 @torch.no_grad()
 def render(model, item, data, device, steps, seed):
     """Normalised mels {variant: [1, n_mels, T]} and the real one."""
     inputs = item.inputs._replace(tension=None).to(device)
-    f0, mask = inputs.f0, inputs.mask
-    cond = model.encoder(inputs)
-    voice = model.encoder.voice(inputs.speaker)
     real = normalize_mel(item.mel.to(device), data)
     generator = torch.Generator(device=device).manual_seed(seed)
     noise = torch.randn(real.shape, device=device, generator=generator)
-    aux = model.aux(cond, mask, voice)
-    ts = model.t_start
     return real, {
-        "aux only": aux,
-        "flow from aux": integrate(model, (1 - ts) * noise + ts * aux, cond, voice, mask, steps),
-        "flow from real (oracle)": integrate(model, (1 - ts) * noise + ts * real, cond, voice, mask, steps),
-        f"flow from aux, {4 * steps} steps": integrate(
-            model, (1 - ts) * noise + ts * aux, cond, voice, mask, 4 * steps
-        ),
-    }, f0
+        "aux only": model.aux_mel(inputs),
+        "flow from aux": model.sample(inputs, steps=steps, noise=noise),
+        "flow from real (oracle)": model.sample(inputs, steps=steps, noise=noise, start_mel=real),
+        f"flow from aux, {4 * steps} steps": model.sample(inputs, steps=4 * steps, noise=noise),
+    }, inputs.f0
 
 
 def band_rows(data):
@@ -118,9 +102,10 @@ def main():
     config = checkpoint["config"]
     model_data = config["data"]
     model = build_flow(config, checkpoint["speaker_count"])
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(match_inputs(checkpoint["model"], model))
     model = model.to(device).eval()
-    print(f"{os.path.basename(export)}, t_start {model.t_start:g}, {args.steps} Euler steps")
+    print(f"{os.path.basename(export)}, t_start {model.t_start:g}, prior noise {model.prior_noise:g}, "
+          f"{args.steps} Euler steps")
 
     entries = read_filelist(args.model)
     assert speaker_count(entries) == checkpoint["speaker_count"]

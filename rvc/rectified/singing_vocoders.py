@@ -30,9 +30,11 @@ PCPH = "pcph-bigvgan"
 #: Discriminators a SingingVocoders run trains against: the recipe's own, or
 #: the repo's v3 with its GAN losses.
 DISCRIMINATORS = ("original", "v3")
-ARCHITECTURES = ("pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax")
+ARCHITECTURES = ("pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax", "wavehax-v2")
 UNIVNET = "nsf-univnet"
 WAVEHAX = wavehax.ARCHITECTURE
+#: The runs that train a Wavehax generator, each by its own recipe.
+WAVEHAX_RUNS = (WAVEHAX, wavehax.V2)
 #: The ones trained on the raw log mel, as SingingVocoders does; the others
 #: take the pipeline's normalised one.
 RAW_MEL = ("pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet")
@@ -41,7 +43,7 @@ UNIVNET_ARCHITECTURE = "nsf_univnet"
 #: Training architecture -> ``architecture`` of its export.
 EXPORT_ARCHITECTURE = {
     "pc-nsf-hifigan": ARCHITECTURE, "nsf-hifigan": ARCHITECTURE, UNIVNET: UNIVNET_ARCHITECTURE,
-    WAVEHAX: WAVEHAX,
+    WAVEHAX: WAVEHAX, wavehax.V2: WAVEHAX,
 }
 RECIPE_DIR = os.path.join(ROOT, "rvc", "configs", "rectified", "vocoders")
 
@@ -288,7 +290,7 @@ RAW_MEL_EXPORTS = (ARCHITECTURE, UNIVNET_ARCHITECTURE)
 def generator_hparams(architecture: str, config: dict) -> dict:
     """The generator's constructor arguments, from the recipe and the mel."""
     data, model = config["data"], config["vocoder"]["model"]
-    if architecture == WAVEHAX:
+    if architecture in WAVEHAX_RUNS:
         return dict(
             sample_rate=int(data["sample_rate"]), num_mels=int(data["n_mels"]),
             hop_length=int(data["hop_length"]), **model,
@@ -323,7 +325,7 @@ def upsample_filters(rates) -> list:
 def build_generator(architecture: str, hparams: dict) -> nn.Module:
     """The generator as its recipe trains it: SingingVocoders' with their
     weight norm and init."""
-    if architecture == WAVEHAX:
+    if architecture in WAVEHAX_RUNS:
         return wavehax.WavehaxGenerator(**hparams)
     if architecture == UNIVNET:
         generator = NSFUnivNet(**hparams)
@@ -569,7 +571,7 @@ class Discriminators(nn.ModuleDict):
 def build_discriminators(architecture: str, settings: dict) -> Discriminators:
     """MSD + MPD for the NSF-HiFiGANs, MRD + MPD for NSF-UnivNet, Wavehax's
     own MPD + MRD for it."""
-    if architecture == WAVEHAX:
+    if architecture in WAVEHAX_RUNS:
         return Discriminators(wavehax.build_families(settings))
     if architecture == UNIVNET:
         spectral = {"mrd": MultiResSpecDiscriminator(

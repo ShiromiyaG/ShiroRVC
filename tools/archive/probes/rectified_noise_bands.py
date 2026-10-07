@@ -14,7 +14,7 @@ the 1-2 kHz bands.
 
 Usage::
 
-    python tools/probes/rectified_noise_bands.py \
+    python archive/probes/rectified_noise_bands.py \
         --vocoder logs/pretrain/vocoder/pretrain_vocoder_3e_64680s.pth
 """
 

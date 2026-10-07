@@ -13,8 +13,8 @@ The first row that leaves -inf is the culprit.
 
 Usage::
 
-    python tools/probes/period_bisect.py
-    python tools/probes/period_bisect.py --f0 220 --frames 600
+    python archive/probes/period_bisect.py
+    python archive/probes/period_bisect.py --f0 220 --frames 600
 """
 
 from __future__ import annotations

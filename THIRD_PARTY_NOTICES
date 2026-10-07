@@ -42,8 +42,8 @@ SOFTWARE.
 Wavehax — https://github.com/chomeyama/wavehax
 -------------------------------------------------------------------------------
 
-Used in: rvc/rectified/wavehax.py (the generator and the discriminators, ported
-and modified) and rvc/rectified/train_vocoder.py (the training recipe).
+Used in: rvc/rectified/wavehax.py (the generator, the closed-form prior and the
+discriminators, ported and modified) and rvc/rectified/train_vocoder.py (the training recipe).
 
 MIT License
 

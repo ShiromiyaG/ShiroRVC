@@ -4,6 +4,7 @@ log mel.
 Usage: python rvc/rectified/train_flow.py <spec.json>
 """
 
+import copy
 import importlib.util
 import json
 import math
@@ -45,8 +46,10 @@ from rvc.rectified.common import (
     split_holdout,
 )
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
-from rvc.rectified.flow_model import build_flow, match_inputs, resize_speakers
-from rvc.rectified.mel import denormalize_mel, normalize_mel
+from rvc.rectified.feature_cache import BucketBatchSampler, CachedFlowDataset, build_cache, load_cache
+from rvc.rectified.flow import build_flow, match_inputs, resize_speakers
+from rvc.rectified.flow_validation import evaluate, preview
+from rvc.rectified.mel import normalize_mel
 from rvc.rectified.muon import MuonAdamW
 from rvc.rectified.previews import RectifiedPreviews
 from rvc.rectified.vocoder import load_vocoder
@@ -59,18 +62,17 @@ from rvc.train.stop import finish_stop, install_stop_handlers, uninterruptible_s
 TAG = "[FLOW]"
 LOG_INTERVAL = 50
 METRICS_INTERVAL = 8
-PREVIEW_STEPS = 16
-#: Held-out clips a preview renders beside the reference clip, of different
-#: speakers.
-PREVIEW_CLIPS = 3
-#: Where in the trained time range the validation loss is taken.
-EVAL_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 #: Ceiling of the FP16 GradScaler's scale: left to grow, it reaches ~2^22,
 #: where the weight gradients overflow and a step is skipped.
 MAX_GRAD_SCALE = 2.0**16
 #: Steps skipped in a row over a non-finite gradient before the run stops: by
 #: then it is the weights or the data, not one batch.
 MAX_SKIPPED_IN_A_ROW = 10
+#: Batches a new run reads for the mel's per-bin statistics.
+MEL_STATS_BATCHES = 200
+#: How much of the data is shifted and stretched: drawn per item, or made
+#: ahead for the feature cache. A fine-tune has its own, under ``finetune_``.
+FINETUNE_AUGMENTATION = ("key_shift_prob", "time_stretch_prob", "key_shift_scale", "time_stretch_scale")
 
 
 def learning_rate(base, step, warmup, total, final_ratio, anchor=(0, 0.0)):
@@ -126,17 +128,16 @@ def conditioning_norms(model) -> dict:
     return norms
 
 
-def compiled_backbone(model, enabled: bool, mode: str, device, mean_flow: bool = False):
-    """``torch.compile`` of the backbone for training, and of the mean
-    velocity with ``mean_flow``; None for each left eager. Evaluation and
-    sampling keep the eager module, whose shapes vary."""
+def compiled_backbone(model, enabled: bool, mode: str, device, dynamic: bool = False):
+    """``torch.compile`` of the backbone for training; None when left eager.
+    ``dynamic`` is for batches of more than one shape. Evaluation and sampling
+    keep the eager module, whose shapes vary."""
     if not enabled:
-        return None, None
+        return None
     if device.type != "cuda" or importlib.util.find_spec("triton") is None:
         warning("torch.compile needs CUDA and Triton; training uncompiled.", tag=TAG)
-        return None, None
-    mean_field = torch.compile(model.mean_velocity, mode=mode) if mean_flow else None
-    return torch.compile(model.backbone, mode=mode), mean_field
+        return None
+    return torch.compile(model.backbone, mode=mode, dynamic=True if dynamic else None)
 
 
 def load_preview_vocoder(path: str, config: dict, device):
@@ -156,9 +157,30 @@ def load_preview_vocoder(path: str, config: dict, device):
     return vocoder.to(device)
 
 
-def build_loaders(ranks: Ranks, config: dict, entries, holdout_entries, batch_size: int):
+def apply_spec(spec: dict, settings: dict) -> None:
+    """The run's own switches over the config's: the feature cache can be
+    turned off for a run, which then augments as it goes, in fixed segments,
+    and a fine-tune takes the ``finetune_`` augmentation shares the config has."""
+    settings["feature_cache"] = bool(settings.get("feature_cache", False) and spec.get("feature_cache", True))
+    if spec.get("pretrained_flow"):
+        for key in FINETUNE_AUGMENTATION:
+            if "finetune_" + key in settings:
+                settings[key] = settings["finetune_" + key]
+
+
+def bucketed(settings: dict) -> bool:
+    """Whether batches are whole clips of similar length, which takes the
+    lengths the feature cache knows."""
+    return bool(settings.get("feature_cache", False) and settings.get("bucket_batches", False))
+
+
+def build_loaders(ranks: Ranks, name: str, config: dict, entries, holdout_entries, batch_size: int):
     """The training set with its loader and sampler, and the held-out clips'
-    loader: None without any, or off the main rank."""
+    loader: None without any, or off the main rank.
+
+    With ``feature_cache`` the loader reads the cached items; with
+    ``bucket_batches`` too, in batches of whole clips up to ``batch_size``
+    segments' worth of padded frames."""
     settings = config["flow"]
     segment = int(settings["segment_frames"])
     dataset = RectifiedDataset(entries, config, "flow", segment)
@@ -170,19 +192,36 @@ def build_loaders(ranks: Ranks, config: dict, entries, holdout_entries, batch_si
     workers = loader_workers(settings.get("num_workers", 4))
     # Every batch padded to the crop length, one shape for the compiled backbone.
     collate = partial(collate_flow, frames=segment)
-    sampler = ranks.sampler(dataset)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
+    stream_seed = settings.get("stream_seed")
+    common = dict(
         num_workers=workers,
-        collate_fn=collate,
-        drop_last=True,
         pin_memory=ranks.device.type == "cuda",
         persistent_workers=workers > 0,
         prefetch_factor=4 if workers > 0 else None,
+        # With ``stream_seed``, the order and the workers' own seeds come from it alone.
+        generator=None if stream_seed is None else torch.Generator().manual_seed(int(stream_seed) + ranks.rank),
     )
+    items = dataset
+    if settings.get("feature_cache", False):
+        limit = int(settings.get("bucket_max_frames", segment)) if bucketed(settings) else segment
+        items = CachedFlowDataset(dataset, *load_cache(name, config, entries), limit)
+    if bucketed(settings):
+        sampler = BucketBatchSampler(
+            items.lengths(), batch_size * segment, int(settings.get("bucket_max_items", 64)),
+            int(settings.get("seed", 1234)), ranks.rank, ranks.world,
+        )
+        loader = DataLoader(items, batch_sampler=sampler, collate_fn=collate_flow, **common)
+    else:
+        sampler = ranks.sampler(items)
+        loader = DataLoader(
+            items,
+            batch_size=batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            collate_fn=collate,
+            drop_last=True,
+            **common,
+        )
     holdout = None
     if holdout_entries and ranks.main:
         holdout = DataLoader(
@@ -194,30 +233,44 @@ def build_loaders(ranks: Ranks, config: dict, entries, holdout_entries, batch_si
     return dataset, loader, sampler, holdout
 
 
-def configure_model(spec: dict, settings: dict, state, main_rank: bool) -> bool:
+def augment_share(settings: dict, kind: str) -> str:
+    """How much of the data is augmented ``kind``, in words: copies made ahead
+    under ``feature_cache``, else a share of the items drawn."""
+    if settings.get("feature_cache", False):
+        return f"x{settings.get(kind + '_scale', 0):g} offline"
+    return f"{100 * settings.get(kind + '_prob', 0):g}%"
+
+
+def configure_model(spec: dict, settings: dict) -> None:
     """Write what the run decides, not the config, into ``settings["model"]``:
-    mean flow and, for a fine-tune, the pretrain's time scale. ``state`` is the
-    checkpoint being resumed, or None. Returns whether the run trains mean
-    flow."""
-    # A resumed run keeps what it started with.
-    mean_flow = bool(spec.get("mean_flow", False))
-    if state is not None:
-        started_with = any(key.startswith("backbone.span_mlp.") for key in state["model"])
-        if started_with != mean_flow and main_rank:
-            warning(f"This run was started {'with' if started_with else 'without'} mean flow "
-                    f"and resumes that way; start fresh to change it.", tag=TAG)
-        mean_flow = started_with
-    settings["model"]["mean_flow"] = mean_flow
-    backbone_args = settings["model"].setdefault("backbone_args", {})
+    whether it is a shortcut model and, for a fine-tune, the pretrain's time
+    scale."""
+    settings["model"]["shortcut"] = bool(spec.get("shortcut", False))
     if spec.get("pretrained_flow"):
         # Not in the weights, and a network reads another scale's times as noise.
         time_scale = pretrain_time_scale(spec["pretrained_flow"])
         if time_scale is not None:
-            backbone_args["time_scale"] = time_scale
-    if mean_flow and float(backbone_args.get("time_scale", 1000.0)) > 10 and main_rank:
-        warning("Mean flow with a time scale over 10 has diverged: its target is the network's own "
-                "derivative in time. Set flow.model.backbone_args.time_scale to 1 for a new pretrain.", tag=TAG)
-    return mean_flow
+            settings["model"].setdefault("backbone_args", {})["time_scale"] = time_scale
+
+
+@torch.no_grad()
+def mel_statistics(ranks: Ranks, loader, data: dict):
+    """Mean and spread of each mel bin, [n_mels] each, in the data's
+    normalisation, over the first ``MEL_STATS_BATCHES`` batches of every rank.
+    Every rank must call it."""
+    total = squares = frames = 0.0
+    for index, (mel, inputs) in enumerate(loader):
+        if index >= MEL_STATS_BATCHES:
+            break
+        mask = inputs.mask.to(ranks.device).double()
+        mel = normalize_mel(mel.to(ranks.device), data).double() * mask
+        total = total + mel.sum((0, 2))
+        squares = squares + mel.square().sum((0, 2))
+        frames = frames + mask.sum()
+    frames = ranks.mean(frames)
+    mean = ranks.mean(total) / frames
+    std = (ranks.mean(squares) / frames - mean.square()).clamp_min(0.0).sqrt()
+    return mean.float(), std.float()
 
 
 def build_optimizer(model, settings: dict, base_lr: float):
@@ -237,10 +290,11 @@ def restore(spec: dict, name: str, resume, state, model, optimizer, ema, scaler)
     fine-tune. Returns the epoch and step to continue from, the FP16 steps
     skipped so far and where the run starts from, in words."""
     if resume:
-        model.load_state_dict(state["model"])
+        model.load_state_dict(match_inputs(state["model"], model))
         optimizer.load_state_dict(state["optimizer"])
         if "ema" in state:
-            ema.load_state_dict(state["ema"], model)
+            shadow = match_inputs(state["ema"]["shadow"], model)
+            ema.load_state_dict({**state["ema"], "shadow": shadow}, model)
         if scaler is not None and state.get("scaler"):
             scaler.load_state_dict(state["scaler"])
         skipped = int(state.get("skipped_steps", 0))
@@ -290,24 +344,62 @@ def nonfinite_names(mel, inputs, model) -> str:
     return ", ".join(found) or "neither the batch nor the weights, so the loss or a gradient overflowed"
 
 
-def loss_scalars(ranks: Ranks, flow_loss, aux_loss, mean_losses) -> dict:
-    """The step's losses averaged over the ranks, by TensorBoard tag. Every
-    rank must call it."""
-    plain_flow = flow_loss if mean_losses is None else mean_losses.flow
-    scalars = {"loss/flow": ranks.mean(plain_flow).item()}
+def loss_scalars(ranks: Ranks, flow_loss, aux_loss) -> dict:
+    """The losses averaged over the ranks, by TensorBoard tag, under the
+    groups the RVC trainer logs to. Every rank must call it."""
+    scalars = {f"loss_avg_{LOG_INTERVAL}/loss_flow_{LOG_INTERVAL}": ranks.mean(flow_loss).item()}
     if aux_loss is not None:
-        scalars["loss/aux_mel_l1"] = ranks.mean(aux_loss).item()
-    if mean_losses is not None:
-        scalars["loss/mean_flow"] = ranks.mean(mean_losses.mean).item()
-        # Over 1 the target is feeding on itself and is being held.
-        scalars["diag/mean_flow_bootstrap"] = ranks.mean(mean_losses.bootstrap_ratio).item()
+        scalars[f"loss_avg_{LOG_INTERVAL}/loss_aux_mel_l1_{LOG_INTERVAL}"] = ranks.mean(aux_loss).item()
     return scalars
+
+
+def save(out_dir: str, name: str, keep: str, model, optimizer, ema, scaler, epoch: int, step: int,
+         skipped: int, export: dict) -> None:
+    """Write the checkpoint to resume from and the export of the averaged
+    weights. ``keep`` is the run's ``checkpoints``: every one, the latest or
+    none. ``export`` is what the export records beside its weights."""
+    if any(not torch.isfinite(param).all() for param in model.parameters()):
+        raise FloatingPointError(
+            "The flow has non-finite weights. Nothing was saved, so the last checkpoint stands."
+        )
+    saved = []
+    with uninterruptible_save("Flow checkpoint"):
+        if keep == "none":
+            # An older run's checkpoint would otherwise be resumed from,
+            # silently undoing everything trained since.
+            remove_older(out_dir, "F")
+        else:
+            path = os.path.join(out_dir, f"F_{step}.pth")
+            torch.save(
+                {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                 "ema": ema.state_dict(), "epoch": epoch, "step": step,
+                 "scaler": scaler.state_dict() if scaler is not None else None,
+                 "skipped_steps": skipped},
+                path,
+            )
+            if keep == "latest":
+                remove_older(out_dir, "F", path)
+            saved.append(os.path.basename(path))
+        export = os.path.join(out_dir, f"{name}_flow_{epoch}e_{step}s.pth")
+        torch.save(
+            {"kind": "rectified_flow", **export, "model": ema.cpu_state_dict(), "epoch": epoch, "step": step},
+            export,
+        )
+    saved.append(os.path.basename(export))
+    success(f"Saved {' and '.join(saved)}.", tag=TAG)
 
 
 def main(spec_path: str) -> None:
     with open(spec_path, encoding="utf-8") as handle:
         spec = json.load(handle)
     install_stop_handlers()
+    config = load_run_config(spec["model_name"])
+    settings = config["flow"]
+    apply_spec(spec, settings)
+    if settings.get("feature_cache", False):
+        # Before the ranks start, which then only read it.
+        entries, _ = split_holdout(read_filelist(spec["model_name"]), int(settings.get("holdout_clips", 0)))
+        build_cache(spec["model_name"], config, entries, loader_workers(settings.get("num_workers", 4)))
     launch(train, spec_path, parse_gpus(spec.get("gpu", "0")))
 
 
@@ -321,6 +413,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     name = spec["model_name"]
     config = load_run_config(name)
     settings = config["flow"]
+    apply_spec(spec, settings)
     out_dir = run_dir(name, "flow")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -328,18 +421,19 @@ def train(ranks: Ranks, spec_path: str) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     # Training batches are one shape; evaluation and previews are not.
-    torch.backends.cudnn.benchmark = bool(settings.get("cudnn_benchmark", False))
+    # Nor are bucketed batches, and the benchmark would run on every new one.
+    torch.backends.cudnn.benchmark = bool(settings.get("cudnn_benchmark", False)) and not bucketed(settings)
 
     entries = read_filelist(name)
     speakers = speaker_count(entries)
     entries, holdout_entries = split_holdout(entries, int(settings.get("holdout_clips", 0)))
     batch_size = int(spec["batch_size"])
-    dataset, loader, sampler, holdout = build_loaders(ranks, config, entries, holdout_entries, batch_size)
+    dataset, loader, sampler, holdout = build_loaders(ranks, name, config, entries, holdout_entries, batch_size)
 
     resume = None if spec.get("fresh") else latest_checkpoint(out_dir, "F")
     state = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
     finetune = bool(spec.get("pretrained_flow"))
-    mean_flow = configure_model(spec, settings, state, main_rank)
+    configure_model(spec, settings)
     model = build_flow(config, speakers).to(device)
     speaker_dropout = float(settings["speaker_dropout"])
     tension_dropout = float(settings.get("tension_dropout", 0.0)) if model.encoder.tension is not None else 0.0
@@ -359,17 +453,22 @@ def train(ranks: Ranks, spec_path: str) -> None:
     epoch, step, skipped, starting_point = restore(spec, name, resume, state, model, optimizer, ema, scaler)
     # Its CPU copy would otherwise stay in RAM for the whole run.
     state = None
+    # A resumed run and a fine-tune keep the statistics their weights came with.
+    if settings.get("mel_bin_norm", False) and not resume and not finetune:
+        model.set_mel_stats(*mel_statistics(ranks, loader, config["data"]))
+        ema.reseed(model)
 
     writer = SummaryWriter(os.path.join(out_dir, "eval")) if main_rank else None
     previews = RectifiedPreviews(out_dir, config, step, device) if main_rank else None
-    # The preview clips, each with whether it is held out: the reference clip
-    # may be another voice's, so only those are sure to be reconstructions.
+    # The preview clip, with whether it is held out: the reference clip, which
+    # may be another voice's, or else one held-out clip, a sure reconstruction.
     clips = []
     if main_rank:
         reference = dataset.reference()
-        clips = [] if reference is None else [(reference, False)]
-        if holdout is not None:
-            clips += [(clip, True) for clip in holdout.dataset.speaker_clips(PREVIEW_CLIPS)]
+        if reference is not None:
+            clips = [(reference, False)]
+        elif holdout is not None:
+            clips = [(clip, True) for clip in holdout.dataset.speaker_clips(1)]
     # A fine-tune is short, so it previews more often; experiments whose config
     # predates the key get the same.
     preview_interval = int(
@@ -378,29 +477,42 @@ def train(ranks: Ranks, spec_path: str) -> None:
     )
     total_epochs = int(spec["total_epochs"])
     save_every = max(1, int(spec["save_every"]))
-    warmup = 0 if finetune else int(settings["warmup_steps"])
     total_steps = total_epochs * len(loader)
+    # A fine-tune's optimizer starts cold on trained weights, and Muon's step
+    # does not shrink with the gradient; a short one is not all warmup.
+    warmup = int(settings["warmup_steps"])
+    if finetune:
+        warmup = min(int(settings.get("finetune_warmup_steps", 0)), total_steps // 4)
     final_ratio = float(settings.get("lr_final_ratio", 1.0))
     lr_anchor = (0, 0.0)
     if resume and step >= warmup:
         lr_anchor = (step, cosine_progress(optimizer.param_groups[0]["lr"] / base_lr, final_ratio))
     aux_weight = float(settings.get("aux_mel_weight", 0.0))
     eval_interval = int(settings.get("eval_interval", 0))
-    mean_ratio = float(settings.get("mean_flow_ratio", 0.25)) if mean_flow else 0.0
-    # The bootstrapped target comes in once the network has a field to differentiate.
-    mean_warmup = 0 if finetune else int(settings.get("mean_flow_warmup_steps", 0))
-    backbone, mean_field = compiled_backbone(
+    backbone = compiled_backbone(
         model, bool(spec.get("compile", False)), spec.get("torch_compile_mode", "default"), device,
-        mean_flow=mean_ratio > 0,
+        dynamic=bucketed(settings),
     )
     # The backward runs outside autocast here, and a compiled graph's would
     # otherwise run under the forward's.
     backward_context = (
         partial(aot_config.patch, backward_pass_autocast="off") if backbone is not None else nullcontext
     )
+    # A shortcut model learns its jumps from a copy of itself that lags it,
+    # which starts at the averaged weights.
+    teacher, teacher_weights, shortcut_share = None, None, 0.0
+    if model.shortcut_levels:
+        shortcut_share = float(settings.get("shortcut_share", 0.125))
+        teacher_decay = float(settings.get("shortcut_ema_decay", 0.999))
+        with ema.applied(model):
+            teacher = copy.deepcopy(model).requires_grad_(False).eval()
+        teacher_weights = (list(teacher.parameters()), list(model.parameters()))
     # Frozen parameters are left out of the gradient sync. Sampling, previews
     # and evaluation go through ``model`` itself.
     train_model = ranks.wrap(model)
+    if settings.get("stream_seed") is not None:
+        # Two models with different layers then train on the same noise and times.
+        model.generator = torch.Generator(device).manual_seed(int(settings["stream_seed"]) + 1 + ranks.rank)
     embedder = embedder_of(name)
     vocoder_path = spec.get("vocoder", "")
     vocoder = load_preview_vocoder(vocoder_path, config, device) if main_rank else None
@@ -410,23 +522,28 @@ def train(ranks: Ranks, spec_path: str) -> None:
         print_settings_panel(
             [
                 ("Model", f"{name}, {speakers} speakers" + (", voice frozen" if voice_frozen else "")),
-                ("Data", f"{len(dataset)} clips ({len(holdout_entries)} held out), batch {batch_size} x "
-                         f"{settings['segment_frames']} frames, {len(loader)} steps per epoch"),
+                ("Data", f"{len(dataset)} clips ({len(holdout_entries)} held out), "
+                         + (f"{len(loader.dataset)} cached items, " if settings.get("feature_cache", False) else "")
+                         + (f"whole clips in batches of up to {batch_size * settings['segment_frames']} frames, "
+                            if bucketed(settings) else f"batch {batch_size} x {settings['segment_frames']} frames, ")
+                         + f"{len(loader)} steps per epoch"),
                 ("Epochs", f"{epoch} -> {total_epochs}, saving every {save_every}, {starting_point}"),
                 ("Backbone", "LYNXNet2"
                              + (" with adaLN" if model.backbone.voice is not None else "")
                              + (f", shallow from t={model.t_start:g}" if model.t_start > 0 else "")
                              + (", dual timestep" if model.dual_timestep else "")
-                             + (f", mean flow on {100 * mean_ratio:g}%" if mean_ratio > 0 else "")
+                             + (f", shortcut on {100 * shortcut_share:g}% of each batch" if teacher is not None else "")
+                             + (", per-bin mel" if settings.get("mel_bin_norm", False) else "")
                              + (", compiled" if backbone is not None else "")),
                 ("Training", f"{'Muon + AdamW' if isinstance(optimizer, MuonAdamW) else 'AdamW'}, lr {base_lr:g}, "
-                             f"cosine to {final_ratio:g}x at step {total_steps}, {precision_label(amp_dtype)} on "
+                             + (f"{warmup}-step warmup, " if warmup else "")
+                             + f"cosine to {final_ratio:g}x at step {total_steps}, {precision_label(amp_dtype)} on "
                              + (torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU")
                              + (f" x {ranks.world} GPUs" if ranks.world > 1 else "")),
                 ("Augment", f"key ±{settings.get('key_shift_range', 0):g} st "
-                            f"({100 * settings.get('key_shift_prob', 0):g}%), "
-                            "stretch x{:g}-{:g} ({:g}%), ".format(
-                                *settings.get("time_stretch_range", (1, 1)), 100 * settings.get("time_stretch_prob", 0))
+                            f"({augment_share(settings, 'key_shift')}), "
+                            "stretch x{:g}-{:g} ({}), ".format(
+                                *settings.get("time_stretch_range", (1, 1)), augment_share(settings, "time_stretch"))
                             + f"speaker dropout {speaker_dropout:g}"
                             + (f", tension dropout {tension_dropout:g}" if tension_dropout > 0 else "")),
                 ("Vocoder", os.path.basename(vocoder_path) if vocoder is not None else "none (previews without audio)"),
@@ -434,110 +551,18 @@ def train(ranks: Ranks, spec_path: str) -> None:
             title="Rectified flow",
         )
 
-    def save(current_epoch: int):
-        if any(not torch.isfinite(param).all() for param in model.parameters()):
-            raise FloatingPointError(
-                "The flow has non-finite weights. Nothing was saved, so the last checkpoint stands."
-            )
-        keep = spec.get("checkpoints", "latest")
-        saved = []
-        with uninterruptible_save("Flow checkpoint"):
-            if keep == "none":
-                # An older run's checkpoint would otherwise be resumed from,
-                # silently undoing everything trained since.
-                remove_older(out_dir, "F")
-            else:
-                path = os.path.join(out_dir, f"F_{step}.pth")
-                torch.save(
-                    {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                     "ema": ema.state_dict(), "epoch": current_epoch, "step": step,
-                     "scaler": scaler.state_dict() if scaler is not None else None,
-                     "skipped_steps": skipped},
-                    path,
-                )
-                if keep == "latest":
-                    remove_older(out_dir, "F", path)
-                saved.append(os.path.basename(path))
-            export = os.path.join(out_dir, f"{name}_flow_{current_epoch}e_{step}s.pth")
-            torch.save(
-                {"kind": "rectified_flow", "config": config, "model": ema.cpu_state_dict(),
-                 "speaker_count": speakers, "embedder_model": embedder,
-                 "vocoder": vocoder_path if vocoder is not None else "",
-                 "epoch": current_epoch, "step": step},
-                export,
-            )
-        saved.append(os.path.basename(export))
-        success(f"Saved {' and '.join(saved)}.", tag=TAG)
-
-    @torch.no_grad()
-    def preview():
-        """Every preview clip through the flow's EMA weights. With a vocoder,
-        also its real mel through the vocoder alone and the aux decoder's mel,
-        and for a held-out clip the flow started from the real mel instead of
-        the aux decoder's, on the same noise: together they tell the vocoder's,
-        the aux decoder's and the flow's errors apart. Without one, the mel
-        figure only."""
-        with previews.media.writer(step) as media, ema.applied(model):
-            model.eval()
-            for index, (clip, held_out) in enumerate(clips):
-                inputs = clip.inputs.to(device)
-                real = normalize_mel(clip.mel.to(device), config["data"])
-                noise = torch.randn_like(real)
-                generated = model.sample(inputs, steps=PREVIEW_STEPS, noise=noise)
-                if vocoder is None:
-                    previews.log(
-                        epoch, step, clip.path, generated_mel=denormalize_mel(generated, config["data"]),
-                        reference_mel=clip.mel, sample_index=index, writer=media,
-                    )
-                    continue
-                mels = {"vocoder_on_real_mel": real}
-                if model.aux is not None:
-                    mels["aux_decoder"] = model.aux_mel(inputs)
-                if model.t_start > 0 and held_out:
-                    mels["flow_from_real_mel"] = model.sample(
-                        inputs, steps=PREVIEW_STEPS, noise=noise, start_mel=real
-                    )
-                if mean_ratio > 0:
-                    mels["mean_flow_1_step"] = model.sample(inputs, steps=1, method="mean", noise=noise)
-                previews.log(
-                    epoch, step, clip.path,
-                    generated_audio=vocoder(generated, inputs.f0),
-                    reference_audio=clip.audio.to(device),
-                    extra_audio={name: vocoder(mel, inputs.f0) for name, mel in mels.items()},
-                    sample_index=index, writer=media,
-                )
-            model.train()
-
-    @torch.no_grad()
-    def evaluate():
-        """Held-out flow loss through the EMA weights, from the same noise and
-        at the same times on every call, so the curve compares across steps."""
-        totals = torch.zeros(len(EVAL_FRACTIONS), device=device)
-        aux_total, items = 0.0, 0
-        with ema.applied(model):
-            model.eval()
-            for index, (mel, inputs) in enumerate(holdout):
-                inputs = inputs.to(device)
-                mel = normalize_mel(mel.to(device), config["data"]) * inputs.mask
-                generator = torch.Generator(device=device).manual_seed(index)
-                noise = torch.randn(mel.shape, device=device, generator=generator)
-                with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
-                    losses, aux = model.validation_losses(mel, inputs, noise, EVAL_FRACTIONS)
-                totals += losses.float() * mel.shape[0]
-                aux_total += (aux.item() if aux is not None else 0.0) * mel.shape[0]
-                items += mel.shape[0]
-            model.train()
-        totals /= max(1, items)
-        writer.add_scalar("val/flow", totals.mean().item(), step)
-        for fraction, value in zip(EVAL_FRACTIONS, totals.tolist()):
-            writer.add_scalar(f"val/flow_t{fraction:g}", value, step)
-        if model.aux is not None:
-            writer.add_scalar("val/aux_mel_l1", aux_total / max(1, items), step)
-
+    export = {
+        "config": config, "speaker_count": speakers, "embedder_model": embedder,
+        "vocoder": vocoder_path if vocoder is not None else "",
+    }
     recorder = EpochRecorder()
     model.train()
     data_wait = step_time = 0.0
     skipped_in_a_row = 0
+    # Flow loss, aux loss and gradient norm summed over the applied steps since
+    # the last log.
+    window = torch.zeros(3, device=device)
+    window_steps = 0
     while epoch <= total_epochs:
         metrics = ""
         if sampler is not None:
@@ -558,15 +583,13 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 with backward_context(), torch.autocast(
                     device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None
                 ):
-                    flow_loss, aux_loss, mean_losses = train_model(
+                    flow_loss, aux_loss = train_model(
                         mel * inputs.mask, inputs,
                         speaker_dropout=speaker_dropout, tension_dropout=tension_dropout,
-                        backbone=backbone, mean_field=mean_field, mean_ratio=mean_ratio,
-                        mean_bootstrap=min(1.0, step / mean_warmup) if mean_warmup else 1.0,
+                        backbone=backbone,
+                        teacher=teacher, shortcut_share=shortcut_share,
                     )
                     loss = flow_loss
-                    if mean_losses is not None:
-                        loss = (1.0 - mean_ratio) * flow_loss + mean_ratio * mean_losses.objective
                     if aux_loss is not None:
                         loss = loss + aux_weight * aux_loss
                 grad_norm, step_skipped = optimizer_step(loss, model, optimizer, scaler, settings["grad_clip"])
@@ -582,38 +605,49 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         warning(f"Step {step + 1} skipped over a non-finite gradient. Non-finite: {culprit}.", tag=TAG)
                 else:
                     skipped_in_a_row = 0
+                    window += torch.stack([
+                        flow_loss.detach(),
+                        aux_loss.detach() if aux_loss is not None else flow_loss.new_zeros(()),
+                        grad_norm,
+                    ]).float()
+                    window_steps += 1
                     ema.update(model)
+                    if teacher is not None:
+                        with torch.no_grad():
+                            torch._foreach_lerp_(*teacher_weights, 1.0 - teacher_decay)
                 step += 1
                 step_time += time.perf_counter() - step_started
 
                 if main_rank:
                     if not metrics or (batch_index + 1) % METRICS_INTERVAL == 0:
-                        shown = flow_loss if mean_losses is None else mean_losses.flow
-                        metrics = f"loss={shown.item():.4f}"
+                        metrics = f"loss={flow_loss.item():.4f}"
                     progress.update(task, advance=1, metrics=metrics)
                     emit_machine_progress(epoch, total_epochs, batch_index + 1, len(loader), step, metrics, 0)
 
                 if step % LOG_INTERVAL == 0:
                     # Collective, so outside the rank check.
-                    scalars = loss_scalars(ranks, flow_loss, aux_loss, mean_losses)
+                    flow_mean, aux_mean, grad_mean = window / max(1, window_steps)
+                    scalars = loss_scalars(ranks, flow_mean, aux_mean if aux_loss is not None else None)
+                    window.zero_()
+                    window_steps = 0
                 if step % LOG_INTERVAL == 0 and main_rank:
                     # Time the loop spent waiting on the loader; near zero when
                     # the workers keep up.
                     scalars["perf/data_wait_ms"] = 1000 * data_wait / LOG_INTERVAL
                     scalars["perf/step_ms"] = 1000 * step_time / LOG_INTERVAL
                     data_wait = step_time = 0.0
-                    scalars["grad_norm"] = grad_norm.item()
+                    scalars[f"grad_avg_{LOG_INTERVAL}/grad_norm_{LOG_INTERVAL}"] = grad_mean.item()
                     scalars.update(conditioning_norms(model))
-                    scalars["lr"] = lr
+                    scalars["learning_rate/lr"] = lr
                     scalars["diag/skipped_steps"] = skipped
                     if scaler is not None:
-                        scalars["amp/scale"] = scaler.get_scale()
+                        scalars["AMP/grad_scaler_scale"] = scaler.get_scale()
                     for tag, value in scalars.items():
                         writer.add_scalar(tag, value, step)
                 if clips and step % preview_interval == 0:
-                    preview()
+                    preview(model, ema, previews, clips, vocoder, config["data"], device, epoch, step)
                 if holdout is not None and eval_interval and step % eval_interval == 0:
-                    evaluate()
+                    evaluate(model, ema, holdout, config["data"], device, amp_dtype, writer, step)
                 if ranks.stop_requested():
                     # Nothing is being written at a batch boundary.
                     finish_stop(writer)
@@ -625,9 +659,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 scale = "" if scaler is None else f" GradScaler at {scaler.get_scale():.0f}."
                 info(f"{skipped} step(s) skipped so far.{scale}", tag=TAG)
             if epoch % save_every == 0 or epoch == total_epochs:
-                save(epoch)
+                save(out_dir, name, spec.get("checkpoints", "latest"), model, optimizer, ema, scaler, epoch, step,
+                     skipped, export)
                 if clips:
-                    preview()
+                    preview(model, ema, previews, clips, vocoder, config["data"], device, epoch, step)
             writer.flush()
         epoch += 1
 

@@ -16,7 +16,7 @@ trained on it would do.  Renders go to ``--save-dir`` for listening.
 
 Usage::
 
-    python tools/probes/source_phase_ab.py --log-dir logs/pretrain_bigvgan_teste
+    python archive/probes/source_phase_ab.py --log-dir logs/pretrain_bigvgan_teste
 """
 
 from __future__ import annotations

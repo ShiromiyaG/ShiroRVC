@@ -7,7 +7,7 @@ another syllable. Raw cosines do not compare across embedders, the ratio does.
 
 Usage::
 
-    python tools/probes/embedder_drift.py --audio logs/reference/ref_audio.wav
+    python archive/probes/embedder_drift.py --audio logs/reference/ref_audio.wav
 """
 
 from __future__ import annotations
