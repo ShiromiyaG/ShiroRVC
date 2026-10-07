@@ -398,7 +398,9 @@ def main(spec_path: str) -> None:
     apply_spec(spec, settings)
     if settings.get("feature_cache", False):
         # Before the ranks start, which then only read it.
-        entries, _ = split_holdout(read_filelist(spec["model_name"]), int(settings.get("holdout_clips", 0)))
+        # Sorted: every extraction shuffles the filelist anew, and the cache is keyed by its order.
+        entries = sorted(read_filelist(spec["model_name"]))
+        entries, _ = split_holdout(entries, int(settings.get("holdout_clips", 0)))
         build_cache(spec["model_name"], config, entries, loader_workers(settings.get("num_workers", 4)))
     launch(train, spec_path, parse_gpus(spec.get("gpu", "0")))
 
@@ -424,7 +426,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     # Nor are bucketed batches, and the benchmark would run on every new one.
     torch.backends.cudnn.benchmark = bool(settings.get("cudnn_benchmark", False)) and not bucketed(settings)
 
-    entries = read_filelist(name)
+    entries = sorted(read_filelist(name))
     speakers = speaker_count(entries)
     entries, holdout_entries = split_holdout(entries, int(settings.get("holdout_clips", 0)))
     batch_size = int(spec["batch_size"])

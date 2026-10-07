@@ -197,8 +197,8 @@ class CachedFlowDataset(Dataset):
 
 class BucketBatchSampler(Sampler):
     """Batches of items of similar length, each within ``max_frames`` padded
-    frames and ``max_items`` items, formed anew every epoch and dealt between
-    the ranks."""
+    frames and ``max_items`` items, formed anew every epoch, always the same
+    number of them, and dealt between the ranks."""
 
     def __init__(self, lengths, max_frames: int, max_items: int, seed: int = 1234, rank: int = 0, world: int = 1):
         self.lengths = np.asarray(lengths)
@@ -207,15 +207,12 @@ class BucketBatchSampler(Sampler):
         self.seed, self.rank, self.world = int(seed), int(rank), int(world)
         self.epoch = 0
         self._formed = None
+        self._count = None
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def _batches(self) -> list:
-        if self._formed is not None and self._formed[0] == self.epoch:
-            return self._formed[1]
-        # The same on every rank, which then takes its own share.
-        rng = np.random.default_rng(self.seed + self.epoch)
+    def _form(self, rng) -> list:
         order = rng.permutation(len(self.lengths))
         order = order[np.argsort(-(self.lengths[order] // LENGTH_GRID), kind="stable")]
         batches, batch, longest = [], [], 0
@@ -229,8 +226,22 @@ class BucketBatchSampler(Sampler):
             longest = max(longest, frames)
         if batch:
             batches.append(batch)
-        batches = [batches[index] for index in rng.permutation(len(batches)).tolist()]
-        each = len(batches) // self.world
+        return [batches[index] for index in rng.permutation(len(batches)).tolist()]
+
+    def _batches(self) -> list:
+        if self._formed is not None and self._formed[0] == self.epoch:
+            return self._formed[1]
+        if self._count is None:
+            self._count = len(self._form(np.random.default_rng(self.seed)))
+        # The same on every rank, which then takes its own share.
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches = self._form(rng)
+        # Every epoch has the same number of steps: batches over it are left
+        # out, and the ones missing are repeated.
+        missing = max(self._count - len(batches), 0)
+        repeated = rng.choice(len(batches), missing, replace=False).tolist()
+        batches = (batches + [batches[index] for index in repeated])[: self._count]
+        each =len(batches) // self.world
         if each == 0:
             raise ValueError(f"{len(batches)} batches is fewer than one for each of {self.world} GPUs.")
         batches = batches[self.rank : each * self.world : self.world]
