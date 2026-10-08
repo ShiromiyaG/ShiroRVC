@@ -56,7 +56,7 @@ def vocoder_pretraineds_list(vocoder=None, sample_rate=None):
 #: The default rectified-flow pretrains (``rvc.lib.catalog.RECTIFIED_FLOW_PRETRAINS``)
 #: that are published; spin_v2's is picked up once it is here.
 rectified_pretrains_list = [
-    ("Rectified_pretrains/", ["pretrain_flow_contentvec_cc_by_nc_sa.pth"]),
+    ("Rectified_pretrains/", ["pretrain_flow_contentvec.pth"]),
 ]
 
 #: OpenVPI vocoders the rectified flow's mel is made for.
