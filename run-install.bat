@@ -11,7 +11,7 @@ set "ENV_DIR=%INSTALL_DIR%\env"
 set "MINICONDA_URL=https://repo.anaconda.com/miniconda/Miniconda3-py312_26.5.3-2-Windows-x86_64.exe"
 set "CONDA_EXE=%MINICONDA_DIR%\Scripts\conda.exe"
 set "PYTHON_VERSION=3.12"
-set "TORCH_VERSION=2.13.0"
+set "TORCH_VERSION=2.14.1"
 set "TORCHAUDIO_VERSION=2.11.0"
 set "PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu130"
 

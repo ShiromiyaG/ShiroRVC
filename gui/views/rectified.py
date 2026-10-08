@@ -226,6 +226,7 @@ class RectifiedPage(Page):
         self.formant_shift = SliderSpin(-5, 5, 0.5, decimals=1, value=0.0)
         self.f0_median = SliderSpin(0, 10, 1, decimals=0, value=0)
         self.tension_strength = SliderSpin(0, 1, 0.05, decimals=2, value=1.0)
+        self.breathiness_strength = SliderSpin(0, 1, 0.05, decimals=2, value=1.0)
         self.f0_octave_fix = Toggle(
             _("Fix octave errors"),
             _("Folds pitch that jumps an octave away from its surroundings back into place."),
@@ -242,6 +243,11 @@ class RectifiedPage(Page):
                   _("How far the input's tension carries over. 0 leaves the voice at its own. "
                     "Only for models trained with the tension input.")),
             self.f0_octave_fix,
+        )
+        advanced.add(
+            Field(_("Breathiness"), self.breathiness_strength,
+                  _("How far the breathiness of the input's voiced frames carries over. "
+                    "0 holds them at the input's usual. Consonants are left alone.")),
         )
 
         advanced.add_group(_("Sampling"))
@@ -349,6 +355,7 @@ class RectifiedPage(Page):
             "f0_octave_fix": self.f0_octave_fix.isChecked(),
             "content_context": self.content_context.value(),
             "tension_strength": self.tension_strength.value(),
+            "breathiness_strength": self.breathiness_strength.value(),
         }
 
     def _refresh_inference(self) -> None:

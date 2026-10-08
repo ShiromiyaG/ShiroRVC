@@ -551,11 +551,11 @@ def collate_vocoder(batch):
     return torch.stack(mel), torch.stack(f0), torch.stack(audio).unsqueeze(1)
 
 
-def collate_flow(batch, frames=None):
+def collate_flow(batch, frames=None, multiple=1):
     """``FlowItem``s -> the mel [B, n_mels, T] and its ``Conditioning``, padded
-    to ``frames``, or to the longest item. A fixed length keeps every batch
-    one shape for ``torch.compile``."""
-    frames = frames or max(item.mel.shape[-1] for item in batch)
+    to ``frames``, or to the longest item rounded up to a ``multiple``. A
+    fixed length keeps every batch one shape for ``torch.compile``."""
+    frames = frames or -(-max(item.mel.shape[-1] for item in batch) // multiple) * multiple
     size = len(batch)
     mel = torch.zeros(size, batch[0].mel.shape[0], frames)
     # Padding reads as silence: no pitch, the energy floor, fully aperiodic.

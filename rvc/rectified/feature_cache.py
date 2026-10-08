@@ -21,6 +21,9 @@ TAG = "[CACHE]"
 CACHE_VERSION = 1
 #: Lengths this many frames apart sort as equal, so batches change by epoch.
 LENGTH_GRID = 8
+#: Batches are padded to a multiple of this many frames, so they come in few
+#: shapes and cuDNN's benchmark settles on each. A multiple of ``LENGTH_GRID``.
+PAD_GRID = 32
 CURVES = ("f0", "energy", "breathiness", "tension")
 
 
@@ -196,9 +199,9 @@ class CachedFlowDataset(Dataset):
 
 
 class BucketBatchSampler(Sampler):
-    """Batches of items of similar length, each within ``max_frames`` padded
-    frames and ``max_items`` items, formed anew every epoch, always the same
-    number of them, and dealt between the ranks."""
+    """Batches of items of similar length, each within ``max_frames`` frames
+    as padded to ``PAD_GRID`` and ``max_items`` items, formed anew every
+    epoch, always the same number of them, and dealt between the ranks."""
 
     def __init__(self, lengths, max_frames: int, max_items: int, seed: int = 1234, rank: int = 0, world: int = 1):
         self.lengths = np.asarray(lengths)
@@ -214,10 +217,11 @@ class BucketBatchSampler(Sampler):
 
     def _form(self, rng) -> list:
         order = rng.permutation(len(self.lengths))
-        order = order[np.argsort(-(self.lengths[order] // LENGTH_GRID), kind="stable")]
+        # Grouped as the padding rounds, up, so a batch's first item is its longest padded.
+        order = order[np.argsort(-((self.lengths[order] - 1) // LENGTH_GRID), kind="stable")]
         batches, batch, longest = [], [], 0
         for index in order.tolist():
-            frames = int(self.lengths[index])
+            frames = -(-int(self.lengths[index]) // PAD_GRID) * PAD_GRID
             if batch and (len(batch) == self.max_items
                           or (len(batch) + 1) * max(longest, frames) > self.max_frames):
                 batches.append(batch)
@@ -241,7 +245,7 @@ class BucketBatchSampler(Sampler):
         missing = max(self._count - len(batches), 0)
         repeated = rng.choice(len(batches), missing, replace=False).tolist()
         batches = (batches + [batches[index] for index in repeated])[: self._count]
-        each =len(batches) // self.world
+        each = len(batches) // self.world
         if each == 0:
             raise ValueError(f"{len(batches)} batches is fewer than one for each of {self.world} GPUs.")
         batches = batches[self.rank : each * self.world : self.world]

@@ -46,7 +46,13 @@ from rvc.rectified.common import (
     split_holdout,
 )
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
-from rvc.rectified.feature_cache import BucketBatchSampler, CachedFlowDataset, build_cache, load_cache
+from rvc.rectified.feature_cache import (
+    PAD_GRID,
+    BucketBatchSampler,
+    CachedFlowDataset,
+    build_cache,
+    load_cache,
+)
 from rvc.rectified.flow import build_flow, match_inputs, resize_speakers
 from rvc.rectified.flow_validation import evaluate, preview
 from rvc.rectified.mel import normalize_mel
@@ -210,7 +216,9 @@ def build_loaders(ranks: Ranks, name: str, config: dict, entries, holdout_entrie
             items.lengths(), batch_size * segment, int(settings.get("bucket_max_items", 64)),
             int(settings.get("seed", 1234)), ranks.rank, ranks.world,
         )
-        loader = DataLoader(items, batch_sampler=sampler, collate_fn=collate_flow, **common)
+        loader = DataLoader(
+            items, batch_sampler=sampler, collate_fn=partial(collate_flow, multiple=PAD_GRID), **common
+        )
     else:
         sampler = ranks.sampler(items)
         loader = DataLoader(
@@ -380,12 +388,12 @@ def save(out_dir: str, name: str, keep: str, model, optimizer, ema, scaler, epoc
             if keep == "latest":
                 remove_older(out_dir, "F", path)
             saved.append(os.path.basename(path))
-        export = os.path.join(out_dir, f"{name}_flow_{epoch}e_{step}s.pth")
+        export_path = os.path.join(out_dir, f"{name}_flow_{epoch}e_{step}s.pth")
         torch.save(
             {"kind": "rectified_flow", **export, "model": ema.cpu_state_dict(), "epoch": epoch, "step": step},
-            export,
+            export_path,
         )
-    saved.append(os.path.basename(export))
+    saved.append(os.path.basename(export_path))
     success(f"Saved {' and '.join(saved)}.", tag=TAG)
 
 
@@ -428,9 +436,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     device = ranks.device
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # Training batches are one shape; evaluation and previews are not.
-    # Nor are bucketed batches, and the benchmark would run on every new one.
-    torch.backends.cudnn.benchmark = bool(settings.get("cudnn_benchmark", False)) and not bucketed(settings)
+    # Training batches are one shape, or the few bucketed ones are padded to;
+    # evaluation and previews are not.
+    torch.backends.cudnn.benchmark = bool(settings.get("cudnn_benchmark", False))
 
     entries = sorted(read_filelist(name))
     speakers = speaker_count(entries)

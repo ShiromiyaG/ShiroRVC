@@ -4,7 +4,7 @@
     "betas": [0.8, 0.9],
     "eps": 1e-08,
     "weight_decay": 0.0,
-    "lr_scheduler": "cosine annealing epoch",
+    "lr_scheduler": "cosine annealing step",
     "lr_decay": 1.0,
     "lr_final_ratio": 0.1,
     "warmup_steps": 0,

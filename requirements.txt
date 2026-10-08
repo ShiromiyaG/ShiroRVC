@@ -21,7 +21,7 @@ stftpitchshift
 # Machine learning and deep learning
 # Pulled in by librosa/resampy, not imported directly; pinned for numpy 2.2.
 numba==0.64.0
-torch==2.13.0
+torch==2.14.1
 torchaudio==2.11.0
 torchcrepe==0.0.23
 einops
@@ -29,7 +29,7 @@ transformers==4.44.2
 # Direct dependency of the SPIN WavLM embedder, which loads its projection head
 # from a .safetensors file rather than through transformers.
 safetensors>=0.4.0
-triton==3.7.1; sys_platform == "linux"
+triton==3.8.0; sys_platform == "linux"
 triton-windows==3.7.1.post27; sys_platform == "win32"
 schedulefree==1.4.1
 

@@ -11,6 +11,9 @@ import torch
 
 from rvc.lib.terminal import warning
 
+#: Schedulers stepped once per optimizer step; the others step per epoch.
+STEP_SCHEDULERS = ("exp decay step", "cosine annealing step")
+
 
 def planned_step_count(total_epoch_count: int, train_loader, max_steps: int = 0) -> int:
     """How many optimizer steps this run will take.
@@ -149,6 +152,7 @@ def prepare_schedulers(
         "exp decay epoch": _horizon_decay,
         "exp decay step": _horizon_decay,
         "cosine annealing epoch": _horizon_cosine,
+        "cosine annealing step": _horizon_cosine,
     }
 
     def build(optim, lr_scheduler):
@@ -161,10 +165,9 @@ def prepare_schedulers(
         )
 
         if lr_final_ratio is not None and scheduler_name in horizon_shapes:
-            # Only one variant is stepped per optimizer step; the others are
-            # stepped per epoch, so the ratio has to land at the end of the run
-            # in whichever unit this scheduler counts.
-            per_epoch = scheduler_name != "exp decay step"
+            # The ratio has to land at the end of the run in whichever unit
+            # this scheduler counts.
+            per_epoch = scheduler_name not in STEP_SCHEDULERS
             span_epochs = max(1, total_epoch_count - horizon_start_epoch)
             total_units = span_epochs * (1 if per_epoch else num_batches_per_epoch)
             resume_at = scheduler_resume_epoch if per_epoch else scheduler_resume_step
@@ -201,6 +204,11 @@ def prepare_schedulers(
         if scheduler_name == "cosine annealing epoch":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 optim, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch
+            )
+        if scheduler_name == "cosine annealing step":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optim, T_max=total_epoch_count * num_batches_per_epoch, eta_min=3e-5,
+                last_epoch=scheduler_resume_step,
             )
         warning(f"Unknown LR scheduler {lr_scheduler!r}; running without one.", tag="[INIT]")
         return None

@@ -162,7 +162,6 @@ def subsequent_mask(length):
     return mask
 
 
-@torch.jit.script
 def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels: int):
     """``n_channels`` is a plain ``int``, not a one-element tensor.
 

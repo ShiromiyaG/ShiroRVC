@@ -336,7 +336,7 @@ def old_session_cleanup(app_root, model_name):
 #: set, which makes ``lr_decay``/``exp_decay_gamma`` dead config for them.  Kept
 #: next to the panel because the panel is the only place that has to know.
 _ENDPOINT_SCHEDULERS = frozenset(
-    {"exp decay epoch", "exp decay step", "cosine annealing", "cosine annealing epoch"}
+    {"exp decay epoch", "exp decay step", "cosine annealing", "cosine annealing epoch", "cosine annealing step"}
 )
 
 

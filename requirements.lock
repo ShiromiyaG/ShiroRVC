@@ -341,7 +341,7 @@ tokenizers==0.19.1
     # via transformers
 tomlkit==0.13.3
     # via gradio
-torch==2.13.0
+torch==2.14.1
     # via
     #   -r requirements.txt
     #   hyper-connections

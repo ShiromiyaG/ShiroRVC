@@ -208,6 +208,15 @@ def rectified_inference_tab():
                 value=1.0,
                 interactive=True,
             )
+            breathiness_strength = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                label=_("Breathiness"),
+                info=_("How far the breathiness of the input's voiced frames carries over. 0 holds them at the input's usual, so a breathy note ending is not copied. Consonants are left alone."),
+                value=1.0,
+                interactive=True,
+            )
             with gr.Row():
                 f0_median = gr.Slider(
                     minimum=0,
@@ -471,7 +480,7 @@ def rectified_inference_tab():
         formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
         noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
         f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
-        tension_strength, restore_level,
+        tension_strength, restore_level, breathiness_strength,
     ):
         if not flow_model or not vocoder_model:
             return _("Pick a flow model and a vocoder model."), None
@@ -527,6 +536,7 @@ def rectified_inference_tab():
             restore_level=restore_level,
             churn=churn,
             tension_strength=tension_strength,
+            breathiness_strength=breathiness_strength,
         )
 
     def refresh():
@@ -584,7 +594,7 @@ def rectified_inference_tab():
             formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
             noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
             f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
-            tension_strength, restore_level,
+            tension_strength, restore_level, breathiness_strength,
         ],
         outputs=[output_info, output_audio],
     )

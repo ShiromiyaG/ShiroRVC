@@ -12,6 +12,7 @@ __pycache__/
 .nox/
 .uv-cache/
 .tmp
+*.pth
 CLAUDE.md
 build/
 dist/

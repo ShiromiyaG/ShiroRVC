@@ -11,7 +11,7 @@ mel spectrogram, which a separate neural vocoder turns into sound. The classic
 RVC pipeline is still here, side by side.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.14-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Gradio](https://img.shields.io/badge/Gradio-6.9-F97316?logo=gradio&logoColor=white)](https://www.gradio.app/)
 [![License](https://img.shields.io/badge/License-MIT-22C55E)](LICENSE)
 
@@ -91,7 +91,7 @@ it, remove the preinstalled stack and install it from PyTorch's index first:
 
 ```bash
 pip uninstall -y torch torchaudio torchvision
-pip install torch==2.13.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+pip install torch==2.14.1 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 ```
 
@@ -365,17 +365,6 @@ catalog falls back to English silently rather than raising.
 - **[OpenVPI SingingVocoders](https://github.com/openvpi/SingingVocoders)** — the
   44.1 kHz mel the rectified pipeline uses and the NSF-HiFiGAN generator ported
   to render it, including the pc-nsf-hifigan release.
-- **[EARS](https://github.com/facebookresearch/ears_dataset)** (CC BY-NC 4.0),
-  **[M4Singer](https://github.com/M4Singer/M4Singer)** and
-  **[GTSinger](https://github.com/AaronZ345/GTSinger)** (both CC BY-NC-SA 4.0) —
-  the speech and singing the rectified pretrains were trained on:
-  - Richter et al., *EARS: An Anechoic Fullband Speech Dataset Benchmarked for
-    Speech Enhancement and Dereverberation*, Interspeech 2024.
-  - Zhang et al., *M4Singer: A Multi-Style, Multi-Singer and Musical Score
-    Provided Mandarin Singing Corpus*, NeurIPS 2022 Datasets and Benchmarks.
-  - Zhang et al., *GTSinger: A Global Multi-Technique Singing Corpus with
-    Realistic Music Scores for All Singing Tasks*, NeurIPS 2024 Datasets and
-    Benchmarks.
 - **[BigVGAN](https://github.com/NVIDIA/BigVGAN)** (NVIDIA) — SnakeBeta and the
   anti-aliased AMP blocks behind the PCPH-BigVGAN vocoder.
 - **[Muon](https://kellerjordan.github.io/posts/muon/)** (Keller Jordan) — the
@@ -399,10 +388,3 @@ The OpenVPI NSF-HiFiGAN vocoder weights are not: they are © Team OpenVPI under
 also applies to the converted `pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth`
 this project downloads. Audio rendered with them is for non-commercial use;
 see [SingingVocoders](https://github.com/openvpi/SingingVocoders).
-
-The rectified pretrains this project publishes (the flow pretrain and the
-PCPH-BigVGAN vocoder pretrain) were trained on EARS, M4Singer and GTSinger,
-which are licensed for non-commercial use only. They are released under
-[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), not
-MIT, and so is any model fine-tuned from them: non-commercial use, with credit
-to the datasets listed under [Credits](#credits).

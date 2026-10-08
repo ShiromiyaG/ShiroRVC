@@ -597,6 +597,7 @@ def run_rectified_infer_script(
     match_level: bool = True,
     restore_level: bool = False,
     tension_strength: float = 1.0,
+    breathiness_strength: float = 1.0,
 ):
     if not flow_path or not vocoder_path:
         problem = "Pick a flow model and a vocoder model."
@@ -638,6 +639,7 @@ def run_rectified_infer_script(
         export_format=export_format,
         formant_shift=float(formant_shift),
         tension_strength=float(tension_strength),
+        breathiness_strength=float(breathiness_strength),
         split_audio=bool(split_audio),
         silence_gate_db=float(silence_gate_db),
         content_context=float(content_context),

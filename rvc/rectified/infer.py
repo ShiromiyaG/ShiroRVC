@@ -273,7 +273,7 @@ class RectifiedConverter:
 
     @torch.no_grad()
     def _inputs(self, audio, full, sid, pitch: PitchOptions, index: IndexOptions, retriever, content_context,
-                formant_shift, tension_strength) -> Conditioning:
+                formant_shift, tension_strength, breathiness_strength) -> Conditioning:
         """The flow's inputs for ``audio``, a NumPy array at ``INPUT_RATE``, at
         the mel frame rate. ``full`` is the same input at the mel's sample
         rate: training measures the loudness, breathiness and tension there,
@@ -299,7 +299,13 @@ class RectifiedConverter:
         source_f0 = torch.from_numpy(source_f0).view(1, -1).to(self.device)
         f0 = torch.from_numpy(f0).view(1, -1).to(self.device)
         energy = smooth_curve(frame_energy(full, rate, frames))
-        breathiness = smooth_curve(aperiodicity(full, rate, source_f0, frames))
+        share = aperiodicity(full, rate, source_f0, frames)
+        voiced = source_f0 > 0
+        if breathiness_strength < 1 and voiced.any():
+            # Voiced frames only: the unvoiced ones are the consonants.
+            usual = share[voiced].median()
+            share = torch.where(voiced, usual + float(breathiness_strength) * (share - usual), share)
+        breathiness = smooth_curve(share)
         strain = None
         if self.flow.encoder.tension is not None and tension_strength > 0:
             strain = float(tension_strength) * smooth_curve(
@@ -417,6 +423,7 @@ class RectifiedConverter:
         export_format: str = "WAV",
         formant_shift: float = 0.0,
         tension_strength: float = 1.0,
+        breathiness_strength: float = 1.0,
         split_audio: bool = False,
         silence_gate_db: float = -60.0,
         content_context: float = 2.0,
@@ -434,8 +441,10 @@ class RectifiedConverter:
         ``formant_shift`` moves the formants by that many semitones, apart
         from the pitch. ``tension_strength`` scales how far the input's
         tension, its departure from its own usual, carries over; ignored by a
-        model without the input. ``content_context`` is the seconds of audio
-        each content pass sees either side.
+        model without the input. ``breathiness_strength`` scales how far the
+        breathiness of the input's voiced frames departs from their median.
+        ``content_context`` is the seconds of audio each content pass sees
+        either side.
 
         ``split_audio`` converts each non-silent segment on its own and puts
         the silences back. ``silence_gate_db`` fades the output out where the
@@ -471,6 +480,7 @@ class RectifiedConverter:
                     ("Content context", f"{content_context:g} s"),
                     ("Formant shift", f"{formant_shift:+g} st"),
                     ("Tension", f"{tension_strength:g}" if self.flow.encoder.tension is not None else "not in this model"),
+                    ("Breathiness", f"{breathiness_strength:g}"),
                     ("Index", index.describe(index_source)),
                     ("Match level", ("on" if match_level else "off")
                      + (", output at the input's level" if restore_level else ", output at the model's level")),
@@ -501,7 +511,7 @@ class RectifiedConverter:
                     return np.zeros(round(audio.shape[0] * sample_rate / INPUT_RATE), dtype=np.float32)
                 inputs = self._inputs(
                     audio, full, int(sid), pitch, index, retriever, content_context,
-                    formant_shift, tension_strength,
+                    formant_shift, tension_strength, breathiness_strength,
                 )
                 mel = self._sample_mel(inputs, sampling)
                 # The vocoder takes the normalised mel the flow produces.

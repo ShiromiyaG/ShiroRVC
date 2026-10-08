@@ -60,7 +60,7 @@ from rvc.train.losses import (
 )
 from rvc.train.mel_processing import build_ms_mel_loss
 from rvc.train.progress import EpochRecorder, emit_machine_progress
-from rvc.train.schedules import prepare_schedulers
+from rvc.train.schedules import STEP_SCHEDULERS, prepare_schedulers
 from rvc.train.setup import (
     apply_precision_policy,
     enable_discriminator_compile,
@@ -719,8 +719,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
         plateau, plateau_metric,
     )
     epoch, step, skipped, mel_cond_since = start.epoch, start.step, start.skipped, start.mel_cond_since
-    # "exp decay epoch" or "exp decay step", as in the RVC trainer; the step
-    # variant spreads ``lr_decay`` over the epoch's steps.
+    # As in the RVC trainer, plus "cosine annealing step"; "exp decay step"
+    # spreads ``lr_decay`` over the epoch's steps.
     lr_scheduler = str(settings.get("lr_scheduler", "exp decay epoch"))
     lr_final_ratio = settings.get("lr_final_ratio")
     scheduler_g, scheduler_d = prepare_schedulers(
@@ -729,7 +729,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
         fresh_start=not start.resumed,
         lr_final_ratio=None if lr_final_ratio is None else float(lr_final_ratio),
     )
-    step_schedulers = lr_scheduler == "exp decay step"
+    step_schedulers = lr_scheduler in STEP_SCHEDULERS
     # Linear ramps from the first step: the LR of both optimizers, and the
     # generator's adversarial weight. The early phase explodes without them.
     lr_warmup = int(settings.get("warmup_steps", 0))

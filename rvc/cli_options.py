@@ -732,6 +732,7 @@ RECTIFIED_INFER_OWN = [
     click.option("--f0_octave_fix", type=click.BOOL, default=False, show_default=True, help="Fold pitch that jumps an octave away from its surroundings back into place."),
     click.option("--formant_shift", type=click.FloatRange(-5, 5), default=0.0, show_default=True, help="Formant shift in semitones, apart from the pitch."),
     click.option("--tension_strength", type=click.FloatRange(0, 1), default=1.0, show_default=True, help="How far the input's tension carries over. 0 leaves the voice at its own; ignored by a model without the input."),
+    click.option("--breathiness_strength", type=click.FloatRange(0, 1), default=1.0, show_default=True, help="How far the breathiness of the input's voiced frames carries over. 0 holds them at the input's usual."),
     click.option("--steps", type=click.IntRange(1, 64), default=16, show_default=True, help="ODE steps from noise to mel."),
     click.option("--sampler", type=click.Choice(["euler", "heun"]), default="euler", show_default=True, help="Heun costs two model passes per step."),
     click.option("--schedule", type=click.Choice(["uniform", "sway", "logit-normal"]), default="uniform", show_default=True, help="Spacing of the steps."),
