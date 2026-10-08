@@ -5,11 +5,13 @@ their exports (``{"generator": ...}``), plain and pitch-controllable
 (``mini_nsf``) alike, and converts them to rectified vocoder exports. The
 architecture comes from the weights; what they cannot tell (rates, dilations,
 the mel) from a ``config.json`` beside the file, else the 44.1 kHz, hop 512,
-128-bin release defaults.
+128-bin release defaults. The export holds its mel, so it needs neither.
 
 The generator is ported from SingingVocoders (MIT, see THIRD_PARTY_NOTICES).
 
-Usage: python rvc/rectified/openvpi.py <checkpoint> <output.pth>
+Usage: python rvc/rectified/openvpi.py <checkpoint> <output.pth> [rectified_config.json]
+
+The rectified config gives the mel of a checkpoint without a ``config.json``.
 """
 
 import json
@@ -262,13 +264,16 @@ def _read_config(path: str) -> dict:
         return json.load(handle)
 
 
-def openvpi_spec(path: str, state: dict):
+def openvpi_spec(path: str, state: dict, data: dict | None = None):
     """``(hparams, mel, weights)`` for ``state`` (from ``generator_state``):
     ``NSFHiFiGAN`` arguments, the mel in this repo's key names, and the
-    weights with weight norm folded."""
+    weights with weight norm folded. ``data`` is the mel of a checkpoint
+    without a ``config.json``, in place of the release defaults."""
     config = _read_config(path)
     state = fold_weight_norm(state)
     mel = dict(DEFAULT_MEL)
+    if not config and data is not None:
+        mel = {key: data[key] for key in DEFAULT_MEL}
     for source, target in CONFIG_MEL_KEYS.items():
         if source in config:
             mel[target] = config[source]
@@ -309,14 +314,15 @@ def openvpi_spec(path: str, state: dict):
     return hparams, mel, state
 
 
-def export_openvpi(path: str, output: str) -> None:
+def export_openvpi(path: str, output: str, data: dict | None = None) -> None:
     """Write the generator of the OpenVPI checkpoint at ``path`` as a rectified
-    vocoder export, without the discriminator and optimiser state."""
+    vocoder export, without the discriminator and optimiser state. ``data`` is
+    its mel when it has no ``config.json``."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     state = generator_state(checkpoint)
     if state is None:
         raise ValueError(f"{path} is not an OpenVPI vocoder checkpoint.")
-    hparams, mel, weights = openvpi_spec(path, state)
+    hparams, mel, weights = openvpi_spec(path, state, data)
     NSFHiFiGAN(**hparams).load_state_dict(weights)
     torch.save(
         {
@@ -331,4 +337,8 @@ def export_openvpi(path: str, output: str) -> None:
 
 
 if __name__ == "__main__":
-    export_openvpi(sys.argv[1], sys.argv[2])
+    mel_data = None
+    if len(sys.argv) > 3:
+        with open(sys.argv[3], encoding="utf-8") as handle:
+            mel_data = json.load(handle)["data"]
+    export_openvpi(sys.argv[1], sys.argv[2], mel_data)
