@@ -124,10 +124,17 @@ def get_d_model(config, vocoder, use_checkpointing):
         # outside FP16 autocast, where their unnormalised magnitude overflowed
         # at a raised learning rate.  ``false`` restores the all-FP16 path.
         mrd_fp32_input=bool(setting("d_mrd_fp32_input", True)),
+        # Opt-in: the scale and period branches' first conv, on the waveform,
+        # outside autocast.
+        wave_fp32_input=bool(setting("d_wave_fp32_input", False)),
         # ``None`` keeps what the version says; see ``MULTIBAND_MRD_VERSIONS``
         # and ``MPD_PRE_EMPHASIS_BY_VERSION``.
         mrd_multiband=setting("d_mrd_multiband", None),
         mrd_channels=int(setting("d_mrd_channels", 32)),
+        sbd_bands=setting("d_sbd_bands"),
+        sbd_subbands=int(setting("d_sbd_subbands", 16)),
+        sbd_channels=int(setting("d_sbd_channels", 64)),
+        sbd_gains_db=setting("d_sbd_gains_db"),
         mpd_pre_emphasis=setting("d_mpd_pre_emphasis", None),
         # ``None`` keeps the version's gamma; see ``R1_GAMMA_BY_VERSION``.
         r1_gamma=setting("d_r1_gamma", None),

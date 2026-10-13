@@ -4,7 +4,6 @@ log mel.
 Usage: python rvc/rectified/train_flow.py <spec.json>
 """
 
-import copy
 import importlib.util
 import json
 import math
@@ -134,16 +133,19 @@ def conditioning_norms(model) -> dict:
     return norms
 
 
-def compiled_backbone(model, enabled: bool, mode: str, device, dynamic: bool = False):
-    """``torch.compile`` of the backbone for training; None when left eager.
-    ``dynamic`` is for batches of more than one shape. Evaluation and sampling
-    keep the eager module, whose shapes vary."""
+def compiled_backbone(model, enabled: bool, mode: str, device, dynamic: bool = False, mean_flow: bool = False):
+    """``torch.compile`` of the backbone for training, and of the mean
+    velocity with ``mean_flow``; None for each left eager. ``dynamic`` is for
+    batches of more than one shape. Evaluation and sampling keep the eager
+    module, whose shapes vary."""
     if not enabled:
-        return None
+        return None, None
     if device.type != "cuda" or importlib.util.find_spec("triton") is None:
         warning("torch.compile needs CUDA and Triton; training uncompiled.", tag=TAG)
-        return None
-    return torch.compile(model.backbone, mode=mode, dynamic=True if dynamic else None)
+        return None, None
+    dynamic = True if dynamic else None
+    mean_field = torch.compile(model.mean_velocity, mode=mode, dynamic=dynamic) if mean_flow else None
+    return torch.compile(model.backbone, mode=mode, dynamic=dynamic), mean_field
 
 
 def load_preview_vocoder(path: str, config: dict, device):
@@ -249,16 +251,36 @@ def augment_share(settings: dict, kind: str) -> str:
     return f"{100 * settings.get(kind + '_prob', 0):g}%"
 
 
-def configure_model(spec: dict, settings: dict) -> None:
+def configure_model(spec: dict, settings: dict, state, main_rank: bool) -> bool:
     """Write what the run decides, not the config, into ``settings["model"]``:
-    whether it is a shortcut model and, for a fine-tune, the pretrain's time
-    scale."""
-    settings["model"]["shortcut"] = bool(spec.get("shortcut", False))
+    mean flow and the time scale, a fine-tune's being its pretrain's.
+    ``state`` is the checkpoint being resumed, or None. Returns whether the run
+    trains mean flow."""
+    # A resumed run keeps what it started with.
+    mean_flow = bool(spec.get("mean_flow", False))
+    if state is not None:
+        started_with = any(key.startswith("backbone.span_mlp.") for key in state["model"])
+        if started_with != mean_flow and main_rank:
+            warning(f"This run was started {'with' if started_with else 'without'} mean flow "
+                    f"and resumes that way; start fresh to change it.", tag=TAG)
+        mean_flow = started_with
+    settings["model"]["mean_flow"] = mean_flow
+    backbone_args = settings["model"].setdefault("backbone_args", {})
     if spec.get("pretrained_flow"):
         # Not in the weights, and a network reads another scale's times as noise.
         time_scale = pretrain_time_scale(spec["pretrained_flow"])
         if time_scale is not None:
-            settings["model"].setdefault("backbone_args", {})["time_scale"] = time_scale
+            backbone_args["time_scale"] = time_scale
+    elif mean_flow and "time_scale" not in backbone_args:
+        # Its target is the network's own derivative in time, which diverged
+        # through DiffSinger's 1000.
+        backbone_args["time_scale"] = 1.0
+        if main_rank:
+            info("Mean flow from scratch: time scale 1 (flow.model.backbone_args.time_scale sets another).", tag=TAG)
+    if mean_flow and float(backbone_args.get("time_scale", 1000.0)) > 10 and main_rank:
+        warning("Mean flow with a time scale over 10 has diverged: its target is the network's own "
+                "derivative in time. A pretrain made at time scale 1 avoids it.", tag=TAG)
+    return mean_flow
 
 
 @torch.no_grad()
@@ -352,12 +374,17 @@ def nonfinite_names(mel, inputs, model) -> str:
     return ", ".join(found) or "neither the batch nor the weights, so the loss or a gradient overflowed"
 
 
-def loss_scalars(ranks: Ranks, flow_loss, aux_loss) -> dict:
+def loss_scalars(ranks: Ranks, flow_loss, aux_loss, mean_loss=None, bootstrap=None) -> dict:
     """The losses averaged over the ranks, by TensorBoard tag, under the
-    groups the RVC trainer logs to. Every rank must call it."""
+    groups the RVC trainer logs to; ``mean_loss`` and ``bootstrap`` are the
+    ``MeanFlowLosses``' unweighted loss and ratio. Every rank must call it."""
     scalars = {f"loss_avg_{LOG_INTERVAL}/loss_flow_{LOG_INTERVAL}": ranks.mean(flow_loss).item()}
     if aux_loss is not None:
         scalars[f"loss_avg_{LOG_INTERVAL}/loss_aux_mel_l1_{LOG_INTERVAL}"] = ranks.mean(aux_loss).item()
+    if mean_loss is not None:
+        scalars[f"loss_avg_{LOG_INTERVAL}/loss_mean_flow_{LOG_INTERVAL}"] = ranks.mean(mean_loss).item()
+        # Over 1 the target is feeding on itself.
+        scalars["diag/mean_flow_bootstrap"] = ranks.mean(bootstrap).item()
     return scalars
 
 
@@ -449,7 +476,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     resume = None if spec.get("fresh") else latest_checkpoint(out_dir, "F")
     state = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
     finetune = bool(spec.get("pretrained_flow"))
-    configure_model(spec, settings)
+    mean_flow = configure_model(spec, settings, state, main_rank)
     model = build_flow(config, speakers).to(device)
     speaker_dropout = float(settings["speaker_dropout"])
     tension_dropout = float(settings.get("tension_dropout", 0.0)) if model.encoder.tension is not None else 0.0
@@ -505,24 +532,18 @@ def train(ranks: Ranks, spec_path: str) -> None:
         lr_anchor = (step, cosine_progress(optimizer.param_groups[0]["lr"] / base_lr, final_ratio))
     aux_weight = float(settings.get("aux_mel_weight", 0.0))
     eval_interval = int(settings.get("eval_interval", 0))
-    backbone = compiled_backbone(
+    mean_ratio = float(settings.get("mean_flow_ratio", 0.25)) if mean_flow else 0.0
+    # The largest speaker guidance scale the mean velocity is trained under.
+    mean_guidance = float(settings.get("mean_flow_guidance_max", 4.0)) if mean_flow else 1.0
+    backbone, mean_field = compiled_backbone(
         model, bool(spec.get("compile", False)), spec.get("torch_compile_mode", "default"), device,
-        dynamic=bucketed(settings),
+        dynamic=bucketed(settings), mean_flow=mean_ratio > 0,
     )
     # The backward runs outside autocast here, and a compiled graph's would
     # otherwise run under the forward's.
     backward_context = (
         partial(aot_config.patch, backward_pass_autocast="off") if backbone is not None else nullcontext
     )
-    # A shortcut model learns its jumps from a copy of itself that lags it,
-    # which starts at the averaged weights.
-    teacher, teacher_weights, shortcut_share = None, None, 0.0
-    if model.shortcut_levels:
-        shortcut_share = float(settings.get("shortcut_share", 0.125))
-        teacher_decay = float(settings.get("shortcut_ema_decay", 0.999))
-        with ema.applied(model):
-            teacher = copy.deepcopy(model).requires_grad_(False).eval()
-        teacher_weights = (list(teacher.parameters()), list(model.parameters()))
     # Frozen parameters are left out of the gradient sync. Sampling, previews
     # and evaluation go through ``model`` itself.
     train_model = ranks.wrap(model)
@@ -548,7 +569,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
                              + (" with adaLN" if model.backbone.voice is not None else "")
                              + (f", shallow from t={model.t_start:g}" if model.t_start > 0 else "")
                              + (", dual timestep" if model.dual_timestep else "")
-                             + (f", shortcut on {100 * shortcut_share:g}% of each batch" if teacher is not None else "")
+                             + (f", mean flow on {100 * mean_ratio:g}% of each batch" if mean_ratio > 0 else "")
+                             + (f" under guidance up to {mean_guidance:g}"
+                                if mean_ratio > 0 and mean_guidance > 1 else "")
                              + (", per-bin mel" if settings.get("mel_bin_norm", False) else "")
                              + (", compiled" if backbone is not None else "")),
                 ("Training", f"{'Muon + AdamW' if isinstance(optimizer, MuonAdamW) else 'AdamW'}, lr {base_lr:g}, "
@@ -575,9 +598,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     model.train()
     data_wait = step_time = 0.0
     skipped_in_a_row = 0
-    # Flow loss, aux loss and gradient norm summed over the applied steps since
-    # the last log.
-    window = torch.zeros(3, device=device)
+    # Flow loss, aux loss, gradient norm, mean-flow loss and its bootstrap
+    # ratio summed over the applied steps since the last log.
+    window = torch.zeros(5, device=device)
     window_steps = 0
     while epoch <= total_epochs:
         metrics = ""
@@ -599,13 +622,17 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 with backward_context(), torch.autocast(
                     device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None
                 ):
-                    flow_loss, aux_loss = train_model(
+                    flow_loss, aux_loss, mean_losses = train_model(
                         mel * inputs.mask, inputs,
                         speaker_dropout=speaker_dropout, tension_dropout=tension_dropout,
-                        backbone=backbone,
-                        teacher=teacher, shortcut_share=shortcut_share,
+                        backbone=backbone, mean_field=mean_field, mean_ratio=mean_ratio,
+                        mean_guidance=mean_guidance,
                     )
                     loss = flow_loss
+                    if mean_losses is not None:
+                        loss = (1.0 - mean_ratio) * flow_loss + mean_ratio * mean_losses.objective
+                        # Unweighted from here on, to read.
+                        flow_loss = mean_losses.flow
                     if aux_loss is not None:
                         loss = loss + aux_weight * aux_loss
                 grad_norm, step_skipped = optimizer_step(loss, model, optimizer, scaler, settings["grad_clip"])
@@ -621,16 +648,16 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         warning(f"Step {step + 1} skipped over a non-finite gradient. Non-finite: {culprit}.", tag=TAG)
                 else:
                     skipped_in_a_row = 0
+                    zero = flow_loss.new_zeros(())
                     window += torch.stack([
                         flow_loss.detach(),
-                        aux_loss.detach() if aux_loss is not None else flow_loss.new_zeros(()),
+                        aux_loss.detach() if aux_loss is not None else zero,
                         grad_norm,
+                        mean_losses.mean if mean_losses is not None else zero,
+                        mean_losses.bootstrap_ratio.detach() if mean_losses is not None else zero,
                     ]).float()
                     window_steps += 1
                     ema.update(model)
-                    if teacher is not None:
-                        with torch.no_grad():
-                            torch._foreach_lerp_(*teacher_weights, 1.0 - teacher_decay)
                 step += 1
                 step_time += time.perf_counter() - step_started
 
@@ -642,8 +669,11 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
                 if step % LOG_INTERVAL == 0:
                     # Collective, so outside the rank check.
-                    flow_mean, aux_mean, grad_mean = window / max(1, window_steps)
-                    scalars = loss_scalars(ranks, flow_mean, aux_mean if aux_loss is not None else None)
+                    flow_mean, aux_mean, grad_mean, mean_mean, bootstrap_mean = window / max(1, window_steps)
+                    scalars = loss_scalars(
+                        ranks, flow_mean, aux_mean if aux_loss is not None else None,
+                        *((mean_mean, bootstrap_mean) if mean_ratio > 0 else ()),
+                    )
                     window.zero_()
                     window_steps = 0
                 if step % LOG_INTERVAL == 0 and main_rank:

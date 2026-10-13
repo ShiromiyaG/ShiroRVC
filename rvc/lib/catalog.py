@@ -26,9 +26,11 @@ RECTIFIED_PRETRAINED_DIR = MODELS_DIR / "pretraineds" / "rectified"
 #: ``RECTIFIED_PRETRAINED_DIR``; a pretrain only fits the features it was
 #: trained on.
 RECTIFIED_FLOW_PRETRAINS = {
-    "contentvec": "pretrain_flow_contentvec_cc_by_nc_sa.pth",
+    "contentvec": "pretrain_flow_contentvec.pth",
     "spin_v2": "pretrain_flow_spin_v2.pth",
 }
+#: The vocoder a flow trains and renders with when none is picked.
+RECTIFIED_DEFAULT_VOCODER = "nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth"
 
 AUDIO_EXTENSIONS = (
     ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4",
@@ -186,6 +188,16 @@ def experiment_embedder(model_name: str, logs_dir: Path = LOGS_DIR) -> str:
             return json.load(handle).get("embedder_model", "contentvec")
     except (OSError, ValueError):
         return "contentvec"
+
+
+def default_vocoder(paths: list[str]) -> str | None:
+    """``RECTIFIED_DEFAULT_VOCODER`` among ``paths``, else the newest of them;
+    None when there is none."""
+    paths = list(paths)
+    for path in paths:
+        if os.path.basename(path) == RECTIFIED_DEFAULT_VOCODER:
+            return path
+    return max(paths, key=sort_key) if paths else None
 
 
 def default_flow_pretrain(embedder: str, root: Path = RECTIFIED_PRETRAINED_DIR) -> str:

@@ -33,9 +33,8 @@ pipeline splits them:
 - **A vocoder** turns that mel into audio. It has no speaker input, so one good
   vocoder renders every voice model. You do not retrain it per voice.
 
-The mel is OpenVPI SingingVocoders' — 44.1 kHz, hop 512, 128 bins from 40 Hz to
-16 kHz — so their NSF-HiFiGAN releases, `pc-nsf-hifigan` included, work as the
-vocoder out of the box.
+The mel is Pupu-Vocoder's: 44.1 kHz, hop 512, 128 bins from 0 Hz to 22.05 kHz.
+The prerequisites download fetches the Pupu-Vocoder weights, small and large.
 
 ## Getting started
 
@@ -134,15 +133,15 @@ Then run the steps in order. In the apps they are numbered; on the command line:
 python core.py rectified_preprocess --model_name my-voice --dataset_path assets/datasets/my-voice
 python core.py rectified_extract    --model_name my-voice --gpu 0
 python core.py rectified_train_flow --model_name my-voice --gpu 0 \
-    --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec_cc_by_nc_sa.pth \
-    --vocoder rvc/models/vocoders/<vocoder>.pth
+    --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec.pth \
+    --vocoder rvc/models/vocoders/nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth
 python core.py index                --model_name my-voice   # optional
 ```
 
 - **The starting point.** Fine-tuning from a pretrained flow is the normal way
   to train a voice. A pretrain only fits the content features it was trained on,
   so in the apps **Pretrained** picks the one for the embedder you extracted with:
-  `pretrain_flow_contentvec_cc_by_nc_sa.pth` (downloaded on first launch) or
+  `pretrain_flow_contentvec.pth` (downloaded on first launch) or
   `pretrain_flow_spin_v2.pth`, in `rvc/models/pretraineds/rectified/`. A pretrain
   of the other embedder is refused. Its speakers are replaced by your dataset's.
   On a single-speaker fine-tune, the time and speaker conditioning stays frozen,
@@ -151,13 +150,15 @@ python core.py index                --model_name my-voice   # optional
   pretrain (`finetune_key_shift_prob`, `finetune_time_stretch_prob`, and the
   `_scale` pair for the feature cache). Without a pretrained flow, the model trains
   from scratch, which needs far more data.
-- **Shortcut flow** (off by default) also teaches the flow to sample in 1, 2, 4
-  or 8 Euler steps, for low latency: part of every batch (`shortcut_share`)
-  learns that one long jump lands where two half as long do, taken by a lagging
-  copy of the model, which costs two more forward passes on that part. The
-  plain flow is untouched inside it, so any pretrain can be fine-tuned with the
-  option on or off, and a shortcut model sampled any other way (Heun, another
-  schedule or start, a step count that is not a power of two) is the plain flow.
+- **Mean flow** (off by default) also teaches the flow the mean velocity over a
+  step (MeanFlow), which the `mean` sampler takes in one or two steps, for low
+  latency: part of every batch (`mean_flow_ratio`) trains it against the
+  network's own derivative in time, under a speaker guidance scale the network
+  reads (up to `mean_flow_guidance_max`), so that sampler takes the guidance in
+  its one pass. The plain flow is the same network at a
+  zero step, so the other samplers work as before and a pretrain without the
+  option can be fine-tuned with it. A mean-flow pretrain from scratch uses a
+  time scale of 1 instead of 1000, and a resumed run keeps what it started with.
 - **The vocoder** you pick renders the audio previews in TensorBoard and is
   stored in every export, so the inference screens select it for you.
 - **Several GPUs.** Pass them as `0-1` (or `0-1-2-3`), as in the RVC trainer.
@@ -184,7 +185,7 @@ python core.py rectified_train_vocoder --model_name big-dataset --gpu 0-1 --batc
 ```
 
 It trains PCPH-BigVGAN against the same 44.1 kHz mel and writes
-`logs/<name>/vocoder/<name>_vocoder_<epoch>e_<step>s.pth`.
+`logs/<name>/vocoder_<architecture>/<name>_vocoder_<epoch>e_<step>s.pth`, one folder per vocoder.
 
 ### Watching it learn
 
@@ -256,30 +257,6 @@ shallow diffusion, trained as a rectified flow.
   under `logs/<model>/flow_cache`; batches are whole clips of similar length.
   Speaker dropout and blurred content on a tenth of the items for the two
   guidances, and 32 held-out clips for the validation curves.
-
-</details>
-
-<details>
-<summary><b>The vocoders</b></summary>
-
-| | **PCPH-BigVGAN** (trained here) | **OpenVPI NSF-HiFiGAN** |
-| --- | --- | --- |
-| Where it comes from | Vocoder Pretrain (`rectified_train_vocoder`) | [SingingVocoders](https://github.com/openvpi/SingingVocoders) releases, `pc-nsf-hifigan` included |
-| Generator | SnakeBeta, anti-aliased AMP blocks, `[4, 4, 4, 4, 2]` upsampling, rectified harmonic source | NSF-HiFiGAN, loaded as-is |
-| Discriminator | v3 + UnivHD with SAN | — |
-
-OpenVPI checkpoints (`.ckpt`) and exports load directly. Anything their weights
-do not say is read from a `config.json` beside the file, and the 44.1 kHz release
-defaults fill in the rest. `python rvc/rectified/openvpi.py <checkpoint> <out.pth>`
-converts one to a rectified vocoder export.
-
-OpenVPI's vocoder weights are licensed
-[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), not MIT:
-non-commercial use only, with attribution, and anything derived from them
-(a converted export, a fine-tune) stays under the same license. That covers
-`pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth`, which the prerequisites
-download fetches and which is a converted OpenVPI checkpoint. A PCPH-BigVGAN
-trained here from scratch is not derived from them.
 
 </details>
 
@@ -362,9 +339,11 @@ catalog falls back to English silently rather than raising.
   modulation of every block, speaker and content guidance with rescale, and
   freezing the conditioning on a one-speaker fine-tune so speaker guidance
   survives it.
+- **[Aliasing-Free Neural Audio Synthesis](https://github.com/sizigi/AliasingFreeNeuralAudioSynthesis)**
+  — Pupu-Vocoder: the 44.1 kHz mel the rectified pipeline uses, the generator
+  and discriminators ported to render and train it, and the released weights.
 - **[OpenVPI SingingVocoders](https://github.com/openvpi/SingingVocoders)** — the
-  44.1 kHz mel the rectified pipeline uses and the NSF-HiFiGAN generator ported
-  to render it, including the pc-nsf-hifigan release.
+  NSF-HiFiGAN generator and training recipes ported from it.
 - **[BigVGAN](https://github.com/NVIDIA/BigVGAN)** (NVIDIA) — SnakeBeta and the
   anti-aliased AMP blocks behind the PCPH-BigVGAN vocoder.
 - **[Muon](https://kellerjordan.github.io/posts/muon/)** (Keller Jordan) — the
@@ -383,8 +362,5 @@ The code is released under the [MIT License](LICENSE). Code ported from other
 projects keeps their licenses, listed in
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
-The OpenVPI NSF-HiFiGAN vocoder weights are not: they are © Team OpenVPI under
-[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), which
-also applies to the converted `pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth`
-this project downloads. Audio rendered with them is for non-commercial use;
-see [SingingVocoders](https://github.com/openvpi/SingingVocoders).
+The Pupu-Vocoder weights this project downloads are their authors', published
+under the MIT License.

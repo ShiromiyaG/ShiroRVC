@@ -50,7 +50,7 @@ from tabs.train.descs import (
     TORCH_COMPILE_MODE_LABEL,
 )
 
-#: The rectified recipe ships one configuration, at 44.1 kHz: SingingVocoders' mel.
+#: The rectified recipe ships one configuration, at 44.1 kHz: Pupu-Vocoder's mel.
 SAMPLE_RATE = 44100
 
 #: Vocoders the Vocoder tab trains: label and ``architecture`` of the run.
@@ -61,6 +61,9 @@ VOCODER_ARCHITECTURES = [
     ("NSF-UnivNet", "nsf-univnet"),
     ("Wavehax", "wavehax"),
     ("Wavehax v2", "wavehax-v2"),
+    ("Multi-Scale Wavehax", "ms-wavehax"),
+    ("NSF-BigVGAN", "nsf-bigvgan"),
+    ("Pupu-Vocoder", "pupu-vocoder"),
 ]
 
 TRAINING_STARTED = (
@@ -103,6 +106,7 @@ def index_for(flow_path):
 def rectified_inference_tab():
     flows = list_exports("flow")
     vocoders = list_exports("vocoder")
+    default_vocoder = default_pretrained("vocoder")
     initial = flow_info(_first(flows))
     with gr.Column():
         with gr.Row():
@@ -126,7 +130,7 @@ def rectified_inference_tab():
                 label=_("Vocoder Model"),
                 info=_("Rectified vocoder export or OpenVPI NSF-HiFiGAN checkpoint that renders the mel."),
                 choices=vocoders,
-                value=_first(vocoders),
+                value=catalog.relative(default_vocoder) if default_vocoder else _first(vocoders),
                 interactive=True,
                 allow_custom_value=True,
             )
@@ -247,7 +251,7 @@ def rectified_inference_tab():
                 )
                 sampler = gr.Radio(
                     label=_("Sampler"),
-                    info=_("Heun costs two model passes per step and is more accurate per step."),
+                    info=_("Heun costs two model passes per step and is more accurate per step. Mean takes one or two steps and needs a model trained with mean flow."),
                     choices=list(SAMPLERS),
                     value="euler",
                     interactive=True,
@@ -297,7 +301,7 @@ def rectified_inference_tab():
                     step=0.1,
                     label=_("Speaker Guidance"),
                     info=_("Classifier-free guidance on the speaker. 1 turns it off; higher pushes toward the target voice."),
-                    value=2.0,
+                    value=1.0,
                     interactive=True,
                 )
                 content_guidance = gr.Slider(
@@ -961,7 +965,7 @@ def rectified_training_tab():
             custom_vocoder = gr.Dropdown(
                 label=_("Vocoder"),
                 info=_("Renders the audio previews and is paired with the exported model. "
-                       "Empty uses the newest in rvc/models/vocoders."),
+                       "Empty uses the default in rvc/models/vocoders, else the newest."),
                 choices=list_exports("vocoder"),
                 value=catalog.relative(default_vocoder) if default_vocoder else None,
                 interactive=True,
@@ -998,9 +1002,9 @@ def rectified_training_tab():
             value=True,
             interactive=True,
         )
-        flow_shortcut = gr.Checkbox(
-            label=_("Shortcut flow"),
-            info=_("Also learn to sample in 1, 2, 4 or 8 steps, for low latency. Slower to train. Any pretrained flow serves with it on or off."),
+        flow_mean = gr.Checkbox(
+            label=_("Mean flow"),
+            info=_("Also train the mean velocity (MeanFlow), which the Mean sampler takes in one or two steps. The other samplers work as before. A resumed run keeps what it started with."),
             value=False,
             interactive=True,
         )
@@ -1011,7 +1015,7 @@ def rectified_training_tab():
 
         def start_flow(name, epochs, save, batch, gpu_ids, pretrained, custom,
                        flow_path, vocoder_path, checkpoints, fresh, compile_backbone, compile_mode,
-                       feature_cache, shortcut):
+                       feature_cache, mean_flow):
             if pretrained and not custom:
                 # The pretrain has to match the features the experiment was extracted with.
                 embedder = catalog.experiment_embedder(name)
@@ -1039,14 +1043,14 @@ def rectified_training_tab():
                 compile=compile_backbone,
                 torch_compile_mode=compile_mode,
                 feature_cache=feature_cache,
-                shortcut=shortcut,
+                mean_flow=mean_flow,
             )
 
         _start_stop(
             start_flow,
             [model_name, flow_epochs, flow_save, flow_batch, gpu, flow_pretrained,
              flow_custom, custom_flow, custom_vocoder, flow_checkpoints,
-             flow_fresh, flow_compile, flow_compile_mode, flow_cache, flow_shortcut],
+             flow_fresh, flow_compile, flow_compile_mode, flow_cache, flow_mean],
         )
 
     with gr.Tab(f"4. {_('Index')}"):

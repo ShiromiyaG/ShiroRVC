@@ -567,7 +567,7 @@ def run_rectified_infer_script(
     f0_method: str = "rmvpe",
     steps: int = 16,
     sampler: str = "euler",
-    cfg_scale: float = 2.0,
+    cfg_scale: float = 1.0,
     f0_autotune: bool = False,
     f0_autotune_strength: float = 1.0,
     seed: int = 0,
@@ -599,6 +599,12 @@ def run_rectified_infer_script(
     tension_strength: float = 1.0,
     breathiness_strength: float = 1.0,
 ):
+    if not vocoder_path:
+        from rvc.lib.catalog import relative
+        from rvc.rectified.common import default_pretrained
+
+        vocoder_path = default_pretrained("vocoder")
+        vocoder_path = relative(vocoder_path) if vocoder_path else ""
     if not flow_path or not vocoder_path:
         problem = "Pick a flow model and a vocoder model."
         error(problem, tag="[RECTIFIED]")
@@ -659,8 +665,12 @@ def unload_rectified_models():
 def _run_rectified_trainer(script: str, spec: dict) -> str:
     global rectified_process
 
-    part = "vocoder" if script == "train_vocoder" else "flow"
-    model_dir = os.path.join(LOGS_DIR, spec["model_name"], part)
+    from rvc.rectified.common import run_dir, vocoder_run_dir
+
+    if script == "train_vocoder":
+        model_dir = vocoder_run_dir(spec["model_name"], spec["architecture"])
+    else:
+        model_dir = run_dir(spec["model_name"], "flow")
     os.makedirs(model_dir, exist_ok=True)
     spec_path = os.path.join(model_dir, "run_spec.json")
     with open(spec_path, "w", encoding="utf-8") as handle:
@@ -726,10 +736,10 @@ def run_rectified_flow_train_script(
     compile: bool = False,
     torch_compile_mode: str = "default",
     feature_cache: bool = True,
-    shortcut: bool = False,
+    mean_flow: bool = False,
 ):
     if not vocoder:
-        # The newest pretrained vocoder, as every interface picks when left empty.
+        # The default vocoder, as every interface picks when left empty.
         from rvc.lib.catalog import relative
         from rvc.rectified.common import default_pretrained
 
@@ -752,7 +762,7 @@ def run_rectified_flow_train_script(
             "compile": bool(compile),
             "torch_compile_mode": str(torch_compile_mode),
             "feature_cache": bool(feature_cache),
-            "shortcut": bool(shortcut),
+            "mean_flow": bool(mean_flow),
         },
     )
 

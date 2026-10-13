@@ -13,6 +13,8 @@ def head_family(label):
         return "mpd"
     if label.startswith("resolution_"):
         return "mrd"
+    if label.startswith("subband_"):
+        return "sbd"
     return label
 
 
@@ -33,9 +35,10 @@ def discriminator_param_groups(net_d, lr):
     ]
 
 
-def head_accuracies(real_outputs, fake_outputs):
-    """Per-head fraction of logits on the right side of 0.5 -- the equilibrium
-    of both the LSGAN and the SAN softplus losses.
+def head_accuracies(real_outputs, fake_outputs, threshold=0.5):
+    """Per-head fraction of logits on the right side of ``threshold``: 0.5,
+    the equilibrium of both the LSGAN and the SAN softplus losses, or 0 for
+    the hinge loss.
 
     0.5 is chance (the generator fools the head), 1.0 is a head that is never
     wrong.  Returns a detached ``(heads,)`` device tensor; under SAN the
@@ -47,7 +50,7 @@ def head_accuracies(real_outputs, fake_outputs):
             dr, dg = dr[0], dg[0]
         dr, dg = dr.detach().float(), dg.detach().float()
         accuracies.append(
-            0.5 * ((dr > 0.5).float().mean() + (dg < 0.5).float().mean())
+            0.5 * ((dr > threshold).float().mean() + (dg < threshold).float().mean())
         )
     return torch.stack(accuracies)
 

@@ -9,7 +9,7 @@ from rvc.lib.algorithm.generators.pcph_bigvgan import PCPHBigVGANGenerator
 MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax")
 
 
-#: Upsampler filters for the 44.1 kHz layout's five stages, ``[4, 4, 4, 4, 2]``.
+#: Upsampler filters for a five-stage layout, as the shipped ``[4, 4, 4, 4, 2]``.
 #: RefineGAN2's four-stage widths extended on their own reasoning: the first
 #: stage short, where a long kernel reaches furthest into the padded edge, the
 #: later ones long; the last repeats the one before it. Rolloffs as
@@ -112,9 +112,9 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict):
-    """A rectified vocoder export (PCPH-BigVGAN, NSF-HiFiGAN, NSF-UnivNet or Wavehax) or
-    an OpenVPI NSF-HiFiGAN checkpoint as a module taking the normalised mel of
-    ``data`` and f0, and its mel settings.
+    """A rectified vocoder export (PCPH-BigVGAN, NSF-HiFiGAN, NSF-UnivNet, Wavehax, Multi-Scale Wavehax,
+    NSF-BigVGAN or Pupu-Vocoder) or an OpenVPI NSF-HiFiGAN checkpoint as a module taking the normalised mel of ``data``
+    and f0, and its mel settings.
 
     Raises ``ValueError`` when ``path`` is neither or renders another mel."""
     from rvc.rectified.openvpi import NSFHiFiGAN, generator_state, openvpi_spec

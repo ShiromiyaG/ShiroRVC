@@ -40,6 +40,8 @@ def preview(model, ema, previews, clips, vocoder, data: dict, device, epoch: int
                 mels["flow_from_real_mel"] = model.sample(
                     inputs, steps=PREVIEW_STEPS, noise=noise, start_mel=real
                 )
+            if model.backbone.span_mlp is not None:
+                mels["mean_flow_1_step"] = model.sample(inputs, steps=1, method="mean", noise=noise)
             previews.log(
                 epoch, step, clip.path,
                 generated_audio=vocoder(generated, inputs.f0),

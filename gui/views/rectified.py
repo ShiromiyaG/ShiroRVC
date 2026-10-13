@@ -256,7 +256,8 @@ class RectifiedPage(Page):
         self.noise_temperature = SliderSpin(0.0, 1.5, 0.05, decimals=2, value=1.0)
         self.flow_start = SliderSpin(0.0, 0.95, 0.05, decimals=2, value=0.0)
         advanced.add_row(
-            Field(_("Sampler"), self.sampler, _("Heun costs two model passes per step.")),
+            Field(_("Sampler"), self.sampler, _("Heun costs two model passes per step. Mean takes one or two "
+                                                "steps and needs a model trained with mean flow.")),
             Field(_("Step schedule"), self.schedule,
                   _("Sway puts more steps early; logit-normal puts more mid-way.")),
         )
@@ -360,7 +361,11 @@ class RectifiedPage(Page):
 
     def _refresh_inference(self) -> None:
         self.flow_model.set_items(catalog.list_rectified_exports("flow"))
+        unset = not self.vocoder_model.text()
         self.vocoder_model.set_items(catalog.list_rectified_exports("vocoder"))
+        default = catalog.default_rectified_pretrained("vocoder")
+        if unset and default:
+            self.vocoder_model.set_text(default)
         self.index_file.set_items([""] + catalog.list_indexes())
         self.input_path.set_suggestions(_input_suggestions())
 
@@ -621,7 +626,7 @@ class RectifiedPage(Page):
         card.add(
             self.flow_pretrained, self.flow_custom, self.custom_flow_field,
             Field(_("Vocoder"), self.flow_vocoder,
-                  _("Renders the previews and is paired with the exports. Empty uses the newest pretrained one.")),
+                  _("Renders the previews and is paired with the exports. Empty uses the default one, else the newest.")),
         )
 
         advanced = Collapsible(_("Advanced settings"), _("learning rate, compilation, mean flow, checkpoints"))
@@ -642,12 +647,12 @@ class RectifiedPage(Page):
               "whole clips. Off augments as it goes, in fixed segments, and writes nothing."),
         )
         self.flow_cache.setChecked(True)
-        self.flow_shortcut = Toggle(
-            _("Shortcut flow"),
-            _("Also learn to sample in 1, 2, 4 or 8 steps, for low latency. Slower to train. "
-              "Any pretrained flow serves with it on or off."),
+        self.flow_mean = Toggle(
+            _("Mean flow"),
+            _("Also train the mean velocity (MeanFlow), which the mean sampler takes in one or two "
+              "steps. The other samplers work as before. A resumed run keeps what it started with."),
         )
-        advanced.add(self.flow_compile, self.flow_compile_mode_field, self.flow_cache, self.flow_shortcut,
+        advanced.add(self.flow_compile, self.flow_compile_mode_field, self.flow_cache, self.flow_mean,
                      flow_checkpoints_field, self.flow_fresh)
 
         self.flow_compile_mode_field.setVisible(False)
@@ -848,7 +853,7 @@ class RectifiedPage(Page):
             "compile": self.flow_compile.isChecked(),
             "torch_compile_mode": self.flow_compile_mode.text(),
             "feature_cache": self.flow_cache.isChecked(),
-            "shortcut": self.flow_shortcut.isChecked(),
+            "mean_flow": self.flow_mean.isChecked(),
         }
 
     def vocoder_train_args(self) -> dict | None:

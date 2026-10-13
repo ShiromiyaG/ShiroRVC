@@ -17,6 +17,7 @@ The rectified config gives the mel of a checkpoint without a ``config.json``.
 import json
 import os
 import sys
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -202,6 +203,19 @@ class NSFHiFiGAN(nn.Module):
         self.conv_post = nn.Conv1d(ch, 1, 7, 1, padding=3)
         # HiFi-GAN's last leaky ReLU is at PyTorch's default slope.
         self.act_post = nn.LeakyReLU() if activation == "leaky_relu" else make_activation(ch)
+        # Set by ``apply_precision_policy`` under AMP: the mel conv, the
+        # source, the upsamplers and the output layer in FP32, and the stream
+        # with them; the residual convs stay under autocast and add onto it.
+        self.fp32_residuals = False
+
+    def _fp32_region(self, x):
+        """A context with autocast off, when ``fp32_residuals`` is set."""
+        if not self.fp32_residuals:
+            return nullcontext()
+        return torch.autocast(x.device.type, enabled=False)
+
+    def _fp32(self, x):
+        return x.float() if self.fp32_residuals else x
 
     def _fast_sine(self, f0):
         n = torch.arange(1, self.upp + 1, device=f0.device)
@@ -215,19 +229,22 @@ class NSFHiFiGAN(nn.Module):
 
     def forward(self, mel, f0):
         f0 = f0.float()
-        source = self._fast_sine(f0) if self.mini_nsf else self.m_source(f0, self.upp).transpose(1, 2)
-        x = self.conv_pre(mel)
+        with self._fp32_region(mel):
+            source = self._fast_sine(f0) if self.mini_nsf else self.m_source(f0, self.upp).transpose(1, 2)
+            x = self.conv_pre(self._fp32(mel))
         if self.noise_sigma > 0:
             x = x + self.noise_sigma * torch.randn_like(x)
         for i, up in enumerate(self.ups):
-            x = up(F.leaky_relu(x, LRELU_SLOPE))
-            if not self.mini_nsf:
-                x = x + self.noise_convs[i](source)
-            elif i == 1:
-                x = x + self.source_conv(source)
+            with self._fp32_region(x):
+                x = up(F.leaky_relu(self._fp32(x), LRELU_SLOPE))
+                if not self.mini_nsf:
+                    x = x + self.noise_convs[i](source)
+                elif i == 1:
+                    x = x + self.source_conv(source)
             blocks = self.resblocks[i * self.num_kernels:(i + 1) * self.num_kernels]
             x = sum(block(x) for block in blocks) / self.num_kernels
-        return torch.tanh(self.conv_post(self.act_post(x)))
+        with self._fp32_region(x):
+            return torch.tanh(self.conv_post(self.act_post(self._fp32(x))))
 
 
 def generator_state(checkpoint: dict):

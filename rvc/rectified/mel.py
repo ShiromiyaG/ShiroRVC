@@ -72,7 +72,9 @@ class LogMel(nn.Module):
             bins = self.n_fft // 2 + 1
             spec = F.pad(spec, (0, 0, 0, max(0, bins - spec.shape[1])))[:, :bins]
             spec = spec * (self.win_length / win_length)
-        return torch.log(torch.clamp(self.basis @ spec, min=1e-5))
+        # Out of autocast: in BF16 the log mel would come in steps of ~0.03.
+        with torch.autocast(spec.device.type, enabled=False):
+            return torch.log(torch.clamp(self.basis @ spec.float(), min=1e-5))
 
 
 def normalize_mel(mel: torch.Tensor, data: dict) -> torch.Tensor:

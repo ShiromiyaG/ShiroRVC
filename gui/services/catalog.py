@@ -135,7 +135,7 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
 }
 
 #: Mirror rvc.rectified.flow.sampling, which imports torch.
-RECTIFIED_SAMPLERS = ["euler", "heun"]
+RECTIFIED_SAMPLERS = ["euler", "heun", "mean"]
 RECTIFIED_SCHEDULES = ["uniform", "sway", "logit-normal"]
 RECTIFIED_RESCALE_MODES = ["global", "frame"]
 #: The rectified recipe ships one configuration; extraction's vocoder id for it.
@@ -220,7 +220,8 @@ def _rectified_pretrained_exports(kind: str) -> list:
 def list_rectified_exports(kind: str) -> list[str]:
     """``rvc.rectified.common.list_exports``, without its torch import."""
     shared = _shared()
-    found = list(paths.LOGS_DIR.glob(f"*/{kind}/*_{kind}_*.pth"))
+    folder = "vocoder*" if kind == "vocoder" else kind
+    found = list(paths.LOGS_DIR.glob(f"*/{folder}/*_{kind}_*.pth"))
     if kind == "vocoder":
         found += paths.RECTIFIED_VOCODER_DIR.glob("*.pth")
         found += paths.RECTIFIED_VOCODER_DIR.glob("*.ckpt")
@@ -238,7 +239,7 @@ def list_rectified_pretrained(kind: str) -> list[str]:
         "vocoder_d": ["D_*.pth"],
         "flow": ["F_*.pth", "*_flow_*.pth", "*_flow.pth"],
     }[kind]
-    folder = "flow" if kind == "flow" else "vocoder"
+    folder = "flow" if kind == "flow" else "vocoder*"
     shared_dir = paths.RECTIFIED_PRETRAINED_DIR if kind == "flow" else paths.RECTIFIED_VOCODER_DIR
     found = []
     for pattern in patterns:
@@ -264,8 +265,9 @@ def default_rectified_pretrained(kind: str) -> str:
     if kind == "vocoder":
         folder = paths.RECTIFIED_VOCODER_DIR
         found = [str(path) for path in folder.glob("*.pth")] or [str(path) for path in folder.glob("*.ckpt")]
-    else:
-        found = [str(path) for path in _rectified_pretrained_exports(kind)]
+        chosen = shared.default_vocoder(found)
+        return shared.relative(chosen) if chosen else ""
+    found = [str(path) for path in _rectified_pretrained_exports(kind)]
     return shared.relative(max(found, key=shared.sort_key)) if found else ""
 
 

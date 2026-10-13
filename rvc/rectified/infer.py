@@ -22,7 +22,7 @@ from rvc.lib.model_bundle import (
     load_model_bundle,
     model_kind,
 )
-from rvc.lib.terminal import info, print_error_panel, print_settings_panel, progress_task, success
+from rvc.lib.terminal import info, print_error_panel, print_settings_panel, progress_task, success, warning
 from rvc.lib.utils import extract_features, load_audio_infer, load_embedder_model
 from rvc.rectified.aperiodicity import aperiodicity, tension
 from rvc.rectified.common import (
@@ -52,6 +52,7 @@ FLOW_OVERLAP = 100
 #: crossfade at each join: every pass starts its sine at phase zero, so a hard
 #: join would click.
 VOCODER_CHUNK = 6000
+VOCODER_MIN_CHUNK = 375
 VOCODER_CONTEXT = 50
 VOCODER_CROSSFADE = 4
 
@@ -101,7 +102,7 @@ class SamplingOptions:
 
     steps: int = 16
     method: str = "euler"
-    cfg_scale: float = 2.0
+    cfg_scale: float = 1.0
     content_guidance: float = 0.1
     guidance_rescale: float = 0.7
     rescale_mode: str = "global"
@@ -187,6 +188,7 @@ class RectifiedConverter:
         self.vocoder = model.to(self.device)
         self.vocoder_path = key
         self.vocoder_config = {"data": vocoder_data}
+        self.vocoder_chunk = VOCODER_CHUNK
 
     def _load_embedder(self, name):
         if name == self.embedder_name:
@@ -379,24 +381,38 @@ class RectifiedConverter:
 
     @torch.no_grad()
     def _render(self, mel, f0):
-        """Waveform from [1, n_mels, T], in passes crossfaded at the joins."""
+        """Waveform from [1, n_mels, T], in passes crossfaded at the joins.
+        The passes halve when one does not fit in memory."""
         hop = self.vocoder_config["data"]["hop_length"]
         frames = mel.shape[-1]
-        output = torch.zeros(frames * hop, device=self.device)
         half = VOCODER_CROSSFADE * hop // 2
-        starts = range(0, frames, VOCODER_CHUNK)
-        with progress_task(len(starts), "Rendering", disable=len(starts) < 2) as (progress, task):
-            for start in starts:
-                self._vocoder_pass(mel, f0, output, start, half)
-                progress.advance(task)
-        return output.cpu().numpy()
+        chunk = self.vocoder_chunk
+        while True:
+            output = torch.zeros(frames * hop, device=self.device)
+            starts = range(0, frames, chunk)
+            try:
+                with progress_task(len(starts), "Rendering", disable=len(starts) < 2) as (progress, task):
+                    for start in starts:
+                        self._vocoder_pass(mel, f0, output, start, half, chunk)
+                        progress.advance(task)
+                # Kept for the next conversions with this vocoder.
+                self.vocoder_chunk = chunk
+                return output.cpu().numpy()
+            except torch.OutOfMemoryError:
+                if chunk <= VOCODER_MIN_CHUNK:
+                    raise
+            # Outside the handler, whose traceback holds the pass's tensors.
+            del output
+            torch.cuda.empty_cache()
+            chunk = max(VOCODER_MIN_CHUNK, chunk // 2)
+            warning(f"The vocoder ran out of memory; rendering {chunk} frames per pass.", tag="[RECTIFIED]")
 
-    def _vocoder_pass(self, mel, f0, output, start, half):
+    def _vocoder_pass(self, mel, f0, output, start, half, chunk):
         """Render one pass from ``start`` and add it into ``output``, faded in
         and out over ``half`` samples either side of its joins."""
         hop = self.vocoder_config["data"]["hop_length"]
         frames = mel.shape[-1]
-        stop = min(frames, start + VOCODER_CHUNK)
+        stop = min(frames, start + chunk)
         left = max(0, start - VOCODER_CONTEXT)
         right = min(frames, stop + VOCODER_CONTEXT)
         audio = self.vocoder(mel[..., left:right], f0[:, left:right])[0, 0].float()

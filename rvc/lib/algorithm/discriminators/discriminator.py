@@ -114,7 +114,7 @@ MULTIBAND_MRD_VERSIONS = {"v4"}
 MPD_PRE_EMPHASIS_BY_VERSION = {"v4": 0.0}
 
 #: R1 strength per version; absent or 0 turns the penalty off.  Opt in with
-#: ``d_r1_gamma`` and tune it from ``r1/penalty``.
+#: ``d_r1_gamma`` and tune it from ``r1/penalty`` and ``r1_grad_sq``.
 R1_GAMMA_BY_VERSION = {}
 
 
@@ -212,6 +212,7 @@ class MPD_MSD_Combined(torch.nn.Module):
         univhd_weight: Optional[float] = None,
         msd_weight: float = DEFAULT_BRANCH_WEIGHT,
         mrd_fp32_input: bool = True,
+        wave_fp32_input: bool = False,
         mrd_multiband: Optional[bool] = None,
         mrd_channels: int = 32,
         mpd_pre_emphasis: Optional[float] = None,
@@ -220,8 +221,16 @@ class MPD_MSD_Combined(torch.nn.Module):
         r1_batch_fraction: float = 0.5,
         r1_segment: int = 6400,
         mrd_mel_cond: Optional[dict] = None,
+        sbd_bands=None,
+        sbd_subbands: int = 16,
+        sbd_channels: int = 64,
+        sbd_gains_db=None,
     ):
         """``version`` picks a preset; the overrides edit it branch by branch.
+
+        ``sbd_bands`` adds one ``SubBandDiscriminator`` per ``[low, high]``
+        range of the ``sbd_subbands`` PQMF sub-bands, after the period branches;
+        ``sbd_gains_db`` is one input gain per range.
 
         ``mrd_mel_cond`` conditions the multi-band spectrogram branches on the
         generator's input mel (see ``MultiBandDiscriminatorR``); ``forward``
@@ -231,7 +240,10 @@ class MPD_MSD_Combined(torch.nn.Module):
         says (``MULTIBAND_MRD_VERSIONS``, ``MPD_PRE_EMPHASIS_BY_VERSION``);
         ``mrd_channels`` is the width of the multi-band branches only.
 
-        ``r1_gamma`` defaults to ``R1_GAMMA_BY_VERSION``.  The trainer penalises
+        ``r1_gamma`` defaults to ``R1_GAMMA_BY_VERSION``.  A number is every
+        branch's; a mapping gives one per family (``mpd``, ``mrd``, ``msd``,
+        ``univhd``) or per branch label (``period_13``), the label winning, and
+        leaves the rest unpenalised.  The trainer penalises
         one branch at a time, each about every ``r1_interval`` steps, on the
         loudest ``r1_batch_fraction`` of the real batch cropped to
         ``r1_segment`` samples (0 keeps the whole segment); the discriminator
@@ -259,7 +271,8 @@ class MPD_MSD_Combined(torch.nn.Module):
         ``mrd_fp32_input`` runs each spectrogram branch's STFT and first conv
         outside FP16 autocast; see :meth:`DiscriminatorR.forward`.  It adds no
         parameters, so a checkpoint loads either way, and without autocast it
-        changes nothing.
+        changes nothing.  ``wave_fp32_input`` does the same for the first conv
+        of the scale and period branches, which reads the waveform.
         """
 
         super().__init__()
@@ -313,10 +326,14 @@ class MPD_MSD_Combined(torch.nn.Module):
             if mpd_pre_emphasis is None
             else mpd_pre_emphasis
         )
-        self.r1_gamma = float(
-            R1_GAMMA_BY_VERSION.get(version, 0.0) if r1_gamma is None else r1_gamma
-        )
-        if self.r1_gamma < 0.0:
+        if r1_gamma is None:
+            r1_gamma = R1_GAMMA_BY_VERSION.get(version, 0.0)
+        if isinstance(r1_gamma, dict):
+            self.r1_gamma = {str(name): float(value) for name, value in r1_gamma.items()}
+        else:
+            self.r1_gamma = float(r1_gamma)
+        gammas = self.r1_gamma.values() if isinstance(self.r1_gamma, dict) else (self.r1_gamma,)
+        if any(value < 0.0 for value in gammas):
             raise ValueError(f"r1_gamma cannot be negative; received {self.r1_gamma}.")
         self.r1_interval = max(1, int(r1_interval))
         self.r1_batch_fraction = min(1.0, max(0.0, float(r1_batch_fraction)))
@@ -368,6 +385,29 @@ class MPD_MSD_Combined(torch.nn.Module):
             )
             for p in self.periods
         ]
+        self.sbd_bands = [tuple(int(edge) for edge in bands) for bands in (sbd_bands or [])]
+        if self.sbd_bands:
+            from rvc.lib.algorithm.discriminators.sbd import SubBandDiscriminator
+
+            gains = list(sbd_gains_db or [0.0] * len(self.sbd_bands))
+            if len(gains) != len(self.sbd_bands):
+                raise ValueError(
+                    f"sbd_gains_db needs one gain per sub-band range; received "
+                    f"{len(gains)} for {len(self.sbd_bands)}."
+                )
+            branches += [
+                SubBandDiscriminator(
+                    bands,
+                    subbands=int(sbd_subbands),
+                    channels=int(sbd_channels),
+                    gain_db=gain,
+                    use_spectral_norm=use_spectral_norm,
+                    use_san=self.use_san,
+                )
+                for bands, gain in zip(self.sbd_bands, gains)
+            ]
+        for branch in branches:
+            branch.wave_fp32_input = bool(wave_fp32_input)
         if mrd_mel_cond and not self.mrd_multiband:
             raise ValueError("mrd_mel_cond needs the multi-band spectrogram branches (v4).")
         self.mrd_mel_cond = dict(mrd_mel_cond) if mrd_mel_cond else None
@@ -437,6 +477,7 @@ class MPD_MSD_Combined(torch.nn.Module):
 
         labels = ["msd"] if self.use_msd else []
         labels += [f"period_{p}" for p in self.periods]
+        labels += [f"subband_{low}_{high}" for low, high in self.sbd_bands]
         labels += [f"resolution_{n_fft}" for n_fft, _, _ in self.resolutions]
         if self.use_univhd:
             labels.append("univhd")
@@ -730,6 +771,9 @@ class MPD_MSD_Combined(torch.nn.Module):
 class DiscriminatorS(torch.nn.Module):
     """Multi-scale discriminator branch, operating directly on the waveform."""
 
+    #: Set by ``MPD_MSD_Combined``; see ``waveform_conv``.
+    wave_fp32_input = False
+
     def __init__(self, use_spectral_norm: bool = False, use_san: bool = False):
         super().__init__()
 
@@ -758,10 +802,19 @@ class DiscriminatorS(torch.nn.Module):
 
     def forward(self, x, san_training: bool = False):
         fmap = []
-        for conv in self.convs:
-            x = self.lrelu(conv(x))
+        for index, conv in enumerate(self.convs):
+            x = self.lrelu(conv(x) if index else waveform_conv(conv, x, self.wave_fp32_input))
             fmap.append(x)
         return san_tail(self, x, fmap, san_training)
+
+
+def waveform_conv(conv, x, fp32: bool):
+    """A branch's first conv, on the waveform; out of autocast when ``fp32``,
+    where BF16 would keep 8 bits of each sample."""
+    if not fp32:
+        return conv(x)
+    with torch.autocast(x.device.type, enabled=False):
+        return conv(x.float())
 
 
 def pre_emphasize(x, coefficient):
@@ -774,6 +827,9 @@ def pre_emphasize(x, coefficient):
 
 class DiscriminatorP(torch.nn.Module):
     """Multi-period discriminator branch: reshapes the waveform onto a period-`p` grid."""
+
+    #: Set by ``MPD_MSD_Combined``; see ``waveform_conv``.
+    wave_fp32_input = False
 
     def __init__(
         self,
@@ -827,8 +883,8 @@ class DiscriminatorP(torch.nn.Module):
             x = torch.nn.functional.pad(x, (0, n_pad), "reflect")
         x = x.view(b, c, -1, self.period)
 
-        for conv in self.convs:
-            x = self.lrelu(conv(x))
+        for index, conv in enumerate(self.convs):
+            x = self.lrelu(conv(x) if index else waveform_conv(conv, x, self.wave_fp32_input))
             fmap.append(x)
         return san_tail(self, x, fmap, san_training)
 
@@ -864,6 +920,9 @@ class FastDiscriminatorP(torch.nn.Module):
     at <=256 channels instead of <=1024 -- which the feature-matching governor,
     the adversarial ceiling and the per-branch R1 all read.
     """
+
+    #: Set by ``MPD_MSD_Combined``; see ``waveform_conv``.
+    wave_fp32_input = False
 
     def __init__(
         self,
@@ -928,8 +987,8 @@ class FastDiscriminatorP(torch.nn.Module):
             x = torch.nn.functional.pad(x, (0, n_pad), "reflect")
         x = x.view(b, c, -1, self.period)
 
-        for conv in self.convs:
-            x = self.lrelu(conv(x))
+        for index, conv in enumerate(self.convs):
+            x = self.lrelu(conv(x) if index else waveform_conv(conv, x, self.wave_fp32_input))
             fmap.append(x)
         x = self.lrelu(self.conv_final(x))
         fmap.append(x)

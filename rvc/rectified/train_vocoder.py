@@ -1,5 +1,5 @@
 """Train the mel vocoder of the rectified pipeline: PCPH-BigVGAN, or one of
-the SingingVocoders architectures by its own recipe (``singing_vocoders.py``).
+the architectures with a recipe of its own (``singing_vocoders.py``).
 
 Usage: python rvc/rectified/train_vocoder.py <spec.json>
 """
@@ -11,7 +11,7 @@ import random
 import sys
 import warnings
 from collections import defaultdict, deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from types import SimpleNamespace
 
@@ -38,11 +38,12 @@ from rvc.rectified.common import (
     precision_label,
     pretrained_weights,
     read_filelist,
-    run_dir,
     remove_older,
     split_holdout,
+    vocoder_run_dir,
 )
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
+from rvc.rectified import pupu_vocoder
 from rvc.rectified import singing_vocoders as sv
 from rvc.rectified.mel import LogMel, degrade_mel, denormalize_mel, normalize_mel
 from rvc.rectified.previews import RectifiedPreviews
@@ -56,6 +57,7 @@ from rvc.train.losses import (
     feature_loss,
     generator_loss,
     loud_crop,
+    R1Schedule,
     r1_penalty,
 )
 from rvc.train.mel_processing import build_ms_mel_loss
@@ -222,7 +224,7 @@ def build_networks(architecture: str, config: dict, d_settings: dict, own_d: boo
     else:
         net_g = build_vocoder(config).to(device)
     if own_d:
-        net_d = sv.build_discriminators(architecture, d_settings).to(device)
+        net_d = sv.build_discriminators(architecture, d_settings, config["data"]["sample_rate"]).to(device)
     else:
         net_d = build_discriminator({"data": config["data"], "vocoder": {"discriminator": d_settings}}).to(device)
     return net_g, net_d, hparams
@@ -235,7 +237,7 @@ def restore(spec, out_dir, architecture, discriminator, net_g, net_d, optim_g, o
     ``skipped``, ``mel_cond_since`` (the step at which the discriminator
     started taking the mel), ``resumed`` and a ``starting_point`` label."""
     singing = architecture != sv.PCPH
-    own_d = discriminator == "original"
+    own_d = isinstance(net_d, sv.Discriminators)
     start = SimpleNamespace(epoch=1, step=0, skipped=0, mel_cond_since=0, resumed=False, starting_point="scratch")
     resume_g = None if spec.get("fresh") else latest_checkpoint(out_dir, "G")
     resume_d = None if spec.get("fresh") else latest_checkpoint(out_dir, "D")
@@ -299,6 +301,9 @@ def restore(spec, out_dir, architecture, discriminator, net_g, net_d, optim_g, o
         weights, d_weights = sv.pretrained_states(d_source)
         d_weights = d_weights or weights
     if d_weights:
+        if own_d:
+            # A recipe may train against some of the families the file holds.
+            d_weights = {key: value for key, value in d_weights.items() if key.partition(".")[0] in net_d}
         net_d.load_state_dict(sv.training_state(d_weights, net_d.state_dict()) if own_d else d_weights)
         start.starting_point += f", D from {d_source or spec['pretrained_g']}"
     return start
@@ -311,13 +316,22 @@ class SpectralLoss:
         data, settings = config["data"], config["vocoder"]
         sample_rate = data["sample_rate"]
         self.stft = self.mel = self.ms_mel = None
-        if architecture == sv.UNIVNET:
+        # The last call's terms, for the log, when there are two.
+        self.terms = {}
+        # Any recipe that sets ``c_stft``: the mel's wide high bands cannot
+        # tell a harmonic from noise, the linear bins can.
+        multi_scale = architecture == sv.PUPU or bool(settings.get("multi_scale_mel"))
+        if settings.get("c_stft") and not multi_scale:
             self.stft = sv.MultiResolutionSTFTLoss(
                 settings["loss_fft_sizes"], settings["loss_hop_sizes"], settings["loss_win_lengths"]
             ).to(device)
-            self.weight = settings["c_stft"]
-            self.label = f"MR-STFT x{self.weight:g}"
-        elif architecture != sv.PCPH:
+            self.stft_weight = settings["c_stft"]
+            self.label = f"MR-STFT x{self.stft_weight:g}"
+        if multi_scale:
+            self.ms_mel = pupu_vocoder.MultiScaleMelLoss(sample_rate).to(device)
+            self.weight = settings["c_mel"]
+            self.label = f"multi-scale mel x{self.weight:g}"
+        elif architecture not in (sv.UNIVNET, sv.PCPH):
             # The recipe's loss mel: the input's, read up to Nyquist, unless
             # the recipe sizes it.
             self.mel = LogMel(
@@ -326,19 +340,25 @@ class SpectralLoss:
                 sample_rate / 2,
             ).to(device)
             self.weight = settings["c_mel"]
-            self.label = f"mel x{self.weight:g}"
-        else:
+            self.label = f"mel x{self.weight:g}" + (f" + {self.label}" if self.stft is not None else "")
+        elif architecture == sv.PCPH:
             self.ms_mel = build_ms_mel_loss(sample_rate).to(device)
             self.weight = settings["c_mel"]
             self.label = f"multi-scale mel x{self.weight:g}"
 
     def __call__(self, y, y_hat):
+        if self.ms_mel is not None:
+            return self.ms_mel(y.float(), y_hat.float()) * self.weight
+        loss_stft = loss_mel = None
         if self.stft is not None:
             sc_loss, mag_loss = self.stft(y_hat.squeeze(1), y.squeeze(1))
-            return (sc_loss + mag_loss) * self.weight
+            loss_stft = (sc_loss + mag_loss) * self.stft_weight
         if self.mel is not None:
-            return F.l1_loss(self.mel(y_hat.squeeze(1)), self.mel(y.squeeze(1))) * self.weight
-        return self.ms_mel(y.float(), y_hat.float()) * self.weight
+            loss_mel = F.l1_loss(self.mel(y_hat.squeeze(1)), self.mel(y.squeeze(1))) * self.weight
+        if loss_stft is None or loss_mel is None:
+            return loss_mel if loss_stft is None else loss_stft
+        self.terms = {"loss_mel": loss_mel.detach(), "loss_stft": loss_stft.detach()}
+        return loss_stft + loss_mel
 
 
 class PitchControl:
@@ -385,23 +405,33 @@ class Adversary:
     conditioning as the network declares them. ``train_d`` is the network as
     the discriminator update calls it (DDP-wrapped)."""
 
-    def __init__(self, net_d, train_d, settings: dict, d_settings: dict, own: bool, univnet: bool, amp_dtype):
+    def __init__(self, net_d, train_d, settings: dict, d_settings: dict, own: bool, univnet: bool, amp_dtype,
+                 repo_hinge: bool = False):
         self.net = net_d
         self.train_net = train_d
         self.own = own
         self.univnet = univnet
-        self.hinge = settings.get("gan_loss", "lsgan") == "hinge"
+        # The recipe's ``gan_loss`` is its own discriminators'; the repo's
+        # takes the hinge loss only as the v3-hinge and v4-hinge choices, on
+        # its SAN heads too.
+        self.hinge = settings.get("gan_loss", "lsgan") == "hinge" if own else repo_hinge
+        # ``average_heads``: the GAN losses, and R1 with them, as a mean over
+        # the heads, as NSF-BigVGAN weighs them, instead of their sum.
+        self.heads = 1
+        if settings.get("average_heads", False):
+            self.heads = sum(len(family.discriminators) for family in (net_d.values() if own else (net_d,)))
         self.c_fm = None if own else settings["c_fm"]
+        # ``branchwise_discriminator``: the recipe's families one at a time,
+        # each one's graph freed before the next, for the memory of the
+        # largest instead of their sum; the gradients are the same. On one
+        # GPU only: the gradient sync wraps the whole network.
+        self.branchwise = own and bool(settings.get("branchwise_discriminator", False)) and train_d is net_d
         self.labels = tuple(getattr(net_d, "branch_labels", ()))
         self.san = bool(getattr(net_d, "supports_san", False))
         self.mel_cond = bool(getattr(net_d, "cond_branches", None))
         self.mel_cond_warmup = int(d_settings.get("d_mrd_mel_cond_warmup", 0))
         self.branch_weights = tuple(net_d.branch_weights) if getattr(net_d, "uses_branch_weights", False) else None
-        self.r1_gamma = float(getattr(net_d, "r1_gamma", 0.0))
-        self.r1_branches = len(getattr(net_d, "discriminators", ())) if self.r1_gamma > 0 else 0
-        interval = int(getattr(net_d, "r1_interval", 16))
-        self.r1_every = max(1, math.ceil(interval / self.r1_branches)) if self.r1_branches else 1
-        self.r1_period = self.r1_every * max(1, self.r1_branches)
+        self.r1_schedule = R1Schedule(net_d)
         # R1's squared input gradient can underflow in FP16, so it runs in FP32 there.
         self.r1_dtype = amp_dtype if amp_dtype == torch.bfloat16 else None
         # The generator update reads D's frozen weights in two passes, real
@@ -415,14 +445,21 @@ class Adversary:
     def describe(self, d_settings: dict) -> str:
         net = self.net
         if self.own:
-            return ("MSD" if "msd" in net else "MRD") + f" + MPD {d_settings['periods']}" + (
+            names = [name.upper() for name in net if name != "mpd"]
+            if "mpd" in net:
+                names.append(f"MPD {d_settings['periods']}")
+            return " + ".join(names) + (
                 ", hinge" if self.hinge else ""
+            ) + (f", mean over {self.heads} heads" if self.heads > 1 else "") + (
+                ", one family at a time" if self.branchwise else ""
             )
         return (
-            f"{d_settings.get('d_version', 'v4')}, R1 gamma {self.r1_gamma:g}"
+            f"{d_settings.get('d_version', 'v4')}, R1 gamma {self.r1_schedule.summary}"
             + (f", UnivHD x{net.univhd_weight:g}" if getattr(net, "use_univhd", False) else "")
             + (", mel-conditioned MRD" if self.mel_cond else "")
+            + (", hinge" if self.hinge else "")
             + (", compiled" if getattr(net, "_compile_enabled", False) else "")
+            + (f", mean over {self.heads} heads" if self.heads > 1 else "")
         )
 
     def mel_cond_scale(self, step: int, since: int) -> float:
@@ -432,38 +469,79 @@ class Adversary:
             return 1.0
         return min(1.0, (step - since) / self.mel_cond_warmup)
 
+    def discriminator_step(self, y, fake, scaler, autocast):
+        """``discriminator_losses`` under ``branchwise``: each family's
+        backward is run here, into gradients the caller steps on. Returns D's
+        loss and its real and fake parts, detached."""
+        fake = fake.detach()
+        totals = [y.new_zeros(()) for _ in range(3)]
+        for name, family in self.net.items():
+            with autocast():
+                losses = sv.discriminator_loss({name: family(y)}, {name: family(fake)}, self.hinge)
+            loss = losses[0] / self.heads
+            (loss if scaler is None else scaler.scale(loss)).backward()
+            totals = [total + part.detach() / self.heads for total, part in zip(totals, losses)]
+        return totals
+
+    def branchwise_generator_losses(self, y, fake, adv_scale: float, grad_scale: float):
+        """``generator_losses`` under ``branchwise``. Each family's gradient
+        is taken at ``fake`` and its graph freed; their sum reaches the
+        generator through one product with ``fake``. The losses carry their
+        values, and the feature-matching one that gradient, the adversarial
+        loss's times ``adv_scale`` included. ``grad_scale`` is the
+        GradScaler's, which keeps an FP16 gradient from underflowing."""
+        leaf = fake.detach().requires_grad_(True)
+        gradient = torch.zeros_like(leaf, dtype=torch.float32)
+        loss_adv = loss_fm = y.new_zeros(())
+        for name, family in self.net.items():
+            outputs, fmaps = family(leaf)
+            with torch.no_grad():
+                _, fmaps_real = family(y)
+            adv = sv.adversarial_loss(outputs, self.hinge) / self.heads
+            # NSF-UnivNet matches features on the MPD alone.
+            matched = not self.univnet or name == "mpd"
+            fm = sv.feature_loss(fmaps_real, fmaps) / self.heads if matched else y.new_zeros(())
+            (part,) = torch.autograd.grad((adv * adv_scale + fm) * grad_scale, leaf)
+            gradient += part.float() / grad_scale
+            loss_adv, loss_fm = loss_adv + adv.detach(), loss_fm + fm.detach()
+        surrogate = (fake.float() * gradient).sum()
+        return loss_adv, loss_fm + surrogate - surrogate.detach(), None
+
     def discriminator_losses(self, y, real, fake, cond):
         """D's loss with its real and fake parts, then the repo
         discriminator's outputs on ``real`` and ``fake`` (None for the
         recipe's own, which scores ``y`` against ``fake``)."""
         if self.own:
             losses = sv.discriminator_loss(self.train_net(y), self.train_net(fake.detach()), self.hinge)
-            return (*losses, None, None)
+            return (*(loss / self.heads for loss in losses), None, None)
         y_d_r, y_d_g, _, _ = self.train_net(
             real, fake.detach(), san_training=self.san, combine_inputs=True, cond=cond
         )
         losses = discriminator_loss(
-            y_d_r, y_d_g, san_direction_weight=SAN_DIRECTION_WEIGHT, branch_weights=self.branch_weights
+            y_d_r, y_d_g, san_direction_weight=SAN_DIRECTION_WEIGHT, branch_weights=self.branch_weights,
+            hinge=self.hinge,
         )
-        return (*losses, y_d_r, y_d_g)
+        return (*(loss / self.heads for loss in losses), y_d_r, y_d_g)
 
-    def r1(self, y, cond, step: int, hop: int):
-        """The branch whose turn it is at ``step`` and its R1 penalty."""
-        branch = (step // self.r1_every) % self.r1_branches
+    def r1(self, y, cond, branch: int, hop: int):
+        """``branch``'s R1 penalty."""
         count = max(1, int(round(y.shape[0] * float(getattr(self.net, "r1_batch_fraction", 0.5)))))
         segment = int(getattr(self.net, "r1_segment", 0))
         if cond is None:
             real, real_cond = loud_crop(y, count, segment), None
         else:
             real, real_cond = loud_crop(y, count, segment, cond=cond, hop=hop)
-        return branch, r1_penalty(self.net, real, branch, dtype=self.r1_dtype, cond=real_cond)
+        return r1_penalty(self.net, real, branch, dtype=self.r1_dtype, cond=real_cond)
 
-    def generator_losses(self, y, y_hat, real, fake, cond):
+    def generator_losses(self, y, y_hat, real, fake, cond, adv_scale: float = 1.0, grad_scale: float = 1.0):
         """The generator's adversarial and feature-matching losses through
         the frozen discriminator, and the adversarial one per branch (the
         repo's only, else None). ``real`` and ``fake`` continue ``y`` and
-        ``y_hat`` with the pitch-shifted renders, if any."""
+        ``y_hat`` with the pitch-shifted renders, if any. ``adv_scale`` and
+        ``grad_scale`` are ``branchwise_generator_losses``'."""
         net = self.net
+        if self.branchwise:
+            return self.branchwise_generator_losses(y, fake, adv_scale, grad_scale)
         if self.own:
             d_fake = net(fake)
             with torch.no_grad():
@@ -474,7 +552,7 @@ class Adversary:
                 sv.feature_loss(d_real[family][1], d_fake[family][1])
                 for family in d_fake if not self.univnet or family == "mpd"
             )
-            return loss_adv, loss_fm, None
+            return loss_adv / self.heads, loss_fm / self.heads, None
         # Features are matched on the batch itself; shifted renders have no
         # target and take the adversarial term alone.
         _, y_d_g, fmap_r, fmap_g = net(y, y_hat, no_grad_real=True, cond=cond)
@@ -482,17 +560,17 @@ class Adversary:
         del fmap_r, fmap_g
         loss_adv, branch_adv = generator_loss(
             y_d_g, san_direction_weight=SAN_DIRECTION_WEIGHT, use_softplus=self.san,
-            branch_weights=self.branch_weights, per_branch=True,
+            branch_weights=self.branch_weights, per_branch=True, hinge=self.hinge,
         )
         if fake.shape[0] > y.shape[0]:
             extra = fake[y.shape[0]:]
             _, y_d_g, _, _ = net(real[y.shape[0]:], extra, no_grad_real=True)
             extra_adv = generator_loss(
                 y_d_g, san_direction_weight=SAN_DIRECTION_WEIGHT, use_softplus=self.san,
-                branch_weights=self.branch_weights,
+                branch_weights=self.branch_weights, hinge=self.hinge,
             )
             loss_adv = (loss_adv * y.shape[0] + extra_adv * extra.shape[0]) / fake.shape[0]
-        return loss_adv, loss_fm, branch_adv
+        return loss_adv / self.heads, loss_fm / self.heads, branch_adv
 
     def scalars(self, step: int, since: int) -> dict:
         """The mel conditioning's diagnostics."""
@@ -518,7 +596,7 @@ class RollingStats:
         self.values = defaultdict(lambda: deque(maxlen=size))
         self.disc, self.adv, self.accuracy, self.r1, self.skips = (deque(maxlen=size) for _ in range(5))
 
-    def scalars(self, r1_gamma: float) -> dict:
+    def scalars(self, r1_schedule: R1Schedule, heads: int) -> dict:
         size, labels, scalars = self.size, self.labels, {}
         if self.accuracy:
             for family, value in zip(self.families.names, torch.stack(list(self.accuracy)).mean(0).tolist()):
@@ -527,12 +605,11 @@ class RollingStats:
             per_branch = defaultdict(list)
             for branch, value in zip((b for b, _ in self.r1), torch.stack([v for _, v in self.r1]).tolist()):
                 per_branch[branch].append(value)
-            total = 0.0
+            means = {}
             for branch, values in sorted(per_branch.items()):
-                mean = sum(values) / len(values)
-                total += mean
+                mean = means[branch] = sum(values) / len(values)
                 scalars[f"r1_grad_sq/{labels[branch] if branch < len(labels) else branch}"] = mean
-            scalars["r1/penalty"] = 0.5 * r1_gamma * total
+            scalars["r1/penalty"] = r1_schedule.penalty(means) / heads
         if self.skips:
             scalars[f"AMP/skip_rate_{size}"] = sum(self.skips) / len(self.skips)
         for key, queue in self.values.items():
@@ -562,15 +639,29 @@ def optimizer_step(optimizer, scaler, lr_scale: float) -> None:
 
 
 def backward(loss, optimizer, parameters, scaler, grad_clip: float, step: int, lr_scale: float):
-    """Backward and step; returns the gradient norm on sampled steps."""
-    if scaler is None:
-        loss.backward()
-    else:
-        scaler.scale(loss).backward()
+    """Backward and step; returns the gradient norm on sampled steps. Without
+    a ``loss`` the gradients are already there."""
+    if loss is not None:
+        (loss if scaler is None else scaler.scale(loss)).backward()
+    if scaler is not None:
         scaler.unscale_(optimizer)
     norm = clip_or_sample_grad_norm(parameters, grad_clip, step, METRICS_INTERVAL)
     optimizer_step(optimizer, scaler, lr_scale)
     return norm
+
+
+@contextmanager
+def running_batch_norm(net_g):
+    """``net_g``'s batch norms on their running statistics, as in inference;
+    the rest keeps its mode."""
+    norms = [m for m in net_g.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm) and m.training]
+    for norm in norms:
+        norm.eval()
+    try:
+        yield
+    finally:
+        for norm in norms:
+            norm.train()
 
 
 def render_preview(net_g, ema, previews, reference, data: dict, raw_mel: bool, device, epoch: int, step: int):
@@ -579,7 +670,7 @@ def render_preview(net_g, ema, previews, reference, data: dict, raw_mel: bool, d
     if reference is None:
         return
     mel = normalize_mel(reference.mel.to(device), data)
-    with ema.applied(net_g), torch.no_grad():
+    with ema.applied(net_g), running_batch_norm(net_g), torch.no_grad():
         generated = net_g(generator_input(mel, data, raw_mel), reference.inputs.f0.to(device))
     previews.log(epoch, step, reference.path, generated, reference.audio.to(device))
 
@@ -592,7 +683,7 @@ def evaluate(net_g, ema, holdout, data: dict, raw_mel: bool, spectral_loss, stft
     device = ranks.device
     totals = torch.zeros(2, device=device)
     items = 0
-    with ema.applied(net_g):
+    with ema.applied(net_g), running_batch_norm(net_g):
         for index, (mel, f0, y) in enumerate(holdout):
             mel = normalize_mel(mel.to(device), data)
             y = y.to(device)
@@ -670,19 +761,34 @@ def train(ranks: Ranks, spec_path: str) -> None:
     config = sv.load_recipe_config(name, architecture) if singing else load_run_config(name)
     settings = config["vocoder"]
     # PCPH-BigVGAN trains against the repo's discriminator, as its config sets
-    # it; the others by the recipe's choice, unless the run names one.
+    # it or as v4-hinge; the others by the recipe's choice, unless the run
+    # names one.
     discriminator = "config"
     if singing:
         discriminator = spec.get("discriminator") or settings.get("discriminator_choice", "original")
         if discriminator not in sv.DISCRIMINATORS:
             raise ValueError(f"discriminator must be one of {sv.DISCRIMINATORS}, not {discriminator!r}.")
-    # The recipe's own discriminators and GAN losses, instead of the repo's.
-    own_d = discriminator == "original"
-    d_settings = settings["repo_discriminator"] if singing and not own_d else settings["discriminator"]
+        if discriminator in sv.WAVEHAX_DISCRIMINATORS and architecture not in sv.WAVEHAX_RUNS:
+            raise ValueError(
+                f"The {discriminator} discriminator is Wavehax's; the other recipes have original, v3 and v4-hinge."
+            )
+    elif (spec.get("discriminator") or settings.get("discriminator_choice")) == sv.V4_HINGE:
+        discriminator = sv.V4_HINGE
+    recipe_d = discriminator in sv.OWN_DISCRIMINATORS
+    d_settings = settings["repo_discriminator"] if singing and not recipe_d else settings["discriminator"]
+    if discriminator == sv.V3_HINGE:
+        d_settings = {**d_settings, "d_use_san": False}
+    elif discriminator == sv.V4_HINGE:
+        d_settings = settings["v4_discriminator"] if singing else {**d_settings, **sv.V4_HINGE_DISCRIMINATOR}
+    if discriminator == "light":
+        d_settings = settings["light_discriminator"]
+    # The recipe's own discriminators and GAN losses, instead of the repo's;
+    # a recipe that writes its own in the repo's settings trains as the repo's.
+    own_d = recipe_d and "d_version" not in d_settings
     data = config["data"]
     sample_rate = data["sample_rate"]
     hop = data["hop_length"]
-    out_dir = run_dir(name, "vocoder")
+    out_dir = vocoder_run_dir(name, architecture)
     os.makedirs(out_dir, exist_ok=True)
 
     device = ranks.device
@@ -700,6 +806,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     eval_interval = int(settings.get("eval_interval", 0)) if holdout else 0
 
     net_g, net_d, hparams = build_networks(architecture, config, d_settings, own_d, device)
+    generator_fp32 = bool(settings.get("generator_fp32", False)) and architecture in sv.WAVEHAX_RUNS
+    if generator_fp32:
+        net_g.fp32 = True
     if settings.get("compile_generator") and device.type == "cuda" and hasattr(net_g, "compile_blocks"):
         net_g.compile_blocks()
     learning_rate = float(settings["learning_rate"])
@@ -747,7 +856,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
     train_d = ranks.wrap(
         net_d, find_unused_parameters=bool(getattr(net_d, "uses_branchwise_r1", False))
     )
-    adversary = Adversary(net_d, train_d, settings, d_settings, own_d, univnet, amp_dtype)
+    adversary = Adversary(
+        net_d, train_d, settings, d_settings, own_d, univnet, amp_dtype,
+        repo_hinge=discriminator in sv.REPO_HINGE,
+    )
     autocast = partial(
         torch.autocast, device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None
     )
@@ -776,6 +888,14 @@ def train(ranks: Ranks, spec_path: str) -> None:
     # held-out evaluation stay on the real mel.
     degradation = min(1.0, max(0.0, float(spec.get("mel_degradation", 0.0))))
     c_pc_wav = float(settings.get("c_pc_wav", 30.0))
+    # ``c_phase_lock``: Pupu-Vocoder's harmonics held to the f0 sine's phase.
+    c_lock = float(settings.get("c_phase_lock", 0.0)) if architecture == sv.PUPU else 0.0
+    phase_lock = None
+    if c_lock > 0:
+        phase_lock = pupu_vocoder.PhaseLockLoss(
+            sample_rate, hop, int(settings.get("phase_lock_harmonics", 4)),
+            fmax=float(settings.get("phase_lock_fmax", 0.0)), low=int(settings.get("phase_lock_low", 0)),
+        ).to(device)
     grad_clip = float(settings.get("grad_clip") or "inf")
 
     if main_rank:
@@ -794,7 +914,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Volume augmentation", f"{volume_prob:g}" if volume_prob > 0 else "off"),
                 ("Epochs", f"{epoch} -> {total_epochs}, saving every {save_every}"),
                 ("Starting point", start.starting_point),
-                ("PRECISION", precision_label(amp_dtype)),
+                ("PRECISION", precision_label(amp_dtype)
+                              + (", generator in FP32" if generator_fp32 and amp_dtype is not None else "")),
                 ("Seed", "random" if seed is None else int(seed)),
                 ("Device", (torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU")
                            + (f" x {ranks.world} GPUs" if ranks.world > 1 else "")),
@@ -808,7 +929,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
                  + ", adversarial"
                  + (f" ramped over {adv_warmup} steps" if adv_warmup > 0 else "")
                  + (f", after {aux_steps} spectral-only steps" if aux_steps > 0 else "")
-                 + (f", PC waveform x{c_pc_wav:g} on {pc_count} clips (+-{pitch.key:g} keys)" if pc_count else "")),
+                 + (f", PC waveform x{c_pc_wav:g} on {pc_count} clips (+-{pitch.key:g} keys)" if pc_count else "")
+                 + (f", phase lock x{c_lock:g} on {len(phase_lock.harmonics)} harmonics"
+                    + (f" under {phase_lock.fmax:g} Hz" if phase_lock.fmax > 0 else "")
+                    + (f" and on the first {phase_lock.low}" if phase_lock.low else "") if phase_lock else "")),
                 ("Discriminator", adversary.describe(d_settings)),
             ],
             title="Rectified vocoder",
@@ -823,6 +947,24 @@ def train(ranks: Ranks, spec_path: str) -> None:
     plateau_sum = torch.zeros((), device=device)
     plateau_count = 0
 
+    def checkpoint(finished: int) -> None:
+        """Save the run after ``finished`` whole epochs; a resume starts the next."""
+        save(
+            out_dir, name, spec.get("checkpoints", "latest"), epoch, step,
+            {"model": net_g.state_dict(), "optimizer": optim_g.state_dict(),
+             "ema": ema.state_dict(), "epoch": finished, "step": step,
+             # ``pretrained_weights`` takes a file naming one for a foreign vocoder.
+             **({"architecture": architecture} if singing else {}),
+             "scaler": scaler.state_dict() if scaler is not None else None,
+             "amp_skipped_steps": skipped, "plateau": {**plateau.state_dict(), "metric": plateau_metric}},
+            {"model": net_d.state_dict(), "optimizer": optim_d.state_dict(),
+             "epoch": finished, "step": step, "discriminator": discriminator,
+             "mel_cond_since": mel_cond_since if mel_cond_d else None},
+            export_payload(architecture, config, hparams, ema),
+        )
+
+    # ``save_steps``: also inside an epoch, for one too long to lose.
+    save_steps = int(spec.get("save_steps") or 0)
     recorder = EpochRecorder()
     net_g.train()
     net_d.train()
@@ -862,22 +1004,29 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 y_d_r = y_d_g = None
                 if aux_only:
                     loss_d = loss_d_real = loss_d_fake = y.new_zeros(())
+                elif adversary.branchwise:
+                    optim_d.zero_grad(set_to_none=True)
+                    loss_d, loss_d_real, loss_d_fake = adversary.discriminator_step(y, fake, scaler, autocast)
+                    grad_norm_d = backward(None, optim_d, net_d.parameters(), scaler, grad_clip, step, lr_scale)
                 else:
                     with autocast():
                         loss_d, loss_d_real, loss_d_fake, y_d_r, y_d_g = adversary.discriminator_losses(
                             y, real, fake, d_cond
                         )
                     loss_d_step = loss_d
-                    if y_d_r is not None and adversary.r1_branches and step % adversary.r1_every == 0:
-                        branch, r1 = adversary.r1(y, d_cond, step, hop)
+                    branch = adversary.r1_schedule.branch(step) if y_d_r is not None else None
+                    if branch is not None:
+                        r1 = adversary.r1(y, d_cond, branch, hop)
                         stats.r1.append((branch, r1.detach()))
-                        loss_d_step = loss_d + 0.5 * adversary.r1_gamma * adversary.r1_period * r1
+                        loss_d_step = loss_d + adversary.r1_schedule.weight(branch) * r1 / adversary.heads
                     families = stats.families
                     if (
                         y_d_r is not None and families is not None and families.names
                         and step % ACCURACY_SAMPLE_EVERY == 0
                     ):
-                        stats.accuracy.append(families(head_accuracies(y_d_r, y_d_g)))
+                        stats.accuracy.append(families(head_accuracies(
+                            y_d_r, y_d_g, threshold=0.0 if adversary.hinge else 0.5
+                        )))
                     optim_d.zero_grad(set_to_none=True)
                     grad_norm_d = backward(
                         loss_d_step, optim_d, net_d.parameters(), scaler, grad_clip, step, lr_scale
@@ -897,7 +1046,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         loss_fm = loss_adv = y.new_zeros(())
                         branch_adv = None
                     else:
-                        loss_adv, loss_fm, branch_adv = adversary.generator_losses(y, y_hat, real, fake, d_cond)
+                        loss_adv, loss_fm, branch_adv = adversary.generator_losses(
+                            y, y_hat, real, fake, d_cond, adv_scale=ramp(step, adv_warmup),
+                            grad_scale=1.0 if scaler is None else scaler.get_scale(),
+                        )
                     if pc_count:
                         # The render at c through a against the render at c,
                         # as mel beside the batch's and as waveform.
@@ -907,6 +1059,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         loss_mel = spectral_loss(y, y_hat)
                         loss_pc = 0.0
                     loss_g = loss_mel + loss_fm + loss_adv * ramp(step, adv_warmup) + loss_pc
+                if phase_lock is not None:
+                    loss_lock = phase_lock(y_hat, f0)
+                    loss_g = loss_g + loss_lock * c_lock
                 optim_g.zero_grad(set_to_none=True)
                 if scaler is None:
                     loss_g.backward()
@@ -934,10 +1089,15 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 losses = {
                     "loss_disc": loss_d, "loss_disc_real": loss_d_real, "loss_disc_fake": loss_d_fake,
                     "loss_adv": loss_adv, "loss_gen_total": loss_g, "loss_fm": loss_fm,
-                    "loss_spectral": loss_mel,
+                    "loss_spectral": loss_mel, **spectral_loss.terms,
                 }
                 if pc_count:
                     losses["loss_pc_wav"] = loss_pc
+                if phase_lock is not None:
+                    losses["loss_phase_lock"] = loss_lock
+                    # The real audio's, which the f0's own error keeps off 0.
+                    with torch.no_grad():
+                        losses["loss_phase_lock_real"] = phase_lock(y, f0)
                 for key, value in losses.items():
                     stats.values[key].append(value.detach().float())
                     epoch_sums[key] += value.detach().float()
@@ -986,7 +1146,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         scalars = {
                             "learning_rate/lr_d": optim_d.param_groups[0]["lr"] * plateau.scale,
                             "learning_rate/lr_g": optim_g.param_groups[0]["lr"] * plateau.scale,
-                            **stats.scalars(adversary.r1_gamma),
+                            **stats.scalars(adversary.r1_schedule, adversary.heads),
                             **adversary.scalars(step, mel_cond_since),
                         }
                         if plateau_interval > 0:
@@ -1003,6 +1163,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                             writer.add_scalar(key, value, step)
                     if step % preview_interval == 0:
                         render_preview(net_g, ema, previews, reference, data, raw_mel, device, epoch, step)
+                if main_rank and save_steps and step % save_steps == 0:
+                    checkpoint(epoch - 1)
                 if ranks.stop_requested():
                     # Nothing is being written at a batch boundary.
                     finish_stop(writer)
@@ -1024,19 +1186,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
             if skipped and scaler is not None:
                 info(f"GradScaler at {scaler.get_scale():.0f}; {skipped} step(s) skipped so far.", tag=TAG)
             if epoch % save_every == 0 or epoch == total_epochs:
-                save(
-                    out_dir, name, spec.get("checkpoints", "latest"), epoch, step,
-                    {"model": net_g.state_dict(), "optimizer": optim_g.state_dict(),
-                     "ema": ema.state_dict(), "epoch": epoch, "step": step,
-                     # ``pretrained_weights`` takes a file naming one for a foreign vocoder.
-                     **({"architecture": architecture} if singing else {}),
-                     "scaler": scaler.state_dict() if scaler is not None else None,
-                     "amp_skipped_steps": skipped, "plateau": {**plateau.state_dict(), "metric": plateau_metric}},
-                    {"model": net_d.state_dict(), "optimizer": optim_d.state_dict(),
-                     "epoch": epoch, "step": step, "discriminator": discriminator,
-                     "mel_cond_since": mel_cond_since if mel_cond_d else None},
-                    export_payload(architecture, config, hparams, ema),
-                )
+                checkpoint(epoch)
                 render_preview(net_g, ema, previews, reference, data, raw_mel, device, epoch, step)
             writer.flush()
         epoch += 1

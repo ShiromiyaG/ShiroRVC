@@ -1,7 +1,8 @@
 """The rectified flow: its losses, its sampler and how its weights load."""
 
 import math
-from typing import Callable, Optional
+from contextlib import nullcontext
+from typing import Callable, NamedTuple, Optional
 
 import torch
 from torch import nn
@@ -12,15 +13,39 @@ from rvc.rectified.flow.sampling import RESCALE_MODES, SAMPLERS, Guidance, time_
 
 #: Share of the frames that get the second time under ``dual_timestep``.
 DUAL_TIMESTEP_SHARE = 0.25
+#: Share of the mean-flow items trained at a zero span: the velocity itself
+#: under a guidance scale, which the other items' targets read.
+BOUNDARY_SHARE = 0.25
 #: Inputs that start at zero, so a checkpoint from before them loads unchanged.
-ZERO_INPUTS = ("encoder.tension.", "backbone.step.")
+ZERO_INPUTS = ("encoder.tension.", "backbone.span_mlp.", "backbone.guide_mlp.")
 #: What a model without the input leaves out of the weights it loads.
-DROPPED_INPUTS = ("backbone.span_mlp.", "backbone.step.", "encoder.phonation.")
+DROPPED_INPUTS = ("backbone.span_mlp.", "backbone.guide_mlp.", "backbone.step.", "encoder.phonation.")
 #: The per-bin mel statistics; a checkpoint from before them keeps the identity.
 MEL_STATS = ("mel_shift", "mel_scale")
 #: Floor of a bin's spread, in the data's normalisation, so a bin that hardly
 #: moves is not blown up into noise.
 MIN_MEL_SCALE = 0.1
+
+
+class MeanFlowLosses(NamedTuple):
+    """The losses of the share of a batch that trains the mean velocity.
+    Only ``objective`` is optimised; the rest are detached, to read."""
+
+    #: Mean-flow loss under ``adaptive_weight``.
+    objective: torch.Tensor
+    #: The rest of the batch's flow loss, unweighted.
+    flow: torch.Tensor
+    #: Mean-flow loss, unweighted.
+    mean: torch.Tensor
+    #: Size of the bootstrapped part of the target against the velocity.
+    bootstrap_ratio: torch.Tensor
+
+
+def adaptive_weight(error: torch.Tensor) -> torch.Tensor:
+    """MeanFlow's per-item loss weight, 1 / (error + c): each item pulls alike
+    whatever its error, which a bootstrapped target far off would otherwise
+    dominate."""
+    return (error.detach() + 1e-3).reciprocal()
 
 
 class RectifiedFlow(nn.Module):
@@ -30,6 +55,11 @@ class RectifiedFlow(nn.Module):
     With an ``aux_decoder`` and ``t_start`` > 0 it is DiffSinger's shallow
     flow: trained on ``t >= t_start`` only, and sampling starts there from the
     aux decoder's mel mixed with noise.
+
+    With ``mean_flow`` the backbone also learns the mean velocity over a step
+    (MeanFlow), which the "mean" sampler takes in one or two steps, under a
+    speaker guidance scale it reads; the velocity at a time is still the same
+    network at a zero span and a scale of 1.
 
     The mel goes in and out in the data's normalisation; inside, each bin is
     normalised again by ``set_mel_stats``' statistics.
@@ -55,8 +85,7 @@ class RectifiedFlow(nn.Module):
         aux_grad: float = 0.1,
         tension: bool = False,
         dual_timestep: bool = False,
-        shortcut: bool = False,
-        shortcut_steps: int = 128,
+        mean_flow: bool = False,
     ):
         """``harmonic_prior`` is the mel's ``sample_rate``, ``n_fft``, ``fmin``
         and ``fmax``, or None for no prior. ``aux_decoder`` is ``AuxDecoder``'s
@@ -64,14 +93,10 @@ class RectifiedFlow(nn.Module):
         gradient into the encoder and the speaker table. ``backbone`` is kept
         because configs and exports name it; LYNXNet2 is the only one.
         ``dual_timestep`` trains a share of each item's frames at a second
-        time, as DiffSinger does. ``shortcut`` gives the backbone a jump length to
-        read (Frans et al., "One Step Diffusion via Shortcut Models"), down to
-        one of ``shortcut_steps`` of the trained range, a power of two."""
+        time, as DiffSinger does. ``mean_flow`` gives the backbone the length
+        of a step and a guidance scale to read (Geng et al., "Mean Flows for
+        One-step Generative Modeling" and "Improved Mean Flows")."""
         super().__init__()
-        if shortcut and (shortcut_steps < 2 or shortcut_steps & (shortcut_steps - 1)):
-            raise ValueError(f"shortcut_steps must be a power of two of 2 or more, not {shortcut_steps}.")
-        #: Jump lengths the backbone knows, 0 for a plain flow.
-        self.shortcut_levels = int(math.log2(shortcut_steps)) if shortcut else 0
         if backbone != "lynxnet2":
             raise ValueError(f"Only the lynxnet2 backbone is supported, not {backbone!r}.")
         self.n_mels = int(n_mels)
@@ -90,13 +115,15 @@ class RectifiedFlow(nn.Module):
             tension,
         )
         self.backbone = LYNXNet2Backbone(
-            n_mels, hidden_channels, step_levels=self.shortcut_levels, **(backbone_args or {})
+            n_mels, hidden_channels, span=bool(mean_flow), **(backbone_args or {})
         )
         self.aux = AuxDecoder(hidden_channels, n_mels, **aux_decoder) if aux_decoder else None
         # Time and speaker reach the network through these; on AdamW, where
         # gradient clipping bounds the step, since Muon's step ignores the
         # gradient's size.
-        conditioning = [self.backbone.time_mlp, *self.speaker_layers()]
+        conditioning = [
+            self.backbone.time_mlp, self.backbone.span_mlp, self.backbone.guide_mlp, *self.speaker_layers(),
+        ]
         for module in filter(None, conditioning):
             for child in module.modules():
                 child.use_adamw = True
@@ -146,51 +173,14 @@ class RectifiedFlow(nn.Module):
         dropped = torch.rand(speaker.shape, device=speaker.device, generator=self.generator) < speaker_dropout
         return torch.where(dropped, torch.full_like(speaker, self.speaker_count), speaker)
 
-    def _flow_error(self, mel, noise, cond, voice, mask, t, backbone, jump=None):
+    def _flow_error(self, mel, noise, cond, voice, mask, t, backbone):
         """Flow loss per item [B] on the path from ``noise`` to ``mel``;
-        ``t`` is [B], or [B, T] for a time per frame. ``jump`` is
-        ``_jump_targets``'s, whose items stand in for the batch's first ones."""
+        ``t`` is [B], or [B, T] for a time per frame."""
         mix = t[:, None, None] if t.dim() == 1 else t[:, None, :]
         x_t = (1.0 - mix) * noise + mix * mel
-        target = mel - noise
-        if jump is None:
-            prediction = backbone(x_t, t, cond, mask, voice)
-        else:
-            count, x_jump, t_jump, level, target_jump = jump
-            x_t = torch.cat((x_jump.to(x_t.dtype), x_t[count:]))
-            target = torch.cat((target_jump.to(target.dtype), target[count:]))
-            t = torch.cat((t_jump if t.dim() == 1 else t_jump[:, None].expand(-1, t.shape[1]), t[count:]))
-            # The rest of the batch trains the plain flow, the finest level.
-            level = torch.cat((level, level.new_full((mel.shape[0] - count,), self.shortcut_levels)))
-            prediction = backbone(x_t, t, cond, mask, voice, level)
-        error = (prediction.float() - target.float()).square() * mask
+        prediction = backbone(x_t, t, cond, mask, voice)
+        error = (prediction.float() - (mel - noise).float()).square() * mask
         return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-
-    @torch.no_grad()
-    def _jump_targets(self, teacher, mel, noise, inputs: Conditioning, share: float):
-        """Self-consistency targets for the first items of the batch, a
-        ``share`` of it: a jump of one of the lengths, from a time on that
-        length's grid, has to land where two of ``teacher``'s half as long do.
-        Returns (count, state, time, level, target), or None when the draw
-        gives no item. ``teacher`` is a copy of the model that lags it."""
-        device = mel.device
-        count = min(mel.shape[0], int(share * mel.shape[0] + torch.rand((), device=device, generator=self.generator).item()))
-        if count < 1:
-            return None
-        mel, noise, inputs = mel[:count], noise[:count], inputs.map(lambda value: value[:count])
-        # Per item: spread over the batch instead, a small one trains few lengths.
-        level = torch.randint(0, self.shortcut_levels, (count,), device=device, generator=self.generator)
-        sections = 2.0**level
-        span = 1.0 - self.t_start
-        slot = torch.floor(torch.rand(count, device=device, generator=self.generator) * sections)
-        t = self.t_start + span * slot / sections
-        half = 0.5 * span / sections
-        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
-        cond, voice = teacher.encoder(inputs), teacher.encoder.voice(inputs.speaker)
-        finer = (level + 1).clamp_max(self.shortcut_levels)
-        first = teacher.backbone(x_t, t, cond, inputs.mask, voice, finer).float()
-        second = teacher.backbone(x_t + half[:, None, None] * first, t + half, cond, inputs.mask, voice, finer).float()
-        return count, x_t, t, level, 0.5 * (first + second)
 
     def _aux_loss(self, mel, cond, voice, mask):
         """The aux decoder's L1, or None without one."""
@@ -201,6 +191,68 @@ class RectifiedFlow(nn.Module):
         )
         error = (self.aux(cond, mask, voice).float() - mel.float()).abs() * mask
         return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
+
+    def mean_velocity(self, x, t, span, velocity, cond, mask, voice, guidance=None):
+        """The mean velocity over ``span`` from ``t`` under ``guidance``, and
+        its derivative along the path ``velocity`` with the step's end held,
+        detached."""
+
+        def field(x, t, span):
+            return self.backbone(x, t, cond, mask, voice, span, guidance)
+
+        tangents = (velocity, torch.ones_like(t), -torch.ones_like(span))
+        mean, derivative = torch.func.jvp(field, (x, t, span), tangents)
+        # Detached here: a compiled graph cannot take the empty gradient the
+        # derivative would otherwise get.
+        return mean, derivative.detach()
+
+    def _mean_error(self, mel, inputs: Conditioning, cond, voice, noise, mean_field, guidance_max=1.0):
+        """MeanFlow loss per item [B], over steps between two drawn times, and
+        how large the bootstrapped part of the target is against the velocity,
+        [B]. With ``guidance_max`` over 1 each item draws a speaker guidance
+        scale up to it and trains the mean of the velocity guided by it."""
+        mask, batch, device = inputs.mask, mel.shape[0], mel.device
+        first, second = (self._times(batch, device) for _ in range(2))
+        t, span = torch.minimum(first, second), (first - second).abs()
+        span = span * (torch.rand(batch, device=device, generator=self.generator) >= BOUNDARY_SHARE)
+        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
+        velocity = mel - noise
+        guidance = None
+        with torch.no_grad():
+            if guidance_max > 1.0:
+                # Log-uniform: the smaller scales are the ones used most.
+                draw = torch.rand(batch, device=device, generator=self.generator)
+                guidance = torch.exp(draw * math.log(guidance_max))
+                null = inputs._replace(speaker=torch.full_like(inputs.speaker, self.speaker_count))
+                free = self.backbone(
+                    x_t, t, self.encoder(null), mask, self.encoder.voice(null.speaker), None, guidance
+                )
+            # The derivative is taken along the network's own velocity: the
+            # item's is that plus its noise, which the target would carry span
+            # times over.
+            path = self.backbone(x_t, t, cond, mask, voice, None, guidance).to(x_t.dtype)
+            if guidance is not None:
+                # The guided velocity, from the item's own and the network's
+                # guided and speaker-free ones.
+                push = (1.0 - 1.0 / guidance)[:, None, None]
+                velocity = velocity + push * (path - free.to(x_t.dtype)) * mask
+        # The time derivative passes FP16's range, so it is taken in FP32 there.
+        kind = device.type
+        fp16 = torch.is_autocast_enabled(kind) and torch.get_autocast_dtype(kind) == torch.float16
+        if fp16:
+            cond, voice = cond.float(), voice.float()
+        with torch.autocast(kind, enabled=False) if fp16 else nullcontext():
+            mean, derivative = mean_field(x_t, t, span, path, cond, mask, voice, guidance)
+        # The mean over [t, t + span] is the velocity at t plus span times its
+        # own derivative in t; the network's derivative stands in as a target.
+        correction = span[:, None, None] * derivative.float() * mask
+        count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
+        size = (correction.square().sum((1, 2)) / count).sqrt()
+        # A path's curvature keeps this well under 1; past it the target is
+        # feeding on itself.
+        ratio = size / ((velocity.square() * mask).sum((1, 2)) / count).sqrt().clamp_min(1e-8)
+        error = (mean.float() - (velocity + correction)).square() * mask
+        return error.sum((1, 2)) / count, ratio
 
     def _times(self, batch, device):
         """Times over the trained range, stratified across the batch so every
@@ -220,21 +272,28 @@ class RectifiedFlow(nn.Module):
         return torch.where(swap, other[:, None], t[:, None])
 
     @staticmethod
-    def _pooled(error, frames):
-        """Per-item ``error`` averaged over the batch's frames."""
-        return (error * frames).sum() / frames.sum().clamp_min(1.0)
+    def _pooled(error, frames, weighted=False):
+        """Per-item ``error`` averaged over the batch's frames; ``weighted``
+        applies ``adaptive_weight``."""
+        weight = adaptive_weight(error) if weighted else 1.0
+        return (weight * error * frames).sum() / frames.sum().clamp_min(1.0)
 
     def forward(self, mel, inputs: Conditioning, speaker_dropout=0.0, backbone=None, tension_dropout=0.0,
-                teacher=None, shortcut_share=0.0):
-        """Flow-matching loss for normalised ``mel`` [B, n_mels, T] and the aux
-        decoder's L1 (None without one), both on the per-bin normalised mel.
-        ``backbone`` stands in for ``self.backbone``, as its compiled wrapper
-        does.
+                mean_ratio=0.0, mean_field=None, mean_guidance=1.0):
+        """Flow-matching loss for normalised ``mel`` [B, n_mels, T], the aux
+        decoder's L1 (None without one) and the ``MeanFlowLosses`` (None when
+        off), all on the per-bin normalised mel. ``backbone`` stands in for
+        ``self.backbone``, as its compiled wrapper does, and ``mean_field`` for
+        ``self.mean_velocity``.
+
+        The first ``mean_ratio`` of the batch trains the mean velocity instead
+        of the flow. Every item's loss then takes ``adaptive_weight``, as in
+        MeanFlow. ``mean_guidance`` is ``_mean_error``'s largest guidance
+        scale; 1 trains the mean velocity unguided.
 
         ``speaker_dropout`` is the share of items trained on the null speaker,
         and ``tension_dropout`` the share trained with a flat tension, so the
-        input can be turned down at inference. With ``teacher``, ``shortcut_share`` of a shortcut model's
-        batch trains the jumps against it, as ``_jump_targets`` has it."""
+        input can be turned down at inference."""
         speaker = self._drop_speakers(inputs.speaker, speaker_dropout)
         tension = inputs.tension
         if tension is not None and tension_dropout > 0:
@@ -248,14 +307,42 @@ class RectifiedFlow(nn.Module):
         noise = torch.randn_like(mel) if self.generator is None else torch.randn(
             mel.shape, device=mel.device, dtype=mel.dtype, generator=self.generator
         )
-        t = self._train_times(mel.shape[0], mel.shape[-1], mel.device)
+        # The batch's head trains the mean velocity, the rest the flow.
+        batch = mel.shape[0]
+        mean_items = 0
+        if self.backbone.span_mlp is not None:
+            mean_items = min(batch - 1, int(round(mean_ratio * batch)))
+        head, rest = slice(0, mean_items), slice(mean_items, None)
+
+        t = self._train_times(batch - mean_items, mel.shape[-1], mel.device)
         # Not ``backbone or ...``: a compiled module's truth test calls len().
         backbone = self.backbone if backbone is None else backbone
-        jump = None
-        if teacher is not None and self.shortcut_levels and shortcut_share > 0:
-            jump = self._jump_targets(teacher, mel, noise, inputs, shortcut_share)
-        error = self._flow_error(mel, noise, cond, voice, mask, t, backbone, jump)
-        return self._pooled(error, mask.sum((1, 2))), self._aux_loss(mel, cond, voice, mask)
+        error = self._flow_error(mel[rest], noise[rest], cond[rest], voice[rest], mask[rest], t, backbone)
+        frames = mask[rest].sum((1, 2))
+        flow = self._pooled(error, frames)
+        mean = None
+        if mean_items:
+            mean_field = self.mean_velocity if mean_field is None else mean_field
+            mean_error, bootstrap_ratio = self._mean_error(
+                mel[head], inputs.map(lambda value: value[head]), cond[head], voice[head], noise[head],
+                mean_field, mean_guidance,
+            )
+            mean_frames = mask[head].sum((1, 2))
+            mean = MeanFlowLosses(
+                objective=self._pooled(mean_error, mean_frames, True),
+                flow=flow.detach(),
+                mean=self._pooled(mean_error, mean_frames).detach(),
+                bootstrap_ratio=bootstrap_ratio.mean(),
+            )
+            flow = self._pooled(error, frames, True)
+        if self.backbone.span_mlp is not None:
+            # DDP wants every parameter in the graph, also on a step that left
+            # these inputs out.
+            idle = [] if mean_items else [self.backbone.span_mlp]
+            if not mean_items or mean_guidance <= 1.0:
+                idle.append(self.backbone.guide_mlp)
+            flow = flow + 0.0 * sum(weight.sum() for module in idle for weight in module.parameters())
+        return flow, self._aux_loss(mel, cond, voice, mask), mean
 
     @torch.no_grad()
     def validation_losses(self, mel, inputs: Conditioning, noise, fractions):
@@ -337,7 +424,10 @@ class RectifiedFlow(nn.Module):
         without an aux decoder. ``start_mel``
         [B, n_mels, T] stands in for the aux decoder's mel there, as the real
         mel does to tell the flow's error from the aux decoder's. ``schedule``
-        is one of ``SCHEDULES``.
+        is one of ``SCHEDULES``. The "mean" ``method`` is meant for one or two
+        steps. It takes ``cfg_scale`` as the scale the network was trained to
+        read, in the one pass; the content guidance applies to it as it is,
+        though it was not trained under it.
 
         ``churn`` makes the sampler stochastic, as EDM's: before each step the
         state is re-noised back ``churn`` times that step's length (never
@@ -347,14 +437,22 @@ class RectifiedFlow(nn.Module):
         """
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
+        if method == "mean" and self.backbone.span_mlp is None:
+            raise ValueError("The mean sampler needs a model trained with mean flow.")
         if rescale_mode not in RESCALE_MODES:
             raise ValueError(f"rescale_mode must be one of {RESCALE_MODES}, not {rescale_mode!r}.")
+        batch, frames = inputs.content.shape[:2]
+        mask = inputs.mask
+        # The mean velocity under a speaker guidance scale is one pass of a
+        # network that reads the scale.
+        scale = None
+        if method == "mean" and self.backbone.guide_mlp is not None and cfg_scale != 1.0:
+            scale = torch.full((batch,), float(cfg_scale), device=mask.device)
+            cfg_scale = 1.0
         guidance = Guidance(
             cfg_scale, content_guidance, guidance_rescale, rescale_mode,
             tuple(float(value) for value in guidance_interval),
         )
-        batch, frames = inputs.content.shape[:2]
-        mask = inputs.mask
 
         # Each guided variant rides along in the batch, after the plain pass.
         variants = guidance.variants(inputs, self.speaker_count)
@@ -370,12 +468,12 @@ class RectifiedFlow(nn.Module):
         cond = self.encoder(stacked)
         voice = self.encoder.voice(stacked.speaker)
 
-        level = None
-
-        def velocity(x, t):
-            if count == 1 or not guidance.active(float(t[0])):
-                return self.backbone(x, t, cond[:batch], mask, voice[:batch], level)
-            passes = self.backbone(repeat(x), repeat(t), cond, stacked.mask, voice, repeat(level))
+        def velocity(x, t, span=None):
+            active = guidance.active(float(t[0]))
+            read = scale if active else None
+            if count == 1 or not active:
+                return self.backbone(x, t, cond[:batch], mask, voice[:batch], span, read)
+            passes = self.backbone(repeat(x), repeat(t), cond, stacked.mask, voice, repeat(span), repeat(read))
             return guidance.combine(passes.chunk(count), mask)
 
         if noise is None:
@@ -386,13 +484,7 @@ class RectifiedFlow(nn.Module):
         elif self.starts_from_aux:
             start_mel = self.aux(cond[:batch], mask, voice[:batch])
         x, t0 = self._start(noise, start_mel, mask, start)
-        steps = max(1, int(steps))
-        times = time_grid(schedule, steps, t0, x.device)
-        # A shortcut model takes its trained jumps on the grid it learned them
-        # on; any other sampling integrates the plain flow.
-        on_grid = method == "euler" and schedule == "uniform" and churn <= 0 and t0 == self.t_start
-        if on_grid and steps & (steps - 1) == 0 and steps < 2**self.shortcut_levels:
-            level = torch.full((batch,), int(math.log2(steps)), device=x.device)
+        times = time_grid(schedule, max(1, int(steps)), t0, x.device)
         for index in range(times.shape[0] - 1):
             now = float(times[index])
             back = max(self.t_start, now - float(churn) * float(times[index + 1] - times[index]))
@@ -402,7 +494,7 @@ class RectifiedFlow(nn.Module):
                 now = back
             t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
             dt = times[index + 1] - now
-            v = velocity(x, t)
+            v = velocity(x, t, dt.expand(batch) if method == "mean" else None)
             if method == "heun":
                 v_next = velocity(x + dt * v, times[index + 1].expand(batch))
                 v = 0.5 * (v + v_next)
@@ -433,7 +525,8 @@ def match_inputs(state_dict: dict, model: RectifiedFlow) -> dict:
     """Fit other weights to ``model``: the optional inputs and mel statistics
     they lack keep ``model``'s own, and what ``model`` has no input for (a
     mean-flow run's span, a shortcut one's jump lengths) is dropped, which
-    leaves the plain flow."""
+    leaves the plain flow. A span or guidance input the weights lack starts
+    at zero."""
     own = model.state_dict()
     state_dict = {
         key: value for key, value in state_dict.items()
@@ -448,7 +541,7 @@ def match_inputs(state_dict: dict, model: RectifiedFlow) -> dict:
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     model = dict(config["flow"]["model"])
     # Exports and configs from when these were options name them.
-    for name in ("mean_flow", "phonation", "prior_noise", "prior_degrade", "time_sampling"):
+    for name in ("phonation", "prior_noise", "prior_degrade", "time_sampling", "shortcut", "shortcut_steps"):
         model.pop(name, None)
     data = config["data"]
     if model.pop("harmonic_prior", False):

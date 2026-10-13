@@ -8,6 +8,8 @@ from torch.nn import functional as F
 from torch import Tensor
 from typing import Tuple
 
+from rvc.train.balance import head_family
+
 def _branch_weight(branch_weights, index):
     """``branch_weights[index]`` as a float, or 1.0 when no weighting is asked for.
 
@@ -114,6 +116,45 @@ def r1_penalty(discriminator, real, branch, dtype=None, cond=None):
     return grad.float().square().flatten(1).sum(1).mean()
 
 
+class R1Schedule:
+    """Branchwise lazy R1 over the branches ``discriminator.r1_gamma`` gives a
+    gamma: one every ``every`` steps, in turn, so each is penalised once per
+    ``period`` steps.  A branch at 0 is never run."""
+
+    def __init__(self, discriminator):
+        gamma = getattr(discriminator, "r1_gamma", 0.0)
+        labels = tuple(getattr(discriminator, "branch_labels", ()))
+        if isinstance(gamma, dict):
+            unknown = set(gamma) - set(labels) - {head_family(label) for label in labels}
+            if unknown:
+                raise ValueError(f"r1_gamma names no branch or family of this discriminator: {sorted(unknown)}.")
+            self.gammas = tuple(gamma.get(label, gamma.get(head_family(label), 0.0)) for label in labels)
+            self.summary = ", ".join(f"{name} {value:g}" for name, value in gamma.items()) or "0"
+        else:
+            self.gammas = (float(gamma),) * len(getattr(discriminator, "discriminators", ()))
+            self.summary = f"{float(gamma):g}"
+        self.branches = tuple(index for index, value in enumerate(self.gammas) if value > 0.0)
+        interval = int(getattr(discriminator, "r1_interval", 16))
+        self.every = max(1, math.ceil(interval / len(self.branches))) if self.branches else 1
+        self.period = self.every * len(self.branches)
+
+    def branch(self, step: int):
+        """The branch whose turn it is at ``step``, or None."""
+        if not self.branches or step % self.every:
+            return None
+        return self.branches[(step // self.every) % len(self.branches)]
+
+    def weight(self, branch: int) -> float:
+        """What multiplies ``branch``'s penalty on its step: by the period, so
+        its average strength is its gamma."""
+        return 0.5 * self.gammas[branch] * self.period
+
+    def penalty(self, grad_sq: dict) -> float:
+        """What R1 adds to D's loss per step, on average, from each branch's
+        mean ``grad_sq``."""
+        return sum(0.5 * self.gammas[branch] * value for branch, value in grad_sq.items())
+
+
 def discriminator_loss(
     disc_real_outputs,
     disc_generated_outputs,
@@ -121,8 +162,11 @@ def discriminator_loss(
     normalize=False,
     per_branch=False,
     branch_weights=None,
+    hinge=False,
 ):
     """Discriminator loss, aggregated across all MPD/MSD heads.
+
+    ``hinge`` replaces LSGAN, and the softplus loss on the SAN heads.
 
     With ``per_branch``, a fourth element is appended: a detached
     ``(heads, 2)`` tensor of each head's ``(real, fake)`` contribution before
@@ -158,14 +202,28 @@ def discriminator_loss(
             # keeps the fake-direction term bounded below and saturating --
             # the unbounded form let the discriminator win by pushing the
             # direction output on fakes negative without discriminating at all.
-            r_loss = (
-                torch.mean(F.softplus(1 - dr_fun.float()) ** 2)
-                + float(san_direction_weight) * torch.mean(F.softplus(1 - dr_dir.float()) ** 2)
-            )
-            g_loss = (
-                torch.mean(F.softplus(dg_fun.float()) ** 2)
-                + float(san_direction_weight) * torch.mean(F.softplus(dg_dir.float()) ** 2)
-            )
+            if hinge:
+                # The hinge on the direction too: bounded like the softplus.
+                r_loss = (
+                    torch.mean(F.relu(1 - dr_fun.float()))
+                    + float(san_direction_weight) * torch.mean(F.relu(1 - dr_dir.float()))
+                )
+                g_loss = (
+                    torch.mean(F.relu(1 + dg_fun.float()))
+                    + float(san_direction_weight) * torch.mean(F.relu(1 + dg_dir.float()))
+                )
+            else:
+                r_loss = (
+                    torch.mean(F.softplus(1 - dr_fun.float()) ** 2)
+                    + float(san_direction_weight) * torch.mean(F.softplus(1 - dr_dir.float()) ** 2)
+                )
+                g_loss = (
+                    torch.mean(F.softplus(dg_fun.float()) ** 2)
+                    + float(san_direction_weight) * torch.mean(F.softplus(dg_dir.float()) ** 2)
+                )
+        elif hinge:
+            r_loss = torch.mean(F.relu(1 - dr.float()))
+            g_loss = torch.mean(F.relu(1 + dg.float()))
         else:
             r_loss = torch.mean((1 - dr.float()) ** 2)
             g_loss = torch.mean(dg.float() ** 2)
@@ -198,9 +256,11 @@ def generator_loss(
     use_softplus=False,
     branch_weights=None,
     per_branch=False,
+    hinge=False,
 ):
     """
-    Generator loss with LSGAN as the default and optional SAN softplus loss.
+    Generator loss with LSGAN as the default and optional SAN softplus loss;
+    ``hinge`` replaces LSGAN, and the softplus loss on the SAN heads.
 
     ``branch_weights`` scales each head's term, in branch order; see
     ``MPD_MSD_Combined.branch_weights`` for where they come from and why one
@@ -227,7 +287,7 @@ def generator_loss(
         weight = _branch_weight(branch_weights, index)
         weights.append(weight)
         if isinstance(dg, (list, tuple)):
-            if use_softplus:
+            if use_softplus or hinge:
                 dg = dg[0]
             else:
                 l = torch.mean((1 - dg[0].float()) ** 2)
@@ -240,7 +300,10 @@ def generator_loss(
                 if branch_terms is not None:
                     branch_terms.append(l.detach())
                 continue
-        if use_softplus:
+        # The hinge's term does not grow with how far the head separates.
+        if hinge:
+            l = -torch.mean(dg.float())
+        elif use_softplus:
             l = torch.mean(F.softplus(1.0 - dg.float()).square())
         else:
             l = torch.mean((1 - dg.float()) ** 2)

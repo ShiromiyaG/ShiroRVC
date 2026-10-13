@@ -144,6 +144,7 @@ from losses import (
     mel_low_frequency_weights,
     mel_frequency_tilt_weights,
     loud_crop,
+    R1Schedule,
     r1_penalty,
     BandWeightedSpectralLoss,
     HighFrequencyFloorNegative,
@@ -1930,16 +1931,7 @@ def training_loop(
     family_reducer = FamilyReducer(
         getattr(model_d, "branch_labels", ()), branch_weights, device
     )
-    # Branchwise lazy R1: one branch every ``r1_every`` steps, in turn, so each
-    # branch is penalised once per ``r1_period`` steps.
-    r1_gamma = float(getattr(model_d, "r1_gamma", 0.0))
-    r1_branches = len(getattr(model_d, "discriminators", ())) if r1_gamma > 0.0 else 0
-    r1_every = (
-        max(1, math.ceil(int(getattr(model_d, "r1_interval", 16)) / r1_branches))
-        if r1_branches
-        else 1
-    )
-    r1_period = r1_every * r1_branches
+    r1_schedule = R1Schedule(model_d)
     r1_batch_fraction = float(getattr(model_d, "r1_batch_fraction", 0.5))
     r1_segment = int(getattr(model_d, "r1_segment", 0))
     # The HF floor negative: spectral heads only (every head on a
@@ -2092,12 +2084,11 @@ def training_loop(
                     )[2]
                     loss_disc = loss_disc + hf_floor_weight * loss_hf_floor
 
-            # Weighted by the period so each branch's average strength is
-            # ``r1_gamma``.  Joined to this backward so DDP and the scaler see
-            # one pass; kept out of the logged loss.
+            # Joined to this backward so DDP and the scaler see one pass; kept
+            # out of the logged loss.
             loss_disc_step = loss_disc
-            if r1_branches and global_step % r1_every == 0:
-                r1_branch = (global_step // r1_every) % r1_branches
+            r1_branch = r1_schedule.branch(global_step)
+            if r1_branch is not None:
                 r1_count = max(1, int(round(y.shape[0] * r1_batch_fraction)))
                 r1_value = r1_penalty(
                     model_d,
@@ -2106,7 +2097,7 @@ def training_loop(
                     dtype=amp_dtype if use_amp else None,
                 )
                 loss_disc_step = (
-                    loss_disc + 0.5 * r1_gamma * r1_period * r1_value
+                    loss_disc + r1_schedule.weight(r1_branch) * r1_value
                 )
                 if rank == 0:
                     r1_cache.append((r1_branch, r1_value.detach()))
@@ -2776,14 +2767,13 @@ def training_loop(
                     for (branch, _), value in zip(r1_cache, values):
                         per_branch.setdefault(branch, []).append(value)
                     r1_labels = getattr(model_d, "branch_labels", ())
-                    r1_total = 0.0
+                    r1_means = {}
                     for branch, branch_values in sorted(per_branch.items()):
-                        mean = sum(branch_values) / len(branch_values)
-                        r1_total += mean
+                        mean = r1_means[branch] = sum(branch_values) / len(branch_values)
                         label = r1_labels[branch] if branch < len(r1_labels) else str(branch)
                         scalar_dict_rolling[f"r1_grad_sq/{label}"] = mean
                     # What the penalty adds to D's loss per step, on average.
-                    scalar_dict_rolling["r1/penalty"] = 0.5 * r1_gamma * r1_total
+                    scalar_dict_rolling["r1/penalty"] = r1_schedule.penalty(r1_means)
                 if d_lr_balancer is not None:
                     for group in optim_d.param_groups:
                         family = group.get("family")

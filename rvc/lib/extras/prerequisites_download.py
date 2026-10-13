@@ -56,12 +56,16 @@ def vocoder_pretraineds_list(vocoder=None, sample_rate=None):
 #: The default rectified-flow pretrains (``rvc.lib.catalog.RECTIFIED_FLOW_PRETRAINS``)
 #: that are published; spin_v2's is picked up once it is here.
 rectified_pretrains_list = [
-    ("Rectified_pretrains/", ["pretrain_flow_contentvec.pth"]),
+    ("rectified_flow_pretrains/", ["pretrain_flow_contentvec.pth"]),
 ]
 
-#: OpenVPI vocoders the rectified flow's mel is made for.
-openvpi_vocoders_list = [
-    ("vocoders/", ["pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth"]),
+#: Vocoders that render the rectified flow's mel: Pupu-Vocoder taught to follow
+#: f0. The small one is ``rvc.lib.catalog.RECTIFIED_DEFAULT_VOCODER``.
+rectified_vocoders_list = [
+    ("vocoders/", [
+        "nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth",
+        "nsf_pupu_large_ft_44.1k_hop512_128bin_vocoder.pth",
+    ]),
 ]
 
 models_list = [
@@ -96,7 +100,7 @@ folder_mapping_list = {
     "fireredvad/VAD/": "rvc/models/fireredvad/VAD/",
     "formant/": "rvc/models/formant/",
     "vocoders/": "rvc/models/vocoders/",
-    "Rectified_pretrains/": "rvc/models/pretraineds/rectified/",
+    "rectified_flow_pretrains/": "rvc/models/pretraineds/rectified/",
 }
 
 
@@ -264,6 +268,6 @@ def prequisites_download_pipeline(
     if pretraineds_hifigan:
         entries += (
             pretraineds_hifigan_list + vocoder_pretraineds_list()
-            + openvpi_vocoders_list + rectified_pretrains_list
+            + rectified_vocoders_list + rectified_pretrains_list
         )
     _download(entries, "Downloading all files")

@@ -8,7 +8,9 @@ from torch.nn import functional as F
 
 from rvc.rectified.flow.conditioning import Conditioning
 
-SAMPLERS = ("euler", "heun")
+#: "mean" takes each step by the mean velocity over it, in one pass; it needs
+#: a model trained with mean flow.
+SAMPLERS = ("euler", "heun", "mean")
 #: Step spacing over the sampled time range: even; sway (F5-TTS), denser near
 #: the start; logit-normal, denser in the middle.
 SCHEDULES = ("uniform", "sway", "logit-normal")

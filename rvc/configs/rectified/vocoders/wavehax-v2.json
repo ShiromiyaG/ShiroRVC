@@ -12,9 +12,14 @@
     "ema_decay": 0.999,
     "grad_clip": 10.0,
     "compile_generator": true,
+    "generator_fp32": false,
     "gan_loss": "hinge",
     "segment_size": 16384,
     "c_mel": 45.0,
+    "c_stft": 0,
+    "loss_fft_sizes": [1024, 2048, 4096, 512],
+    "loss_hop_sizes": [120, 240, 480, 50],
+    "loss_win_lengths": [600, 1200, 2400, 240],
     "loss_n_mels": 120,
     "loss_fmin": 0.0,
     "volume_aug_prob": 0.0,
@@ -30,8 +35,9 @@
         "kernel_size": [13, 7],
         "num_blocks": 8,
         "prior_noise": 0.01,
+        "use_logmag_phase": false,
         "prior_type": "pcph_closed_form",
-        "prior_max_frequency": 16000
+        "prior_max_frequency": null
     },
     "discriminator": {
         "periods": [2, 3, 5, 7, 11],
