@@ -59,12 +59,13 @@ rectified_pretrains_list = [
     ("rectified_flow_pretrains/", ["pretrain_flow_contentvec.pth"]),
 ]
 
-#: Vocoders that render the rectified flow's mel: Pupu-Vocoder taught to follow
-#: f0. The small one is ``rvc.lib.catalog.RECTIFIED_DEFAULT_VOCODER``.
+#: Vocoders that render the rectified flow's mel: Pupu-Vocoder and BigVGAN v2
+#: taught to follow f0. The small Pupu is ``rvc.lib.catalog.RECTIFIED_DEFAULT_VOCODER``.
 rectified_vocoders_list = [
     ("vocoders/", [
         "nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth",
         "nsf_pupu_large_ft_44.1k_hop512_128bin_vocoder.pth",
+        "nsf_bigvgan_v2_44.1k_hop512_128bin_vocoder.pth",
     ]),
 ]
 

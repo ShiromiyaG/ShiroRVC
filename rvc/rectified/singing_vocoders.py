@@ -1,7 +1,8 @@
 """The vocoders the rectified pipeline trains by their own recipes: OpenVPI
 SingingVocoders' PC-NSF-HiFiGAN, NSF-HiFiGAN and NSF-UnivNet, Wavehax
-(``wavehax.py``), NSF-BigVGAN (``nsf_bigvgan.py``) and Pupu-Vocoder
-(``pupu_vocoder.py``). Trained by ``train_vocoder.py``.
+(``wavehax.py``), NSF-BigVGAN (``nsf_bigvgan.py``), Pupu-Vocoder
+(``pupu_vocoder.py``) and BigVGAN v2 (``bigvgan_v2.py``). Trained by
+``train_vocoder.py``.
 
 The NSF-UnivNet generator, the discriminators and the losses are ported from
 SingingVocoders (MIT, see THIRD_PARTY_NOTICES); the NSF-HiFiGAN generator is
@@ -22,7 +23,7 @@ from torch.nn.utils.parametrizations import spectral_norm, weight_norm
 
 from rvc.lib.paths import LOGS_DIR, ROOT
 from rvc.rectified.common import DEFAULT_CONFIG, load_run_config
-from rvc.rectified import nsf_bigvgan, pupu_vocoder, wavehax
+from rvc.rectified import bigvgan_v2, nsf_bigvgan, pupu_vocoder, wavehax
 from rvc.rectified.openvpi import ARCHITECTURE, NSFHiFiGAN, SourceModuleHnNSF
 
 LRELU_SLOPE = 0.1
@@ -56,24 +57,28 @@ V4_HINGE_WAVEHAX = {
 }
 ARCHITECTURES = (
     "pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax", "wavehax-v2", "ms-wavehax", "nsf-bigvgan",
-    "pupu-vocoder",
+    "pupu-vocoder", "bigvgan-v2",
 )
 UNIVNET = "nsf-univnet"
 BIGVGAN = "nsf-bigvgan"
 PUPU = "pupu-vocoder"
+BIGVGAN_V2 = "bigvgan-v2"
+#: The ones with an f0 source added to released mel-only weights, which the
+#: phase lock loss teaches to follow the sine.
+PHASE_LOCKED = (PUPU, BIGVGAN_V2)
 WAVEHAX = wavehax.ARCHITECTURE
 #: The runs that train a Wavehax generator, each by its own recipe.
 WAVEHAX_RUNS = (WAVEHAX, wavehax.V2, wavehax.MS)
 #: The ones trained on the raw log mel, as their own recipes do; the others
 #: take the pipeline's normalised one.
-RAW_MEL = ("pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "nsf-bigvgan", "pupu-vocoder")
+RAW_MEL = ("pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "nsf-bigvgan", "pupu-vocoder", "bigvgan-v2")
 #: ``architecture`` of an NSF-UnivNet rectified vocoder export.
 UNIVNET_ARCHITECTURE = "nsf_univnet"
 #: Training architecture -> ``architecture`` of its export.
 EXPORT_ARCHITECTURE = {
     "pc-nsf-hifigan": ARCHITECTURE, "nsf-hifigan": ARCHITECTURE, UNIVNET: UNIVNET_ARCHITECTURE,
     WAVEHAX: WAVEHAX, wavehax.V2: WAVEHAX, wavehax.MS: wavehax.MS, BIGVGAN: nsf_bigvgan.ARCHITECTURE,
-    PUPU: pupu_vocoder.ARCHITECTURE,
+    PUPU: pupu_vocoder.ARCHITECTURE, BIGVGAN_V2: bigvgan_v2.ARCHITECTURE,
 }
 RECIPE_DIR = os.path.join(ROOT, "rvc", "configs", "rectified", "vocoders")
 
@@ -332,10 +337,13 @@ class NSFUnivNet(nn.Module):
 GENERATORS = {
     ARCHITECTURE: NSFHiFiGAN, UNIVNET_ARCHITECTURE: NSFUnivNet, WAVEHAX: wavehax.WavehaxGenerator,
     wavehax.MS: wavehax.MultiScaleWavehaxGenerator, nsf_bigvgan.ARCHITECTURE: nsf_bigvgan.NSFBigVGAN,
-    pupu_vocoder.ARCHITECTURE: pupu_vocoder.PupuVocoder,
+    pupu_vocoder.ARCHITECTURE: pupu_vocoder.PupuVocoder, bigvgan_v2.ARCHITECTURE: bigvgan_v2.BigVGANv2,
 }
 #: The exports whose generator takes the raw log mel.
-RAW_MEL_EXPORTS = (ARCHITECTURE, UNIVNET_ARCHITECTURE, nsf_bigvgan.ARCHITECTURE, pupu_vocoder.ARCHITECTURE)
+RAW_MEL_EXPORTS = (
+    ARCHITECTURE, UNIVNET_ARCHITECTURE, nsf_bigvgan.ARCHITECTURE, pupu_vocoder.ARCHITECTURE,
+    bigvgan_v2.ARCHITECTURE,
+)
 
 
 def generator_hparams(architecture: str, config: dict) -> dict:
@@ -375,13 +383,15 @@ def upsample_filters(rates) -> list:
 
 def build_generator(architecture: str, hparams: dict) -> nn.Module:
     """The generator as its recipe trains it: SingingVocoders' with their
-    weight norm and init, NSF-BigVGAN and Pupu-Vocoder with their own weight norm."""
+    weight norm and init, NSF-BigVGAN, Pupu-Vocoder and BigVGAN v2 with their
+    own weight norm."""
     if architecture in WAVEHAX_RUNS:
         return GENERATORS[EXPORT_ARCHITECTURE[architecture]](**hparams)
-    if architecture == PUPU:
-        generator = pupu_vocoder.PupuVocoder(**hparams)
-        for module in pupu_vocoder.weight_normed(generator):
-            weight_norm(module)
+    if architecture in PHASE_LOCKED:
+        module = pupu_vocoder if architecture == PUPU else bigvgan_v2
+        generator = GENERATORS[EXPORT_ARCHITECTURE[architecture]](**hparams)
+        for conv in module.weight_normed(generator):
+            weight_norm(conv)
         return generator
     if architecture == BIGVGAN:
         generator = nsf_bigvgan.NSFBigVGAN(**hparams)
@@ -631,19 +641,22 @@ class Discriminators(nn.ModuleDict):
 def build_discriminators(architecture: str, settings: dict, sample_rate: int) -> Discriminators:
     """MSD + MPD for the NSF-HiFiGANs, MRD + MPD for NSF-UnivNet, Wavehax's
     own MPD + MRD for it, and for Pupu-Vocoder MSD + MPD with the multi-band
-    STFT and sub-band CQT ones, or those of them its ``families`` names.
-    NSF-BigVGAN's own is the repo's, built from its recipe by
-    ``build_discriminator``."""
+    STFT and sub-band CQT ones, for BigVGAN v2 the release's MPD and sub-band
+    CQT, or those of them its ``families`` names. NSF-BigVGAN's own is the
+    repo's, built from its recipe by ``build_discriminator``."""
     if architecture in WAVEHAX_RUNS:
         return Discriminators(wavehax.build_families(settings))
-    if architecture == PUPU:
-        families = {
-            "msd": MultiScaleDiscriminator(), "mpd": MultiPeriodDiscriminator(settings["periods"]),
-            **pupu_vocoder.build_spectral_families(settings, sample_rate),
-        }
+    if architecture in PHASE_LOCKED:
+        families = {"mpd": MultiPeriodDiscriminator(settings["periods"])}
+        if architecture == PUPU:
+            families = {"msd": MultiScaleDiscriminator(), **families}
+        spectral = ("mbd", "cqt") if architecture == PUPU else ("cqt",)
+        families.update(pupu_vocoder.build_spectral_families(settings, sample_rate, spectral))
         kept = settings.get("families") or tuple(families)
         if unknown := set(kept) - set(families):
-            raise ValueError(f"Pupu-Vocoder has the families {', '.join(families)}, not {', '.join(sorted(unknown))}.")
+            raise ValueError(
+                f"{architecture} has the families {', '.join(families)}, not {', '.join(sorted(unknown))}."
+            )
         return Discriminators({name: family for name, family in families.items() if name in kept})
     if architecture == UNIVNET:
         spectral = {"mrd": MultiResSpecDiscriminator(

@@ -699,10 +699,10 @@ RECTIFIED_TRAIN_VOCODER_OWN = [
     click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
     click.option(
         "--architecture",
-        type=click.Choice(["pcph-bigvgan", "pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax", "wavehax-v2", "ms-wavehax", "nsf-bigvgan", "pupu-vocoder"]),
+        type=click.Choice(["pcph-bigvgan", "pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax", "wavehax-v2", "ms-wavehax", "nsf-bigvgan", "pupu-vocoder", "bigvgan-v2"]),
         default="pcph-bigvgan",
         show_default=True,
-        help="Vocoder to train. OpenVPI SingingVocoders' three, Wavehax, NSF-BigVGAN and Pupu-Vocoder train by their own recipes (rvc/configs/rectified/vocoders).",
+        help="Vocoder to train. OpenVPI SingingVocoders' three, Wavehax, NSF-BigVGAN, Pupu-Vocoder and BigVGAN v2 train by their own recipes (rvc/configs/rectified/vocoders).",
     ),
     click.option(
         "--discriminator",

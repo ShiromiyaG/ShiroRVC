@@ -1,11 +1,13 @@
-"""Teach a converted Pupu-Vocoder to use f0, in two phases.
+"""Teach a converted Pupu-Vocoder or BigVGAN v2 to use f0, in two phases.
 
 The official weights take the mel alone, so a sustained note drifts off pitch
-and its phase slips. ``convert_pupu_vocoder.py`` adds the f0 source as zeros;
-this trains it.
+and its phase slips. ``convert_pupu_vocoder.py`` and ``convert_bigvgan_v2.py``
+add the f0 source as zeros; this trains it.
 
     python tools/pretrain/adapt_pupu_f0.py source --model_name my-data
     python tools/pretrain/adapt_pupu_f0.py finish --model_name my-data --epochs 1
+
+``--architecture bigvgan-v2`` in both phases does the same for BigVGAN v2.
 
 ``source`` trains the f0 source alone, the rest of the generator frozen, on
 the recipe's spectral loss with no discriminator: a step costs a sixth of an
@@ -13,7 +15,7 @@ adversarial one, and nothing the official weights know can be undone. The mel
 it reads is degraded, so the pitch has to come from f0, and a second loss
 holds the harmonics to the sine's phase, which the spectral one cannot see
 (``--lock_weight``, 0 for none). It writes an export into the experiment's
-Pupu-Vocoder folder.
+folder of that vocoder.
 
 ``finish`` is a short run of the ordinary trainer from that export and the
 official discriminator, everything trainable, at a fine-tune's learning rate
@@ -23,9 +25,10 @@ weight of the loss that holds the harmonics to the f0 sine's phase, 0 for
 none. Run it again with ``--resume`` to continue, with the same families. It saves every
 ``--save_steps`` steps as well as at each epoch's end.
 
-For the large model, name its files: ``--pretrained_g`` in ``source`` and
-``--pretrained_d`` in ``finish``. The experiment's recipe takes the layout of
-the generator it is given.
+For the large Pupu-Vocoder, name its files: ``--pretrained_g`` in ``source``
+and ``--pretrained_d`` in ``finish``. The experiment's recipe takes the layout
+of the generator it is given. BigVGAN v2's discriminator has the families mpd
+and cqt.
 
 The experiment has to be preprocessed and extracted at the recipe's rate.
 """
@@ -58,17 +61,28 @@ from rvc.rectified.common import (
 from rvc.rectified.mel import degrade_mel, denormalize_mel, normalize_mel
 from rvc.rectified.pupu_vocoder import PhaseLockLoss
 from rvc.rectified.train_vocoder import SpectralLoss, export_payload
+from rvc.train.setup import apply_precision_policy
 
 TAG = "[ADAPT]"
-ARCHITECTURE = sv.PUPU
 #: What ``source`` trains: the sine's mix and the convs that bring it to each stage.
 SOURCE = ("source_convs.", "m_source.")
 #: Tag of the exports ``source`` writes, which ``finish`` looks for.
 SOURCE_EXPORT = "f0source"
 LOG_EVERY = 50
 VOCODER_DIR = os.path.join("rvc", "models", "vocoders")
-DEFAULT_G = os.path.join(VOCODER_DIR, "pupu_small_44.1k_hop512_128bin_vocoder.pth")
-DEFAULT_D = os.path.join("rvc", "models", "pretraineds", "custom", "D_pupu_small_44.1k.pth")
+D_DIR = os.path.join("rvc", "models", "pretraineds", "custom")
+#: Per architecture: the converted generator and discriminator it starts from.
+DEFAULTS = {
+    sv.PUPU: (
+        os.path.join(VOCODER_DIR, "pupu_small_44.1k_hop512_128bin_vocoder.pth"),
+        os.path.join(D_DIR, "D_pupu_small_44.1k.pth"),
+    ),
+    sv.BIGVGAN_V2: (
+        os.path.join(VOCODER_DIR, "bigvgan_v2_44.1k_hop512_128bin_vocoder.pth"),
+        os.path.join(D_DIR, "D_bigvgan_v2_44.1k.pth"),
+    ),
+}
+FAMILIES = {sv.PUPU: ("msd", "mpd", "mbd", "cqt"), sv.BIGVGAN_V2: ("mpd", "cqt")}
 
 
 def source_norm(net_g) -> float:
@@ -76,38 +90,42 @@ def source_norm(net_g) -> float:
     return sum(conv.weight.detach().float().square().sum() for conv in net_g.source_convs).sqrt().item()
 
 
-def export(net_g, config: dict, hparams: dict, path: str) -> None:
+def export(net_g, architecture: str, config: dict, hparams: dict, path: str) -> None:
     weights = SimpleNamespace(
         cpu_state_dict=lambda: {key: value.detach().cpu() for key, value in net_g.state_dict().items()}
     )
-    torch.save({"kind": "rectified_vocoder", **export_payload(ARCHITECTURE, config, hparams, weights)}, path)
+    torch.save({"kind": "rectified_vocoder", **export_payload(architecture, config, hparams, weights)}, path)
 
 
-def adopt_layout(name: str, path: str) -> None:
+def adopt_layout(name: str, architecture: str, path: str) -> None:
     """Give the experiment's recipe the layout of the export at ``path``: the
     small and the large Pupu-Vocoder differ in their channels."""
-    layout = torch.load(path, map_location="cpu", weights_only=True, mmap=True)["config"]["vocoder"]["model"]
-    settings = sv.read_vocoder_settings(name, ARCHITECTURE)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    if checkpoint.get("architecture") != sv.EXPORT_ARCHITECTURE[architecture]:
+        raise ValueError(f"{os.path.basename(path)} is not a {architecture} export.")
+    layout = checkpoint["config"]["vocoder"]["model"]
+    settings = sv.read_vocoder_settings(name, architecture)
     wanted = {key: layout[key] for key in settings["model"] if key in layout}
     if any(settings["model"][key] != value for key, value in wanted.items()):
         settings["model"].update(wanted)
-        sv.write_vocoder_settings(name, ARCHITECTURE, settings)
+        sv.write_vocoder_settings(name, architecture, settings)
         info(f"{name}'s recipe now has the layout of {os.path.basename(path)}.", tag=TAG)
 
 
 def train_source(args) -> None:
-    name = args.model_name
-    adopt_layout(name, args.pretrained_g)
-    config = sv.load_recipe_config(name, ARCHITECTURE)
+    name, architecture = args.model_name, args.architecture
+    pretrained_g = args.pretrained_g or DEFAULTS[architecture][0]
+    adopt_layout(name, architecture, pretrained_g)
+    config = sv.load_recipe_config(name, architecture)
     data, settings = config["data"], config["vocoder"]
-    out_dir = vocoder_run_dir(name, ARCHITECTURE)
+    out_dir = vocoder_run_dir(name, architecture)
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
-    hparams = sv.generator_hparams(ARCHITECTURE, config)
-    net_g = sv.build_generator(ARCHITECTURE, hparams).to(device)
-    sv.load_pretrained_generator(net_g, sv.pretrained_states(args.pretrained_g)[0])
+    hparams = sv.generator_hparams(architecture, config)
+    net_g = sv.build_generator(architecture, hparams).to(device)
+    sv.load_pretrained_generator(net_g, sv.pretrained_states(pretrained_g)[0])
     trained = []
     for key, parameter in net_g.named_parameters():
         parameter.requires_grad_(key.startswith(SOURCE))
@@ -115,7 +133,8 @@ def train_source(args) -> None:
             trained.append(parameter)
     optimizer = torch.optim.AdamW(trained, args.learning_rate, betas=tuple(settings["betas"]), weight_decay=0.0)
     amp_dtype, scaler = amp_setup(args.precision, device, TAG)
-    spectral_loss = SpectralLoss(ARCHITECTURE, config, device)
+    apply_precision_policy(net_g, amp_dtype)
+    spectral_loss = SpectralLoss(architecture, config, device)
     phase_lock = None
     if args.lock_weight > 0:
         phase_lock = PhaseLockLoss(
@@ -131,7 +150,7 @@ def train_source(args) -> None:
     )
     reference = dataset.reference()
     info(
-        f"{name}: f0 source of {os.path.basename(args.pretrained_g)}, {sum(p.numel() for p in trained)} of "
+        f"{name}: f0 source of {os.path.basename(pretrained_g)}, {sum(p.numel() for p in trained)} of "
         f"{sum(p.numel() for p in net_g.parameters())} weights, {args.steps} steps of batch {args.batch_size}, "
         f"lr {args.learning_rate:g}, {spectral_loss.label}"
         + (f", phase lock x{args.lock_weight:g} on {args.lock_harmonics} harmonics" if phase_lock is not None else "")
@@ -153,7 +172,7 @@ def train_source(args) -> None:
 
     def save(step: int) -> str:
         path = os.path.join(out_dir, f"{name}_vocoder_{SOURCE_EXPORT}_{step}s.pth")
-        export(net_g, config, hparams, path)
+        export(net_g, architecture, config, hparams, path)
         return path
 
     step, total, started = 0, 0.0, time.perf_counter()
@@ -218,24 +237,28 @@ def newest_source_export(out_dir: str) -> str:
 
 
 def finish(args) -> int:
-    name = args.model_name
-    out_dir = vocoder_run_dir(name, ARCHITECTURE)
+    name, architecture = args.model_name, args.architecture
+    if unknown := set(args.families) - set(FAMILIES[architecture]):
+        raise ValueError(f"{architecture} has the families {', '.join(FAMILIES[architecture])}, "
+                         f"not {', '.join(sorted(unknown))}.")
+    out_dir = vocoder_run_dir(name, architecture)
     os.makedirs(out_dir, exist_ok=True)
     pretrained_g = args.pretrained_g or newest_source_export(out_dir)
-    adopt_layout(name, pretrained_g)
+    pretrained_d = args.pretrained_d or DEFAULTS[architecture][1]
+    adopt_layout(name, architecture, pretrained_g)
     # A fine-tune's start: a cold optimizer at the recipe's learning rate
     # throws the trained weights off before its statistics settle.
-    settings = sv.read_vocoder_settings(name, ARCHITECTURE)
+    settings = sv.read_vocoder_settings(name, architecture)
     settings.update(learning_rate=args.learning_rate, warmup_steps=args.warmup_steps)
     settings["discriminator"]["families"] = args.families
     settings["c_phase_lock"] = args.lock_weight
     settings["phase_lock_harmonics"] = args.lock_harmonics
     settings["phase_lock_fmax"] = args.lock_fmax
     settings["phase_lock_low"] = args.lock_low
-    sv.write_vocoder_settings(name, ARCHITECTURE, settings)
+    sv.write_vocoder_settings(name, architecture, settings)
     spec = {
         "model_name": name,
-        "architecture": ARCHITECTURE,
+        "architecture": architecture,
         "discriminator": "original",
         "total_epochs": args.epochs,
         "save_every": 1,
@@ -243,7 +266,7 @@ def finish(args) -> int:
         "batch_size": args.batch_size,
         "gpu": args.gpu,
         "pretrained_g": pretrained_g,
-        "pretrained_d": args.pretrained_d,
+        "pretrained_d": pretrained_d,
         "checkpoints": "latest",
         "fresh": not args.resume,
         "precision": args.precision,
@@ -254,7 +277,7 @@ def finish(args) -> int:
         json.dump(spec, handle, indent=4)
     info(
         f"{name}: adversarial finish from {os.path.basename(pretrained_g)} and "
-        f"{os.path.basename(args.pretrained_d)} ({' + '.join(args.families)}), {args.epochs} epoch(s), "
+        f"{os.path.basename(pretrained_d)} ({' + '.join(args.families)}), {args.epochs} epoch(s), "
         f"lr {args.learning_rate:g} behind {args.warmup_steps} warmup steps"
         + (f", phase lock x{args.lock_weight:g}" if args.lock_weight > 0 else "")
         + (", resuming." if args.resume else "."),
@@ -265,12 +288,16 @@ def finish(args) -> int:
 
 def main() -> int:
     install_rich_print()
-    parser = argparse.ArgumentParser(description="Teach a converted Pupu-Vocoder to use f0.")
+    parser = argparse.ArgumentParser(description="Teach a converted Pupu-Vocoder or BigVGAN v2 to use f0.")
     phases = parser.add_subparsers(dest="phase", required=True)
 
     source = phases.add_parser("source", help="Train the f0 source alone, without a discriminator.")
     source.add_argument("--model_name", required=True, help="Experiment with the dataset, preprocessed and extracted.")
-    source.add_argument("--pretrained_g", default=DEFAULT_G, help="Converted Pupu-Vocoder export to start from.")
+    source.add_argument("--architecture", choices=sv.PHASE_LOCKED, default=sv.PUPU)
+    source.add_argument(
+        "--pretrained_g", default="",
+        help=f"Converted export to start from; default: the architecture's in {VOCODER_DIR}.",
+    )
     source.add_argument("--steps", type=int, default=20000)
     source.add_argument("--batch_size", type=int, default=8)
     source.add_argument("--learning_rate", type=float, default=5e-4)
@@ -286,11 +313,15 @@ def main() -> int:
 
     end = phases.add_parser("finish", help="A short adversarial run from the source phase's export.")
     end.add_argument("--model_name", required=True)
+    end.add_argument("--architecture", choices=sv.PHASE_LOCKED, default=sv.PUPU)
     end.add_argument("--pretrained_g", default="", help="Default: the newest export of the source phase.")
-    end.add_argument("--pretrained_d", default=DEFAULT_D, help="The official discriminator, converted.")
+    end.add_argument(
+        "--pretrained_d", default="",
+        help=f"The official discriminator, converted; default: the architecture's in {D_DIR}.",
+    )
     end.add_argument(
         "--families", nargs="+", default=["mpd"], choices=("msd", "mpd", "mbd", "cqt"),
-        help="Discriminator families to train against.",
+        help="Discriminator families to train against; BigVGAN v2 has mpd and cqt.",
     )
     end.add_argument("--lock_weight", type=float, default=5.0, help="Weight of the phase lock loss; 0 for none.")
     end.add_argument("--lock_harmonics", type=int, default=4, help="Harmonics the phase lock loss holds.")

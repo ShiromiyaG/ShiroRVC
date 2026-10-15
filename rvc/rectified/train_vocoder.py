@@ -888,8 +888,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
     # held-out evaluation stay on the real mel.
     degradation = min(1.0, max(0.0, float(spec.get("mel_degradation", 0.0))))
     c_pc_wav = float(settings.get("c_pc_wav", 30.0))
-    # ``c_phase_lock``: Pupu-Vocoder's harmonics held to the f0 sine's phase.
-    c_lock = float(settings.get("c_phase_lock", 0.0)) if architecture == sv.PUPU else 0.0
+    # ``c_phase_lock``: the harmonics of Pupu-Vocoder or BigVGAN v2 held to the f0 sine's phase.
+    c_lock = float(settings.get("c_phase_lock", 0.0)) if architecture in sv.PHASE_LOCKED else 0.0
     phase_lock = None
     if c_lock > 0:
         phase_lock = pupu_vocoder.PhaseLockLoss(

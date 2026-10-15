@@ -1,0 +1,37 @@
+{
+    "architecture": "bigvgan-v2",
+    "learning_rate": 0.0001,
+    "betas": [0.8, 0.99],
+    "eps": 1e-08,
+    "lr_scheduler": "exp decay epoch",
+    "lr_decay": 0.9999996,
+    "warmup_steps": 0,
+    "adv_warmup_steps": 0,
+    "ema_decay": 0.999,
+    "segment_size": 16384,
+    "c_mel": 15.0,
+    "multi_scale_mel": true,
+    "grad_clip": 500.0,
+    "branchwise_discriminator": true,
+    "volume_aug_prob": 0.0,
+    "seed": 1234,
+    "rolling_loss_steps": 50,
+    "preview_interval": 500,
+    "holdout_clips": 0,
+    "eval_interval": 0,
+    "model": {
+        "upsample_rates": [8, 4, 2, 2, 2, 2],
+        "upsample_kernel_sizes": [16, 8, 4, 4, 4, 4],
+        "upsample_initial_channel": 1536,
+        "resblock_kernel_sizes": [3, 7, 11],
+        "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        "harmonic_num": 0
+    },
+    "discriminator": {
+        "periods": [2, 3, 5, 7, 11],
+        "cqt_hop_lengths": [512, 256, 256],
+        "cqt_n_octaves": [9, 9, 9],
+        "cqt_bins_per_octave": [24, 36, 48],
+        "cqt_filters": 128
+    }
+}

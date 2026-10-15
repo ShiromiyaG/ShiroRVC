@@ -471,16 +471,18 @@ class DiscriminatorCQT(nn.Module):
         return self.conv_post(z), fmap
 
 
-def build_spectral_families(settings: dict, sample_rate: int) -> dict:
-    """The original's multi-band STFT and sub-band CQT discriminators."""
-    return {
-        "mbd": Heads(
+def build_spectral_families(settings: dict, sample_rate: int, names=("mbd", "cqt")) -> dict:
+    """The original's multi-band STFT (``mbd``) and sub-band CQT (``cqt``)
+    discriminators, those of ``names``."""
+    builders = {
+        "mbd": lambda: Heads(
             DiscriminatorB(window, int(settings.get("mbd_channels", 32))) for window in settings["mbd_fft_sizes"]
         ),
-        "cqt": Heads(
+        "cqt": lambda: Heads(
             DiscriminatorCQT(sample_rate, hop, octaves, bins, int(settings.get("cqt_filters", 32)))
             for hop, octaves, bins in zip(
                 settings["cqt_hop_lengths"], settings["cqt_n_octaves"], settings["cqt_bins_per_octave"]
             )
         ),
     }
+    return {name: builders[name]() for name in names}
