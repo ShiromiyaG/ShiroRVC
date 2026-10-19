@@ -36,7 +36,7 @@ from rvc.rectified.common import (
     list_pretrained,
 )
 from rvc.rectified.flow import RESCALE_MODES, SAMPLERS, SCHEDULES
-from tabs.inference.inference import F0_METHODS, EXPORT_FORMATS, save_to_wav, save_to_wav2
+from tabs.inference.inference import EMBEDDER_MODELS, F0_METHODS, EXPORT_FORMATS, save_to_wav, save_to_wav2
 from tabs.rectified.vocoder_config import vocoder_config_tab
 from tabs.train.descs import (
     AUDIO_FILE_SLICING_INFO,
@@ -61,7 +61,7 @@ def flow_info(flow_path, submodel=None):
     try:
         return describe_flow(flow_path, submodel)
     except Exception:
-        return {"submodels": [], "submodel": "", "speakers": [0], "vocoder": ""}
+        return {"submodels": [], "submodel": "", "speakers": [0], "vocoder": "", "embedder": ""}
 
 
 def save_uploaded_pretrained(path):
@@ -84,7 +84,10 @@ def index_for(flow_path):
     """The RVC index of the experiment a flow export was trained in, or ""."""
     if not flow_path:
         return ""
-    folder = os.path.dirname(os.path.dirname(os.path.abspath(flow_path)))
+    folder = os.path.dirname(os.path.abspath(flow_path))
+    # An export in the experiment's flow folder; one at its root is beside the index already.
+    if os.path.basename(folder) == "flow":
+        folder = os.path.dirname(folder)
     return catalog.guess_index_for(os.path.join(folder, os.path.basename(flow_path)))
 
 
@@ -388,6 +391,14 @@ def rectified_inference_tab():
                     value=0,
                     interactive=True,
                 )
+                embedder_model = gr.Radio(
+                    label=_("Embedder Model"),
+                    info=_("Model used for the content features. Set to the one the flow was trained with when it records it."),
+                    choices=EMBEDDER_MODELS,
+                    value=initial["embedder"] or "contentvec",
+                    interactive=True,
+                )
+            with gr.Row():
                 protect = gr.Slider(
                     minimum=0,
                     maximum=0.5,
@@ -492,6 +503,7 @@ def rectified_inference_tab():
         noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
         f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
         tension_strength, restore_level, breathiness_strength, normalize_loudness, min_loudness, peak_limiter,
+        embedder_model,
     ):
         if not flow_model or not vocoder_model:
             return _("Pick a flow model and a vocoder model."), None
@@ -551,6 +563,7 @@ def rectified_inference_tab():
             churn=churn,
             tension_strength=tension_strength,
             breathiness_strength=breathiness_strength,
+            embedder_model=embedder_model,
         )
 
     def refresh():
@@ -562,11 +575,12 @@ def rectified_inference_tab():
         )
 
     def voice_updates(described):
-        """Speakers of the flow and the vocoder it was trained with, when a
-        file of that name is here."""
+        """Speakers of the flow, the vocoder it was trained with when a file
+        of that name is here, and its embedder when it records one."""
         speakers = described["speakers"]
         vocoder = gr.update(value=described["vocoder"]) if described["vocoder"] else gr.update()
-        return gr.update(choices=speakers, value=speakers[0]), vocoder
+        embedder = gr.update(value=described["embedder"]) if described["embedder"] in EMBEDDER_MODELS else gr.update()
+        return gr.update(choices=speakers, value=speakers[0]), vocoder, embedder
 
     def on_flow_change(path):
         """The bundle's flows, the speakers and vocoder of the flow, and its
@@ -582,13 +596,13 @@ def rectified_inference_tab():
     refresh_button.click(fn=refresh, inputs=[], outputs=[flow_model, vocoder_model, index_file, audio])
     unload_button.click(fn=unload_rectified_models, inputs=[], outputs=[])
     flow_model.change(
-        fn=on_flow_change, inputs=[flow_model], outputs=[sid, vocoder_model, index_file, flow_submodel],
+        fn=on_flow_change, inputs=[flow_model], outputs=[sid, vocoder_model, embedder_model, index_file, flow_submodel],
         show_progress="hidden",
     )
     flow_submodel.change(
         fn=lambda path, submodel: voice_updates(flow_info(path, submodel)),
         inputs=[flow_model, flow_submodel],
-        outputs=[sid, vocoder_model],
+        outputs=[sid, vocoder_model, embedder_model],
         show_progress="hidden",
     )
     autotune.change(
@@ -609,6 +623,7 @@ def rectified_inference_tab():
             noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
             f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
             tension_strength, restore_level, breathiness_strength, normalize_loudness, min_loudness, peak_limiter,
+            embedder_model,
         ],
         outputs=[output_info, output_audio],
     )

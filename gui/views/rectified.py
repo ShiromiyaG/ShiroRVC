@@ -68,7 +68,10 @@ def _index_for(flow_path: str) -> str:
     """The RVC index of the experiment a flow export was trained in, or ""."""
     if not flow_path:
         return ""
-    folder = os.path.dirname(os.path.dirname(os.path.abspath(flow_path)))
+    folder = os.path.dirname(os.path.abspath(flow_path))
+    # An export in the experiment's flow folder; one at its root is beside the index already.
+    if os.path.basename(folder) == "flow":
+        folder = os.path.dirname(folder)
     return catalog.guess_index_for(os.path.join(folder, os.path.basename(flow_path)))
 
 

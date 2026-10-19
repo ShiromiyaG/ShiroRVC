@@ -623,6 +623,7 @@ def run_rectified_infer_script(
     peak_limiter: bool = False,
     tension_strength: float = 1.0,
     breathiness_strength: float = 1.0,
+    embedder_model: str = "",
 ):
     if not vocoder_path:
         from rvc.lib.catalog import relative
@@ -680,6 +681,7 @@ def run_rectified_infer_script(
         normalize_loudness=bool(normalize_loudness),
         min_loudness=float(min_loudness),
         peak_limiter=bool(peak_limiter),
+        embedder_model=embedder_model or "",
     )
     if written is None:
         return "Conversion failed; see the terminal for the error.", None

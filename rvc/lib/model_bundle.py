@@ -20,6 +20,7 @@ import pickle
 import re
 import shutil
 import struct
+import zipfile
 from functools import lru_cache
 from os import PathLike
 from pathlib import Path
@@ -401,6 +402,28 @@ def _checkpoint_kind(path: str, _mtime_ns: int, _size: int) -> str | None:
         return state["kind"]
     if "weight" in state and "config" in state:
         return RVC_KIND
+    return None
+
+
+def stored_kind(path: str | PathLike[str]) -> str | None:
+    """``RECTIFIED_KIND`` or ``VOCODER_KIND`` when a ``.pth`` is one of those
+    exports, else None (an RVC model, a legacy file, anything unreadable).
+    Read from the pickle inside the file's zip without unpickling it, a few
+    kilobytes, so a listing can tell a folder's files apart without torch."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            name = next((item for item in archive.namelist() if item.endswith("data.pkl")), None)
+            if name is None:
+                return None
+            data = archive.read(name)
+    except (OSError, zipfile.BadZipFile):
+        return None
+    for kind in (RECTIFIED_KIND, VOCODER_KIND):
+        encoded = kind.encode()
+        # The string as torch.save's pickle writes it, and as protocol 4 would.
+        if (b"X" + struct.pack("<I", len(encoded)) + encoded in data
+                or b"\x8c" + bytes([len(encoded)]) + encoded in data):
+            return kind
     return None
 
 

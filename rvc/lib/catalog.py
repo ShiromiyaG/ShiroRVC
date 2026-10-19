@@ -11,7 +11,15 @@ import os
 import re
 from pathlib import Path
 
-from rvc.lib.model_bundle import RVC_KIND, bundle_kinds, is_model_bundle, is_model_file, walk_models
+from rvc.lib.model_bundle import (
+    RECTIFIED_KIND,
+    RVC_KIND,
+    bundle_kinds,
+    is_model_bundle,
+    is_model_file,
+    stored_kind,
+    walk_models,
+)
 from rvc.lib.paths import (
     AUDIO_DIR,
     CUSTOM_PRETRAINED_DIR,
@@ -102,6 +110,20 @@ def list_bundles(logs_dir: Path = LOGS_DIR, kind: str | None = None) -> list[str
         for name in filenames:
             path = os.path.join(dirpath, name)
             if is_model_bundle(name) and (kind is None or kind in bundle_kinds(path)):
+                found.append(relative(path))
+    return sorted(found, key=sort_key)
+
+
+def list_root_flows(logs_dir: Path = LOGS_DIR) -> list[str]:
+    """Rectified-flow models kept where RVC models are, at an experiment's
+    root rather than in its ``flow`` folder, told from the RVC models beside
+    them by what the file says it is: a flow trained elsewhere need not be
+    named like this fork's exports."""
+    found = []
+    for dirpath, _dirnames, filenames in walk_models(logs_dir):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if name.endswith(".pth") and not name.startswith(("G_", "D_", "F_")) and stored_kind(path) == RECTIFIED_KIND:
                 found.append(relative(path))
     return sorted(found, key=sort_key)
 

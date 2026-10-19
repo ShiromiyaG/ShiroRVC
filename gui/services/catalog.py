@@ -226,7 +226,7 @@ def list_rectified_exports(kind: str) -> list[str]:
         found += paths.RECTIFIED_VOCODER_DIR.glob("*.pth")
     listed = sorted((shared.relative(path) for path in found), key=shared.sort_key)
     if kind == "flow":
-        listed += shared.list_bundles(paths.LOGS_DIR, "rectified_flow")
+        listed += shared.list_root_flows(paths.LOGS_DIR) + shared.list_bundles(paths.LOGS_DIR, "rectified_flow")
     return listed
 
 

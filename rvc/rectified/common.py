@@ -640,10 +640,11 @@ def _vocoder_files(pattern: str) -> list:
 
 def list_exports(kind: str) -> list:
     """Models to render with: exported ``kind`` models (``flow`` or
-    ``vocoder``) under ``logs/*/flow`` or ``logs/*/vocoder*``; for flows, also the bundles holding
-    one; for vocoders, also ``VOCODER_DIR``'s exports. The flow pretrains are
-    starting points and are left out."""
-    from rvc.lib.catalog import list_bundles, relative, sort_key
+    ``vocoder``) under ``logs/*/flow`` or ``logs/*/vocoder*``; for flows, also
+    those kept where RVC models are, at an experiment's root, and the bundles
+    holding one; for vocoders, also ``VOCODER_DIR``'s exports. The flow
+    pretrains are starting points and are left out."""
+    from rvc.lib.catalog import list_bundles, list_root_flows, relative, sort_key
     from rvc.lib.model_bundle import RECTIFIED_KIND
 
     folder = "vocoder*" if kind == "vocoder" else kind
@@ -652,7 +653,7 @@ def list_exports(kind: str) -> list:
         paths += _vocoder_files("*.pth")
     found = sorted((relative(path) for path in paths), key=sort_key)
     if kind == "flow":
-        found += list_bundles(LOGS_DIR, RECTIFIED_KIND)
+        found += list_root_flows(LOGS_DIR) + list_bundles(LOGS_DIR, RECTIFIED_KIND)
     return found
 
 
@@ -672,25 +673,29 @@ def resolve_vocoder(reference: str) -> str:
 
 def describe_flow(path: str, submodel: str | None = None) -> dict:
     """``submodels`` (the flows in a bundle, else []), ``submodel`` (the one
-    described), its ``speakers`` and its resolved ``vocoder``."""
+    described), its ``speakers``, its resolved ``vocoder`` and its
+    ``embedder`` ("" when the file does not record one)."""
     from rvc.lib.model_bundle import RECTIFIED_KIND, bundle_model_info, bundle_model_names, is_model_bundle
 
     if not path or not os.path.isfile(path):
-        return {"submodels": [], "submodel": "", "speakers": [0], "vocoder": ""}
+        return {"submodels": [], "submodel": "", "speakers": [0], "vocoder": "", "embedder": ""}
     if is_model_bundle(path):
         names = bundle_model_names(path, RECTIFIED_KIND)
         name = submodel if submodel in names else (names[0] if names else "")
         info = bundle_model_info(path, name) if name else {}
         count, reference = info.get("speakers_id"), info.get("vocoder") or ""
+        embedder = info.get("embedder_model") or ""
     else:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         names, name = [], ""
         count, reference = checkpoint.get("speaker_count"), checkpoint.get("vocoder") or ""
+        embedder = checkpoint.get("embedder_model") or ""
     return {
         "submodels": names,
         "submodel": name,
         "speakers": list(range(int(count or 1))),
         "vocoder": resolve_vocoder(reference),
+        "embedder": embedder,
     }
 
 

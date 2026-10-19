@@ -450,8 +450,12 @@ class RectifiedConverter:
         normalize_loudness: bool = False,
         min_loudness: float = -18.0,
         peak_limiter: bool = False,
+        embedder_model: str = "",
     ):
         """Convert one file; returns the path written, or None on failure.
+
+        ``embedder_model`` overrides the content embedder the flow records
+        (contentvec when it records none).
 
         ``flow_submodel`` picks the flow when ``flow_path`` is a bundle; a
         bundled index, when the flow has one, is used in place of
@@ -485,7 +489,7 @@ class RectifiedConverter:
             self._load_flow(flow_path, flow_submodel)
             flow_data = self.flow_meta["config"]["data"]
             self._load_vocoder(vocoder_path, flow_data)
-            self._load_embedder(self.flow_meta.get("embedder_model", "contentvec"))
+            self._load_embedder(embedder_model or self.flow_meta.get("embedder_model", "contentvec"))
             mismatch = mel_mismatch(flow_data, self.vocoder_config["data"])
             if mismatch:
                 raise ValueError(f"The flow and vocoder models disagree on {mismatch}.")
