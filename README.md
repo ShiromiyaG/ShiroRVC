@@ -6,8 +6,8 @@
 
 ShiroRVC is a voice conversion fork of [Applio](https://github.com/IAHispano/Applio)
 built around a **rectified-flow** voice model: it keeps the melody, timing and
-emotion of the original performance and renders the target voice as a 44.1 kHz
-mel spectrogram, which a separate neural vocoder turns into sound. The classic
+emotion of the original performance and renders the target voice as a mel
+spectrogram, which a separate neural vocoder turns into sound. The classic
 RVC pipeline is still here, side by side.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -33,8 +33,14 @@ pipeline splits them:
 - **A vocoder** turns that mel into audio. It has no speaker input, so one good
   vocoder renders every voice model. You do not retrain it per voice.
 
-The mel is Pupu-Vocoder's: 44.1 kHz, hop 512, 128 bins from 0 Hz to 22.05 kHz.
-The prerequisites download fetches the Pupu-Vocoder weights, small and large.
+The vocoder is ChouwaGAN: a frame-rate network that predicts the gains of a
+phase-aligned pulse train and of noise, synthesised by overlap-add, so nothing
+runs at the audio rate. An experiment picks its sample rate when its dataset is
+preprocessed: 32, 40, 44.1 or 48 kHz, each with its own mel (128 bins from 0 Hz
+to Nyquist) and its own vocoder recipe. 44.1 kHz has a hop of 512; the others
+have a 10 ms hop, the content's own frame rate, and repeat each content frame
+(`content_interpolation` nearest). A flow and its vocoder have to be at the
+same rate.
 
 ## Getting started
 
@@ -130,11 +136,11 @@ Put clean audio in a folder under `assets/datasets/`.
 Then run the steps in order. In the apps they are numbered; on the command line:
 
 ```bash
-python core.py rectified_preprocess --model_name my-voice --dataset_path assets/datasets/my-voice
+python core.py rectified_preprocess --model_name my-voice --dataset_path assets/datasets/my-voice --sample_rate 44100
 python core.py rectified_extract    --model_name my-voice --gpu 0
 python core.py rectified_train_flow --model_name my-voice --gpu 0 \
     --pretrained_flow rvc/models/pretraineds/rectified/pretrain_flow_contentvec.pth \
-    --vocoder rvc/models/vocoders/nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth
+    --vocoder rvc/models/vocoders/<vocoder>.pth
 python core.py index                --model_name my-voice   # optional
 ```
 
@@ -159,8 +165,13 @@ python core.py index                --model_name my-voice   # optional
   zero step, so the other samplers work as before and a pretrain without the
   option can be fine-tuned with it. A mean-flow pretrain from scratch uses a
   time scale of 1 instead of 1000, and a resumed run keeps what it started with.
+- **The sample rate** is set by `rectified_preprocess` (`--sample_rate`, 44100
+  by default) and written to `logs/<name>/rectified_config.json`; extraction and
+  both trainers read it from there. A pretrain only fits its own rate.
 - **The vocoder** you pick renders the audio previews in TensorBoard and is
-  stored in every export, so the inference screens select it for you.
+  stored in every export, so the inference screens select it for you. Left
+  empty, the default in `rvc/models/vocoders/` (else the newest) that renders
+  the experiment's mel is used.
 - **Several GPUs.** Pass them as `0-1` (or `0-1-2-3`), as in the RVC trainer.
   Each GPU runs its own process under DDP, and **the batch size is per GPU**. A
   single GPU runs the plain trainer, with no distributed overhead.
@@ -184,8 +195,10 @@ multi-speaker dataset in the **Vocoder Pretrain** tab, or:
 python core.py rectified_train_vocoder --model_name big-dataset --gpu 0-1 --batch_size 16
 ```
 
-It trains PCPH-BigVGAN against the same 44.1 kHz mel and writes
-`logs/<name>/vocoder_<architecture>/<name>_vocoder_<epoch>e_<step>s.pth`, one folder per vocoder.
+It trains ChouwaGAN on the experiment's mel by the recipe for its rate
+(`rvc/configs/rectified/chouwagan/<rate>.json`, copied to
+`logs/<name>/rectified_vocoder_chouwagan.json`) and writes
+`logs/<name>/vocoder_chouwagan/<name>_vocoder_<epoch>e_<step>s.pth`.
 
 ### Watching it learn
 
@@ -339,11 +352,11 @@ catalog falls back to English silently rather than raising.
   modulation of every block, speaker and content guidance with rescale, and
   freezing the conditioning on a one-speaker fine-tune so speaker guidance
   survives it.
-- **[Aliasing-Free Neural Audio Synthesis](https://github.com/sizigi/AliasingFreeNeuralAudioSynthesis)**
-  — Pupu-Vocoder: the 44.1 kHz mel the rectified pipeline uses, the generator
-  and discriminators ported to render and train it, and the released weights.
 - **[OpenVPI SingingVocoders](https://github.com/openvpi/SingingVocoders)** — the
-  NSF-HiFiGAN generator and training recipes ported from it.
+  mel framing and the GAN losses, multi-resolution STFT loss and volume
+  augmentation the vocoder trains with.
+- **[Wavehax](https://github.com/chomeyama/wavehax)** — the period and
+  spectrogram discriminators ChouwaGAN trains against.
 - **[BigVGAN](https://github.com/NVIDIA/BigVGAN)** (NVIDIA) — SnakeBeta and the
   anti-aliased AMP blocks behind the PCPH-BigVGAN vocoder.
 - **[Muon](https://kellerjordan.github.io/posts/muon/)** (Keller Jordan) — the
@@ -361,6 +374,3 @@ catalog falls back to English silently rather than raising.
 The code is released under the [MIT License](LICENSE). Code ported from other
 projects keeps their licenses, listed in
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
-
-The Pupu-Vocoder weights this project downloads are their authors', published
-under the MIT License.

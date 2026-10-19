@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
+from rvc.lib.algorithm.loudness import integrated_loudness, limit_peaks, loudness_gain
 from rvc.lib.extras.split_audio import merge_audio, process_audio
 from rvc.lib.model_bundle import (
     RECTIFIED_KIND,
@@ -179,8 +180,8 @@ class RectifiedConverter:
         self.flow_index = index
 
     def _load_vocoder(self, path, data):
-        """The vocoder at ``path`` for the flow's mel ``data``; an OpenVPI one
-        is rebuilt when the flow's normalisation changes."""
+        """The vocoder at ``path`` for the flow's mel ``data``, rebuilt when
+        the flow's normalisation changes: it denormalises the contrast rows."""
         key = (path, data["mel_mean"], data["mel_std"])
         if key == self.vocoder_path:
             return
@@ -337,7 +338,7 @@ class RectifiedConverter:
     def _sample_mel(self, inputs: Conditioning, options: SamplingOptions):
         """Normalised mel [1, n_mels, T], in overlapping passes crossfaded."""
         frames = inputs.content.shape[1]
-        noise = torch.randn(1, self.flow.n_mels, frames, device=self.device)
+        noise = torch.randn(1, self.flow.channels, frames, device=self.device)
         churn_seed = int(torch.randint(2**31 - 1, ()))
         mel = torch.zeros_like(noise)
         weight = torch.zeros(1, 1, frames, device=self.device)
@@ -381,7 +382,7 @@ class RectifiedConverter:
 
     @torch.no_grad()
     def _render(self, mel, f0):
-        """Waveform from [1, n_mels, T], in passes crossfaded at the joins.
+        """Waveform from the flow's [1, channels, T], in passes crossfaded at the joins.
         The passes halve when one does not fit in memory."""
         hop = self.vocoder_config["data"]["hop_length"]
         frames = mel.shape[-1]
@@ -446,6 +447,9 @@ class RectifiedConverter:
         flow_submodel: str = "",
         match_level: bool = True,
         restore_level: bool = False,
+        normalize_loudness: bool = False,
+        min_loudness: float = -18.0,
+        peak_limiter: bool = False,
     ):
         """Convert one file; returns the path written, or None on failure.
 
@@ -468,7 +472,14 @@ class RectifiedConverter:
         ``match_level`` peak-normalises the input as the training data was,
         since the energy input is absolute; off, the input is only attenuated
         when it would clip. ``restore_level`` puts the output back at the
-        input's level instead of the model's."""
+        input's level instead of the model's.
+
+        ``normalize_loudness`` brings the output to the input's integrated
+        loudness, or to ``min_loudness`` LUFS when the input is quieter than
+        that, in place of either level. The model renders the input's
+        dynamics, so its output can sit well under an RVC model's.
+        ``peak_limiter`` then limits the peaks under -1 dBFS; off, the output
+        is only scaled down when it would clip."""
         try:
             started = time.time()
             self._load_flow(flow_path, flow_submodel)
@@ -500,6 +511,8 @@ class RectifiedConverter:
                     ("Index", index.describe(index_source)),
                     ("Match level", ("on" if match_level else "off")
                      + (", output at the input's level" if restore_level else ", output at the model's level")),
+                    ("Loudness", f"the input's, at least {min_loudness:g} LUFS" if normalize_loudness else "off"),
+                    ("Peak limiter", "-1 dBFS" if peak_limiter else "off"),
                     ("Split audio", "on" if split_audio else "off"),
                     ("Silence gate", f"{silence_gate_db:g} dBFS"),
                     ("Seed", seed),
@@ -510,6 +523,7 @@ class RectifiedConverter:
             sample_rate = self.vocoder_config["data"]["sample_rate"]
             # Decoded once, at the mel's rate; content and pitch read a copy of it.
             full = load_audio_infer(audio_input_path, sample_rate)
+            input_loudness = integrated_loudness(full, sample_rate)
             audio = librosa.resample(full, orig_sr=sample_rate, target_sr=INPUT_RATE, res_type="soxr_vhq")
             peak = float(np.abs(audio).max())
             gain = 0.95 / peak if peak > 0 else 1.0
@@ -548,8 +562,13 @@ class RectifiedConverter:
             else:
                 output = convert_segment(audio, full)
 
-            # At the model's level a loud passage can pass full scale.
-            output = output / max(1.0, float(np.abs(output).max()))
+            if normalize_loudness:
+                output = output * loudness_gain(output, sample_rate, max(input_loudness, float(min_loudness)))
+            # A loud passage can pass full scale at the model's level, and more so once boosted.
+            if peak_limiter:
+                output = limit_peaks(output.astype(np.float32), sample_rate)
+            else:
+                output = output / max(1.0, float(np.abs(output).max()))
             os.makedirs(os.path.dirname(os.path.abspath(audio_output_path)), exist_ok=True)
             sf.write(audio_output_path, output, sample_rate, format="WAV")
             if export_format != "WAV":

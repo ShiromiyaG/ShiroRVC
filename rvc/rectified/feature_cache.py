@@ -1,5 +1,5 @@
 """The flow's training features computed once and kept on disk: every clip's
-mel and curves, and its shifted and stretched copies, so a step only reads
+mel (with its band contrast, for a flow that has it) and curves, and its shifted and stretched copies, so a step only reads
 them. With the lengths known ahead, batches can be made of whole clips of
 similar length.
 """
@@ -68,6 +68,9 @@ def cache_folder(name: str, config: dict, entries, seed: int) -> str:
         "version": CACHE_VERSION,
         "data": config["data"],
         "tension": bool(settings["model"].get("tension", False)),
+        # Only when set, so caches from before it keep their folder.
+        **({"contrast": settings["model"]["contrast_band_edges"]}
+           if settings["model"].get("contrast_band_edges") else {}),
         "augmentation": [settings.get(key) for key in (
             "key_shift_range", "key_shift_scale", "time_stretch_range", "time_stretch_scale")],
         "seed": seed,

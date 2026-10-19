@@ -6,10 +6,10 @@ import gradio as gr
 
 from core import (
     list_experiment_speakers,
-    run_extract_script,
     run_index_script,
-    run_preprocess_script,
+    run_rectified_extract_script,
     run_rectified_flow_train_script,
+    run_rectified_preprocess_script,
     run_rectified_infer_script,
     run_rectified_vocoder_train_script,
     stop_rectified_train_script,
@@ -21,13 +21,14 @@ from rvc.configs.config import (
     get_training_precision,
     max_vram_gpu,
 )
-from rvc.configs.vocoders import RECTIFIED_EXTRACTION
 from rvc.lib import catalog
 from rvc.lib.i18n import _
 from rvc.lib.model_bundle import is_model_bundle
 from rvc.lib.terminal import DEFAULT_CPU_THREADS
 from rvc.rectified.common import (
+    DEFAULT_SAMPLE_RATE,
     PRETRAINED_DIR,
+    SAMPLE_RATES,
     VOCODER_DIR,
     default_pretrained,
     describe_flow,
@@ -49,22 +50,6 @@ from tabs.train.descs import (
     TORCH_COMPILE_MODE_INFO,
     TORCH_COMPILE_MODE_LABEL,
 )
-
-#: The rectified recipe ships one configuration, at 44.1 kHz: Pupu-Vocoder's mel.
-SAMPLE_RATE = 44100
-
-#: Vocoders the Vocoder tab trains: label and ``architecture`` of the run.
-VOCODER_ARCHITECTURES = [
-    ("PCPH-BigVGAN", "pcph-bigvgan"),
-    ("PC-NSF-HiFiGAN", "pc-nsf-hifigan"),
-    ("NSF-HiFiGAN", "nsf-hifigan"),
-    ("NSF-UnivNet", "nsf-univnet"),
-    ("Wavehax", "wavehax"),
-    ("Wavehax v2", "wavehax-v2"),
-    ("Multi-Scale Wavehax", "ms-wavehax"),
-    ("NSF-BigVGAN", "nsf-bigvgan"),
-    ("Pupu-Vocoder", "pupu-vocoder"),
-]
 
 TRAINING_STARTED = (
     "Training started. Epoch, step and loss progress is shown in the terminal window."
@@ -128,7 +113,7 @@ def rectified_inference_tab():
             )
             vocoder_model = gr.Dropdown(
                 label=_("Vocoder Model"),
-                info=_("Rectified vocoder export or OpenVPI NSF-HiFiGAN checkpoint that renders the mel."),
+                info=_("ChouwaGAN export that renders the flow's mel, at the flow's sample rate."),
                 choices=vocoders,
                 value=catalog.relative(default_vocoder) if default_vocoder else _first(vocoders),
                 interactive=True,
@@ -251,7 +236,7 @@ def rectified_inference_tab():
                 )
                 sampler = gr.Radio(
                     label=_("Sampler"),
-                    info=_("Heun costs two model passes per step and is more accurate per step. Mean takes one or two steps and needs a model trained with mean flow."),
+                    info=_("Heun costs two model passes per step and is more accurate per step. Mean takes any number of steps, 1 or 2 being where it pays, and needs a model trained with mean flow."),
                     choices=list(SAMPLERS),
                     value="euler",
                     interactive=True,
@@ -453,6 +438,28 @@ def rectified_inference_tab():
                     value=False,
                     interactive=True,
                 )
+                normalize_loudness = gr.Checkbox(
+                    label=_("Normalize Loudness"),
+                    info=_("Bring the output to the input's loudness, or to the minimum below when the input is quieter. "
+                           "The model follows the input's dynamics, so without this it can come out much quieter than an RVC model."),
+                    value=False,
+                    interactive=True,
+                )
+                min_loudness = gr.Slider(
+                    minimum=-40,
+                    maximum=-6,
+                    step=1,
+                    label=_("Minimum Loudness"),
+                    info=_("The quietest the output is brought to, in LUFS."),
+                    value=-18,
+                    interactive=True,
+                )
+                peak_limiter = gr.Checkbox(
+                    label=_("Peak Limiter"),
+                    info=_("Limit the output's peaks under -1 dBFS. Off, the whole output is only turned down when it would clip."),
+                    value=False,
+                    interactive=True,
+                )
                 silence_gate_db = gr.Slider(
                     minimum=-120,
                     maximum=0,
@@ -484,7 +491,7 @@ def rectified_inference_tab():
         formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
         noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
         f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
-        tension_strength, restore_level, breathiness_strength,
+        tension_strength, restore_level, breathiness_strength, normalize_loudness, min_loudness, peak_limiter,
     ):
         if not flow_model or not vocoder_model:
             return _("Pick a flow model and a vocoder model."), None
@@ -538,6 +545,9 @@ def rectified_inference_tab():
             flow_submodel=flow_submodel if is_model_bundle(flow_model) else "",
             match_level=match_level,
             restore_level=restore_level,
+            normalize_loudness=normalize_loudness,
+            min_loudness=min_loudness,
+            peak_limiter=peak_limiter,
             churn=churn,
             tension_strength=tension_strength,
             breathiness_strength=breathiness_strength,
@@ -598,7 +608,7 @@ def rectified_inference_tab():
             formant_shift, content_guidance, guidance_rescale, split_audio, silence_gate_db,
             noise_temperature, flow_start, guidance_from, guidance_until, rescale_mode, schedule,
             f0_median, f0_octave_fix, content_context, flow_submodel, match_level, churn,
-            tension_strength, restore_level, breathiness_strength,
+            tension_strength, restore_level, breathiness_strength, normalize_loudness, min_loudness, peak_limiter,
         ],
         outputs=[output_info, output_audio],
     )
@@ -702,7 +712,6 @@ def _experiment(default_name: str):
             scale=4,
         )
         refresh_button = gr.Button(_("Refresh"), scale=1)
-    gr.Markdown(_("Sample rate: 44100 Hz. The rectified recipe has one configuration."))
 
     with gr.Accordion(_("CPU / GPU settings"), open=False):
         with gr.Row():
@@ -736,6 +745,14 @@ def _experiment(default_name: str):
 def _preprocess_tab(model_name, cpu_threads):
     """The preprocessing step; returns the dataset dropdown, for refreshing."""
     with gr.Tab(f"1. {_('Preprocessing')}"):
+        sample_rate = gr.Radio(
+            label=_("Sampling Rate"),
+            info=_("Set when the dataset is preprocessed; every later step of the experiment keeps it. "
+                   "44.1 kHz has a 512-sample hop, the others 10 ms, the content's own frame rate."),
+            choices=list(SAMPLE_RATES),
+            value=DEFAULT_SAMPLE_RATE,
+            interactive=True,
+        )
         dataset_path = gr.Dropdown(
             label=_("Dataset Path"),
             info=_("Folder containing the training audio."),
@@ -839,9 +856,9 @@ def _preprocess_tab(model_name, cpu_threads):
         outputs=[rms_norm_db],
     )
     preprocess_button.click(
-        fn=lambda *args: run_preprocess_script(args[0], args[1], SAMPLE_RATE, *args[2:]),
+        fn=run_rectified_preprocess_script,
         inputs=[
-            model_name, dataset_path, cpu_threads, cut_preprocess, process_effects,
+            model_name, dataset_path, sample_rate, cpu_threads, cut_preprocess, process_effects,
             noise_reduction, clean_strength, chunk_len, overlap_len,
             normalization_mode, loading_resampling, dataset_format, rms_norm_db,
         ],
@@ -891,9 +908,7 @@ def _extraction_tab(model_name, cpu_threads, gpu):
         )
 
     extract_button.click(
-        fn=lambda name, method, threads, gpu_ids, embedder, mutes, precision: run_extract_script(
-            name, method, threads, gpu_ids, SAMPLE_RATE, RECTIFIED_EXTRACTION, embedder, mutes, precision
-        ),
+        fn=run_rectified_extract_script,
         inputs=[model_name, f0_method, cpu_threads, gpu, embedder_model, include_mutes, feature_precision],
         outputs=[extract_output],
     )
@@ -961,13 +976,13 @@ def rectified_training_tab():
 
         gr.Markdown(f"#### {_('Vocoder')}")
         with gr.Row():
-            default_vocoder = default_pretrained("vocoder")
             custom_vocoder = gr.Dropdown(
                 label=_("Vocoder"),
                 info=_("Renders the audio previews and is paired with the exported model. "
-                       "Empty uses the default in rvc/models/vocoders, else the newest."),
+                       "Empty uses the default in rvc/models/vocoders, else the newest, among those "
+                       "that render the experiment's mel."),
                 choices=list_exports("vocoder"),
-                value=catalog.relative(default_vocoder) if default_vocoder else None,
+                value=None,
                 interactive=True,
                 allow_custom_value=True,
             )
@@ -1004,8 +1019,8 @@ def rectified_training_tab():
         )
         flow_mean = gr.Checkbox(
             label=_("Mean flow"),
-            info=_("Also train the mean velocity (MeanFlow), which the Mean sampler takes in one or two steps. The other samplers work as before. A resumed run keeps what it started with."),
-            value=False,
+            info=_("Also train the mean velocity (MeanFlow), which the Mean sampler takes in any number of steps, one included. The other samplers work as before. A resumed run keeps what it started with."),
+            value=True,
             interactive=True,
         )
 
@@ -1169,27 +1184,17 @@ def rectified_vocoder_tab():
 
     with gr.Tab(f"3. {_('Vocoder')}"):
         gr.Markdown(
-            _("Trains the mel vocoder, on a large multi-speaker dataset. Not "
-              "needed to fine-tune a voice: the vocoder has no speaker input, "
-              "so one vocoder renders every voice model.")
-        )
-        voc_architecture = gr.Radio(
-            label=_("Vocoder Architecture"),
-            info=_("PCPH-BigVGAN is this fork's vocoder. The next three are OpenVPI SingingVocoders', and "
-                   "Wavehax estimates the spectrogram from a harmonic prior, with no upsampling; they train by "
-                   "their own recipes (discriminators, losses, augmentation and learning rate). Each "
-                   "architecture's settings are in the Config tab. A run resumes only its own architecture."),
-            choices=VOCODER_ARCHITECTURES,
-            value="pcph-bigvgan",
-            interactive=True,
+            _("Trains ChouwaGAN, the mel vocoder, on a large multi-speaker dataset, at the "
+              "experiment's sample rate. Not needed to fine-tune a voice: the vocoder has no "
+              "speaker input, so one vocoder renders every voice model at that rate. Its "
+              "settings are in the Config tab.")
         )
         voc_batch, voc_save, voc_epochs = _run_controls("vocoder")
         gr.Markdown(f"#### {_('Starting point')}")
         with gr.Row():
             pretrained_g = gr.Dropdown(
                 label=_("Pretrained Generator"),
-                info=_("Optional. A vocoder checkpoint or export of the same architecture to fine-tune from; "
-                       "for the NSF-HiFiGANs, also an OpenVPI checkpoint, whose discriminator is loaded with it."),
+                info=_("Optional. A vocoder checkpoint or export at the same sample rate to fine-tune from."),
                 choices=list_pretrained("vocoder_g"),
                 value=None,
                 interactive=True,
@@ -1216,7 +1221,7 @@ def rectified_vocoder_tab():
         voc_checkpoints, voc_fresh = _checkpoint_controls("vocoder")
 
         def start_vocoder(name, epochs, save, batch, gpu_ids, g_path, d_path, checkpoints, fresh,
-                          degradation, architecture):
+                          degradation):
             return run_rectified_vocoder_train_script(
                 model_name=name,
                 total_epochs=epochs,
@@ -1229,17 +1234,16 @@ def rectified_vocoder_tab():
                 fresh=fresh,
                 precision=get_training_precision(),
                 mel_degradation=degradation,
-                architecture=architecture,
             )
 
         _start_stop(
             start_vocoder,
             [model_name, voc_epochs, voc_save, voc_batch, gpu, pretrained_g,
-             pretrained_d, voc_checkpoints, voc_fresh, voc_degradation, voc_architecture],
+             pretrained_d, voc_checkpoints, voc_fresh, voc_degradation],
         )
 
     with gr.Tab(f"{_('Config')}") as config_tab:
-        vocoder_config_tab(model_name, VOCODER_ARCHITECTURES, config_tab)
+        vocoder_config_tab(model_name, config_tab)
 
     def refresh():
         return (

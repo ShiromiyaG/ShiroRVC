@@ -54,19 +54,11 @@ def vocoder_pretraineds_list(vocoder=None, sample_rate=None):
     return entries
 
 #: The default rectified-flow pretrains (``rvc.lib.catalog.RECTIFIED_FLOW_PRETRAINS``)
-#: that are published; spin_v2's is picked up once it is here.
+#: that are published, and their vocoder (``RECTIFIED_DEFAULT_VOCODER``);
+#: spin_v2's is picked up once it is here.
 rectified_pretrains_list = [
     ("rectified_flow_pretrains/", ["pretrain_flow_contentvec.pth"]),
-]
-
-#: Vocoders that render the rectified flow's mel: Pupu-Vocoder and BigVGAN v2
-#: taught to follow f0. The small Pupu is ``rvc.lib.catalog.RECTIFIED_DEFAULT_VOCODER``.
-rectified_vocoders_list = [
-    ("vocoders/", [
-        "nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth",
-        "nsf_pupu_large_ft_44.1k_hop512_128bin_vocoder.pth",
-        "nsf_bigvgan_v2_44.1k_hop512_128bin_vocoder.pth",
-    ]),
+    ("vocoders/", ["chouwagan_44.1k_hop512_128bin_vocoder.pth"]),
 ]
 
 models_list = [
@@ -268,7 +260,6 @@ def prequisites_download_pipeline(
         entries += executables_list
     if pretraineds_hifigan:
         entries += (
-            pretraineds_hifigan_list + vocoder_pretraineds_list()
-            + rectified_vocoders_list + rectified_pretrains_list
+            pretraineds_hifigan_list + vocoder_pretraineds_list() + rectified_pretrains_list
         )
     _download(entries, "Downloading all files")

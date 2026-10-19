@@ -65,15 +65,17 @@ TORCH_COMPILE_MODES = (
 
 TENSORBOARD_VALIDATION_PREVIEW_DIR = "validation_samples"
 TENSORBOARD_VALIDATION_MEL_TITLES = (
-    "Mel Generated",
-    "Mel Original",
-    "Difference",
+    "Generated",
+    "Original",
+    "Generated − original",
 )
+TENSORBOARD_VALIDATION_PANEL_TITLE = "{title} · {row}"
+TENSORBOARD_VALIDATION_PROFILE_TITLE = "Mean"
 TENSORBOARD_VALIDATION_FOOTER = (
-    "Sample rate: {sample_rate} Hz   |   Hop length: {hop_length}   |   n_mels: {n_mels}"
-    "   |   Epoch: {epoch}   |   Global Step: {step}"
+    "Epoch {epoch}   |   Step {step}   |   {sample_rate} Hz, hop {hop_length}, {n_mels} mels"
+    "   |   grey: both {quiet:g} dB under the peak"
 )
-TENSORBOARD_VALIDATION_DIFFERENCE_LABEL = "(Mel Generated − Mel Original) in dB"
+TENSORBOARD_VALIDATION_DIFFERENCE_LABEL = "dB, generated − original"
 TENSORBOARD_VALIDATION_AXIS_X = "Time (s)"
 TENSORBOARD_VALIDATION_AXIS_Y = "Frequency (Hz)"
 TENSORBOARD_VALIDATION_DB_LABEL = "dB"

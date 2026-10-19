@@ -546,8 +546,30 @@ atexit.register(_stop_training_at_exit)
 
 # Rectified flow
 rectified_process = None
-#: The rectified recipe ships one configuration, at 44.1 kHz.
-RECTIFIED_SAMPLE_RATE = 44100
+
+
+def run_rectified_preprocess_script(model_name: str, dataset_path: str, sample_rate: int, *args, **kwargs):
+    """``run_preprocess_script`` for an experiment whose rectified config is
+    the shipped one for ``sample_rate``; an experiment set up at another rate
+    is refused."""
+    from rvc.rectified.common import load_run_config
+
+    try:
+        load_run_config(model_name, int(sample_rate))
+    except ValueError as problem:
+        error(str(problem), tag="[RECTIFIED]")
+        return str(problem)
+    return run_preprocess_script(model_name, dataset_path, int(sample_rate), *args, **kwargs)
+
+
+def run_rectified_extract_script(model_name: str, f0_method: str, cpu_threads: int, gpu: int, *args, **kwargs):
+    """``run_extract_script`` at the sample rate of the experiment."""
+    from rvc.rectified.common import load_run_config
+
+    sample_rate = load_run_config(model_name)["data"]["sample_rate"]
+    return run_extract_script(
+        model_name, f0_method, cpu_threads, gpu, sample_rate, RECTIFIED_EXTRACTION, *args, **kwargs
+    )
 
 
 @lru_cache(maxsize=1)
@@ -596,6 +618,9 @@ def run_rectified_infer_script(
     flow_submodel: str = "",
     match_level: bool = True,
     restore_level: bool = False,
+    normalize_loudness: bool = False,
+    min_loudness: float = -18.0,
+    peak_limiter: bool = False,
     tension_strength: float = 1.0,
     breathiness_strength: float = 1.0,
 ):
@@ -652,6 +677,9 @@ def run_rectified_infer_script(
         flow_submodel=flow_submodel or "",
         match_level=bool(match_level),
         restore_level=bool(restore_level),
+        normalize_loudness=bool(normalize_loudness),
+        min_loudness=float(min_loudness),
+        peak_limiter=bool(peak_limiter),
     )
     if written is None:
         return "Conversion failed; see the terminal for the error.", None
@@ -668,7 +696,7 @@ def _run_rectified_trainer(script: str, spec: dict) -> str:
     from rvc.rectified.common import run_dir, vocoder_run_dir
 
     if script == "train_vocoder":
-        model_dir = vocoder_run_dir(spec["model_name"], spec["architecture"])
+        model_dir = vocoder_run_dir(spec["model_name"])
     else:
         model_dir = run_dir(spec["model_name"], "flow")
     os.makedirs(model_dir, exist_ok=True)
@@ -698,15 +726,11 @@ def run_rectified_vocoder_train_script(
     fresh: bool = False,
     precision: str = "fp32",
     mel_degradation: float = 0.0,
-    architecture: str = "pcph-bigvgan",
-    discriminator: str = "",
 ):
     return _run_rectified_trainer(
         "train_vocoder",
         {
             "model_name": model_name,
-            "architecture": str(architecture),
-            "discriminator": str(discriminator or ""),
             "total_epochs": int(total_epochs),
             "save_every": int(save_every),
             "batch_size": int(batch_size),
@@ -736,14 +760,15 @@ def run_rectified_flow_train_script(
     compile: bool = False,
     torch_compile_mode: str = "default",
     feature_cache: bool = True,
-    mean_flow: bool = False,
+    mean_flow: bool = True,
 ):
     if not vocoder:
-        # The default vocoder, as every interface picks when left empty.
+        # The default vocoder, as every interface picks when left empty, among
+        # those that render the experiment's mel.
         from rvc.lib.catalog import relative
-        from rvc.rectified.common import default_pretrained
+        from rvc.rectified.common import default_pretrained, load_run_config
 
-        vocoder = default_pretrained("vocoder")
+        vocoder = default_pretrained("vocoder", load_run_config(model_name)["data"])
         vocoder = relative(vocoder) if vocoder else ""
     return _run_rectified_trainer(
         "train_flow",
@@ -965,18 +990,18 @@ def train(**kwargs):
 @cli.command("rectified_preprocess")
 @apply_options(RECTIFIED_PREPROCESS_OWN)
 def rectified_preprocess(**kwargs):
-    """Preprocess a dataset for the rectified-flow recipe (44.1 kHz)."""
+    """Preprocess a dataset for the rectified-flow recipe."""
     kwargs["clean_strength"] = kwargs.pop("noise_reduction_strength")
-    run_preprocess_script(sample_rate=RECTIFIED_SAMPLE_RATE, **kwargs)
+    kwargs["sample_rate"] = int(kwargs["sample_rate"])
+    run_rectified_preprocess_script(**kwargs)
 
 
 @cli.command("rectified_extract")
 @apply_options(RECTIFIED_EXTRACT_OWN)
 def rectified_extract(**kwargs):
-    """Extract features and F0 for the rectified-flow recipe."""
-    run_extract_script(
-        sample_rate=RECTIFIED_SAMPLE_RATE, vocoder_arch=RECTIFIED_EXTRACTION, **kwargs
-    )
+    """Extract features and F0 for the rectified-flow recipe, at the
+    experiment's sample rate."""
+    run_rectified_extract_script(**kwargs)
 
 
 @cli.command("rectified_train_flow")

@@ -315,8 +315,8 @@ TTS_OWN = [
 ]
 
 # ---- preprocess ----
-# Split around --sample_rate so rectified_preprocess, which has one rate, can
-# reuse the rest.
+# Split around --sample_rate so rectified_preprocess, which has its own rates,
+# can reuse the rest.
 _PREPROCESS_SOURCE = [
     click.option(
         "--model_name",
@@ -412,7 +412,8 @@ PREPROCESS_OWN = [
 ]
 
 # ---- extract ----
-# Split around --sample_rate and --vocoder_arch, which rectified_extract fixes.
+# Split around --sample_rate and --vocoder_arch, which rectified_extract
+# reads from the experiment and fixes.
 _EXTRACT_HEAD = [
     click.option("--model_name", type=str, required=True, help="Name of the model."),
     click.option(
@@ -652,7 +653,7 @@ RECTIFIED_TRAIN_FLOW_OWN = [
     click.option("--batch_size", type=click.IntRange(1, 256), default=16, show_default=True, help="Clips per step."),
     click.option("--gpu", type=str, default="0", show_default=True, help="GPUs to train on, separated by '-' (e.g. 0-1). Batch size is per GPU."),
     click.option("--pretrained_flow", type=str, default="", help="Flow export or checkpoint to fine-tune from; empty trains from scratch."),
-    click.option("--vocoder", type=str, default="", help="Vocoder that renders the audio previews and is paired with the exports. Empty uses the default in rvc/models/vocoders, else the newest."),
+    click.option("--vocoder", type=str, default="", help="Vocoder that renders the audio previews and is paired with the exports. Empty uses the default in rvc/models/vocoders, else the newest, among those that render the experiment's mel."),
     click.option("--learning_rate", type=float, default=0.0, show_default=True, help="0 uses the config's rate."),
     click.option(
         "--checkpoints",
@@ -672,11 +673,21 @@ RECTIFIED_TRAIN_FLOW_OWN = [
         help="Torch compile mode used for the flow backbone.",
     ),
     click.option("--feature_cache", type=click.BOOL, default=True, show_default=True, help="Write the features and the augmented copies to logs/<model>/flow_cache once and train from them, in batches of whole clips. Off augments as it goes, in fixed segments, and writes nothing."),
-    click.option("--mean_flow", type=click.BOOL, default=False, show_default=True, help="Also train the mean velocity (MeanFlow), for the one- or two-step mean sampler. A resumed run keeps what it started with."),
+    click.option("--mean_flow", type=click.BOOL, default=True, show_default=True, help="Also train the mean velocity (MeanFlow), for the mean sampler, which takes any number of steps, one included. A resumed run keeps what it started with."),
 ]
 
 # ---- rectified_preprocess / rectified_extract ----
-RECTIFIED_PREPROCESS_OWN = [*_PREPROCESS_SOURCE, *_PREPROCESS_SETTINGS]
+RECTIFIED_PREPROCESS_OWN = [
+    *_PREPROCESS_SOURCE,
+    click.option(
+        "--sample_rate",
+        type=click.Choice(["32000", "40000", "44100", "48000"]),
+        default="44100",
+        show_default=True,
+        help="Sampling rate of the experiment, kept by every later step. 44.1 kHz has a 512-sample hop, the others 10 ms.",
+    ),
+    *_PREPROCESS_SETTINGS,
+]
 RECTIFIED_EXTRACT_OWN = [*_EXTRACT_HEAD, *_EXTRACT_TAIL]
 
 # ---- rectified_train_vocoder ----
@@ -697,19 +708,6 @@ RECTIFIED_TRAIN_VOCODER_OWN = [
     ),
     click.option("--fresh", type=click.BOOL, default=False, show_default=True, help="Ignore this run's checkpoints and start over."),
     click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
-    click.option(
-        "--architecture",
-        type=click.Choice(["pcph-bigvgan", "pc-nsf-hifigan", "nsf-hifigan", "nsf-univnet", "wavehax", "wavehax-v2", "ms-wavehax", "nsf-bigvgan", "pupu-vocoder", "bigvgan-v2"]),
-        default="pcph-bigvgan",
-        show_default=True,
-        help="Vocoder to train. OpenVPI SingingVocoders' three, Wavehax, NSF-BigVGAN, Pupu-Vocoder and BigVGAN v2 train by their own recipes (rvc/configs/rectified/vocoders).",
-    ),
-    click.option(
-        "--discriminator",
-        type=click.Choice(["original", "light", "v3", "v3-hinge", "v4-hinge"]),
-        default=None,
-        help="For the SingingVocoders architectures: their recipe's own discriminator, this repo's v3 with its adversarial and feature losses, v4 under the hinge loss (v4-hinge, SAN as the config sets it; lighter for Wavehax), or, for Wavehax, the light one under the recipe's losses or v3 without SAN under the hinge loss. Empty uses the recipe's discriminator_choice. PCPH-BigVGAN uses its config's, or v4-hinge.",
-    ),
     click.option("--mel_degradation", type=click.FloatRange(0, 1), default=0.0, show_default=True, help="Trains on mels blurred, dulled and noised up to this strength, so the vocoder tolerates a flow's imperfect mels. 0 is off; 0.5 is a moderate start."),
 ]
 
@@ -721,7 +719,7 @@ RECTIFIED_INFER_OWN = [
     click.option("--output_path", type=str, required=True, help="Full path to the output audio file."),
     click.option("--flow_path", type=str, required=True, help="Exported rectified-flow model (.pth), or a model bundle (.srvc) holding one."),
     click.option("--flow_submodel", type=str, default="", help="The flow to use inside a bundle; empty uses its first. A bundled index replaces --index_path."),
-    click.option("--vocoder_path", type=str, default="", help="Rectified vocoder export or OpenVPI NSF-HiFiGAN checkpoint. Empty uses the default in rvc/models/vocoders, else the newest."),
+    click.option("--vocoder_path", type=str, default="", help="ChouwaGAN vocoder export. Empty uses the default in rvc/models/vocoders, else the newest."),
     click.option("--index_path", type=str, default="", help="Optional RVC index over the voice model's training features."),
     click.option("--sid", type=int, default=0, show_default=True, help="Speaker ID for multi-speaker models."),
     click.option("--pitch", type=click.IntRange(-24, 24), default=0, show_default=True, help="Pitch shift in semitones."),
@@ -734,7 +732,7 @@ RECTIFIED_INFER_OWN = [
     click.option("--tension_strength", type=click.FloatRange(0, 1), default=1.0, show_default=True, help="How far the input's tension carries over. 0 leaves the voice at its own; ignored by a model without the input."),
     click.option("--breathiness_strength", type=click.FloatRange(0, 1), default=1.0, show_default=True, help="How far the breathiness of the input's voiced frames carries over. 0 holds them at the input's usual."),
     click.option("--steps", type=click.IntRange(1, 64), default=16, show_default=True, help="ODE steps from noise to mel."),
-    click.option("--sampler", type=click.Choice(["euler", "heun", "mean"]), default="euler", show_default=True, help="Heun costs two model passes per step. Mean takes one or two steps and needs a model trained with mean flow."),
+    click.option("--sampler", type=click.Choice(["euler", "heun", "mean"]), default="euler", show_default=True, help="Heun costs two model passes per step. Mean takes any number of steps, 1 or 2 being where it pays, and needs a model trained with mean flow."),
     click.option("--schedule", type=click.Choice(["uniform", "sway", "logit-normal"]), default="uniform", show_default=True, help="Spacing of the steps."),
     click.option("--noise_temperature", type=click.FloatRange(0, 1.5), default=1.0, show_default=True, help="Scale of the starting noise. 1 is what the model was trained on."),
     click.option("--churn", type=click.FloatRange(0, 2), default=0.0, show_default=True, help="Re-noise back this many step lengths before each step (stochastic sampling). 0 is the plain ODE."),
@@ -753,6 +751,9 @@ RECTIFIED_INFER_OWN = [
     click.option("--split_audio", type=click.BOOL, default=False, show_default=True, help="Split the input at silences."),
     click.option("--match_level", type=click.BOOL, default=True, show_default=True, help="Peak-normalise the input as the training data was, since the model reads loudness as timbre."),
     click.option("--restore_level", type=click.BOOL, default=False, show_default=True, help="Scale the output back to the input's level. Off leaves it at the model's, as an RVC model's output is."),
+    click.option("--normalize_loudness", type=click.BOOL, default=False, show_default=True, help="Bring the output to the input's loudness, or to --min_loudness when the input is quieter, in place of either level."),
+    click.option("--min_loudness", type=click.FloatRange(-40, -6), default=-18.0, show_default=True, help="The quietest the output is brought to, in LUFS, with --normalize_loudness."),
+    click.option("--peak_limiter", type=click.BOOL, default=False, show_default=True, help="Limit the output's peaks under -1 dBFS. Off, it is only scaled down when it would clip."),
     click.option("--silence_gate_db", type=click.FloatRange(-120, 0), default=-60.0, show_default=True, help="Fade the output out where the input is quieter than this, in dBFS. -120 disables it."),
     click.option("--content_context", type=click.FloatRange(0, 10), default=2.0, show_default=True, help="Seconds of audio the content encoder sees either side of each 30 s pass."),
     click.option("--seed", type=int, default=0, show_default=True, help="0 picks a random seed."),

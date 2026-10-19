@@ -30,7 +30,7 @@ RECTIFIED_FLOW_PRETRAINS = {
     "spin_v2": "pretrain_flow_spin_v2.pth",
 }
 #: The vocoder a flow trains and renders with when none is picked.
-RECTIFIED_DEFAULT_VOCODER = "nsf_pupu_small_44.1k_hop512_128bin_vocoder.pth"
+RECTIFIED_DEFAULT_VOCODER = "chouwagan_44.1k_hop512_128bin_vocoder.pth"
 
 AUDIO_EXTENSIONS = (
     ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4",

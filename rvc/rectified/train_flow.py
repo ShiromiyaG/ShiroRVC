@@ -80,16 +80,21 @@ MEL_STATS_BATCHES = 200
 FINETUNE_AUGMENTATION = ("key_shift_prob", "time_stretch_prob", "key_shift_scale", "time_stretch_scale")
 
 
-def learning_rate(base, step, warmup, total, final_ratio, anchor=(0, 0.0)):
-    """Linear warmup, then cosine decay to ``final_ratio`` of ``base`` at ``total``.
+def schedule_progress(step, warmup, total, anchor=(0, 0.0)):
+    """How far ``step`` is along the schedule after warmup, 0 to 1 at ``total``.
 
-    ``anchor`` is the (step, progress along the cosine) a resumed run continues
-    from, so a changed ``total`` stretches or compresses what is left of it.
+    ``anchor`` is the (step, progress) a resumed run continues from, so a
+    changed ``total`` stretches or compresses what is left of it.
     """
+    start, done = max(anchor[0], warmup), anchor[1]
+    return done + (1.0 - done) * min(1.0, max(0.0, (step - start) / max(1, total - start)))
+
+
+def learning_rate(base, step, warmup, progress, final_ratio):
+    """Linear warmup, then cosine decay to ``final_ratio`` of ``base`` along
+    ``schedule_progress``."""
     if warmup and step < warmup:
         return base * (step + 1) / warmup
-    start, done = max(anchor[0], warmup), anchor[1]
-    progress = done + (1.0 - done) * min(1.0, max(0.0, (step - start) / max(1, total - start)))
     return base * (final_ratio + (1.0 - final_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
@@ -108,14 +113,24 @@ def freeze_voice(model) -> int:
     return frozen
 
 
-def pretrain_time_scale(path: str):
-    """The time scale a flow export was trained with; None for a checkpoint,
-    which records no config."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    model = checkpoint.get("config", {}).get("flow", {}).get("model")
-    if model is None:
-        return None
-    return float((model.get("backbone_args") or {}).get("time_scale", 1000.0))
+def adopt_pretrain(spec: dict, settings: dict) -> None:
+    """A fine-tune's time scale and band contrast, from its pretrain export's
+    config. A checkpoint records none, and the run's config stands."""
+    if not spec.get("pretrained_flow"):
+        return
+    checkpoint = torch.load(spec["pretrained_flow"], map_location="cpu", weights_only=True, mmap=True)
+    pretrain = checkpoint.get("config", {}).get("flow", {}).get("model")
+    if pretrain is None:
+        return
+    # Not in the weights, and a network reads another scale's times as noise.
+    time_scale = float((pretrain.get("backbone_args") or {}).get("time_scale", 1000.0))
+    settings["model"].setdefault("backbone_args", {})["time_scale"] = time_scale
+    # The contrast rows are part of the weights' shape, whatever the run's config says.
+    edges = pretrain.get("contrast_band_edges")
+    if edges:
+        settings["model"]["contrast_band_edges"] = edges
+    else:
+        settings["model"].pop("contrast_band_edges", None)
 
 
 def conditioning_norms(model) -> dict:
@@ -133,19 +148,26 @@ def conditioning_norms(model) -> dict:
     return norms
 
 
-def compiled_backbone(model, enabled: bool, mode: str, device, dynamic: bool = False, mean_flow: bool = False):
-    """``torch.compile`` of the backbone for training, and of the mean
-    velocity with ``mean_flow``; None for each left eager. ``dynamic`` is for
-    batches of more than one shape. Evaluation and sampling keep the eager
-    module, whose shapes vary."""
+def compiled_backbone(model, enabled: bool, mode: str, device, dynamic: bool = False):
+    """``torch.compile`` of the backbone for training; None left eager.
+    ``dynamic`` is for batches of more than one shape. Evaluation and sampling
+    keep the eager module, whose shapes vary."""
     if not enabled:
-        return None, None
+        return None
     if device.type != "cuda" or importlib.util.find_spec("triton") is None:
         warning("torch.compile needs CUDA and Triton; training uncompiled.", tag=TAG)
-        return None, None
-    dynamic = True if dynamic else None
-    mean_field = torch.compile(model.mean_velocity, mode=mode, dynamic=dynamic) if mean_flow else None
-    return torch.compile(model.backbone, mode=mode, dynamic=dynamic), mean_field
+        return None
+    return torch.compile(model.backbone, mode=mode, dynamic=True if dynamic else None)
+
+
+def mean_flow_alpha(progress: float, share: float, alpha_min: float) -> float:
+    """α-Flow's curriculum: 1, the flow-matching target, eased down to
+    ``alpha_min`` by ``share`` of the schedule's ``progress``; ``alpha_min``
+    throughout for 0."""
+    if share <= 0:
+        return alpha_min
+    eased = min(1.0, progress / share)
+    return alpha_min + (1.0 - alpha_min) * 0.5 * (1.0 + math.cos(math.pi * eased))
 
 
 def load_preview_vocoder(path: str, config: dict, device):
@@ -253,7 +275,8 @@ def augment_share(settings: dict, kind: str) -> str:
 
 def configure_model(spec: dict, settings: dict, state, main_rank: bool) -> bool:
     """Write what the run decides, not the config, into ``settings["model"]``:
-    mean flow and the time scale, a fine-tune's being its pretrain's.
+    mean flow and the time scale, a fine-tune's being its pretrain's (set by
+    ``adopt_pretrain``).
     ``state`` is the checkpoint being resumed, or None. Returns whether the run
     trains mean flow."""
     # A resumed run keeps what it started with.
@@ -266,20 +289,15 @@ def configure_model(spec: dict, settings: dict, state, main_rank: bool) -> bool:
         mean_flow = started_with
     settings["model"]["mean_flow"] = mean_flow
     backbone_args = settings["model"].setdefault("backbone_args", {})
-    if spec.get("pretrained_flow"):
-        # Not in the weights, and a network reads another scale's times as noise.
-        time_scale = pretrain_time_scale(spec["pretrained_flow"])
-        if time_scale is not None:
-            backbone_args["time_scale"] = time_scale
-    elif mean_flow and "time_scale" not in backbone_args:
-        # Its target is the network's own derivative in time, which diverged
-        # through DiffSinger's 1000.
+    if not spec.get("pretrained_flow") and mean_flow and "time_scale" not in backbone_args:
+        # Its target is the network a short step on, which DiffSinger's 1000
+        # makes rough; with the derivative there it diverged.
         backbone_args["time_scale"] = 1.0
         if main_rank:
             info("Mean flow from scratch: time scale 1 (flow.model.backbone_args.time_scale sets another).", tag=TAG)
     if mean_flow and float(backbone_args.get("time_scale", 1000.0)) > 10 and main_rank:
-        warning("Mean flow with a time scale over 10 has diverged: its target is the network's own "
-                "derivative in time. A pretrain made at time scale 1 avoids it.", tag=TAG)
+        warning("Mean flow with a time scale over 10 has diverged: its target is the network a short "
+                "step on in time. A pretrain made at time scale 1 avoids it.", tag=TAG)
     return mean_flow
 
 
@@ -374,25 +392,24 @@ def nonfinite_names(mel, inputs, model) -> str:
     return ", ".join(found) or "neither the batch nor the weights, so the loss or a gradient overflowed"
 
 
-def loss_scalars(ranks: Ranks, flow_loss, aux_loss, mean_loss=None, bootstrap=None) -> dict:
+def loss_scalars(ranks: Ranks, flow_loss, aux_loss, mean_loss=None) -> dict:
     """The losses averaged over the ranks, by TensorBoard tag, under the
-    groups the RVC trainer logs to; ``mean_loss`` and ``bootstrap`` are the
-    ``MeanFlowLosses``' unweighted loss and ratio. Every rank must call it."""
+    groups the RVC trainer logs to; ``mean_loss`` is the ``MeanFlowLosses``'
+    unweighted one. Every rank must call it."""
     scalars = {f"loss_avg_{LOG_INTERVAL}/loss_flow_{LOG_INTERVAL}": ranks.mean(flow_loss).item()}
     if aux_loss is not None:
         scalars[f"loss_avg_{LOG_INTERVAL}/loss_aux_mel_l1_{LOG_INTERVAL}"] = ranks.mean(aux_loss).item()
     if mean_loss is not None:
         scalars[f"loss_avg_{LOG_INTERVAL}/loss_mean_flow_{LOG_INTERVAL}"] = ranks.mean(mean_loss).item()
-        # Over 1 the target is feeding on itself.
-        scalars["diag/mean_flow_bootstrap"] = ranks.mean(bootstrap).item()
     return scalars
 
 
 def save(out_dir: str, name: str, keep: str, model, optimizer, ema, scaler, epoch: int, step: int,
-         skipped: int, export: dict) -> None:
+         skipped: int, progress: float, export: dict) -> None:
     """Write the checkpoint to resume from and the export of the averaged
     weights. ``keep`` is the run's ``checkpoints``: every one, the latest or
-    none. ``export`` is what the export records beside its weights."""
+    none. ``progress`` is ``schedule_progress`` at ``step``. ``export`` is
+    what the export records beside its weights."""
     if any(not torch.isfinite(param).all() for param in model.parameters()):
         raise FloatingPointError(
             "The flow has non-finite weights. Nothing was saved, so the last checkpoint stands."
@@ -409,7 +426,7 @@ def save(out_dir: str, name: str, keep: str, model, optimizer, ema, scaler, epoc
                 {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                  "ema": ema.state_dict(), "epoch": epoch, "step": step,
                  "scaler": scaler.state_dict() if scaler is not None else None,
-                 "skipped_steps": skipped},
+                 "skipped_steps": skipped, "progress": progress},
                 path,
             )
             if keep == "latest":
@@ -431,6 +448,7 @@ def main(spec_path: str) -> None:
     config = load_run_config(spec["model_name"])
     settings = config["flow"]
     apply_spec(spec, settings)
+    adopt_pretrain(spec, settings)
     speakers = speaker_count(read_filelist(spec["model_name"]))
     if spec.get("pretrained_flow") and speakers > 1:
         raise ValueError(
@@ -457,6 +475,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     config = load_run_config(name)
     settings = config["flow"]
     apply_spec(spec, settings)
+    adopt_pretrain(spec, settings)
     out_dir = run_dir(name, "flow")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -478,6 +497,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     finetune = bool(spec.get("pretrained_flow"))
     mean_flow = configure_model(spec, settings, state, main_rank)
     model = build_flow(config, speakers).to(device)
+    if model.contrast_band_edges and not settings.get("mel_bin_norm", False):
+        # Under the mel's one normalisation the contrast rows barely move.
+        raise ValueError("A flow with contrast_band_edges needs mel_bin_norm.")
     speaker_dropout = float(settings["speaker_dropout"])
     tension_dropout = float(settings.get("tension_dropout", 0.0)) if model.encoder.tension is not None else 0.0
     voice_frozen = finetune and speakers == 1 and settings.get("finetune_freeze_voice", True)
@@ -494,6 +516,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
     ema_decay = settings.get("finetune_ema_decay", settings["ema_decay"]) if finetune else settings["ema_decay"]
     ema = WeightEMA(model, ema_decay)
     epoch, step, skipped, starting_point = restore(spec, name, resume, state, model, optimizer, ema, scaler)
+    saved_progress = state.get("progress") if resume else None
     # Its CPU copy would otherwise stay in RAM for the whole run.
     state = None
     # A resumed run and a fine-tune keep the statistics their weights came with.
@@ -529,15 +552,23 @@ def train(ranks: Ranks, spec_path: str) -> None:
     final_ratio = float(settings.get("lr_final_ratio", 1.0))
     lr_anchor = (0, 0.0)
     if resume and step >= warmup:
-        lr_anchor = (step, cosine_progress(optimizer.param_groups[0]["lr"] / base_lr, final_ratio))
+        # A checkpoint from before it saved its progress: read off the LR,
+        # which a flat LR or another base no longer tells.
+        if saved_progress is None:
+            saved_progress = cosine_progress(optimizer.param_groups[0]["lr"] / base_lr, final_ratio)
+        lr_anchor = (step, float(saved_progress))
     aux_weight = float(settings.get("aux_mel_weight", 0.0))
     eval_interval = int(settings.get("eval_interval", 0))
     mean_ratio = float(settings.get("mean_flow_ratio", 0.25)) if mean_flow else 0.0
     # The largest speaker guidance scale the mean velocity is trained under.
     mean_guidance = float(settings.get("mean_flow_guidance_max", 4.0)) if mean_flow else 1.0
-    backbone, mean_field = compiled_backbone(
+    alpha_min = float(settings.get("mean_flow_alpha_min", 0.05))
+    # A fine-tune's pretrain has been through the curriculum already.
+    alpha_share = float(settings.get("finetune_mean_flow_alpha_share", 0.0) if finetune
+                        else settings.get("mean_flow_alpha_share", 0.0))
+    backbone = compiled_backbone(
         model, bool(spec.get("compile", False)), spec.get("torch_compile_mode", "default"), device,
-        dynamic=bucketed(settings), mean_flow=mean_ratio > 0,
+        dynamic=bucketed(settings),
     )
     # The backward runs outside autocast here, and a compiled graph's would
     # otherwise run under the forward's.
@@ -570,6 +601,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                              + (f", shallow from t={model.t_start:g}" if model.t_start > 0 else "")
                              + (", dual timestep" if model.dual_timestep else "")
                              + (f", mean flow on {100 * mean_ratio:g}% of each batch" if mean_ratio > 0 else "")
+                             + ((f" (alpha 1 -> {alpha_min:g} over {100 * alpha_share:g}% of the schedule)"
+                                 if alpha_share > 0 else f" (alpha {alpha_min:g})") if mean_ratio > 0 else "")
                              + (f" under guidance up to {mean_guidance:g}"
                                 if mean_ratio > 0 and mean_guidance > 1 else "")
                              + (", per-bin mel" if settings.get("mel_bin_norm", False) else "")
@@ -598,9 +631,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     model.train()
     data_wait = step_time = 0.0
     skipped_in_a_row = 0
-    # Flow loss, aux loss, gradient norm, mean-flow loss and its bootstrap
-    # ratio summed over the applied steps since the last log.
-    window = torch.zeros(5, device=device)
+    # Flow loss, aux loss, gradient norm and mean-flow loss summed over the
+    # applied steps since the last log.
+    window = torch.zeros(4, device=device)
     window_steps = 0
     while epoch <= total_epochs:
         metrics = ""
@@ -616,17 +649,18 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 mel = normalize_mel(mel.to(device, non_blocking=True), config["data"])
                 inputs = inputs.to(device, non_blocking=True)
 
-                lr = learning_rate(base_lr, step, warmup, total_steps, final_ratio, lr_anchor)
+                run_progress = schedule_progress(step, warmup, total_steps, lr_anchor)
+                lr = learning_rate(base_lr, step, warmup, run_progress, final_ratio)
                 for group in optimizer.param_groups:
                     group["lr"] = lr
+                alpha = mean_flow_alpha(run_progress, alpha_share, alpha_min)
                 with backward_context(), torch.autocast(
                     device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None
                 ):
                     flow_loss, aux_loss, mean_losses = train_model(
                         mel * inputs.mask, inputs,
                         speaker_dropout=speaker_dropout, tension_dropout=tension_dropout,
-                        backbone=backbone, mean_field=mean_field, mean_ratio=mean_ratio,
-                        mean_guidance=mean_guidance,
+                        backbone=backbone, mean_ratio=mean_ratio, mean_guidance=mean_guidance, alpha=alpha,
                     )
                     loss = flow_loss
                     if mean_losses is not None:
@@ -654,7 +688,6 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         aux_loss.detach() if aux_loss is not None else zero,
                         grad_norm,
                         mean_losses.mean if mean_losses is not None else zero,
-                        mean_losses.bootstrap_ratio.detach() if mean_losses is not None else zero,
                     ]).float()
                     window_steps += 1
                     ema.update(model)
@@ -669,10 +702,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
                 if step % LOG_INTERVAL == 0:
                     # Collective, so outside the rank check.
-                    flow_mean, aux_mean, grad_mean, mean_mean, bootstrap_mean = window / max(1, window_steps)
+                    flow_mean, aux_mean, grad_mean, mean_mean = window / max(1, window_steps)
                     scalars = loss_scalars(
                         ranks, flow_mean, aux_mean if aux_loss is not None else None,
-                        *((mean_mean, bootstrap_mean) if mean_ratio > 0 else ()),
+                        mean_mean if mean_ratio > 0 else None,
                     )
                     window.zero_()
                     window_steps = 0
@@ -685,6 +718,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     scalars[f"grad_avg_{LOG_INTERVAL}/grad_norm_{LOG_INTERVAL}"] = grad_mean.item()
                     scalars.update(conditioning_norms(model))
                     scalars["learning_rate/lr"] = lr
+                    if mean_ratio > 0:
+                        scalars["diag/mean_flow_alpha"] = alpha
                     scalars["diag/skipped_steps"] = skipped
                     if scaler is not None:
                         scalars["AMP/grad_scaler_scale"] = scaler.get_scale()
@@ -706,7 +741,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 info(f"{skipped} step(s) skipped so far.{scale}", tag=TAG)
             if epoch % save_every == 0 or epoch == total_epochs:
                 save(out_dir, name, spec.get("checkpoints", "latest"), model, optimizer, ema, scaler, epoch, step,
-                     skipped, export)
+                     skipped, schedule_progress(step, warmup, total_steps, lr_anchor), export)
                 if clips:
                     preview(model, ema, previews, clips, vocoder, config["data"], device, epoch, step)
             writer.flush()

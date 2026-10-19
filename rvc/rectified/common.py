@@ -17,13 +17,18 @@ from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
 from rvc.lib.paths import LOGS_DIR, MODELS_DIR, ROOT
 from rvc.rectified.aperiodicity import aperiodicity, tension
+from rvc.rectified.chouwagan import ARCHITECTURE, CONTRAST_SCALE, BandContrast
 from rvc.rectified.flow import Conditioning
 from rvc.rectified.mel import LogMel
 
-DEFAULT_CONFIG = os.path.join(ROOT, "rvc", "configs", "rectified", "44100.json")
+CONFIG_DIR = os.path.join(ROOT, "rvc", "configs", "rectified")
 #: Frame rate of the extracted pitch, of the content once ``upsample_content``
 #: has doubled it, and of ``frame_energy``.
 FEATURE_RATE = 100
+#: Sample rates with a shipped config. Every one but 44.1 kHz has a 10 ms hop,
+#: so a mel frame is a ``FEATURE_RATE`` frame.
+SAMPLE_RATES = (32000, 40000, 44100, 48000)
+DEFAULT_SAMPLE_RATE = 44100
 #: Where downloaded rectified flow pretrains go.
 PRETRAINED_DIR = os.path.join(MODELS_DIR, "pretraineds", "rectified")
 #: Where the vocoders the flows render through go.
@@ -39,27 +44,41 @@ def run_dir(model_name: str, part: str) -> str:
     return os.path.join(LOGS_DIR, model_name, part)
 
 
-def vocoder_run_dir(model_name: str, architecture: str) -> str:
-    """``logs/<model_name>/vocoder_<architecture>``, one per architecture; the
-    plain ``vocoder`` of an older run of the same one while that is all there is."""
-    folder = run_dir(model_name, "vocoder_" + architecture.replace("-", "_"))
-    legacy_spec = os.path.join(run_dir(model_name, "vocoder"), "run_spec.json")
-    if not os.path.isdir(folder) and os.path.isfile(legacy_spec):
-        with open(legacy_spec, encoding="utf-8") as handle:
-            if json.load(handle).get("architecture", "pcph-bigvgan") == architecture:
-                return os.path.dirname(legacy_spec)
-    return folder
+def vocoder_run_dir(model_name: str) -> str:
+    """``logs/<model_name>/vocoder_chouwagan``."""
+    return run_dir(model_name, f"vocoder_{ARCHITECTURE}")
 
 
-def load_run_config(model_name: str) -> dict:
+def shipped_config(sample_rate: int = DEFAULT_SAMPLE_RATE) -> str:
+    """Path of the shipped rectified config for ``sample_rate``."""
+    if int(sample_rate) not in SAMPLE_RATES:
+        raise ValueError(f"The rectified recipe has no config for {sample_rate} Hz, only {SAMPLE_RATES}.")
+    return os.path.join(CONFIG_DIR, f"{int(sample_rate)}.json")
+
+
+def run_config_path(model_name: str) -> str:
+    return os.path.join(LOGS_DIR, model_name, "rectified_config.json")
+
+
+def load_run_config(model_name: str, sample_rate: int | None = None) -> dict:
     """The experiment's rectified config, copied from the shipped one on first
-    use. Not ``config.json``, which is the RVC config extraction writes."""
-    path = os.path.join(LOGS_DIR, model_name, "rectified_config.json")
+    use. Not ``config.json``, which is the RVC config extraction writes.
+
+    ``sample_rate`` picks the shipped config of a new experiment; an existing
+    one must already be at it."""
+    path = run_config_path(model_name)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        shutil.copyfile(DEFAULT_CONFIG, path)
+        shutil.copyfile(shipped_config(sample_rate or DEFAULT_SAMPLE_RATE), path)
     with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
+        config = json.load(handle)
+    own_rate = int(config["data"]["sample_rate"])
+    if sample_rate and own_rate != int(sample_rate):
+        raise ValueError(
+            f"{model_name} is set up for {own_rate} Hz. Delete {path} to start it over at "
+            f"{sample_rate} Hz, or use another model name."
+        )
+    return config
 
 
 def read_filelist(model_name: str):
@@ -254,10 +273,7 @@ def pretrained_weights(path: str) -> dict:
     """Weights from a training checkpoint (its EMA when present) or an export."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("architecture"):
-        raise ValueError(
-            f"{path} is a {checkpoint['architecture']} vocoder; it renders previews "
-            f"and audio but cannot start a PCPH-BigVGAN training run."
-        )
+        raise ValueError(f"{path} is a {checkpoint['architecture']} vocoder, not a flow.")
     ema = checkpoint.get("ema")
     return ema["shadow"] if ema else checkpoint["model"]
 
@@ -277,7 +293,8 @@ def check_pretrain_embedder(path: str, embedder: str) -> None:
 
 
 class FlowItem(NamedTuple):
-    """One flow training crop, without a batch axis: ``mel`` [n_mels, T],
+    """One flow training crop, without a batch axis: ``mel`` [channels, T]
+    (the band contrast under the mel, for a flow that has it),
     ``content`` [T, C], the curves [T], and the rest one number each."""
 
     mel: torch.Tensor
@@ -292,7 +309,7 @@ class FlowItem(NamedTuple):
 
 
 class Reference(NamedTuple):
-    """The preview clip, as a batch of one: its ``mel`` [1, n_mels, T], not
+    """The preview clip, as a batch of one: its ``mel`` [1, channels, T], not
     normalised, its ``audio`` [1, samples], the ``path`` it came from and the
     flow's ``inputs`` for it."""
 
@@ -311,7 +328,9 @@ class RectifiedDataset(Dataset):
     time-stretched at random with the config's probabilities; ``feature_cache``
     holds the same items made ahead of training. Without
     ``augment``, neither mode is randomly cropped (vocoder items take the
-    middle), and flow items are not shifted or stretched.
+    middle), and flow items are not shifted or stretched. A flow with
+    ``contrast_band_edges`` has its items' and the preview's mel carry that
+    band contrast after the bins.
     """
 
     def __init__(self, entries, config: dict, mode: str, segment_frames: int, augment: bool = True):
@@ -331,6 +350,8 @@ class RectifiedDataset(Dataset):
         self.stretch_prob = float(config["flow"].get("time_stretch_prob", 0.0))
         self.augment = augment
         self.tension = bool(config["flow"]["model"].get("tension", False))
+        edges = config["flow"]["model"].get("contrast_band_edges") if mode == "flow" else None
+        self.contrast = BandContrast(self.sample_rate, self.hop, edges) if edges else None
 
     def __len__(self):
         return len(self.entries)
@@ -368,6 +389,15 @@ class RectifiedDataset(Dataset):
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         curve = smooth_curve(tension(audio, self.sample_rate, f0, feature_frames), TENSION_SMOOTH_SECONDS)
         return curve_to_mel_rate(curve, frames, self.sample_rate, hop)
+
+    def _with_contrast(self, mel, audio, f0, hop, scale=1.0):
+        """``mel`` [n_mels, frames] with the band contrast after it, for a flow
+        that learns it; ``f0`` [frames] is the audio's own pitch, and
+        ``scale`` the factor the mel was shifted by."""
+        if self.contrast is None:
+            return mel
+        contrast = self.contrast(audio.unsqueeze(0), f0.unsqueeze(0), hop, scale)[0] / CONTRAST_SCALE
+        return torch.cat((mel, contrast), dim=0)
 
     def content(self, index):
         """Clip ``index``'s content at ``FEATURE_RATE``, [time, channels]."""
@@ -439,9 +469,11 @@ class RectifiedDataset(Dataset):
         )
         audio = audio[: frames * hop]
         content = to_mel_rate(content, frames, self.sample_rate, hop)
-        f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, hop) * 2.0 ** (key_shift / 12.0)
+        own_f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, hop)
+        f0 = own_f0 * 2.0 ** (key_shift / 12.0)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), key_shift, hop)[0, :, :frames]
+        mel = self._with_contrast(mel, audio, own_f0, hop, 2.0 ** (key_shift / 12.0))
         return FlowItem(
             mel=mel, content=content, f0=f0,
             energy=self._energy(audio.unsqueeze(0), frames, hop)[0],
@@ -465,6 +497,7 @@ class RectifiedDataset(Dataset):
         f0 = f0_to_mel_rate(f0, frames, self.sample_rate, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
+        mel = self._with_contrast(mel[0], audio, f0, self.hop).unsqueeze(0)
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)
         inputs = Conditioning(
             content=content.unsqueeze(0), f0=f0.unsqueeze(0), energy=energy,
@@ -608,15 +641,15 @@ def _vocoder_files(pattern: str) -> list:
 def list_exports(kind: str) -> list:
     """Models to render with: exported ``kind`` models (``flow`` or
     ``vocoder``) under ``logs/*/flow`` or ``logs/*/vocoder*``; for flows, also the bundles holding
-    one; for vocoders, also ``VOCODER_DIR``'s exports and OpenVPI checkpoints
-    (``*.ckpt``). The flow pretrains are starting points and are left out."""
+    one; for vocoders, also ``VOCODER_DIR``'s exports. The flow pretrains are
+    starting points and are left out."""
     from rvc.lib.catalog import list_bundles, relative, sort_key
     from rvc.lib.model_bundle import RECTIFIED_KIND
 
     folder = "vocoder*" if kind == "vocoder" else kind
     paths = glob.glob(os.path.join(LOGS_DIR, "*", folder, f"*_{kind}_*.pth"))
     if kind == "vocoder":
-        paths += _vocoder_files("*.pth") + _vocoder_files("*.ckpt")
+        paths += _vocoder_files("*.pth")
     found = sorted((relative(path) for path in paths), key=sort_key)
     if kind == "flow":
         found += list_bundles(LOGS_DIR, RECTIFIED_KIND)
@@ -670,7 +703,7 @@ def list_pretrained(kind: str) -> list:
     from rvc.lib.catalog import list_custom_pretraineds, relative
 
     patterns = {
-        "vocoder_g": ["G_*.pth", "*_vocoder_*.pth", "*_vocoder.pth", "*.ckpt"],
+        "vocoder_g": ["G_*.pth", "*_vocoder_*.pth", "*_vocoder.pth"],
         "vocoder_d": ["D_*.pth"],
         "flow": ["F_*.pth", "*_flow_*.pth", "*_flow.pth"],
     }[kind]
@@ -714,13 +747,32 @@ def precision_label(amp_dtype) -> str:
     return "BF16 autocast"
 
 
-def default_pretrained(kind: str):
+def _renders(path: str, data: dict) -> bool:
+    """Whether ``path`` is a ChouwaGAN export that renders the mel of
+    ``data``, read without loading its weights."""
+    from rvc.rectified.vocoder import mel_mismatch
+
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        return (
+            checkpoint.get("kind") == "rectified_vocoder" and checkpoint.get("architecture") == ARCHITECTURE
+            and mel_mismatch(data, checkpoint["config"]["data"]) is None
+        )
+    except Exception:
+        return False
+
+
+def default_pretrained(kind: str, data: dict | None = None):
     """The newest ``flow`` pretrain in ``PRETRAINED_DIR``, or the default
     ``vocoder`` in ``VOCODER_DIR``: ``RECTIFIED_DEFAULT_VOCODER``, else the
-    newest export, else the newest OpenVPI checkpoint; None when there is none."""
+    newest export; with ``data``, only one that renders that mel. None when
+    there is none."""
     from rvc.lib.catalog import default_vocoder, sort_key
 
     if kind == "vocoder":
-        return default_vocoder(_vocoder_files("*.pth") or _vocoder_files("*.ckpt"))
+        paths = _vocoder_files("*.pth")
+        if data is not None:
+            paths = [path for path in paths if _renders(path, data)]
+        return default_vocoder(paths)
     paths = _pretrained_exports(kind)
     return max(paths, key=sort_key) if paths else None

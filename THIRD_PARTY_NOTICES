@@ -9,11 +9,9 @@ own licenses.
 OpenVPI SingingVocoders — https://github.com/openvpi/SingingVocoders
 -------------------------------------------------------------------------------
 
-Used in: rvc/rectified/openvpi.py (the NSF-HiFiGAN generator, ported and
-modified to load OpenVPI checkpoints for inference).
-rvc/rectified/singing_vocoders.py and rvc/rectified/train_vocoder.py (the
-NSF-UnivNet generator, the discriminators, the losses and the training
-recipes, ported and modified).
+Used in: rvc/rectified/mel.py (the mel's framing and key shift) and
+rvc/rectified/train_vocoder.py (the GAN losses, the multi-resolution STFT loss
+and the volume augmentation, ported and modified).
 
 MIT License
 
@@ -39,100 +37,11 @@ SOFTWARE.
 
 
 -------------------------------------------------------------------------------
-NSF-BigVGAN — https://github.com/PlayVoice/NSF-BigVGAN
--------------------------------------------------------------------------------
-
-Used in: rvc/rectified/nsf_bigvgan.py (the generator, ported and modified).
-
-MIT License
-
-Copyright (c) 2022 PlayVoice
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
--------------------------------------------------------------------------------
-Aliasing-Free Neural Audio Synthesis — https://github.com/sizigi/AliasingFreeNeuralAudioSynthesis
--------------------------------------------------------------------------------
-
-Used in: rvc/rectified/pupu_vocoder.py (Pupu-Vocoder's generator, sine
-generator, multi-scale mel loss and discriminators, ported and modified).
-
-MIT License
-
-Copyright (c) 2025 AliasingFreeNeuralAudioSynthesis
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
--------------------------------------------------------------------------------
-BigVGAN — https://github.com/NVIDIA/BigVGAN
--------------------------------------------------------------------------------
-
-Used in: rvc/rectified/bigvgan_v2.py (the generator, ported with an f0 source added)
-and tools/pretrain/convert_bigvgan_v2.py (reads the released checkpoints).
-
-MIT License
-
-Copyright (c) 2024 NVIDIA CORPORATION.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
--------------------------------------------------------------------------------
 Wavehax — https://github.com/chomeyama/wavehax
 -------------------------------------------------------------------------------
 
-Used in: rvc/rectified/wavehax.py (the generators, Multi-Scale Wavehax's with its
-decomposition, the closed-form prior and the discriminators, ported and modified) and rvc/rectified/train_vocoder.py (the training recipe).
+Used in: rvc/rectified/chouwagan.py (the period and spectrogram
+discriminators, as Wavehax sizes them, ported and modified).
 
 MIT License
 

@@ -157,6 +157,14 @@ def cmd_extract(args):
     return {"message": _core().run_extract_script(**args)}
 
 
+def cmd_rectified_preprocess(args):
+    return {"message": _core().run_rectified_preprocess_script(**args)}
+
+
+def cmd_rectified_extract(args):
+    return {"message": _core().run_rectified_extract_script(**args)}
+
+
 def cmd_train(args):
     return {"message": _core().run_train_script(**args)}
 
@@ -333,6 +341,8 @@ HANDLERS = {
     "tts": cmd_tts,
     "preprocess": cmd_preprocess,
     "extract": cmd_extract,
+    "rectified_preprocess": cmd_rectified_preprocess,
+    "rectified_extract": cmd_rectified_extract,
     "train": cmd_train,
     "index": cmd_index,
     "rectified_infer": cmd_rectified_infer,

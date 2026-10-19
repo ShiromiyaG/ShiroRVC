@@ -28,9 +28,11 @@ def preview(model, ema, previews, clips, vocoder, data: dict, device, epoch: int
             noise = torch.randn_like(real)
             generated = model.sample(inputs, steps=PREVIEW_STEPS, noise=noise)
             if vocoder is None:
+                # The mel's bins only, without any band contrast after them.
+                bins = int(data["n_mels"])
                 previews.log(
-                    epoch, step, clip.path, generated_mel=denormalize_mel(generated, data),
-                    reference_mel=clip.mel, sample_index=index, writer=media,
+                    epoch, step, clip.path, generated_mel=denormalize_mel(generated[:, :bins], data),
+                    reference_mel=clip.mel[:, :bins], sample_index=index, writer=media,
                 )
                 continue
             mels = {"vocoder_on_real_mel": real}

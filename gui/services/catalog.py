@@ -138,9 +138,9 @@ INFERENCE_DEFAULTS: dict[str, dict] = {
 RECTIFIED_SAMPLERS = ["euler", "heun", "mean"]
 RECTIFIED_SCHEDULES = ["uniform", "sway", "logit-normal"]
 RECTIFIED_RESCALE_MODES = ["global", "frame"]
-#: The rectified recipe ships one configuration; extraction's vocoder id for it.
-RECTIFIED_SAMPLE_RATE = 44100
-RECTIFIED_EXTRACTION = "rectified"
+#: Mirror rvc.rectified.common: the sample rates with a shipped rectified config.
+RECTIFIED_SAMPLE_RATES = [32000, 40000, 44100, 48000]
+RECTIFIED_DEFAULT_SAMPLE_RATE = 44100
 
 TTS_RAW_NAME = "tts_output.wav"
 TTS_CONVERTED_NAME = "tts_rvc_output.wav"
@@ -224,7 +224,6 @@ def list_rectified_exports(kind: str) -> list[str]:
     found = list(paths.LOGS_DIR.glob(f"*/{folder}/*_{kind}_*.pth"))
     if kind == "vocoder":
         found += paths.RECTIFIED_VOCODER_DIR.glob("*.pth")
-        found += paths.RECTIFIED_VOCODER_DIR.glob("*.ckpt")
     listed = sorted((shared.relative(path) for path in found), key=shared.sort_key)
     if kind == "flow":
         listed += shared.list_bundles(paths.LOGS_DIR, "rectified_flow")
@@ -264,7 +263,7 @@ def default_rectified_pretrained(kind: str) -> str:
     shared = _shared()
     if kind == "vocoder":
         folder = paths.RECTIFIED_VOCODER_DIR
-        found = [str(path) for path in folder.glob("*.pth")] or [str(path) for path in folder.glob("*.ckpt")]
+        found = [str(path) for path in folder.glob("*.pth")]
         chosen = shared.default_vocoder(found)
         return shared.relative(chosen) if chosen else ""
     found = [str(path) for path in _rectified_pretrained_exports(kind)]

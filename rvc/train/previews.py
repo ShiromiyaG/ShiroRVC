@@ -8,6 +8,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from scipy.ndimage import uniform_filter1d
 from torch.utils.tensorboard import SummaryWriter
 
 from rvc.lib.algorithm.commons import upsample_content
@@ -16,6 +17,7 @@ from rvc.lib.terminal import info, warning
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 
 from rvc.train.messages import (
     TENSORBOARD_VALIDATION_AUDIO_NAMES,
@@ -27,7 +29,9 @@ from rvc.train.messages import (
     TENSORBOARD_VALIDATION_FOOTER,
     TENSORBOARD_VALIDATION_MEL_TAG,
     TENSORBOARD_VALIDATION_MEL_TITLES,
+    TENSORBOARD_VALIDATION_PANEL_TITLE,
     TENSORBOARD_VALIDATION_PREVIEW_DIR,
+    TENSORBOARD_VALIDATION_PROFILE_TITLE,
     TENSORBOARD_VALIDATION_SOURCE_TAG,
 )
 
@@ -49,8 +53,33 @@ VALIDATION_PREVIEW_FIGSIZE = (24.0, 5.8)
 #: bottom octaves into a few pixels and label almost nothing where the voice
 #: actually lives.  Whatever falls outside the filterbank's range is dropped.
 VALIDATION_PREVIEW_FREQUENCY_TICKS = (
-    0.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 16000.0, 20000.0,
 )
+#: A tick closer than this share of the axis to the one under it is dropped.
+VALIDATION_PREVIEW_TICK_SPACING = 0.05
+
+#: The mels are the natural log of a magnitude, as both trainers make them.
+NATURAL_LOG_TO_DB = 20.0 / np.log(10.0)
+#: Shown below the original's peak; fixed, so previews compare across steps.
+VALIDATION_PREVIEW_RANGE_DB = 80.0
+VALIDATION_PREVIEW_DIFFERENCE_DB = 10.0
+#: Where both mels are this far under the peak, the difference is inaudible
+#: and only noise; it is greyed out.
+VALIDATION_PREVIEW_QUIET_DB = 60.0
+VALIDATION_PREVIEW_BACKGROUND = "#10161f"
+VALIDATION_PREVIEW_QUIET_COLOR = "#2a313c"
+
+#: The second row, from the audio: a linear axis to Nyquist, where the mel's
+#: top bins (~700 Hz wide at 44.1 kHz) merge the harmonics. Its height in
+#: inches is added to the figure's.
+VALIDATION_PREVIEW_STFT_FFT = 2048
+VALIDATION_PREVIEW_STFT_HEIGHT = 12.0
+VALIDATION_PREVIEW_STFT_TICK_HZ = 2000.0
+#: Its difference compares power pooled over this much (a bin is ~20 Hz), so a
+#: harmonic a few Hz off reads as the same level, not as a red and a blue line.
+VALIDATION_PREVIEW_STFT_POOL_HZ = 200.0
+#: Figure margins and the gap between the rows, in inches.
+VALIDATION_PREVIEW_MARGINS = (0.8, 1.0, 1.0)
 
 
 #: Previews kept for TensorBoard, which by default shows 10 images and 10
@@ -162,6 +191,51 @@ def _format_frequency(frequency):
     return f"{frequency:g}" if frequency < 1000.0 else f"{frequency / 1000:g}k"
 
 
+def _wave_to_numpy(wave):
+    if torch.is_tensor(wave):
+        wave = wave.detach().float().cpu().numpy()
+    return np.nan_to_num(np.asarray(wave, dtype=np.float32), copy=True).reshape(-1)
+
+
+def _stft_db(wave, n_fft, hop_length):
+    """[n_fft // 2 + 1, frames] magnitude in dB of a full-scale sine."""
+    window = torch.hann_window(n_fft)
+    spectrum = torch.stft(
+        torch.from_numpy(wave), n_fft, hop_length, window=window, center=True, return_complex=True
+    ).abs()
+    return (20.0 * torch.log10(torch.clamp(spectrum / (window.sum() / 2), min=1e-5))).numpy()
+
+
+def _band_profile(difference):
+    """The masked ``difference``'s mean over time per bin; NaN where a bin is
+    never audible."""
+    sums = difference.filled(0.0).sum(axis=1)
+    counts = (~np.ma.getmaskarray(difference)).sum(axis=1).astype(float)
+    return np.where(counts > 0, sums / np.maximum(counts, 1.0), np.nan)
+
+
+def _pool_db(values, width):
+    """dB images [bins, frames] as their power averaged over ``width``
+    neighbouring bins."""
+    if width <= 1:
+        return values
+    return 10.0 * np.log10(uniform_filter1d(np.power(10.0, values / 10.0), int(width), axis=0, mode="nearest"))
+
+
+def _mel_ticks(mel_bins, mel_fmin, mel_fmax):
+    """Tick positions and labels on a mel bin axis, too-close ones dropped."""
+    positions = _mel_axis_positions(VALIDATION_PREVIEW_FREQUENCY_TICKS, mel_bins, mel_fmin, mel_fmax)
+    ticks, labels = [], []
+    for frequency, position in zip(VALIDATION_PREVIEW_FREQUENCY_TICKS, positions):
+        if not -0.5 <= position <= mel_bins - 0.5:
+            continue
+        if ticks and position - ticks[-1] < VALIDATION_PREVIEW_TICK_SPACING * mel_bins:
+            continue
+        ticks.append(float(position))
+        labels.append(_format_frequency(frequency))
+    return ticks, labels
+
+
 def plot_validation_preview_to_figure(
     predicted_mel,
     target_mel,
@@ -174,13 +248,18 @@ def plot_validation_preview_to_figure(
     mel_fmax=None,
     dpi=None,
     figsize=None,
+    predicted_wave=None,
+    target_wave=None,
 ):
-    """Create a dark TensorBoard-style three-panel validation report.
+    """Create a dark TensorBoard-style validation report: generated, original
+    and their difference with its mean per frequency, for the mel and, with
+    both waves, for their STFT on a linear axis to Nyquist.
 
     ``hop_length`` sets the time axis and must match the config the mels were
     produced with -- the default is a fallback, not a good guess.  The same goes
     for ``mel_fmin`` / ``mel_fmax``, which set the frequency axis; ``mel_fmax``
-    of ``None`` means Nyquist, matching the mel extraction.
+    of ``None`` means Nyquist, matching the mel extraction. ``figsize`` sizes
+    the mel row; the STFT row adds ``VALIDATION_PREVIEW_STFT_HEIGHT`` inches.
     """
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
@@ -194,121 +273,139 @@ def plot_validation_preview_to_figure(
     if mel_bins <= 0 or frames <= 0:
         raise ValueError("Validation mel spectrograms must not be empty.")
 
-    target_mel = target_mel[:mel_bins, :frames]
-    predicted_mel = predicted_mel[:mel_bins, :frames]
-    difference_mel = predicted_mel - target_mel
-
-    shared_values = np.concatenate((target_mel.ravel(), predicted_mel.ravel()))
-    shared_low = float(np.quantile(shared_values, 0.01))
-    shared_high = float(np.quantile(shared_values, 0.99))
-    if not np.isfinite(shared_low) or not np.isfinite(shared_high):
-        shared_low, shared_high = 0.0, 1.0
-    if shared_low >= shared_high:
-        shared_high = shared_low + 1.0
-
-    difference_limit = max(
-        1e-5,
-        float(np.quantile(np.abs(difference_mel), 0.99)),
-    )
-    time_axis = np.arange(frames, dtype=np.float32) * float(hop_length) / float(sample_rate)
-    # The mel filterbank spans DC to Nyquist, not DC to the sample rate. Using
-    # the sample rate as the extent labelled every frequency tick at twice its
-    # true value.
+    # The image stays in bin space, mel bins not being evenly spaced in Hz;
+    # the ticks move to where their frequencies fall instead.
     top_frequency = float(sample_rate) / 2.0 if mel_fmax is None else float(mel_fmax)
-    # The vertical axis is bin index, and mel bins are not evenly spaced in Hz.
-    # Stretching them onto a linear 0..Nyquist ruler -- which is what an extent
-    # of ``(0, top_frequency)`` does -- put every label except the two endpoints
-    # in the wrong place, and not by a little: at 128 bins over 32 kHz the
-    # tick reading "4.0k" sits on bin 32, whose real centre is 0.94 kHz. A
-    # deficit under 1 kHz reads as a defect at 4 kHz, which is a diagnosis this
-    # axis has no business making. Keep the image in bin space and move the
-    # ticks instead, so what the eye measures is the filterbank's own spacing.
-    tick_positions = _mel_axis_positions(
-        VALIDATION_PREVIEW_FREQUENCY_TICKS, mel_bins, mel_fmin, top_frequency
-    )
-    visible = (tick_positions >= -0.5) & (tick_positions <= mel_bins - 0.5)
-    tick_positions = tick_positions[visible]
-    tick_labels = [
-        _format_frequency(frequency)
-        for frequency, keep in zip(VALIDATION_PREVIEW_FREQUENCY_TICKS, visible)
-        if keep
-    ]
-    figure, axes = plt.subplots(
+    duration = frames * float(hop_length) / float(sample_rate)
+    rows = [(
+        "mel",
+        predicted_mel[:mel_bins, :frames] * NATURAL_LOG_TO_DB,
+        target_mel[:mel_bins, :frames] * NATURAL_LOG_TO_DB,
+        np.arange(mel_bins, dtype=float),
+        *_mel_ticks(mel_bins, mel_fmin, top_frequency),
         1,
-        3,
-        figsize=tuple(figsize) if figsize else VALIDATION_PREVIEW_FIGSIZE,
-        dpi=float(dpi) if dpi else VALIDATION_PREVIEW_DPI,
-        facecolor="#10161f",
-        gridspec_kw={
-            "left": 0.045,
-            "right": 0.955,
-            "wspace": 0.16,
-            "bottom": 0.25,
-            "top": 0.86,
-        },
-    )
-    figure.patch.set_facecolor("#10161f")
-    panels = (predicted_mel, target_mel, difference_mel)
-    panel_cmaps = ("inferno", "inferno", "turbo")
-    panel_norms = (
-        (shared_low, shared_high),
-        (shared_low, shared_high),
-        (-difference_limit, difference_limit),
-    )
-    for axis, mel, title, cmap, (vmin, vmax) in zip(
-        axes,
-        panels,
-        TENSORBOARD_VALIDATION_MEL_TITLES,
-        panel_cmaps,
-        panel_norms,
-    ):
-        axis.set_facecolor("#10161f")
-        rendered = axis.imshow(
-            mel,
-            origin="lower",
-            aspect="auto",
-            interpolation="nearest",
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            # Half a bin past the first and last centres, so a data coordinate
-            # of ``i`` lands exactly on the centre of bin ``i``.
-            extent=(time_axis[0], time_axis[-1], -0.5, mel_bins - 0.5),
-        )
-        axis.set_title(title, color="#f4f4f4", fontsize=17, fontweight="bold", pad=12)
-        axis.set_xlabel(TENSORBOARD_VALIDATION_AXIS_X, color="#f4f4f4", fontsize=11)
-        axis.set_ylabel(TENSORBOARD_VALIDATION_AXIS_Y, color="#f4f4f4", fontsize=11)
-        axis.set_yticks(tick_positions)
-        axis.set_yticklabels(tick_labels)
-        axis.tick_params(colors="#f4f4f4", labelsize=9)
-        for spine in axis.spines.values():
-            spine.set_color("#c9cdd3")
-        colorbar = figure.colorbar(
-            rendered,
-            ax=axis,
-            orientation="horizontal",
-            fraction=0.055,
-            pad=0.12,
-        )
-        colorbar.set_label(
-            TENSORBOARD_VALIDATION_DIFFERENCE_LABEL
-            if title == TENSORBOARD_VALIDATION_MEL_TITLES[-1]
-            else TENSORBOARD_VALIDATION_DB_LABEL,
-            color="#d7dbe1",
-            fontsize=8,
-        )
-        colorbar.ax.tick_params(colors="#d7dbe1", labelsize=8)
-        colorbar.outline.set_edgecolor("#c9cdd3")
+    )]
+    if predicted_wave is not None and target_wave is not None:
+        predicted_wave, target_wave = _wave_to_numpy(predicted_wave), _wave_to_numpy(target_wave)
+        length = min(predicted_wave.size, target_wave.size)
+        if length > VALIDATION_PREVIEW_STFT_FFT:
+            n_fft = VALIDATION_PREVIEW_STFT_FFT
+            step = float(sample_rate) / n_fft
+            ticks = np.arange(0.0, float(sample_rate) / 2.0 + 1.0, VALIDATION_PREVIEW_STFT_TICK_HZ)
+            rows.append((
+                "STFT",
+                _stft_db(predicted_wave[:length], n_fft, int(hop_length)),
+                _stft_db(target_wave[:length], n_fft, int(hop_length)),
+                np.arange(n_fft // 2 + 1) * step,
+                list(ticks),
+                [_format_frequency(frequency) for frequency in ticks],
+                max(1, round(VALIDATION_PREVIEW_STFT_POOL_HZ / step)),
+            ))
 
+    width, height = tuple(figsize) if figsize else VALIDATION_PREVIEW_FIGSIZE
+    top_margin, bottom_margin, gap = VALIDATION_PREVIEW_MARGINS
+    heights = [max(1.0, float(height) - top_margin - bottom_margin)]
+    heights += [VALIDATION_PREVIEW_STFT_HEIGHT] * (len(rows) - 1)
+    total = top_margin + bottom_margin + sum(heights) + gap * (len(rows) - 1)
+    background, text, edge = VALIDATION_PREVIEW_BACKGROUND, "#f4f4f4", "#c9cdd3"
+    figure = plt.figure(
+        figsize=(float(width), total),
+        dpi=float(dpi) if dpi else VALIDATION_PREVIEW_DPI,
+        facecolor=background,
+    )
+    # Generated | original | their colourbar | gap | difference | mean by bin | its colourbar.
+    grid = figure.add_gridspec(
+        len(rows), 7, width_ratios=(1.0, 1.0, 0.025, 0.16, 1.0, 0.16, 0.025), height_ratios=heights,
+        left=0.04, right=0.965, bottom=bottom_margin / total, top=1.0 - top_margin / total,
+        wspace=0.05, hspace=gap / (sum(heights) / len(heights)),
+    )
+    difference_cmap = matplotlib.colormaps["RdBu_r"].copy()
+    difference_cmap.set_bad(VALIDATION_PREVIEW_QUIET_COLOR)
+    limit = VALIDATION_PREVIEW_DIFFERENCE_DB
+    first = None
+
+    for index, (row, predicted, target, bins, ticks, labels, pool) in enumerate(rows):
+        frames = min(predicted.shape[1], target.shape[1])
+        predicted, target = predicted[:, :frames], target[:, :frames]
+        top = float(np.ceil(target.max() / 5.0) * 5.0)
+        pooled_predicted, pooled_target = _pool_db(predicted, pool), _pool_db(target, pool)
+        quiet = np.maximum(pooled_target, pooled_predicted) < top - VALIDATION_PREVIEW_QUIET_DB
+        difference = np.ma.masked_array(pooled_predicted - pooled_target, mask=quiet)
+        # The mean over the audible frames of each bin: a band's bias at a glance.
+        profile = _band_profile(difference)
+        biases = np.abs(profile[np.isfinite(profile)])
+        profile_limit = max(3.0, float(np.ceil(biases.max() * 1.1))) if biases.size else 3.0
+        # Half a bin past the first and last centres, so a bin's value sits on its centre.
+        half = (bins[1] - bins[0]) / 2.0 if bins.size > 1 else 0.5
+        extent = (0.0, frames * float(hop_length) / float(sample_rate), bins[0] - half, bins[-1] + half)
+
+        generated_axis = figure.add_subplot(grid[index, 0], sharex=first)
+        if first is None:
+            first = generated_axis
+        original_axis = figure.add_subplot(grid[index, 1], sharex=first, sharey=generated_axis)
+        difference_axis = figure.add_subplot(grid[index, 4], sharex=first, sharey=generated_axis)
+        profile_axis = figure.add_subplot(grid[index, 5], sharey=generated_axis)
+        level_bar, difference_bar = figure.add_subplot(grid[index, 2]), figure.add_subplot(grid[index, 6])
+
+        panels = (
+            (generated_axis, predicted, "inferno", top - VALIDATION_PREVIEW_RANGE_DB, top),
+            (original_axis, target, "inferno", top - VALIDATION_PREVIEW_RANGE_DB, top),
+            (difference_axis, difference, difference_cmap, -limit, limit),
+        )
+        images = []
+        for (axis, values, cmap, vmin, vmax), title in zip(panels, TENSORBOARD_VALIDATION_MEL_TITLES):
+            images.append(axis.imshow(
+                values, origin="lower", aspect="auto", interpolation="antialiased",
+                cmap=cmap, vmin=vmin, vmax=vmax, extent=extent,
+            ))
+            axis.set_title(
+                TENSORBOARD_VALIDATION_PANEL_TITLE.format(title=title, row=row),
+                color=text, fontsize=15, fontweight="bold", pad=10,
+            )
+
+        profile_axis.axvline(0.0, color="#8a93a0", linewidth=0.8)
+        profile_axis.plot(profile, bins, color=text, linewidth=1.2)
+        profile_axis.set_xlim(-profile_limit, profile_limit)
+        profile_axis.set_xticks((-profile_limit, 0.0, profile_limit))
+        profile_axis.xaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%g"))
+        profile_axis.set_title(TENSORBOARD_VALIDATION_PROFILE_TITLE, color=text, fontsize=12, pad=10)
+        profile_axis.grid(axis="x", color=VALIDATION_PREVIEW_QUIET_COLOR, linewidth=0.8)
+
+        generated_axis.set_ylim(extent[2], extent[3])
+        generated_axis.set_yticks(ticks, labels)
+        generated_axis.set_ylabel(TENSORBOARD_VALIDATION_AXIS_Y, color=text, fontsize=11)
+        original_axis.tick_params(labelleft=False)
+        profile_axis.tick_params(labelleft=False)
+        for axis in (generated_axis, original_axis, difference_axis, profile_axis):
+            axis.set_facecolor(background)
+            axis.tick_params(colors=text, labelsize=9)
+            for spine in axis.spines.values():
+                spine.set_color(edge)
+        if index == len(rows) - 1:
+            for axis in (generated_axis, original_axis, difference_axis):
+                axis.set_xlabel(TENSORBOARD_VALIDATION_AXIS_X, color=text, fontsize=11)
+            profile_axis.set_xlabel(TENSORBOARD_VALIDATION_DB_LABEL, color=text, fontsize=11)
+
+        for bar, image, label, extend in (
+            (level_bar, images[0], TENSORBOARD_VALIDATION_DB_LABEL, "neither"),
+            (difference_bar, images[2], TENSORBOARD_VALIDATION_DIFFERENCE_LABEL, "both"),
+        ):
+            colorbar = figure.colorbar(image, cax=bar, extend=extend)
+            colorbar.set_label(label, color="#d7dbe1", fontsize=9)
+            colorbar.ax.tick_params(colors="#d7dbe1", labelsize=8)
+            colorbar.outline.set_edgecolor(edge)
+
+    first.set_xlim(0.0, duration)
     figure.text(
         0.5,
-        0.055,
+        0.35 / total,
         TENSORBOARD_VALIDATION_FOOTER.format(
             sample_rate=int(sample_rate),
             hop_length=int(hop_length),
             n_mels=int(mel_bins),
             epoch=int(epoch),
             step=int(global_step),
+            quiet=VALIDATION_PREVIEW_QUIET_DB,
         ),
         color="#bfc5ce",
         fontsize=10,
@@ -375,6 +472,8 @@ def log_validation_preview(
         mel_fmax=mel_fmax,
         dpi=dpi,
         figsize=figsize,
+        predicted_wave=predicted_wave,
+        target_wave=target_wave,
     )
     image_path = os.path.join(mel_dir, f"{sample_stem}.png")
     try:

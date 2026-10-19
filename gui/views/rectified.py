@@ -1,7 +1,7 @@
 """Rectified flow: conversion and training, apart from the RVC screens.
 
 Mirrors the Gradio "Rectified" tab: the flow model and its vocoder are
-separate files, and training runs at the recipe's single rate of 44.1 kHz.
+separate files, and training runs at the rate the dataset was preprocessed at.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QTabWidget, QVBoxLayout, QWidget
 
 from ..services import catalog, paths
 from ..widgets.audio import AudioPlayer
@@ -163,7 +163,7 @@ class RectifiedPage(Page):
         models.add(
             self.flow_submodel_field,
             Field(_("Vocoder model"), self.vocoder_model,
-                  _("Rectified PCPH-BigVGAN export or OpenVPI NSF-HiFiGAN checkpoint. "
+                  _("ChouwaGAN export at the flow's sample rate. "
                     "Follows the vocoder the flow was trained with when a file of that name is here.")),
             Field(_("Index"), self.index_file,
                   _("Optional RVC index over the voice model's training features. "
@@ -256,8 +256,9 @@ class RectifiedPage(Page):
         self.noise_temperature = SliderSpin(0.0, 1.5, 0.05, decimals=2, value=1.0)
         self.flow_start = SliderSpin(0.0, 0.95, 0.05, decimals=2, value=0.0)
         advanced.add_row(
-            Field(_("Sampler"), self.sampler, _("Heun costs two model passes per step. Mean takes one or two "
-                                                "steps and needs a model trained with mean flow.")),
+            Field(_("Sampler"), self.sampler, _("Heun costs two model passes per step. Mean takes any number "
+                                                "of steps, 1 or 2 being where it pays, and needs a "
+                                                "model trained with mean flow.")),
             Field(_("Step schedule"), self.schedule,
                   _("Sway puts more steps early; logit-normal puts more mid-way.")),
         )
@@ -513,10 +514,6 @@ class RectifiedPage(Page):
             Field(_("Precision"), self.precision, _("Training precision of both models.")),
             stretch=[2, 1, 1],
         )
-        rate = QLabel(_("Sample rate: {rate} Hz. The rectified recipe has one configuration.")
-                      .format(rate=catalog.RECTIFIED_SAMPLE_RATE))
-        rate.setObjectName("FieldHint")
-        card.add(rate)
         return card
 
     def _build_preprocess_card(self) -> Card:
@@ -524,6 +521,12 @@ class RectifiedPage(Page):
         self.dataset = PathPicker(mode="dir", placeholder=_("Folder with your training audio"))
         card.add(Field(_("Dataset folder"), self.dataset, _("Every audio file below this folder is used.")))
 
+        self.sample_rate = _combo([str(rate) for rate in catalog.RECTIFIED_SAMPLE_RATES],
+                                  str(catalog.RECTIFIED_DEFAULT_SAMPLE_RATE))
+        card.add(Field(
+            _("Sample rate"), self.sample_rate,
+            _("Every later step of the experiment keeps it. 44.1 kHz has a 512-sample hop, the others 10 ms."),
+        ))
         self.cut_preprocess = _combo(catalog.CUT_PREPROCESS, "New Automatic")
         self.chunk_len = SliderSpin(0.5, 30.0, 0.1, decimals=1, value=3.0)
         self.overlap_len = SliderSpin(0.0, 0.42, 0.01, decimals=2, value=0.40)
@@ -622,11 +625,12 @@ class RectifiedPage(Page):
             _("Pretrained flow"), self.custom_flow,
             _("Its speakers are replaced by this dataset's."),
         )
-        self.flow_vocoder = PathPicker(filters="Vocoder (*.pth *.ckpt)")
+        self.flow_vocoder = PathPicker(filters="Vocoder (*.pth)")
         card.add(
             self.flow_pretrained, self.flow_custom, self.custom_flow_field,
             Field(_("Vocoder"), self.flow_vocoder,
-                  _("Renders the previews and is paired with the exports. Empty uses the default one, else the newest.")),
+                  _("Renders the previews and is paired with the exports. Empty uses the default one, else the "
+                    "newest, among those that render the experiment's mel.")),
         )
 
         advanced = Collapsible(_("Advanced settings"), _("learning rate, compilation, mean flow, checkpoints"))
@@ -649,9 +653,11 @@ class RectifiedPage(Page):
         self.flow_cache.setChecked(True)
         self.flow_mean = Toggle(
             _("Mean flow"),
-            _("Also train the mean velocity (MeanFlow), which the mean sampler takes in one or two "
-              "steps. The other samplers work as before. A resumed run keeps what it started with."),
+            _("Also train the mean velocity (MeanFlow), which the mean sampler takes in any number of "
+              "steps, one included. The other samplers work as before. A resumed run keeps what it "
+              "started with."),
         )
+        self.flow_mean.setChecked(True)
         advanced.add(self.flow_compile, self.flow_compile_mode_field, self.flow_cache, self.flow_mean,
                      flow_checkpoints_field, self.flow_fresh)
 
@@ -693,8 +699,9 @@ class RectifiedPage(Page):
     def _build_vocoder_card(self) -> Card:
         card = Card(
             _("Vocoder Pretrain"),
-            _("Builds the PCPH-BigVGAN vocoder pretrain, on a large multi-speaker dataset. Not needed "
-              "to fine-tune a voice: the vocoder has no speaker input, so one pretrain renders every voice."),
+            _("Builds the ChouwaGAN vocoder pretrain at the experiment's sample rate, on a large multi-speaker "
+              "dataset. Not needed to fine-tune a voice: the vocoder has no speaker input, so one pretrain "
+              "renders every voice at that rate."),
             icon="volume",
         )
         self.voc_epochs, self.voc_batch, self.voc_save = self._run_controls(card)
@@ -721,8 +728,6 @@ class RectifiedPage(Page):
         self.dataset.set_suggestions(catalog.list_dataset_folders())
         self.custom_flow.set_suggestions(catalog.list_rectified_pretrained("flow"))
         self.flow_vocoder.set_suggestions(catalog.list_rectified_exports("vocoder"))
-        if not self.flow_vocoder.path():
-            self.flow_vocoder.set_path(catalog.default_rectified_pretrained("vocoder"))
         self.pretrained_g.set_suggestions(catalog.list_rectified_pretrained("vocoder_g"))
         self.pretrained_d.set_suggestions(catalog.list_rectified_pretrained("vocoder_d"))
 
@@ -751,11 +756,11 @@ class RectifiedPage(Page):
             self.notify.emit("error", _("The dataset folder does not exist."))
             return
         self.run(
-            "preprocess",
+            "rectified_preprocess",
             {
                 "model_name": name,
                 "dataset_path": self.dataset.path(),
-                "sample_rate": catalog.RECTIFIED_SAMPLE_RATE,
+                "sample_rate": int(self.sample_rate.text()),
                 "cpu_threads": int(self.cpu_threads.value()),
                 "cut_preprocess": self.cut_preprocess.text(),
                 "process_effects": self.process_effects.isChecked(),
@@ -778,14 +783,12 @@ class RectifiedPage(Page):
         if name is None:
             return
         self.run(
-            "extract",
+            "rectified_extract",
             {
                 "model_name": name,
                 "f0_method": self.extract_f0.text(),
                 "cpu_threads": int(self.cpu_threads.value()),
                 "gpu": self.gpu.text(),
-                "sample_rate": catalog.RECTIFIED_SAMPLE_RATE,
-                "vocoder_arch": catalog.RECTIFIED_EXTRACTION,
                 "embedder_model": self.extract_embedder.text(),
                 "include_mutes": int(self.include_mutes.value()),
                 "feature_precision": self.feature_precision.text(),
