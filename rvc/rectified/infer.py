@@ -10,6 +10,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn.functional as F
+from scipy import signal
 
 from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
@@ -56,6 +57,9 @@ VOCODER_CHUNK = 6000
 VOCODER_MIN_CHUNK = 375
 VOCODER_CONTEXT = 50
 VOCODER_CROSSFADE = 4
+#: High-pass on the input: a sub-bass pop would set the peak the input is
+#: normalised to and read as a loud frame of the energy input.
+INPUT_HIGHPASS_HZ = 40.0
 
 
 @dataclass(frozen=True)
@@ -527,6 +531,8 @@ class RectifiedConverter:
             sample_rate = self.vocoder_config["data"]["sample_rate"]
             # Decoded once, at the mel's rate; content and pitch read a copy of it.
             full = load_audio_infer(audio_input_path, sample_rate)
+            highpass = signal.butter(4, INPUT_HIGHPASS_HZ, "highpass", fs=sample_rate, output="sos")
+            full = signal.sosfiltfilt(highpass, full).astype(np.float32)
             input_loudness = integrated_loudness(full, sample_rate)
             audio = librosa.resample(full, orig_sr=sample_rate, target_sr=INPUT_RATE, res_type="soxr_vhq")
             peak = float(np.abs(audio).max())
