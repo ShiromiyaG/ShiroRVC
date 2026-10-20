@@ -17,7 +17,7 @@ from rvc.lib.algorithm.commons import upsample_content
 from rvc.lib.algorithm.energy import frame_energy
 from rvc.lib.paths import LOGS_DIR, MODELS_DIR, ROOT
 from rvc.rectified.aperiodicity import aperiodicity, tension
-from rvc.rectified.chouwagan import ARCHITECTURE, CONTRAST_SCALE, BandContrast
+from rvc.rectified.chouwagan import CONTRAST_SCALE, BandContrast
 from rvc.rectified.flow import Conditioning
 from rvc.rectified.mel import LogMel
 
@@ -45,8 +45,10 @@ def run_dir(model_name: str, part: str) -> str:
 
 
 def vocoder_run_dir(model_name: str) -> str:
-    """``logs/<model_name>/vocoder_chouwagan``."""
-    return run_dir(model_name, f"vocoder_{ARCHITECTURE}")
+    """``logs/<model_name>/vocoder_<architecture>``, the recipe's."""
+    from rvc.rectified.vocoder import experiment_architecture
+
+    return run_dir(model_name, f"vocoder_{experiment_architecture(model_name)}")
 
 
 def shipped_config(sample_rate: int = DEFAULT_SAMPLE_RATE) -> str:
@@ -753,14 +755,14 @@ def precision_label(amp_dtype) -> str:
 
 
 def _renders(path: str, data: dict) -> bool:
-    """Whether ``path`` is a ChouwaGAN export that renders the mel of
+    """Whether ``path`` is a rectified vocoder export that renders the mel of
     ``data``, read without loading its weights."""
-    from rvc.rectified.vocoder import mel_mismatch
+    from rvc.rectified.vocoder import EXPORT_ARCHITECTURES, mel_mismatch
 
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
         return (
-            checkpoint.get("kind") == "rectified_vocoder" and checkpoint.get("architecture") == ARCHITECTURE
+            checkpoint.get("kind") == "rectified_vocoder" and checkpoint.get("architecture") in EXPORT_ARCHITECTURES
             and mel_mismatch(data, checkpoint["config"]["data"]) is None
         )
     except Exception:

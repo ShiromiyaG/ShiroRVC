@@ -1,0 +1,199 @@
+{
+    "architecture": "sifigan",
+    "sample_rate": 48000,
+    "learning_rate": 0.0002,
+    "betas": [
+        0.5,
+        0.9
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "lr_scheduler": "cosine annealing step",
+    "lr_decay": 1.0,
+    "lr_final_ratio": 0.1,
+    "warmup_steps": 1000,
+    "adv_warmup_steps": 0,
+    "ema_decay": 0.999,
+    "grad_clip": 10.0,
+    "segment_size": 16800,
+    "c_mel": 45.0,
+    "c_stft": 2.5,
+    "loss_fft_sizes": [
+        576,
+        1152,
+        2304
+    ],
+    "loss_hop_sizes": [
+        144,
+        288,
+        576
+    ],
+    "loss_win_lengths": [
+        576,
+        1152,
+        2304
+    ],
+    "c_harmonic": 10.0,
+    "c_envelope": 1.0,
+    "envelope_loss_bands_hz": [
+        3000,
+        6000,
+        10000,
+        16000
+    ],
+    "contrast_dropout": 0.3,
+    "aux_epochs": 0,
+    "volume_aug_prob": 0.5,
+    "seed": 1234,
+    "rolling_loss_steps": 50,
+    "preview_interval": 500,
+    "holdout_clips": 0,
+    "eval_interval": 0,
+    "c_source": 1.0,
+    "model": {
+        "channels": 512,
+        "kernel_size": 7,
+        "upsample_rates": [
+            8,
+            6,
+            5,
+            2
+        ],
+        "dense_factors": null,
+        "source_dilations": [
+            [
+                1
+            ],
+            [
+                1,
+                2
+            ],
+            [
+                1,
+                2,
+                4
+            ],
+            [
+                1,
+                2,
+                4,
+                8
+            ]
+        ],
+        "filter_kernel_sizes": [
+            3,
+            5,
+            7
+        ],
+        "filter_dilations": [
+            [
+                1,
+                3,
+                5
+            ],
+            [
+                1,
+                3,
+                5
+            ],
+            [
+                1,
+                3,
+                5
+            ]
+        ],
+        "upsampler": "sinc",
+        "downsampler": "sinc",
+        "sinc_taps": 12,
+        "sinc_rolloff": 0.88,
+        "sinc_beta": 6.0,
+        "antialias_stages": [
+            0,
+            1
+        ],
+        "antialias_width": 8,
+        "sine_amp": 0.1,
+        "noise_amp": 0.003,
+        "contrast_band_edges": [
+            2000,
+            4000,
+            6000,
+            8000,
+            10000,
+            12000,
+            14000,
+            17000,
+            20000
+        ]
+    },
+    "discriminator": "original",
+    "discriminators": {
+        "original": {
+            "architecture": "sifigan",
+            "periods": [
+                2,
+                3,
+                5,
+                7,
+                11
+            ],
+            "mpd_max_channels": 1024,
+            "fft_sizes": [
+                2048,
+                4096,
+                1024
+            ],
+            "hop_sizes": [
+                240,
+                480,
+                100
+            ],
+            "win_lengths": [
+                1200,
+                2400,
+                480
+            ],
+            "channels": 32,
+            "average_heads": false,
+            "gan_loss": "lsgan"
+        },
+        "chouwa": {
+            "periods": [
+                2,
+                3,
+                5,
+                7,
+                11
+            ],
+            "mpd_max_channels": 256,
+            "mrd_fft_sizes": [
+                576,
+                1152,
+                2304
+            ],
+            "mrd_hop_sizes": [
+                144,
+                288,
+                576
+            ],
+            "mrd_win_lengths": [
+                576,
+                1152,
+                2304
+            ],
+            "mrd_compression": 0.3,
+            "mrd_floor": 0.001,
+            "mrd_first_channels": 16,
+            "use_san": true,
+            "envelope_bands_hz": [
+                3000,
+                6000,
+                12000,
+                24000
+            ],
+            "envelope_downsample": 4,
+            "average_heads": false,
+            "san_loss": "bigvsan"
+        }
+    }
+}

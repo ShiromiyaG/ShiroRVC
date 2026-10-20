@@ -719,7 +719,7 @@ RECTIFIED_INFER_OWN = [
     click.option("--output_path", type=str, required=True, help="Full path to the output audio file."),
     click.option("--flow_path", type=str, required=True, help="Exported rectified-flow model (.pth), or a model bundle (.srvc) holding one."),
     click.option("--flow_submodel", type=str, default="", help="The flow to use inside a bundle; empty uses its first. A bundled index replaces --index_path."),
-    click.option("--vocoder_path", type=str, default="", help="ChouwaGAN vocoder export. Empty uses the default in rvc/models/vocoders, else the newest."),
+    click.option("--vocoder_path", type=str, default="", help="Rectified vocoder export (ChouwaGAN, SiFi-GAN or OpenVPI NSF-HiFiGAN). Empty uses the default in rvc/models/vocoders, else the newest."),
     click.option("--index_path", type=str, default="", help="Optional RVC index over the voice model's training features."),
     click.option("--sid", type=int, default=0, show_default=True, help="Speaker ID for multi-speaker models."),
     click.option("--pitch", type=click.IntRange(-24, 24), default=0, show_default=True, help="Pitch shift in semitones."),

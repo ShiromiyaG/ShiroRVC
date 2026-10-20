@@ -58,7 +58,7 @@ def vocoder_pretraineds_list(vocoder=None, sample_rate=None):
 #: spin_v2's is picked up once it is here.
 rectified_pretrains_list = [
     ("rectified_flow_pretrains/", ["pretrain_flow_contentvec.pth"]),
-    ("vocoders/", ["chouwagan_44.1k_hop512_128bin_vocoder.pth"]),
+    ("vocoders/", ["chouwagan_44.1k_hop512_128bin_vocoder.pth", "pc_nsf_hifigan_ft_44.1k_hop512_128bin_vocoder.pth"]),
 ]
 
 models_list = [

@@ -31,7 +31,11 @@ per bin from the harmonic of f0 nearest to it, so the top is not one click per
 cycle and the gains train on that. Both branches are
 synthesised at ``synthesis_hop`` by overlap-add over blocks of frames, which
 add up to the whole transform exactly and bound the memory of long inputs. No
-upsampling layer and no activation run at the audio rate.
+upsampling layer and no activation run at the audio rate. With ``synthesis``
+"wavehax", none of that renders: Wavehax's 2D ConvNeXt makes the complex
+spectrogram from the STFTs of the pulse train and the noise, the features and
+the band contrast (``WavehaxSynthesis``), and the network predicts only the
+source's scalars beside them.
 """
 
 import math
@@ -43,6 +47,11 @@ from torch.nn.utils.parametrizations import weight_norm
 
 from rvc.lib.algorithm.discriminators.san import SANConv2d
 
+try:
+    from rvc.rectified.chouwagan_triton import FusedAntiAliasedLeakyReLU
+except ImportError:
+    FusedAntiAliasedLeakyReLU = None
+
 #: ``architecture`` of a ChouwaGAN rectified vocoder export, and of its runs.
 ARCHITECTURE = "chouwagan"
 SOURCE_F0_FLOOR = 50.0
@@ -51,6 +60,7 @@ LOG_GAIN_RANGE = (-12.0, 6.0)
 CONTRAST_SCALE = 4.0
 PHASES = ("mixed", "minimum", "zero")
 INTERPOLATIONS = ("linear", "cubic")
+SYNTHESES = ("dsp", "wavehax")
 #: Initial logit of the phase spread: about 2% of ``max_phase_spread``, nearly coherent.
 SPREAD_INIT_BIAS = -4.0
 #: Below ``phase_head_hz`` the phase head's turn fades in over this much.
@@ -184,6 +194,231 @@ class ConvNeXtBlock(nn.Module):
         return x + (self.gamma * y).transpose(1, 2)
 
 
+class AntiAliasedLeakyReLU(nn.Module):
+    """A leaky ReLU at twice the rate, filtered back to it (BigVGAN's
+    ``Activation1d``): at the audio rate its products above Nyquist would fold
+    back inharmonically. Kaiser-windowed sinc of ``width`` taps per side at
+    each rate, cut at ``rolloff`` of Nyquist; the input is extended by
+    replicating its ends. On CUDA with Triton it runs as one fused op
+    (``chouwagan_triton``), which computes the same."""
+
+    def __init__(self, slope=0.1, width=16, rolloff=0.99, beta=6.0):
+        super().__init__()
+        self.slope = float(slope)
+        half = 2 * int(width)
+        positions = torch.arange(-half, half + 1, dtype=torch.float64)
+        cutoff = 0.25 * rolloff
+        kernel = 2 * cutoff * torch.sinc(2 * cutoff * positions)
+        kernel = kernel * torch.kaiser_window(len(positions), periodic=False, beta=beta, dtype=torch.float64)
+        kernel = kernel / kernel.sum()
+        self.register_buffer("kernel", kernel.float().view(1, 1, -1), persistent=False)
+        # The fused op's polyphase taps: phase e of the upsampler reads
+        # x[q + t - width], and the lowpass reads phase e at q = n - width + i.
+        taps = torch.arange(width * 2 + 1)
+        up = torch.stack([half + e - 2 * (taps - int(width)) for e in (0, 1)])
+        down = torch.stack([2 * taps + e for e in (0, 1)])
+        pick = lambda index: torch.where(index <= 2 * half, kernel[index.clamp(max=2 * half)], 0.0)
+        self.register_buffer("up_weight", (2 * pick(up)).float(), persistent=False)
+        self.register_buffer("down_weight", pick(down).float(), persistent=False)
+
+    def forward(self, x):
+        if FusedAntiAliasedLeakyReLU is not None and x.is_cuda:
+            return FusedAntiAliasedLeakyReLU.apply(x, self.up_weight, self.down_weight, self.slope)
+        channels, length = x.shape[1], x.shape[-1]
+        kernel = self.kernel.to(x.dtype).expand(channels, 1, -1)
+        half = (kernel.shape[-1] - 1) // 2
+        # The upsampled signal from half a kernel before the input to half
+        # after it: input sample n lands on 2n + 3 * half of the transposed
+        # conv, and the lowpass then needs no padding.
+        up = F.conv_transpose1d(F.pad(x, (half, half), mode="replicate"), 2 * kernel, stride=2, groups=channels)
+        up = F.leaky_relu(up[..., 2 * half:4 * half + 2 * length], self.slope)
+        return F.conv1d(up, kernel, stride=2, groups=channels)
+
+
+class PostFilter(nn.Module):
+    """The rendered waveform [B, 1, T] plus a learned correction from dilated
+    convolutions at the audio rate, which read the backbone's frame features
+    [B, dim, frames] and the glottal cycle (``theta``, ``gate`` [B, T]). The
+    gains set the phase only through fixed minimum- and maximum-phase maps,
+    which sounded metallic; this learns it in time, as NSF vocoders do. The
+    output layer starts at zero, so the filter starts as the identity. With
+    ``antialias`` its activations run at twice the rate, so they do not alias,
+    through a filter of ``antialias_width`` taps per side; that costs several
+    times the plain filter."""
+
+    def __init__(self, dim, hop_length, channels, kernel_size=3, dilations=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512),
+                 antialias=True, antialias_width=16):
+        super().__init__()
+        self.hop_length = int(hop_length)
+        self.condition = nn.Conv1d(dim, channels, 1)
+        self.input = nn.Conv1d(4, channels, 7, padding=3)
+        self.convs = nn.ModuleList(
+            nn.Conv1d(channels, channels, kernel_size, dilation=d, padding=d * (kernel_size - 1) // 2)
+            for d in dilations
+        )
+        self.mixes = nn.ModuleList(nn.Conv1d(channels, channels, 1) for _ in dilations)
+        self.output = nn.Conv1d(channels, 1, 7, padding=3)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+        def activation():
+            return AntiAliasedLeakyReLU(width=int(antialias_width)) if antialias else nn.LeakyReLU(0.1)
+
+        # Before and inside each block, and before the output; none holds weights.
+        self.block_activations = nn.ModuleList(
+            nn.ModuleList((activation(), activation())) for _ in dilations
+        )
+        self.output_activation = activation()
+
+    def forward(self, audio, theta, gate, features):
+        samples = audio.shape[-1]
+        condition = to_steps(self.condition(features), samples, 1, self.hop_length, self.hop_length // 2)
+        cycle = torch.stack((torch.cos(theta) * gate, torch.sin(theta) * gate, gate), dim=1)
+        h = self.input(torch.cat((audio, cycle.to(audio.dtype)), dim=1)) + condition
+        for conv, mix, (before, inside) in zip(self.convs, self.mixes, self.block_activations):
+            h = h + mix(inside(conv(before(h))))
+        return audio + self.output(self.output_activation(h))
+
+
+class STFT(nn.Module):
+    """Frames every ``hop_length`` with no centring, as Wavehax's: zero padding
+    either side gives ``samples // hop_length`` frames, one per mel frame."""
+
+    def __init__(self, n_fft, hop_length):
+        super().__init__()
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+
+    def forward(self, x):
+        """[N, samples] -> [N, bins, frames], complex."""
+        pad = self.n_fft - self.hop_length
+        x = F.pad(x.float(), (pad // 2, pad - pad // 2))
+        return torch.stft(x, self.n_fft, self.hop_length, window=self.window, center=False, return_complex=True)
+
+    def inverse(self, real, imag):
+        """[B, bins, frames] each -> [B, 1, frames * hop_length], by overlap-add
+        normalised by the window's own."""
+        frames = real.shape[-1]
+        length = (frames - 1) * self.hop_length + self.n_fft
+
+        def overlap_add(windows):
+            return F.fold(windows, (1, length), (1, self.n_fft), stride=(1, self.hop_length)).squeeze(2)
+
+        x = torch.fft.irfft(torch.complex(real.float(), imag.float()), n=self.n_fft, dim=1)
+        x = overlap_add(x * self.window[:, None])
+        envelope = overlap_add(self.window.square()[None, :, None].expand(1, -1, frames))
+        # Cropped before the division: the envelope is 0 at the very edges.
+        keep = slice((self.n_fft - self.hop_length) // 2, (self.n_fft - self.hop_length) // 2 + frames * self.hop_length)
+        return x[..., keep] / envelope[..., keep]
+
+
+class LayerNorm2d(nn.Module):
+    """Over channels, bins and frames together, with a per-channel affine; in
+    FP32, as the statistics run over the whole spectrogram."""
+
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        x = x.float()
+        var, mean = torch.var_mean(x, dim=(1, 2, 3), keepdim=True, correction=0)
+        x = (x - mean) * torch.rsqrt(var + self.eps)
+        return torch.addcmul(self.beta.view(1, -1, 1, 1), x, self.gamma.view(1, -1, 1, 1))
+
+
+class ConvNeXtBlock2d(nn.Module):
+    def __init__(self, channels, mult_channels, kernel_size, layer_scale):
+        super().__init__()
+        kernel_size = tuple(kernel_size)
+        self.dwconv = nn.Conv2d(
+            channels, channels, kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2),
+            groups=channels, bias=False, padding_mode="reflect",
+        )
+        self.norm = LayerNorm2d(channels)
+        self.pwconv1 = nn.Conv2d(channels, channels * mult_channels, 1)
+        self.pwconv2 = nn.Conv2d(channels * mult_channels, channels, 1)
+        self.gamma = nn.Parameter(layer_scale * torch.ones(1, channels, 1, 1))
+
+    def forward(self, x):
+        return x + self.gamma * self.pwconv2(F.gelu(self.pwconv1(self.norm(self.dwconv(x)))))
+
+
+class WavehaxSynthesis(nn.Module):
+    """Wavehax's estimate of the waveform's complex spectrogram by ConvNeXt
+    blocks over (bins, frames). Its inputs are the STFTs of the sources [B,
+    sources, T] (the pulse train and the glottal-cycle noise), the backbone's
+    frame features [B, dim, frames] projected to the bins and, with
+    ``band_edges``, the band contrast [B, bands + 1, frames] spread over each
+    band's bins: Wavehax alone filled the valleys above ~6 kHz, which the mel
+    cannot show. All blocks but the last run on bins pooled by ``pool``, that
+    many times cheaper; the last, at full resolution over them plus the input,
+    keeps the harmonics' peaks. The frames need ``kernel_size[1] // 2 + 1`` or more for
+    the reflect padding."""
+
+    def __init__(self, dim, hop_length, sample_rate, sources, n_fft, channels, mult_channels=2,
+                 kernel_size=(13, 7), num_blocks=8, pool=4, band_edges=None):
+        super().__init__()
+        self.stft = STFT(n_fft, hop_length)
+        self.bins = n_fft // 2 + 1
+        self.pool = int(pool)
+        self.cond_proj = nn.Conv1d(dim, self.bins, 1)
+        planes = 2 * sources + 1
+        self.contrast_bands = 0
+        if band_edges:
+            freqs = torch.linspace(0, sample_rate / 2, self.bins)
+            edges = torch.tensor([float(hz) for hz in band_edges])
+            members = F.one_hot(torch.bucketize(freqs, edges), len(edges) + 1).T.float()
+            self.register_buffer("contrast_members", members, persistent=False)
+            self.contrast_bands = len(edges) + 1
+            # The contrast over its bands' bins and whether it is known.
+            planes += 2
+        self.input_proj = nn.Conv2d(planes, channels, 1, bias=False)
+        self.input_norm = LayerNorm2d(channels)
+
+        def block():
+            return ConvNeXtBlock2d(channels, mult_channels, kernel_size, 1 / num_blocks)
+
+        self.down = nn.Conv2d(channels, channels, (self.pool, 1), stride=(self.pool, 1))
+        self.blocks = nn.ModuleList(block() for _ in range(num_blocks - 1))
+        self.up = nn.Conv2d(channels, channels * self.pool, 1)
+        self.last = block()
+        self.output_norm = LayerNorm2d(channels)
+        self.output_proj = nn.Conv2d(channels, 2, 1)
+
+    def forward(self, sources, features, contrast=None):
+        batch, count = sources.shape[:2]
+        # The transforms and projections in FP32: the few weights of the 1x1
+        # ones take the whole spectrogram's gradient.
+        with torch.autocast(sources.device.type, enabled=False):
+            spec = self.stft(sources.flatten(0, 1))
+            spec = spec.view(batch, count, self.bins, -1)
+            planes = [spec.real, spec.imag, self.cond_proj(features.float()).unsqueeze(1)]
+            if self.contrast_bands:
+                frames = spec.shape[-1]
+                if contrast is None:
+                    contrast = spec.real.new_zeros(batch, self.contrast_bands + 1, frames)
+                contrast = contrast.float()
+                spread = torch.einsum("bnt,nf->bft", contrast[:, :self.contrast_bands], self.contrast_members)
+                known = contrast[:, self.contrast_bands:].unsqueeze(2).expand(-1, -1, self.bins, -1)
+                planes += [spread.unsqueeze(1), known]
+            x = self.input_proj(torch.cat(planes, dim=1))
+        x = self.input_norm(x)
+        rows = -(-self.bins // self.pool)
+        low = self.down(F.pad(x, (0, 0, 0, rows * self.pool - self.bins)))
+        for block in self.blocks:
+            low = block(low)
+        up = self.up(low).unflatten(1, (-1, self.pool)).transpose(2, 3).flatten(2, 3)
+        x = self.last(x + up[:, :, :self.bins])
+        x = self.output_norm(x)
+        with torch.autocast(sources.device.type, enabled=False):
+            x = self.output_proj(x.float())
+            return self.stft.inverse(x[:, 0], x[:, 1])
+
+
 class ChouwaGAN(nn.Module):
     """Normalised log mel [B, n_mels, T], f0 [B, T] (0 unvoiced) and, with
     ``contrast_band_edges``, optionally ``measure_contrast``'s [B, bands + 1, T]
@@ -196,10 +431,19 @@ class ChouwaGAN(nn.Module):
                  taper_hz=2000.0, max_jitter=0.02, max_shimmer=0.1, max_f0_correction=20.0, phase="mixed",
                  residual_bound=0.1, block_steps=4096, noise_curve_hz=None, aspiration_regions_hz=None,
                  max_aspiration_sharpness=16.0, contrast_band_edges=None, max_phase_spread=0.0, phase_head_hz=None,
-                 phase_noise_mix=False, control_interpolation="linear", source_phase_hz=None):
+                 phase_noise_mix=False, control_interpolation="linear", source_phase_hz=None,
+                 post_filter_channels=0, post_filter_kernel_size=3,
+                 post_filter_dilations=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512), post_filter_antialias=False,
+                 post_filter_antialias_width=16, synthesis="dsp", synthesis_n_fft=None, synthesis_channels=32,
+                 synthesis_mult_channels=2, synthesis_kernel_size=(13, 7), synthesis_blocks=8, synthesis_pool=4):
         super().__init__()
         if phase not in PHASES:
             raise ValueError(f"phase must be one of {PHASES}, not {phase!r}.")
+        if synthesis not in SYNTHESES:
+            raise ValueError(f"synthesis must be one of {SYNTHESES}, not {synthesis!r}.")
+        gains = synthesis == "dsp"
+        if not gains and (post_filter_channels or phase_head_hz is not None):
+            raise ValueError(f"The {synthesis} synthesis takes no post-filter and no phase head.")
         if control_interpolation not in INTERPOLATIONS:
             raise ValueError(f"control_interpolation must be one of {INTERPOLATIONS}, not {control_interpolation!r}.")
         # How the head's gains go from frames to synthesis steps.
@@ -316,11 +560,14 @@ class ChouwaGAN(nn.Module):
         # the voiced noise curve's knots, then aspiration depth (and
         # sharpness, per region), jitter, shimmer and the f0 correction, then
         # the phase spread per tract band (last, so older exports load).
+        # Another synthesis reads only the source's scalars; it shapes the rest itself.
+        if not gains:
+            self.glottal_bands = self.curve_knots = 0
         self.splits = [
-            self.bands * self.harmonic_substeps, self.glottal_bands, self.bands * self.noise_substeps,
-            2 * self.bands if self.residual_bound > 0 else 0, self.curve_knots,
+            self.bands * self.harmonic_substeps * gains, self.glottal_bands, self.bands * self.noise_substeps * gains,
+            2 * self.bands if gains and self.residual_bound > 0 else 0, self.curve_knots,
             2 * self.aspiration_regions + 3 if self.aspiration_regions else 4,
-            self.bands if self.max_phase_spread > 0 else 0,
+            self.bands if gains and self.max_phase_spread > 0 else 0,
         ]
         self.head = nn.Linear(dim, sum(self.splits))
         # Each turned bin's (cos, sin), and with the noise mix its logit, per harmonic sub-step.
@@ -353,6 +600,19 @@ class ChouwaGAN(nn.Module):
                 bias[0], bias[1] = 1.0, 0.0
                 if self.phase_noise_mix:
                     bias[2] = NOISE_MIX_INIT_BIAS
+        # After ``_init_weights``: audio-rate convs keep PyTorch's default init.
+        self.post_filter = (
+            PostFilter(dim, hop_length, int(post_filter_channels), int(post_filter_kernel_size), post_filter_dilations,
+                       bool(post_filter_antialias), int(post_filter_antialias_width))
+            if post_filter_channels else None
+        )
+        self.synthesis = (
+            WavehaxSynthesis(dim, hop_length, sample_rate, max(1, self.aspiration_regions) + 1,
+                             int(synthesis_n_fft or 4 * hop_length), int(synthesis_channels),
+                             int(synthesis_mult_channels), synthesis_kernel_size, int(synthesis_blocks),
+                             int(synthesis_pool), contrast_band_edges)
+            if synthesis == "wavehax" else None
+        )
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         # An export from before the phase spread has no rows for it: they
@@ -376,6 +636,10 @@ class ChouwaGAN(nn.Module):
                 head_bias = torch.cat((head_bias, head_bias.new_full((rows,), NOISE_MIX_INIT_BIAS)))
                 state_dict[prefix + "phase_head.weight"] = head_weight
                 state_dict[prefix + "phase_head.bias"] = head_bias
+        # Nor a post-filter: it starts as the identity, as a new model's does.
+        if self.post_filter is not None and weight is not None:
+            for key, value in self.post_filter.state_dict().items():
+                state_dict.setdefault(prefix + "post_filter." + key, value.detach().clone())
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     @staticmethod
@@ -406,7 +670,7 @@ class ChouwaGAN(nn.Module):
             x = block(x)
         x = self.output_norm(x.transpose(1, 2))
         turns = self.phase_head(x).transpose(1, 2).float() if self.phase_head is not None else None
-        return self.head(x).transpose(1, 2).float(), turns
+        return self.head(x).transpose(1, 2).float(), turns, x.transpose(1, 2)
 
     def _per_step(self, x, substeps, steps):
         """[B, C * substeps, frames] -> [B, C, steps] at the synthesis steps."""
@@ -506,9 +770,19 @@ class ChouwaGAN(nn.Module):
         steps = samples // self.synthesis_hop + 1
         voiced = f0 > 0
         cf0 = continuous_f0(f0)
-        controls, turns = self._controls(mel, cf0, voiced, contrast)
+        controls, turns, features = self._controls(mel, cf0, voiced, contrast)
+        device = mel.device.type
+        amp = torch.is_autocast_enabled(device), torch.get_autocast_dtype(device)
 
-        with torch.autocast(mel.device.type, enabled=False):
+        def finish(audio):
+            """[B, T] -> [B, 1, T], through the post-filter under the caller's autocast."""
+            audio = audio.unsqueeze(1)
+            if self.post_filter is None:
+                return audio
+            with torch.autocast(device, dtype=amp[1], enabled=amp[0]):
+                return self.post_filter(audio, theta, gate, features)
+
+        with torch.autocast(device, enabled=False):
             tract, glottal, noise, residual, curve, scalars, spread = controls.split(self.splits, dim=1)
             log_tract = self._per_step(tract, self.harmonic_substeps, steps).clamp(*LOG_GAIN_RANGE)
             log_glottal = self._per_step(glottal, 1, steps).clamp(*LOG_GAIN_RANGE) if self.glottal_bands else None
@@ -581,31 +855,33 @@ class ChouwaGAN(nn.Module):
             def noise_gain(start, end):
                 return torch.exp(torch.einsum("bcs,cf->bfs", log_noise[..., start:end], self.noise_bands))
 
-            voice = self._render(pulse, self.harmonic_fft, self.harmonic_window, harmonic_gain, steps, samples)
             # Aspiration follows the glottal cycle where voiced; plain noise elsewhere.
-            if not self.aspiration_regions:
-                envelope = 1 + aspiration[:, 0] * gate * torch.cos(theta - self.aspiration_phase)
-                breath = self._render(
-                    torch.randn_like(pulse) * envelope, self.noise_fft, self.noise_window, noise_gain, steps, samples
-                )
-                return (voice + breath).unsqueeze(1)
-
             regions = self.aspiration_regions
-            depth = aspiration[:, :regions] * gate.unsqueeze(1)
-            sharpness = aspiration[:, regions:] * self.max_aspiration_sharpness
-            # A von Mises pulse of mean 1: aspiration comes as a burst, which a
-            # cosine cannot be, and it is more so at the top.
-            cycle = torch.cos(theta.unsqueeze(1) - self.aspiration_phase.view(1, -1, 1)) - 1
-            envelope = 1 + depth * (torch.exp(sharpness * cycle) / torch.special.i0e(sharpness) - 1)
+            if not regions:
+                envelope = (1 + aspiration[:, 0] * gate * torch.cos(theta - self.aspiration_phase)).unsqueeze(1)
+            else:
+                depth = aspiration[:, :regions] * gate.unsqueeze(1)
+                sharpness = aspiration[:, regions:] * self.max_aspiration_sharpness
+                # A von Mises pulse of mean 1: aspiration comes as a burst, which a
+                # cosine cannot be, and it is more so at the top.
+                cycle = torch.cos(theta.unsqueeze(1) - self.aspiration_phase.view(1, -1, 1)) - 1
+                envelope = 1 + depth * (torch.exp(sharpness * cycle) / torch.special.i0e(sharpness) - 1)
+            noise = torch.randn_like(envelope) * envelope
+
+            if self.synthesis is not None:
+                with torch.autocast(device, dtype=amp[1], enabled=amp[0]):
+                    return self.synthesis(torch.cat((pulse.unsqueeze(1), noise), dim=1), features, contrast)
+
+            voice = self._render(pulse, self.harmonic_fft, self.harmonic_window, harmonic_gain, steps, samples)
+            if not regions:
+                breath = self._render(noise[:, 0], self.noise_fft, self.noise_window, noise_gain, steps, samples)
+                return finish(voice + breath)
 
             def region_gain(start, end):
                 return (noise_gain(start, end).unsqueeze(1) * self.aspiration_masks.unsqueeze(-1)).flatten(0, 1)
 
-            breath = self._render(
-                (torch.randn_like(envelope) * envelope).flatten(0, 1), self.noise_fft, self.noise_window, region_gain,
-                steps, samples,
-            )
-            return (voice + breath.view(-1, regions, samples).sum(1)).unsqueeze(1)
+            breath = self._render(noise.flatten(0, 1), self.noise_fft, self.noise_window, region_gain, steps, samples)
+            return finish(voice + breath.view(-1, regions, samples).sum(1))
 
 
 class HarmonicLoss(nn.Module):

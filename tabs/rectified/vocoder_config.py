@@ -1,5 +1,5 @@
 """Gradio tab editing the main settings an experiment's vocoder trains by:
-its copy of the ChouwaGAN recipe for its sample rate."""
+its copy of the ChouwaGAN or SiFi-GAN recipe for its sample rate."""
 
 import os
 
@@ -8,7 +8,9 @@ import gradio as gr
 from rvc.lib.i18n import _
 from rvc.rectified.common import DEFAULT_SAMPLE_RATE, load_run_config, run_config_path
 from rvc.rectified.vocoder import (
+    GENERATORS,
     read_vocoder_settings,
+    recipe_architecture,
     reset_vocoder_settings,
     shipped_vocoder_settings,
     write_vocoder_settings,
@@ -27,6 +29,13 @@ def vocoder_config_tab(model_name, tab):
         _("Settings the experiment's vocoder trains by. They are read when training starts; the other "
           "settings are in the experiment's rectified_vocoder_chouwagan.json and are kept as they are. "
           "The recipe follows the sample rate the dataset was preprocessed at, so preprocess first.")
+    )
+    architecture = gr.Dropdown(
+        label=_("Architecture"),
+        info=_("ChouwaGAN or SiFi-GAN. Reset to defaults switches the experiment to the shipped recipe of the one "
+               "chosen here; each trains in its own vocoder_<architecture> folder."),
+        choices=list(GENERATORS),
+        interactive=True,
     )
     with gr.Row():
         learning_rate = gr.Number(
@@ -72,6 +81,7 @@ def vocoder_config_tab(model_name, tab):
                 settings = shipped_vocoder_settings(load_run_config(name)["data"]["sample_rate"])
                 message = str(problem)
         return [
+            recipe_architecture(settings),
             settings["learning_rate"],
             float(settings.get("lr_final_ratio") or 0) > 0,
             float(settings["ema_decay"]) > 0,
@@ -79,7 +89,7 @@ def vocoder_config_tab(model_name, tab):
             message,
         ]
 
-    def save(name, lr, final_ratio, ema, aux):
+    def save(name, chosen, lr, final_ratio, ema, aux):
         if missing(name):
             return _("Preprocess the dataset of {name} first: the recipe follows its sample rate.").format(
                 name=name or "?"
@@ -88,6 +98,8 @@ def vocoder_config_tab(model_name, tab):
             settings = read_vocoder_settings(name)
         except ValueError as problem:
             return str(problem)
+        if chosen != recipe_architecture(settings):
+            return _("Reset to defaults to switch the experiment to {architecture}.").format(architecture=chosen)
         settings["learning_rate"] = float(lr)
         # Turned on, a value already in the file is kept.
         if not final_ratio:
@@ -104,14 +116,14 @@ def vocoder_config_tab(model_name, tab):
         write_vocoder_settings(name, settings)
         return _("Saved the vocoder settings of {name}.").format(name=name)
 
-    def reset(name):
+    def reset(name, chosen):
         if missing(name):
             return load(name)
-        reset_vocoder_settings(name)
+        reset_vocoder_settings(name, chosen)
         return load(name, _("Back to the shipped settings for the experiment's sample rate."))
 
-    outputs = [*fields, output]
+    outputs = [architecture, *fields, output]
     for trigger in (model_name.change, tab.select):
         trigger(fn=load, inputs=[model_name], outputs=outputs, show_progress="hidden")
-    reset_button.click(fn=reset, inputs=[model_name], outputs=outputs, show_progress="hidden")
-    save_button.click(fn=save, inputs=[model_name, *fields], outputs=[output])
+    reset_button.click(fn=reset, inputs=[model_name, architecture], outputs=outputs, show_progress="hidden")
+    save_button.click(fn=save, inputs=[model_name, architecture, *fields], outputs=[output])

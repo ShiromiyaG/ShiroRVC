@@ -20,6 +20,7 @@ from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from rvc.lib.catalog import NO_EMBEDDER
 from rvc.lib.terminal import (
     info,
     print_model_summary,
@@ -472,6 +473,11 @@ def train(ranks: Ranks, spec_path: str) -> None:
     main_rank = ranks.main
 
     name = spec["model_name"]
+    if embedder_of(name) == NO_EMBEDDER:
+        raise ValueError(
+            f"{name} was extracted without an embedder, for the vocoder alone; "
+            f"extract it again with contentvec or spin_v2 to train a flow."
+        )
     config = load_run_config(name)
     settings = config["flow"]
     apply_spec(spec, settings)

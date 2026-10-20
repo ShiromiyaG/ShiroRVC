@@ -116,7 +116,7 @@ def rectified_inference_tab():
             )
             vocoder_model = gr.Dropdown(
                 label=_("Vocoder Model"),
-                info=_("ChouwaGAN export that renders the flow's mel, at the flow's sample rate."),
+                info=_("ChouwaGAN, SiFi-GAN or OpenVPI NSF-HiFiGAN export that renders the flow's mel, at the flow's sample rate."),
                 choices=vocoders,
                 value=catalog.relative(default_vocoder) if default_vocoder else _first(vocoders),
                 interactive=True,
@@ -882,8 +882,16 @@ def _preprocess_tab(model_name, cpu_threads):
     return dataset_path
 
 
-def _extraction_tab(model_name, cpu_threads, gpu):
-    """The extraction step."""
+def _extraction_tab(model_name, cpu_threads, gpu, allow_no_embedder=False):
+    """The extraction step. ``allow_no_embedder`` offers extracting the pitch
+    alone, which is all the vocoder reads."""
+    embedders = [("contentvec", "contentvec"), ("spin_v2", "spin_v2")]
+    embedder_info = _("Content features the flow model is conditioned on.")
+    if allow_no_embedder:
+        embedders.append((_("None"), catalog.NO_EMBEDDER))
+        embedder_info = _("Content features the flow model is conditioned on. The vocoder does "
+                          "not read them: None extracts the pitch alone, and the experiment then "
+                          "cannot train a flow.")
     with gr.Tab(f"2. {_('Extraction')}"):
         with gr.Row():
             f0_method = gr.Radio(
@@ -895,8 +903,8 @@ def _extraction_tab(model_name, cpu_threads, gpu):
             )
             embedder_model = gr.Radio(
                 label=_("Embedder Model"),
-                info=_("Content features the flow model is conditioned on."),
-                choices=["contentvec", "spin_v2"],
+                info=embedder_info,
+                choices=embedders,
                 value="contentvec",
                 interactive=True,
             )
@@ -1046,6 +1054,9 @@ def rectified_training_tab():
         def start_flow(name, epochs, save, batch, gpu_ids, pretrained, custom,
                        flow_path, vocoder_path, checkpoints, fresh, compile_backbone, compile_mode,
                        feature_cache, mean_flow):
+            if catalog.experiment_embedder(name) == catalog.NO_EMBEDDER:
+                return _("{name} was extracted without an embedder, for the vocoder alone. "
+                         "Extract it again with contentvec or spin_v2 to train a flow.").format(name=name)
             if pretrained and not custom:
                 # The pretrain has to match the features the experiment was extracted with.
                 embedder = catalog.experiment_embedder(name)
@@ -1195,11 +1206,11 @@ def rectified_training_tab():
 def rectified_vocoder_tab():
     model_name, refresh_button, cpu_threads, gpu = _experiment("example-rectified-vocoder")
     dataset_path = _preprocess_tab(model_name, cpu_threads)
-    _extraction_tab(model_name, cpu_threads, gpu)
+    _extraction_tab(model_name, cpu_threads, gpu, allow_no_embedder=True)
 
     with gr.Tab(f"3. {_('Vocoder')}"):
         gr.Markdown(
-            _("Trains ChouwaGAN, the mel vocoder, on a large multi-speaker dataset, at the "
+            _("Trains the mel vocoder (ChouwaGAN or SiFi-GAN, set in the Config tab) on a large multi-speaker dataset, at the "
               "experiment's sample rate. Not needed to fine-tune a voice: the vocoder has no "
               "speaker input, so one vocoder renders every voice model at that rate. Its "
               "settings are in the Config tab.")

@@ -2,6 +2,7 @@ import os
 import shutil
 from random import shuffle
 from rvc.configs.config import Config
+from rvc.lib.catalog import NO_EMBEDDER
 from rvc.lib.paths import LOGS_DIR, ROOT
 from rvc.lib.terminal import info, success, warning
 from rvc.train.extract.noise_mutes import generated_mutes
@@ -174,9 +175,15 @@ def generate_filelist(
         return {_stem(name): name for name in os.listdir(directory)}
 
     gt_wavs_by_stem = _by_stem(gt_wavs_dir)
-    feature_by_stem = _by_stem(feature_dir)
     f0_by_stem = _by_stem(f0_dir)
     f0nsf_by_stem = _by_stem(f0nsf_dir)
+    # Without an embedder the features column names files that do not exist;
+    # only the vocoder reads such a filelist, and it never opens them.
+    use_embedder = embedder_model != NO_EMBEDDER
+    if use_embedder:
+        feature_by_stem = _by_stem(feature_dir)
+    else:
+        feature_by_stem = {stem: f"{stem}.npy" for stem in gt_wavs_by_stem}
 
     # Pair by clip name rather than by list position: a clip that failed one of
     # the extraction passes leaves a hole, and index pairing would silently
@@ -198,7 +205,7 @@ def generate_filelist(
 
     options = []
 
-    if embedder_model == "contentvec":
+    if embedder_model in ("contentvec", NO_EMBEDDER):
         mute_folder = "mute"
     else:
         mute_folder = "mute_spin_v2"
@@ -231,7 +238,7 @@ def generate_filelist(
         # The low-noise clips ``extract.py`` generated for this experiment, one
         # entry each per speaker.  The shared digital-zero clip is only the
         # fallback for when they are missing (a failed embedding pass).
-        mute_clips = generated_mutes(model_path)[:include_mutes]
+        mute_clips = generated_mutes(model_path, use_embedder)[:include_mutes]
         if not mute_clips:
             warning(
                 "No generated mute clips found; using the shared digital-silence "

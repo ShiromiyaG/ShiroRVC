@@ -202,6 +202,10 @@ def list_training_models(logs_dir: Path = LOGS_DIR) -> list[str]:
     )
 
 
+#: The embedder of an experiment extracted for the vocoder alone: pitch only.
+NO_EMBEDDER = "none"
+
+
 def experiment_embedder(model_name: str, logs_dir: Path = LOGS_DIR) -> str:
     """The content embedder an experiment was extracted with; contentvec
     before extraction has written it."""

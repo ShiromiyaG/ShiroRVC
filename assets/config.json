@@ -15,5 +15,5 @@
         "mode": "true_pitch",
         "f0_ceil": 1250
     },
-    "precision": "fp16"
+    "precision": "bf16"
 }

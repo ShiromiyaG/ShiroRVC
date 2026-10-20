@@ -188,11 +188,12 @@ def prepare_noise_mutes(exp_dir, sample_rate, embedder_model, count):
     return clips, pending
 
 
-def generated_mutes(exp_dir):
+def generated_mutes(exp_dir, features=True):
     """Completed clips under ``<experiment>/mutes/`` as filelist tuples.
 
     Only clips with every file present are returned, so a failed embedding
     pass leaves a clip out instead of pointing the filelist at nothing.
+    Without ``features`` (no embedder), the features file is not required.
     """
     root = os.path.join(exp_dir, MUTE_DIR)
     target_dir = os.path.join(root, "sliced_audios")
@@ -209,6 +210,7 @@ def generated_mutes(exp_dir):
             os.path.join(root, "f0", f"{name}.npy"),
             os.path.join(root, "f0_voiced", f"{name}.npy"),
         )
-        if all(os.path.isfile(path) for path in clip):
+        required = clip if features else clip[:1] + clip[2:]
+        if all(os.path.isfile(path) for path in required):
             clips.append(clip)
     return clips

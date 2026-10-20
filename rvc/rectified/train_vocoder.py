@@ -1,6 +1,6 @@
-"""Train ChouwaGAN, the mel vocoder of the rectified pipeline, by its recipe
-(``rvc/configs/rectified/chouwagan/<sample rate>.json``, copied into the
-experiment on first use).
+"""Train the mel vocoder of the rectified pipeline, ChouwaGAN or SiFi-GAN, by
+its recipe (``rvc/configs/rectified/<architecture>/<sample rate>.json``,
+copied into the experiment on first use).
 
 The GAN and multi-resolution STFT losses and the volume augmentation are
 ported from OpenVPI SingingVocoders (MIT, see THIRD_PARTY_NOTICES).
@@ -34,7 +34,7 @@ from rvc.lib.terminal import (
     success,
     warning,
 )
-from rvc.rectified import chouwagan
+from rvc.rectified import chouwagan, sifigan
 from rvc.rectified.common import (
     RectifiedDataset,
     amp_setup,
@@ -49,7 +49,14 @@ from rvc.rectified.common import (
 from rvc.rectified.distributed import Ranks, launch, parse_gpus
 from rvc.rectified.mel import LogMel, degrade_mel, normalize_mel
 from rvc.rectified.previews import RectifiedPreviews
-from rvc.rectified.vocoder import MEL_KEYS, load_recipe_config
+from rvc.rectified.vocoder import (
+    GENERATORS,
+    MEL_KEYS,
+    generator_architecture,
+    load_recipe_config,
+    recipe_architecture,
+    resolve_discriminator,
+)
 from rvc.train.diagnostics import clip_or_sample_grad_norm
 from rvc.train.ema import WeightEMA
 from rvc.train.losses import MultiScaleSTFTLoss, discriminator_loss as repo_discriminator_loss, generator_loss
@@ -71,11 +78,15 @@ AUX_MAX_SHARE = 0.25
 def generator_gradient_metrics(net_g):
     """``rvc.train.diagnostics.generator_gradient_metrics`` for a bare vocoder,
     whose parameters carry no ``dec.`` prefix: the trunk, and the output
-    ``head`` kept apart as ``output``."""
-    groups = {"decoder": [], "output": []}
+    ``head``, the ``post_filter`` and the Wavehax ``synthesis`` kept apart;
+    SiFi-GAN's ``source`` and ``filter`` networks."""
+    groups = {"decoder": [], "output": [], "post_filter": [], "synthesis": [], "source": [], "filter": []}
     for name, parameter in net_g.named_parameters():
         if parameter.requires_grad:
-            groups["output" if name.startswith("head.") else "decoder"].append(parameter)
+            group = name.partition(".")[0]
+            group = {"sn": "source", "fn": "filter"}.get(group.partition("_")[0], group)
+            groups[{"head": "output", "post_filter": "post_filter", "synthesis": "synthesis", "source": "source",
+                    "filter": "filter"}.get(group, "decoder")].append(parameter)
     metrics = {}
     for group, parameters in groups.items():
         if not parameters:
@@ -251,8 +262,11 @@ def build_networks(config: dict, device):
         sample_rate=int(data["sample_rate"]), num_mels=int(data["n_mels"]),
         hop_length=int(data["hop_length"]), **settings["model"],
     )
-    net_g = chouwagan.ChouwaGAN(**hparams).to(device)
-    net_d = Discriminators(chouwagan.build_families(settings["discriminator"], data["sample_rate"])).to(device)
+    net_g = GENERATORS[recipe_architecture(settings)](**hparams).to(device)
+    d_settings = settings["discriminator"]
+    # ``architecture`` "sifigan": SiFi-GAN's own; ChouwaGAN's otherwise.
+    families = sifigan if d_settings.get("architecture") == sifigan.ARCHITECTURE else chouwagan
+    net_d = Discriminators(families.build_families(d_settings, data["sample_rate"])).to(device)
     return net_g, net_d, hparams
 
 
@@ -292,11 +306,12 @@ def restore(spec, out_dir, sample_rate, net_g, net_d, optim_g, optim_d, ema, sca
     if resume_g and resume_d:
         state_g = torch.load(resume_g, map_location="cpu", weights_only=True)
         state_d = torch.load(resume_d, map_location="cpu", weights_only=True)
+        architecture = generator_architecture(net_g)
         saved = (state_g.get("architecture", chouwagan.ARCHITECTURE), state_d.get("discriminator", "original"))
-        if saved != (chouwagan.ARCHITECTURE, "original"):
+        if saved != (architecture, "original"):
             raise ValueError(
-                f"{resume_g} is a {saved[0]} checkpoint with the {saved[1]} discriminator, not ChouwaGAN with "
-                f"its own. Turn on Fresh Training or use another model name."
+                f"{resume_g} is a {saved[0]} checkpoint with the {saved[1]} discriminator, not {architecture} with "
+                f"the rectified one. Turn on Fresh Training or use another model name."
             )
         net_g.load_state_dict(state_g["model"])
         optim_g.load_state_dict(state_g["optimizer"])
@@ -649,7 +664,7 @@ def export_payload(config: dict, hparams: dict, ema) -> dict:
     normalisation."""
     keys = MEL_KEYS + ("mel_mean", "mel_std")
     return {
-        "architecture": chouwagan.ARCHITECTURE, "recipe": chouwagan.ARCHITECTURE,
+        "architecture": recipe_architecture(config["vocoder"]), "recipe": recipe_architecture(config["vocoder"]),
         "config": {"data": {key: config["data"][key] for key in keys}, "vocoder": {"model": hparams}},
         "model": {key: value.detach().float().cpu().contiguous() for key, value in ema.cpu_state_dict().items()},
     }
@@ -696,7 +711,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
     name = spec["model_name"]
     config = load_recipe_config(name)
-    settings = config["vocoder"]
+    config["vocoder"] = settings = resolve_discriminator(config["vocoder"])
     d_settings = settings["discriminator"]
     data = config["data"]
     sample_rate = data["sample_rate"]
@@ -718,6 +733,13 @@ def train(ranks: Ranks, spec_path: str) -> None:
     eval_interval = int(settings.get("eval_interval", 0)) if holdout else 0
 
     net_g, net_d, hparams = build_networks(config, device)
+    # ``train_post_filter_only``: the rest of G frozen as the pretrained one renders.
+    post_filter_only = bool(settings.get("train_post_filter_only", False))
+    if post_filter_only:
+        if getattr(net_g, "post_filter", None) is None:
+            raise ValueError("train_post_filter_only needs a ChouwaGAN with post_filter_channels above 0.")
+        net_g.requires_grad_(False)
+        net_g.post_filter.requires_grad_(True)
     if settings.get("compile_generator") and device.type == "cuda":
         net_g.compile_blocks()
     learning_rate = float(settings["learning_rate"])
@@ -808,6 +830,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
     if c_envelope > 0:
         envelope_bands = settings.get("envelope_loss_bands_hz") or (3000, 6000, 10000, 16000)
         envelope_loss = chouwagan.EnvelopeLoss(sample_rate, envelope_bands).to(device)
+    # SiFi-GAN's: the excitation's spectrum against the target's with its envelope flattened.
+    c_source = float(settings.get("c_source", 0.0)) if isinstance(net_g, sifigan.SiFiGAN) else 0.0
+    source_loss = sifigan.SourceLoss(sample_rate, data["hop_length"]).to(device) if c_source > 0 else None
     grad_clip = float(settings.get("grad_clip") or "inf")
     # Clips trained without the measured contrast, as inference runs.
     contrast_dropout = float(settings.get("contrast_dropout", 0.0))
@@ -820,7 +845,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
         print_settings_panel(
             [
                 ("Model", name),
-                ("Vocoder", f"ChouwaGAN, {sample_rate} Hz, hop {data['hop_length']}"),
+                ("Vocoder", f"{'SiFi-GAN' if isinstance(net_g, sifigan.SiFiGAN) else 'ChouwaGAN'}, "
+                            f"{sample_rate} Hz, hop {data['hop_length']}"
+                 + (f", {hparams.get('upsampler', 'sinc')} upsampling" if isinstance(net_g, sifigan.SiFiGAN) else "")),
                 ("Clips", f"{len(dataset)} ({len(loader)} steps per epoch)"
                  + (f", {held_out} held out" if held_out else "")),
                 ("Batch size", batch_size),
@@ -841,9 +868,19 @@ def train(ranks: Ranks, spec_path: str) -> None:
                  + (f" ramped over {adv_warmup} steps" if adv_warmup > 0 else "")
                  + (f", spectral only until step {aux_steps}" if step < aux_steps else "")
                  + (f", harmonic contrast and level x{c_harmonic:g}" if harmonic_loss is not None else "")
-                 + (f", band envelope x{c_envelope:g}" if envelope_loss is not None else "")),
+                 + (f", band envelope x{c_envelope:g}" if envelope_loss is not None else "")
+                 + (f", source x{c_source:g}" if source_loss is not None else "")),
                 *([("Band contrast input", f"measured, dropped on {contrast_dropout:g} of clips")]
                   if net_g.contrast is not None else []),
+                *([("Post-filter", f"{hparams['post_filter_channels']} channels"
+                    + (", anti-aliased" if hparams.get("post_filter_antialias") else "")
+                    + (", the only part trained" if post_filter_only else ""))]
+                  if getattr(net_g, "post_filter", None) is not None else []),
+                *([("Synthesis", f"Wavehax, {hparams.get('synthesis_channels', 32)} channels, "
+                    f"{hparams.get('synthesis_blocks', 8)} blocks, bins pooled x{hparams.get('synthesis_pool', 4)}"
+                    + (" but the last" if hparams.get("synthesis_pool", 4) > 1 else "")
+                    + (", band contrast planes" if net_g.contrast is not None else ""))]
+                  if getattr(net_g, "synthesis", None) is not None else []),
                 ("Discriminator", adversary.describe(d_settings)),
             ],
             title="Rectified vocoder",
@@ -864,7 +901,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
             out_dir, name, spec.get("checkpoints", "latest"), epoch, step,
             {"model": net_g.state_dict(), "optimizer": optim_g.state_dict(),
              "ema": ema.state_dict(), "epoch": finished, "step": step,
-             "architecture": chouwagan.ARCHITECTURE,
+             "architecture": generator_architecture(net_g),
              "scaler": scaler.state_dict() if scaler is not None else None,
              "amp_skipped_steps": skipped, "plateau": {**plateau.state_dict(), "metric": plateau_metric},
              "aux_steps": aux_steps},
@@ -943,6 +980,9 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 if envelope_loss is not None:
                     loss_envelope = envelope_loss(y_hat, y) * c_envelope
                     loss_g = loss_g + loss_envelope
+                if source_loss is not None:
+                    loss_source = source_loss(net_g.excitation, y, f0) * c_source
+                    loss_g = loss_g + loss_source
                 optim_g.zero_grad(set_to_none=True)
                 if scaler is None:
                     loss_g.backward()
@@ -977,6 +1017,8 @@ def train(ranks: Ranks, spec_path: str) -> None:
                     losses["loss_harmonic"] = loss_harmonic
                 if envelope_loss is not None:
                     losses["loss_envelope"] = loss_envelope
+                if source_loss is not None:
+                    losses["loss_source"] = loss_source
                 for key, value in losses.items():
                     stats.values[key].append(value.detach().float())
                     epoch_sums[key] += value.detach().float()

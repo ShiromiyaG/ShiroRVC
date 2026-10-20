@@ -1,6 +1,8 @@
-"""The rectified pipeline's vocoder, ChouwaGAN: its recipe, shipped per sample
-rate in ``rvc/configs/rectified/chouwagan`` and copied into each experiment on
-first use, and the loader of its exports."""
+"""The rectified pipeline's vocoder, ChouwaGAN or SiFi-GAN: its recipe, shipped
+per architecture and sample rate in ``rvc/configs/rectified/<architecture>``
+and copied into each experiment on first use (ChouwaGAN's unless the
+experiment is reset to another), and the loader of its exports, which also
+renders OpenVPI's NSF-HiFiGANs."""
 
 import json
 import math
@@ -11,13 +13,21 @@ import torch
 from torch import nn
 
 from rvc.lib.paths import LOGS_DIR, ROOT
+from rvc.rectified import openvpi, sifigan
 from rvc.rectified.chouwagan import ARCHITECTURE, SOURCE_F0_FLOOR, ChouwaGAN, known_contrast
 from rvc.rectified.common import load_run_config
+from rvc.rectified.mel import denormalize_mel
 
 #: Mel settings a vocoder must share with the flow to render its output.
 MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax")
-#: The shipped recipes, one ``<sample rate>.json`` each.
-RECIPE_DIR = os.path.join(ROOT, "rvc", "configs", "rectified", "chouwagan")
+#: The generator of each ``architecture`` a recipe or an export names.
+GENERATORS = {ARCHITECTURE: ChouwaGAN, sifigan.ARCHITECTURE: sifigan.SiFiGAN}
+#: Exports rendered but not trained here, OpenVPI's NSF-HiFiGANs, by ``architecture``.
+INFERENCE_ONLY = {openvpi.ARCHITECTURE: openvpi.NSFHiFiGAN, openvpi.LEGACY_ARCHITECTURE: openvpi.NSFHiFiGAN}
+#: Every ``architecture`` an export may name.
+EXPORT_ARCHITECTURES = (*GENERATORS, *INFERENCE_ONLY)
+#: The shipped recipes, one ``<architecture>/<sample rate>.json`` each.
+RECIPE_DIR = os.path.join(ROOT, "rvc", "configs", "rectified")
 #: The rate of an experiment's recipe that names none: those predate the others.
 LEGACY_RECIPE_RATE = 44100
 #: ``Diffuser``'s bins turn from here up, faded in over the kHz below.
@@ -26,21 +36,43 @@ DIFFUSE_SEED = 0
 
 
 def recipe_path(model_name: str) -> str:
-    """The experiment's copy of the recipe."""
+    """The experiment's copy of the recipe, whatever its architecture (the
+    name predates SiFi-GAN)."""
     return os.path.join(LOGS_DIR, model_name, f"rectified_vocoder_{ARCHITECTURE}.json")
 
 
-def shipped_recipe(sample_rate: int) -> str:
-    """Path of the shipped recipe for ``sample_rate``."""
-    path = os.path.join(RECIPE_DIR, f"{int(sample_rate)}.json")
+def recipe_architecture(settings: dict) -> str:
+    """The ``architecture`` a recipe trains; ChouwaGAN when it names none."""
+    architecture = settings.get("architecture", ARCHITECTURE)
+    if architecture not in GENERATORS:
+        raise ValueError(f"The vocoder architecture must be one of {list(GENERATORS)}, not {architecture!r}.")
+    return architecture
+
+
+def generator_architecture(generator: nn.Module) -> str:
+    return next(name for name, cls in GENERATORS.items() if isinstance(generator, cls))
+
+
+def experiment_architecture(model_name: str) -> str:
+    """The architecture of the experiment's recipe, ChouwaGAN before it has one."""
+    path = recipe_path(model_name)
     if not os.path.exists(path):
-        raise ValueError(f"There is no vocoder recipe for {sample_rate} Hz.")
+        return ARCHITECTURE
+    with open(path, encoding="utf-8") as handle:
+        return recipe_architecture(json.load(handle))
+
+
+def shipped_recipe(sample_rate: int, architecture: str = ARCHITECTURE) -> str:
+    """Path of the shipped ``architecture`` recipe for ``sample_rate``."""
+    path = os.path.join(RECIPE_DIR, architecture, f"{int(sample_rate)}.json")
+    if not os.path.exists(path):
+        raise ValueError(f"There is no {architecture} vocoder recipe for {sample_rate} Hz.")
     return path
 
 
-def shipped_vocoder_settings(sample_rate: int) -> dict:
+def shipped_vocoder_settings(sample_rate: int, architecture: str = ARCHITECTURE) -> dict:
     """The recipe a new experiment at ``sample_rate`` starts from."""
-    with open(shipped_recipe(sample_rate), encoding="utf-8") as handle:
+    with open(shipped_recipe(sample_rate, architecture), encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -64,6 +96,25 @@ def load_recipe_config(model_name: str) -> dict:
     return config
 
 
+def resolve_discriminator(settings: dict) -> dict:
+    """``settings`` whose ``discriminator`` names one of its ``discriminators``
+    with that section in its place; the section's ``gan_loss`` and
+    ``san_loss`` become the recipe's. A section given as such is kept."""
+    choice = settings.get("discriminator")
+    if not isinstance(choice, str):
+        return settings
+    presets = settings.get("discriminators") or {}
+    if choice not in presets:
+        raise ValueError(f"discriminator {choice!r} is not one of the recipe's discriminators {list(presets)}.")
+    section = dict(presets[choice])
+    resolved = {key: value for key, value in settings.items() if key != "discriminators"}
+    for key in ("gan_loss", "san_loss"):
+        if key in section:
+            resolved[key] = section.pop(key)
+    resolved["discriminator"] = section
+    return resolved
+
+
 def read_vocoder_settings(model_name: str) -> dict:
     """The recipe the experiment's vocoder trains by, as stored."""
     return load_recipe_config(model_name)["vocoder"]
@@ -74,10 +125,14 @@ def write_vocoder_settings(model_name: str, settings: dict) -> None:
         json.dump(settings, handle, indent=4)
 
 
-def reset_vocoder_settings(model_name: str) -> None:
-    """Back to the shipped recipe, copied again on next use."""
+def reset_vocoder_settings(model_name: str, architecture: str | None = None) -> None:
+    """Back to the shipped recipe: ``architecture``'s for the experiment's
+    sample rate, or ChouwaGAN's, copied again on next use."""
     if os.path.exists(recipe_path(model_name)):
         os.remove(recipe_path(model_name))
+    if architecture is not None and architecture != ARCHITECTURE:
+        rate = load_run_config(model_name)["data"]["sample_rate"]
+        shutil.copyfile(shipped_recipe(rate, architecture), recipe_path(model_name))
 
 
 class Diffuser(nn.Module):
@@ -118,13 +173,18 @@ class FlowFeatures(nn.Module):
     flow with ``contrast_band_edges``, the band contrast after its bins. That
     goes to a vocoder that reads the same bands, and is dropped otherwise.
     With ``diffuse``, the output goes through a ``Diffuser``, unless the
-    vocoder already scatters its harmonics' phases (``source_phase_hz``)."""
+    vocoder already scatters its harmonics' phases (``source_phase_hz``) or
+    learns them (``post_filter``, the Wavehax ``synthesis``, SiFi-GAN)."""
 
     def __init__(self, vocoder: nn.Module, data: dict, diffuse: bool = True):
         super().__init__()
         self.vocoder = vocoder
         self.diffuser = None
-        if diffuse and getattr(vocoder, "source_phase_hz", None) is None:
+        own_phase = (not isinstance(vocoder, ChouwaGAN)
+                     or vocoder.source_phase_hz is not None
+                     or vocoder.post_filter is not None
+                     or vocoder.synthesis is not None)
+        if diffuse and not own_phase:
             self.diffuser = Diffuser(vocoder.sample_rate, vocoder.noise_fft, vocoder.synthesis_hop, vocoder.hop_length)
         self.n_mels = int(data["n_mels"])
         self.mel_mean = float(data["mel_mean"])
@@ -146,6 +206,19 @@ class FlowFeatures(nn.Module):
         return self.vocoder(mel, f0, known_contrast(contrast * self.mel_std + self.mel_mean))
 
 
+class RawMelVocoder(nn.Module):
+    """An OpenVPI vocoder fed the flow's normalised mel: the log mel it takes,
+    the band contrast rows dropped."""
+
+    def __init__(self, vocoder: nn.Module, data: dict):
+        super().__init__()
+        self.vocoder = vocoder
+        self.data = {key: data[key] for key in ("n_mels", "mel_mean", "mel_std")}
+
+    def forward(self, mel, f0):
+        return self.vocoder(denormalize_mel(mel[:, :self.data["n_mels"]], self.data), f0)
+
+
 def mel_mismatch(data: dict, vocoder_data: dict):
     """The first mel setting the vocoder does not share with ``data``, or None."""
     for key in MEL_KEYS + ("mel_mean", "mel_std"):
@@ -155,18 +228,23 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict, diffuse: bool = True):
-    """A ChouwaGAN export as a ``FlowFeatures`` module taking the flow's output
-    for ``data`` and f0 (through a ``Diffuser`` with ``diffuse``), and its mel
-    settings.
+    """A ChouwaGAN, SiFi-GAN or OpenVPI NSF-HiFiGAN export as a module taking
+    the flow's output for ``data`` and f0 (a ChouwaGAN's through a ``Diffuser``
+    with ``diffuse``), and its mel settings.
 
     Raises ``ValueError`` when ``path`` is not one or renders another mel."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("kind") != "rectified_vocoder" or checkpoint.get("architecture") != ARCHITECTURE:
-        raise ValueError(f"{path} is not a ChouwaGAN export, the only rectified vocoder.")
-    generator = ChouwaGAN(**checkpoint["config"]["vocoder"]["model"])
-    generator.load_state_dict(checkpoint["model"])
+    architecture = checkpoint.get("architecture")
+    if checkpoint.get("kind") != "rectified_vocoder" or architecture not in EXPORT_ARCHITECTURES:
+        raise ValueError(f"{path} is not a rectified vocoder export ({', '.join(EXPORT_ARCHITECTURES)}).")
     vocoder_data = checkpoint["config"]["data"]
     mismatch = mel_mismatch(data, vocoder_data)
     if mismatch:
         raise ValueError(f"{path} renders another mel than the flow's: {mismatch}.")
+    if architecture in INFERENCE_ONLY:
+        generator = INFERENCE_ONLY[architecture](**checkpoint["config"]["vocoder"]["model"])
+        generator.load_state_dict(checkpoint["model"])
+        return RawMelVocoder(generator, data).eval(), vocoder_data
+    generator = GENERATORS[architecture](**checkpoint["config"]["vocoder"]["model"])
+    generator.load_state_dict(checkpoint["model"])
     return FlowFeatures(generator, data, diffuse).eval(), vocoder_data

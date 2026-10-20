@@ -32,6 +32,7 @@ from rvc.lib.terminal import (
 
 install_rich_print()
 
+from rvc.lib.catalog import NO_EMBEDDER
 from rvc.lib.utils import load_audio_16k, load_embedder_model, extract_features
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
 from rvc.train.extract.noise_mutes import (
@@ -522,7 +523,9 @@ if __name__ == "__main__":
     # Finished clips are dropped before anything reads an audio header, so a
     # resumed extraction starts where it stopped.
     pitch_pending = [f for f in files if not (os.path.exists(f[1]) and os.path.exists(f[2]))]
-    embed_pending = [f for f in files if not os.path.exists(f[3])]
+    # Without an embedder (a vocoder-only experiment) only the pitch is extracted.
+    use_embedder = embedder_model != NO_EMBEDDER
+    embed_pending = [f for f in files if use_embedder and not os.path.exists(f[3])]
     lengths = scan_lengths(sorted({f[0] for f in pitch_pending + embed_pending}))
 
     if pitch_pending:
@@ -533,9 +536,11 @@ if __name__ == "__main__":
     # The mute clips' pitch is written, not tracked (they are unvoiced by
     # construction), so they join only the embedding pass.
     _, mute_files = prepare_noise_mutes(exp_dir, sample_rate, embedder_model, include_mutes)
-    embed_pending += [f for f in mute_files if not os.path.exists(f[3])]
+    embed_pending += [f for f in mute_files if use_embedder and not os.path.exists(f[3])]
 
-    if embed_pending:
+    if not use_embedder:
+        info("No embedder: content features skipped.", tag="[EXTRACT]")
+    elif embed_pending:
         run_embedding_extraction(
             embed_pending,
             devices,
