@@ -8,6 +8,7 @@
     ],
     "eps": 1e-08,
     "weight_decay": 0.0,
+    "filter_weight_decay": 0.1,
     "lr_scheduler": "cosine annealing step",
     "lr_decay": 1.0,
     "lr_final_ratio": 0.1,
@@ -15,6 +16,7 @@
     "adv_warmup_steps": 0,
     "ema_decay": 0.999,
     "grad_clip": 10.0,
+    "grad_clip_by_group": true,
     "segment_size": 15360,
     "c_mel": 45.0,
     "c_stft": 2.5,
@@ -34,6 +36,7 @@
         2048
     ],
     "c_harmonic": 10.0,
+    "c_harmonic_peak": 5.0,
     "c_envelope": 1.0,
     "envelope_loss_bands_hz": [
         3000,
@@ -50,6 +53,8 @@
     "holdout_clips": 0,
     "eval_interval": 0,
     "c_source": 1.0,
+    "adv_balance": 1.0,
+    "fm_relative": true,
     "model": {
         "channels": 512,
         "kernel_size": 7,
@@ -104,12 +109,14 @@
         ],
         "upsampler": "sinc",
         "downsampler": "sinc",
-        "sinc_taps": 12,
-        "sinc_rolloff": 0.88,
-        "sinc_beta": 6.0,
+        "sinc_taps": 24,
+        "sinc_rolloff": 0.94,
+        "sinc_beta": 8.0,
         "antialias_stages": [
             0,
-            1
+            1,
+            2,
+            3
         ],
         "antialias_width": 8,
         "sine_amp": 0.1,
@@ -123,9 +130,19 @@
             12000,
             14000,
             17000
-        ]
+        ],
+        "output_tanh": false,
+        "learn_output_gain": false,
+        "antialias_ratios": [
+            4,
+            4,
+            2,
+            2
+        ],
+        "output_bias": false
     },
-    "discriminator": "original",
+    "remove_dc": true,
+    "discriminator": "chouwa",
     "discriminators": {
         "original": {
             "architecture": "sifigan",
@@ -192,7 +209,7 @@
             ],
             "envelope_downsample": 4,
             "average_heads": false,
-            "san_loss": "bigvsan"
+            "san_loss": "repo"
         }
     }
 }

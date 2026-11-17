@@ -38,6 +38,37 @@ SOFTWARE.
 
 
 -------------------------------------------------------------------------------
+pc-ddsp — https://github.com/yxlllc/pc-ddsp
+-------------------------------------------------------------------------------
+
+Used in: rvc/rectified/chouwagan.py (the per-bin harmonic allpass with its
+moving mean, and the excitation samples as network input) and
+rvc/rectified/train_vocoder.py (the random-scale spectral loss), reimplemented.
+
+MIT License
+
+Copyright (c) 2023 yxlllc
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+-------------------------------------------------------------------------------
 SiFi-GAN — https://github.com/chomeyama/SiFiGAN
 -------------------------------------------------------------------------------
 
@@ -73,7 +104,9 @@ Wavehax — https://github.com/chomeyama/wavehax
 -------------------------------------------------------------------------------
 
 Used in: rvc/rectified/chouwagan.py (the period and spectrogram
-discriminators, as Wavehax sizes them, ported and modified).
+discriminators, as Wavehax sizes them, ported and modified) and
+rvc/rectified/wavehax.py (the generator and its closed-form PCPH prior,
+ported and modified).
 
 MIT License
 

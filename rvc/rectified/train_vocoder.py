@@ -34,7 +34,7 @@ from rvc.lib.terminal import (
     success,
     warning,
 )
-from rvc.rectified import chouwagan, sifigan
+from rvc.rectified import chouwagan, nagi, sifigan, wavehax
 from rvc.rectified.common import (
     RectifiedDataset,
     amp_setup,
@@ -73,20 +73,28 @@ SAN_DIRECTION_WEIGHT = 0.25
 MAX_GRAD_SCALE = 2.0**16
 #: Most of a run the spectral-only stage may take, so a short run still meets the discriminator.
 AUX_MAX_SHARE = 0.25
+#: Under a compressed magnitude in ``LockedSpectralLoss``: bounds its slope at silence.
+COMPRESSION_FLOOR = 1e-4
+VOCODER_NAMES = {chouwagan.ARCHITECTURE: "ChouwaGAN", sifigan.ARCHITECTURE: "SiFi-GAN", wavehax.ARCHITECTURE: "Wavehax",
+                 nagi.ARCHITECTURE: "Nagi"}
 
 
 def generator_gradient_metrics(net_g):
     """``rvc.train.diagnostics.generator_gradient_metrics`` for a bare vocoder,
     whose parameters carry no ``dec.`` prefix: the trunk, and the output
-    ``head``, the ``post_filter`` and the Wavehax ``synthesis`` kept apart;
-    SiFi-GAN's ``source`` and ``filter`` networks."""
-    groups = {"decoder": [], "output": [], "post_filter": [], "synthesis": [], "source": [], "filter": []}
+    ``head``, the ``post_filter``, the Wavehax ``synthesis`` and ``ddsp``
+    kept apart; SiFi-GAN's ``source`` and ``filter`` networks; Nagi's ``free`` branch."""
+    groups = {"decoder": [], "output": [], "post_filter": [], "synthesis": [], "source": [], "filter": [],
+              "allpass": [], "exciter": [], "ddsp": [], "free": []}
     for name, parameter in net_g.named_parameters():
         if parameter.requires_grad:
             group = name.partition(".")[0]
-            group = {"sn": "source", "fn": "filter"}.get(group.partition("_")[0], group)
+            group = {"sn": "source", "fn": "filter", "free": "free"}.get(group.partition("_")[0], group)
             groups[{"head": "output", "post_filter": "post_filter", "synthesis": "synthesis", "source": "source",
-                    "filter": "filter"}.get(group, "decoder")].append(parameter)
+                    "filter": "filter", "allpass_head": "allpass", "exciter": "exciter",
+                    "ddsp": "ddsp", "free": "free"}.get(group, "decoder")].append(
+                parameter
+            )
     metrics = {}
     for group, parameters in groups.items():
         if not parameters:
@@ -96,6 +104,59 @@ def generator_gradient_metrics(net_g):
         gradient_norm = torch.sqrt(sum(terms)) if terms else parameter_norm.new_zeros(())
         metrics[f"grad_norm_{group}"] = gradient_norm
         metrics[f"grad_to_param_{group}"] = gradient_norm / parameter_norm.clamp_min(1e-8)
+    if isinstance(net_g, sifigan.SiFiGAN):
+        metrics.update(sifigan_gradient_metrics(net_g))
+    return metrics
+
+
+def sifigan_clip_groups(net_g):
+    """SiFi-GAN's parameters in the groups ``grad_clip_by_group`` clips
+    apart: the source network, the filter network, the filter's output conv
+    (whose gradient the discriminator drives) and the rest."""
+    groups = defaultdict(list)
+    for name, parameter in net_g.named_parameters():
+        if parameter.requires_grad:
+            group = {"sn": "source", "fn": "filter"}.get(name.partition("_")[0], "decoder")
+            groups["output" if name.startswith("fn_output.") else group].append(parameter)
+    return list(groups.values())
+
+
+def clip_groups_grad_norm(groups, max_norm: float):
+    """Each group clipped to ``max_norm`` on its own; the norm of them all,
+    before clipping."""
+    norms = torch.stack([torch.nn.utils.clip_grad_norm_(group, max_norm) for group in groups])
+    return norms.square().sum().sqrt()
+
+
+def sifigan_gradient_metrics(net_g):
+    """SiFi-GAN's gradient norms per part of each network: every stage's
+    upsampling, blocks and downsampling into it, and the output conv's weight
+    and bias apart; and, read from its last forward, ``stream_rms``."""
+    stages = len(net_g.upsample_rates)
+    parts = defaultdict(list)
+    for name, parameter in net_g.named_parameters():
+        if parameter.grad is None:
+            continue
+        module, _, rest = name.partition(".")
+        prefix, _, kind = module.partition("_")
+        network = {"sn": "source", "fn": "filter"}.get(prefix)
+        if network is None:
+            continue
+        index = int(rest.partition(".")[0]) if rest[:1].isdigit() else None
+        if kind == "output":
+            part = "output_bias" if name.endswith("bias") else "output_weight"
+        elif kind == "upsamples":
+            part = f"up{index}"
+        elif kind == "blocks":
+            part = f"blocks{index // net_g.filter_kernels if network == 'filter' else index}"
+        elif kind == "downsamples":
+            # Layer j lands at the output rate of stage stages - 2 - j.
+            part = f"down{stages - 2 - index}"
+        else:
+            part = kind
+        parts[f"grad_norm_{network}_{part}"].append(parameter.grad.detach().float().square().sum())
+    metrics = {key: torch.sqrt(sum(terms)) for key, terms in parts.items()}
+    metrics.update({f"stream_rms_{key}": value for key, value in net_g.stream_rms.items()})
     return metrics
 
 
@@ -262,6 +323,16 @@ def build_networks(config: dict, device):
         sample_rate=int(data["sample_rate"]), num_mels=int(data["n_mels"]),
         hop_length=int(data["hop_length"]), **settings["model"],
     )
+    if recipe_architecture(settings) == wavehax.ARCHITECTURE and hparams.get("mel_prior"):
+        # Kept in the export, which then builds the same prior from its own settings.
+        hparams.update(
+            mel_n_fft=int(data["n_fft"]), mel_win_length=int(data["win_length"]), mel_fmin=float(data["mel_fmin"]),
+            mel_fmax=float(data["mel_fmax"]), mel_mean=float(data["mel_mean"]), mel_std=float(data["mel_std"]),
+        )
+    if recipe_architecture(settings) == nagi.ARCHITECTURE:
+        # The mel its gains start from, kept in the export as the prior's above.
+        hparams.update(mel_fmin=float(data["mel_fmin"]), mel_fmax=float(data["mel_fmax"]),
+                       mel_mean=float(data["mel_mean"]), mel_std=float(data["mel_std"]))
     net_g = GENERATORS[recipe_architecture(settings)](**hparams).to(device)
     d_settings = settings["discriminator"]
     # ``architecture`` "sifigan": SiFi-GAN's own; ChouwaGAN's otherwise.
@@ -295,6 +366,51 @@ def load_families(net_d, weights: dict) -> bool:
     return loaded == set(net_d) == {key.partition(".")[0] for key in weights}
 
 
+def load_optimizer_state(optim, saved, net_g=None):
+    """Load the optimiser's state from a checkpoint whose generator had other
+    parameters: the DDSP branch's, when it was turned off. The state is mapped
+    by the parameters' order -- the branch's parameters sit at the end -- so
+    the ones the other run had and this one does not are dropped, and the ones
+    it did not have start fresh."""
+    groups, saved_groups = optim.param_groups, saved.get("param_groups", [])
+    if len(groups) != 1 or len(saved_groups) != 1:
+        optim.load_state_dict(saved)
+        return
+    current, previous = groups[0]["params"], saved_groups[0]["params"]
+    if len(current) == len(previous):
+        optim.load_state_dict(saved)
+        return
+    keep = previous[:len(current)]
+    padding = list(range(-1, -1 - (len(current) - len(keep))))
+    state = saved.get("state", {})
+    trimmed = dict(saved_groups[0], params=keep + padding)
+    optim.load_state_dict({"state": {k: v for k, v in state.items() if k in keep}, "param_groups": [trimmed]})
+
+
+def adapt_optimizer_state(optim, net_g):
+    """Reshape the moments Adam keeps for the parameters whose shape the run
+    changed: the Wavehax input projection, whose width follows the mel prior.
+    The planes the other run had and this one does not are dropped, and the
+    ones it did not have start at zero."""
+    adapter = getattr(net_g, "adapt_plane_weight", None)
+    if adapter is None:
+        return
+    names = {id(parameter): name for name, parameter in net_g.named_parameters()}
+    for parameter, state in optim.state.items():
+        if not names.get(id(parameter), "").endswith("input_proj.weight"):
+            continue
+        for key, value in list(state.items()):
+            if not torch.is_tensor(value) or value.ndim != parameter.ndim:
+                continue
+            if value.shape == parameter.shape:
+                continue
+            if value.shape[0] != parameter.shape[0] or value.shape[2:] != parameter.shape[2:]:
+                continue
+            adapted = adapter(value, torch.zeros_like(parameter))
+            if adapted.shape == parameter.shape:
+                state[key] = adapted
+
+
 def restore(spec, out_dir, sample_rate, net_g, net_d, optim_g, optim_d, ema, scaler, plateau, plateau_metric):
     """Resume the run's latest checkpoints, or start from the pretrained
     weights of ``spec``. Returns where training starts: ``epoch``, ``step``,
@@ -314,7 +430,9 @@ def restore(spec, out_dir, sample_rate, net_g, net_d, optim_g, optim_d, ema, sca
                 f"the rectified one. Turn on Fresh Training or use another model name."
             )
         net_g.load_state_dict(state_g["model"])
-        optim_g.load_state_dict(state_g["optimizer"])
+        load_optimizer_state(optim_g, state_g["optimizer"], net_g)
+        # A parameter the run resized keeps its moments in the old shape.
+        adapt_optimizer_state(optim_g, net_g)
         # A family added or changed in the config since starts fresh, and so do
         # D's Adam moments; its LR stays where the schedule had it.
         same_d = load_families(net_d, state_d["model"])
@@ -375,6 +493,162 @@ class MultiResolutionSTFTLoss(nn.Module):
         return sc_loss / len(self.resolutions), mag_loss / len(self.resolutions)
 
 
+class RandomScaleSpectralLoss(nn.Module):
+    """pc-ddsp's random-scale spectral loss (https://github.com/yxlllc/pc-ddsp,
+    MIT): spectral convergence and log-magnitude L1 at ``scales`` FFT sizes
+    drawn each call from [``fft_min``, ``fft_max``), with no overlap, from a
+    random start. The sizes and frame edges move every step, so the magnitude
+    depends on how the harmonics add up inside each frame: what lets it train
+    phase. Only sizes without a prime factor above 7: cuFFT plans every new
+    size, slowly for the others, and would plan anew for most steps."""
+
+    def __init__(self, fft_min=256, fft_max=2048, scales=4, eps=1e-7):
+        super().__init__()
+        self.scales, self.eps = int(scales), float(eps)
+
+        def smooth(n):
+            for prime in (2, 3, 5, 7):
+                while n % prime == 0:
+                    n //= prime
+            return n == 1
+
+        self.sizes = [n for n in range(int(fft_min), int(fft_max)) if smooth(n)]
+        self.windows = {}
+
+    def _magnitude(self, x, n_fft):
+        window = self.windows.get(n_fft)
+        if window is None or window.device != x.device:
+            window = self.windows[n_fft] = torch.hann_window(n_fft, device=x.device)
+        spec = torch.stft(x, n_fft, n_fft, window=window, center=False, return_complex=True)
+        # As torchaudio's ``normalized=True``: over the window's energy.
+        return spec.abs() / window.square().sum().sqrt() + self.eps
+
+    def forward(self, x, y):
+        """Predicted ``x`` and target ``y``, [B, T] each."""
+        with torch.autocast(x.device.type, enabled=False):
+            x, y = x.float(), y.float()
+            loss = 0.0
+            for index in torch.randint(len(self.sizes), (self.scales,)).tolist():
+                n_fft = self.sizes[index]
+                start = int(torch.randint(n_fft, ()))
+                x_mag, y_mag = self._magnitude(x[:, start:], n_fft), self._magnitude(y[:, start:], n_fft)
+                convergence = torch.linalg.norm(y_mag - x_mag, dim=(1, 2)) / torch.linalg.norm(y_mag + x_mag, dim=(1, 2))
+                loss = loss + convergence.mean() + F.l1_loss(y_mag.log(), x_mag.log())
+            return loss / self.scales
+
+
+class LockedSpectralLoss(nn.Module):
+    """The complex spectrum of Nagi's filtered pulses against the target's,
+    both compressed in magnitude, over the voiced frames under ``max_hz``:
+    with the pulses locked to the target it trains their phase directly. On
+    the pulses alone: a noise the target's is not correlated with would only
+    be pushed down. Each frame of the pulses is first turned by the delay,
+    within half a period, and the one angle that bring it closest to the
+    target: a recording's own (its polarity among them), not heard and not in
+    the mel, and without them pulses of the right shape cost more than none."""
+
+    #: Steps per sample of the delay search.
+    oversample = 4
+
+    def __init__(self, sample_rate, hop_length, fft_sizes, hop_sizes, win_lengths, max_hz, compression=0.3):
+        super().__init__()
+        self.resolutions = list(zip(fft_sizes, hop_sizes, win_lengths))
+        self.sample_rate = int(sample_rate)
+        self.hop_length, self.compression = int(hop_length), float(compression)
+        for index, (fft_size, _, win_length) in enumerate(self.resolutions):
+            window = torch.hann_window(win_length)
+            # A sine's bin reads its amplitude.
+            self.register_buffer(f"window_{index}", window * 2 / window.sum(), persistent=False)
+            setattr(self, f"bins_{index}", int(min(max_hz, sample_rate / 2) * fft_size / sample_rate) + 1)
+
+    def _spectrum(self, x, index):
+        fft_size, hop_size, win_length = self.resolutions[index]
+        spec = torch.stft(x, fft_size, hop_size, win_length, getattr(self, f"window_{index}"), return_complex=True)
+        spec = spec[:, :getattr(self, f"bins_{index}")]
+        return spec * (spec.abs() + COMPRESSION_FLOOR) ** (self.compression - 1)
+
+    @torch.no_grad()
+    def _alignment(self, pulses, target, f0, fft_size):
+        """The factor [B, bins, frames] that turns ``pulses``' spectrum by each
+        frame's best delay and angle against ``target``'s; ``f0`` [B, frames]."""
+        size = self.oversample * fft_size
+        # Lag m is the pulses turned by exp(2j pi bin m / size).
+        correlation = torch.fft.ifft(pulses * target.conj(), n=size, dim=1)
+        lag = torch.fft.fftfreq(size, 1 / size, device=pulses.device) / self.oversample
+        period = self.sample_rate / f0.clamp(min=chouwagan.SOURCE_F0_FLOOR)
+        outside = lag.abs().view(1, -1, 1) > 0.5 * period.unsqueeze(1)
+        best = correlation.abs().masked_fill(outside, 0.0).argmax(1, keepdim=True)
+        bins = torch.arange(pulses.shape[1], device=pulses.device).view(1, -1, 1)
+        angle = 2 * math.pi * bins * lag[best] / fft_size - correlation.gather(1, best).angle()
+        return torch.polar(torch.ones_like(angle), angle)
+
+    def forward(self, pulses, y, f0):
+        """``pulses`` and ``y`` [B, 1, T], ``f0`` [B, frames] (0 unvoiced)."""
+        with torch.autocast(y.device.type, enabled=False):
+            pulses, y = pulses.squeeze(1).float(), y.squeeze(1).float()
+            loss = 0.0
+            for index, (fft_size, hop_size, _) in enumerate(self.resolutions):
+                predicted, target = self._spectrum(pulses, index), self._spectrum(y, index)
+                frame = (torch.arange(target.shape[-1], device=y.device) * hop_size // self.hop_length)
+                frame_f0 = f0[:, frame.clamp(max=f0.shape[-1] - 1)].float()
+                predicted = predicted * self._alignment(predicted, target, frame_f0, fft_size)
+                error = (predicted - target).abs().square().mean(1)
+                voiced = (frame_f0 > 0).to(error.dtype)
+                loss = loss + (error * voiced).sum() / voiced.sum().clamp(min=1)
+            return loss / len(self.resolutions)
+
+
+class SyncEnvelopeLoss(nn.Module):
+    """How each band's power moves inside the glottal cycle, generated against
+    target: the first ``harmonics`` Fourier coefficients of its envelope along
+    the locked cycle, over its mean, read under the lock's window in the
+    voiced frames. The generated ones are first turned by each frame's best
+    delay, one for all bands. It gives the burst of each cycle its depth,
+    shape and place across bands, in noise as in harmonics, which a magnitude
+    averages away and the locked spectrum cannot see in noise."""
+
+    def __init__(self, sample_rate, hop_length, band_edges, harmonics=6, hop=256, delays=256):
+        super().__init__()
+        self.hop_length, self.hop = int(hop_length), int(hop)
+        self.bands = chouwagan.EnvelopeLoss(sample_rate, band_edges)
+        window = torch.hann_window(int(nagi.LOCK_SECONDS * sample_rate) | 1, periodic=False)
+        self.register_buffer("window", (window / window.sum()).view(1, 1, -1), persistent=False)
+        order = torch.arange(1, harmonics + 1)
+        self.register_buffer("order", order.view(1, -1, 1), persistent=False)
+        angle = -2 * math.pi * order.view(-1, 1) * torch.arange(delays) / delays
+        self.register_buffer("delays", torch.polar(torch.ones_like(angle), angle), persistent=False)
+
+    def _coefficients(self, x, turns):
+        """[N, T] -> the coefficients [N, bands, harmonics, frames] of each
+        band's power along the cycle ``turns``, and the bands that sound
+        [N, bands, 1]."""
+        envelopes, means = self.bands._envelopes(x)
+        power = envelopes.square()
+        angle = -2 * math.pi * torch.remainder(self.order * turns.unsqueeze(1), 1.0).float()
+        moving = power.unsqueeze(2) * torch.polar(torch.ones_like(angle), angle).unsqueeze(1)
+        batch, bands, harmonics, length = moving.shape
+        moving = torch.view_as_real(moving).permute(0, 1, 2, 4, 3).reshape(-1, 1, length)
+        moving = F.conv1d(moving, self.window, stride=self.hop).view(batch, bands, harmonics, 2, -1)
+        mean = F.conv1d(power.reshape(-1, 1, length), self.window, stride=self.hop).view(batch, bands, 1, -1)
+        return torch.complex(moving[:, :, :, 0], moving[:, :, :, 1]) / mean.clamp(min=1e-4), means > 1e-4
+
+    def forward(self, y_hat, y, turns, f0):
+        """``y_hat`` and ``y`` [B, 1, T], ``turns`` [B, T] the locked cycle
+        (cycles, in double), ``f0`` [B, frames] (0 unvoiced)."""
+        with torch.autocast(y.device.type, enabled=False):
+            generated, _ = self._coefficients(y_hat.squeeze(1).float(), turns)
+            with torch.no_grad():
+                target, audible = self._coefficients(y.squeeze(1).float(), turns)
+                cross = (generated * target.conj() * audible.unsqueeze(-1)).sum(1)
+                best = torch.einsum("bhf,hd->bdf", cross, self.delays).real.argmax(1)
+            generated = generated * self.delays[:, best].permute(1, 0, 2).unsqueeze(1)
+            error = (generated - target).abs().square().mean(2)
+            centre = torch.arange(error.shape[-1], device=y.device) * self.hop + self.window.shape[-1] // 2
+            voiced = f0[:, (centre // self.hop_length).clamp(max=f0.shape[-1] - 1)] > 0
+            weight = (audible & voiced.unsqueeze(1)).to(error.dtype)
+            return (error * weight).sum() / weight.sum().clamp(min=1)
+
+
 class SpectralLoss:
     """The recipe's reconstruction loss: the L1 of the input's mel read up to
     Nyquist (``loss_n_mels`` and ``loss_fmin`` resize it) at ``c_mel``, and
@@ -401,8 +675,18 @@ class SpectralLoss:
             self.stft_weight = settings["c_stft"]
             self.label += f" + MR-STFT x{self.stft_weight:g}"
 
+    def mel_error(self, y, y_hat):
+        """The per-band, per-frame absolute log-mel error of ``y_hat`` against
+        ``y``, [B, 1, T] each -> [B, n_mels, T]."""
+        return (self.mel(y_hat.squeeze(1)) - self.mel(y.squeeze(1))).abs()
+
+    def mel_l1(self, y, y_hat):
+        """The log-mel L1 of ``y_hat`` against ``y``, [B, 1, T] each, at the
+        loss mel's scale."""
+        return self.mel_error(y, y_hat).mean()
+
     def __call__(self, y, y_hat):
-        loss_mel = F.l1_loss(self.mel(y_hat.squeeze(1)), self.mel(y.squeeze(1))) * self.weight
+        loss_mel = self.mel_l1(y, y_hat) * self.weight
         if self.stft is None:
             return loss_mel
         sc_loss, mag_loss = self.stft(y_hat.squeeze(1), y.squeeze(1))
@@ -428,12 +712,16 @@ def bigvsan_discriminator_loss(real: dict, fake: dict):
     return loss_real + loss_fake, loss_real, loss_fake
 
 
-def feature_loss(fmaps_real, fmaps_fake) -> torch.Tensor:
-    """Feature matching over every layer of every head, x2."""
+def feature_loss(fmaps_real, fmaps_fake, relative=False) -> torch.Tensor:
+    """Feature matching over every layer of every head, x2. ``relative``
+    divides each layer's error by the mean magnitude of its real features:
+    a discriminator whose features grow then cannot grow the loss with them."""
     loss = 0.0
     for head_real, head_fake in zip(fmaps_real, fmaps_fake):
         for real, fake in zip(head_real, head_fake):
-            loss = loss + torch.mean(torch.abs(real.float() - fake.float()))
+            real = real.float()
+            error = torch.mean(torch.abs(real - fake.float()))
+            loss = loss + (error / (real.abs().mean() + 1e-6) if relative else error)
     return loss * 2
 
 
@@ -447,6 +735,18 @@ def volume_augment(mel, audio, probability: float):
     shift = torch.where(torch.rand_like(high) < probability, shift, torch.zeros_like(shift))
     mel = torch.clamp(mel + shift.view(-1, 1, 1), min=math.log(1e-5))
     return mel, audio * shift.exp().view(-1, 1, 1)
+
+
+def _halves(value, size):
+    """``value``, a tensor or a nest of dicts, lists and tuples of tensors
+    batched real then fake, as its (real, fake) pair."""
+    if torch.is_tensor(value):
+        return value[:size], value[size:]
+    if isinstance(value, dict):
+        pairs = {key: _halves(item, size) for key, item in value.items()}
+        return {key: pair[0] for key, pair in pairs.items()}, {key: pair[1] for key, pair in pairs.items()}
+    pairs = [_halves(item, size) for item in value]
+    return type(value)(pair[0] for pair in pairs), type(value)(pair[1] for pair in pairs)
 
 
 class Adversary:
@@ -463,11 +763,18 @@ class Adversary:
         self.heads = 1
         if d_settings.get("average_heads", settings.get("average_heads", False)):
             self.heads = sum(len(family.discriminators) for family in net_d.values())
-        # ``branchwise_discriminator``: the families one at a time, each one's
-        # graph freed before the next, for the memory of the largest instead
-        # of their sum; the gradients are the same. On one GPU only: the
-        # gradient sync wraps the whole network.
+        # ``branchwise_discriminator``: D's update one family at a time, each
+        # one's graph freed before the next, for the memory of the largest
+        # instead of their sum; the gradients are the same. On one GPU only:
+        # the gradient sync wraps the whole network. G's update always runs
+        # that way, reading D frozen and outside the sync.
         self.branchwise = bool(settings.get("branchwise_discriminator", False)) and train_d is net_d
+        # ``fm_relative``: ``feature_loss`` over the real features' magnitude.
+        # ``adv_balance``: the norm of G's gradient from D (adversarial and
+        # feature matching) at the output is capped at that many times the
+        # spectral losses', so a discriminator that sharpens cannot drown them.
+        self.fm_relative = bool(settings.get("fm_relative", False))
+        self.adv_balance = float(settings.get("adv_balance", 0.0))
         self.san = net_d.supports_san
         # ``san_loss`` "bigvsan": BigVSAN's discriminator loss on the SAN
         # heads, in place of the repo's bounded mirror of it.
@@ -476,6 +783,13 @@ class Adversary:
         # then fake: cached, each weight norm is built once. Not compiled,
         # where the graph already fuses it.
         self.cache_weights = not getattr(net_d, "_compile_enabled", False)
+        # ``remove_dc``: D sees each segment without its mean. Real audio has
+        # next to no DC, so a compressed magnitude's DC bin otherwise sends
+        # the generator a gradient far larger than anything audible.
+        self.remove_dc = bool(d_settings.get("remove_dc", settings.get("remove_dc", False)))
+
+    def _input(self, x):
+        return x - x.mean(-1, keepdim=True) if self.remove_dc else x
 
     def describe(self, d_settings: dict) -> str:
         net = self.net
@@ -487,7 +801,12 @@ class Adversary:
             (", SAN, BigVSAN loss" if self.bigvsan else ", SAN") if self.san else ""
         ) + (", hinge" if self.hinge else "") + (f", mean over {self.heads} heads" if self.heads > 1 else "") + (
             ", one family at a time" if self.branchwise else ""
-        ) + (", compiled" if getattr(net, "_compile_enabled", False) else "")
+        ) + (", compiled" if getattr(net, "_compile_enabled", False) else "") + (
+            ", DC removed" if self.remove_dc else ""
+        ) + (", relative FM" if self.fm_relative else "") + (
+            f", G's gradient from D capped at {self.adv_balance:g}x the spectral one's" if self.adv_balance > 0
+            else ""
+        )
 
     def _loss(self, real, fake):
         """D's loss on ``real`` and ``fake`` outputs, and its real and fake parts."""
@@ -505,64 +824,47 @@ class Adversary:
         return generator_loss(outputs, use_softplus=self.san, hinge=self.hinge)
 
     def discriminator_losses(self, y, fake):
-        """D's loss and its real and fake parts."""
-        losses = self._loss(
-            self.train_net(y, san_training=self.san), self.train_net(fake.detach(), san_training=self.san)
-        )
+        """D's loss and its real and fake parts; real and fake go through D
+        as one batch, one pass instead of two."""
+        joint = torch.cat((self._input(y), self._input(fake.detach())))
+        losses = self._loss(*_halves(self.train_net(joint, san_training=self.san), y.shape[0]))
         return tuple(loss / self.heads for loss in losses)
 
     def discriminator_step(self, y, fake, scaler, autocast):
         """``discriminator_losses`` under ``branchwise``: each family's
         backward is run here, into gradients the caller steps on. Returns D's
         loss and its real and fake parts, detached."""
-        fake = fake.detach()
+        joint = torch.cat((self._input(y), self._input(fake.detach())))
         totals = [y.new_zeros(()) for _ in range(3)]
         for name, family in self.net.items():
             with autocast():
-                if self.san:
-                    real, generated = family(y, san_training=True), family(fake, san_training=True)
-                else:
-                    real, generated = family(y), family(fake)
+                real, generated = _halves(family(joint, san_training=self.san), y.shape[0])
                 losses = self._loss({name: real}, {name: generated})
             loss = losses[0] / self.heads
             (loss if scaler is None else scaler.scale(loss)).backward()
             totals = [total + part.detach() / self.heads for total, part in zip(totals, losses)]
         return totals
 
-    def branchwise_generator_losses(self, y, fake, adv_scale: float, grad_scale: float):
-        """``generator_losses`` under ``branchwise``. Each family's gradient
-        is taken at ``fake`` and its graph freed; their sum reaches the
-        generator through one product with ``fake``. The losses carry their
-        values, and the feature-matching one that gradient, the adversarial
-        loss's times ``adv_scale`` included. ``grad_scale`` is the
+    def generator_gradient(self, y, leaf, adv_scale: float, grad_scale: float):
+        """The generator's adversarial (times ``adv_scale``) and
+        feature-matching losses through the frozen discriminator, detached,
+        and their gradient at ``leaf``, the output as an FP32 leaf. Each
+        family's gradient is taken there and its graph freed, for the memory
+        of the largest instead of their sum. ``grad_scale`` is the
         GradScaler's, which keeps an FP16 gradient from underflowing."""
-        leaf = fake.detach().requires_grad_(True)
-        gradient = torch.zeros_like(leaf, dtype=torch.float32)
+        y = self._input(y)
+        gradient = torch.zeros_like(leaf)
         loss_adv = loss_fm = y.new_zeros(())
         for family in self.net.values():
-            outputs, fmaps = family(leaf)
+            outputs, fmaps = family(self._input(leaf))
             with torch.no_grad():
                 _, fmaps_real = family(y)
             adv = self._adversarial(outputs) / self.heads
-            fm = feature_loss(fmaps_real, fmaps) / self.heads
+            fm = feature_loss(fmaps_real, fmaps, self.fm_relative) / self.heads
             (part,) = torch.autograd.grad((adv * adv_scale + fm) * grad_scale, leaf)
             gradient += part.float() / grad_scale
             loss_adv, loss_fm = loss_adv + adv.detach(), loss_fm + fm.detach()
-        surrogate = (fake.float() * gradient).sum()
-        return loss_adv, loss_fm + surrogate - surrogate.detach()
-
-    def generator_losses(self, y, fake, adv_scale: float = 1.0, grad_scale: float = 1.0):
-        """The generator's adversarial and feature-matching losses through
-        the frozen discriminator. ``adv_scale`` and ``grad_scale`` are
-        ``branchwise_generator_losses``'."""
-        if self.branchwise:
-            return self.branchwise_generator_losses(y, fake, adv_scale, grad_scale)
-        d_fake = self.net(fake)
-        with torch.no_grad():
-            d_real = self.net(y)
-        loss_adv = sum(self._adversarial(outputs) for outputs, _ in d_fake.values())
-        loss_fm = sum(feature_loss(d_real[family][1], d_fake[family][1]) for family in d_fake)
-        return loss_adv / self.heads, loss_fm / self.heads
+        return loss_adv, loss_fm, gradient
 
 
 class RollingStats:
@@ -579,7 +881,7 @@ class RollingStats:
             scalars[f"AMP/skip_rate_{size}"] = sum(self.skips) / len(self.skips)
         for key, queue in self.values.items():
             if queue:
-                category = "loss" if key.startswith("loss_") else "grad"
+                category = "loss" if key.startswith("loss_") else "grad" if key.startswith("grad_") else "diag"
                 scalars[f"{category}_avg_{size}/{key}_{size}"] = torch.stack(list(queue)).mean().item()
         return scalars
 
@@ -627,12 +929,16 @@ def render_preview(net_g, ema, previews, reference, data: dict, device, epoch: i
     mel = normalize_mel(reference.mel.to(device), data)
     f0 = reference.inputs.f0.to(device)
     audio = reference.audio.to(device)
-    extra = None
+    extra = {}
     with ema.applied(net_g), torch.no_grad():
         conditions = measured_conditions(net_g, audio.reshape(1, -1), f0)
-        generated = net_g(mel, f0, *conditions)
+        if getattr(net_g, "ddsp", None) is not None:
+            generated, aux = net_g(mel, f0, *conditions, return_aux=True)
+            extra["ddsp"] = aux["ddsp"][0]
+        else:
+            generated = net_g(mel, f0, *conditions)
         if conditions:
-            extra = {"unmeasured": net_g(mel, f0)[0]}
+            extra["unmeasured"] = net_g(mel, f0)[0]
     previews.log(epoch, step, reference.path, generated, audio, extra_audio=extra)
 
 
@@ -745,11 +1051,19 @@ def train(ranks: Ranks, spec_path: str) -> None:
     learning_rate = float(settings["learning_rate"])
     if spec.get("pretrained_g"):
         learning_rate = float(settings.get("finetune_learning_rate", learning_rate))
-    adam = {"betas": tuple(settings["betas"]), "eps": float(settings.get("eps", 1e-9))}
+    adam = {"betas": tuple(settings["betas"]), "eps": float(settings.get("eps", 1e-9)), "fused": device.type == "cuda"}
     if "weight_decay" in settings:
         adam["weight_decay"] = float(settings["weight_decay"])
     optim_g = torch.optim.AdamW(net_g.parameters(), learning_rate, **adam)
     optim_d = torch.optim.AdamW(net_d.parameters(), learning_rate, **adam)
+    # ``filter_weight_decay``: SiFi-GAN's filter network alone decays, as AdamW
+    # does, applied after each step so the optimiser keeps one group. Only its
+    # gains and biases: a weight-norm direction has no scale to pull down.
+    filter_decay = float(settings.get("filter_weight_decay", 0.0)) if isinstance(net_g, sifigan.SiFiGAN) else 0.0
+    decayed = [
+        parameter for name, parameter in net_g.named_parameters()
+        if name.startswith("fn_") and parameter.requires_grad and not name.endswith("original1")
+    ] if filter_decay > 0 else []
     amp_dtype, scaler = amp_setup(spec.get("precision", "fp32"), device, TAG)
     plateau, plateau_metric, plateau_interval = build_plateau(settings, eval_interval)
     ema = WeightEMA(net_g, settings["ema_decay"])
@@ -824,18 +1138,51 @@ def train(ranks: Ranks, spec_path: str) -> None:
     # held-out evaluation stay on the real mel.
     degradation = min(1.0, max(0.0, float(spec.get("mel_degradation", 0.0))))
     c_harmonic = float(settings.get("c_harmonic", 0.0))
-    harmonic_loss = chouwagan.HarmonicLoss(sample_rate, data["hop_length"]).to(device) if c_harmonic > 0 else None
+    # ``c_harmonic_peak``: the same loss's per-harmonic peak term.
+    c_harmonic_peak = float(settings.get("c_harmonic_peak", 0.0))
+    harmonic_loss = (
+        chouwagan.HarmonicLoss(sample_rate, data["hop_length"]).to(device)
+        if c_harmonic > 0 or c_harmonic_peak > 0 else None
+    )
+    c_ddsp = float(settings.get("c_ddsp", 0.0)) if getattr(net_g, "ddsp", None) is not None else 0.0
+    c_ddsp_guard = float(settings.get("c_ddsp_guard", 0.0)) if getattr(net_g, "ddsp", None) is not None else 0.0
     c_envelope = float(settings.get("c_envelope", 0.0))
     envelope_loss = None
     if c_envelope > 0:
         envelope_bands = settings.get("envelope_loss_bands_hz") or (3000, 6000, 10000, 16000)
         envelope_loss = chouwagan.EnvelopeLoss(sample_rate, envelope_bands).to(device)
+    c_rss = float(settings.get("c_rss", 0.0))
+    rss_loss = RandomScaleSpectralLoss(
+        settings.get("rss_fft_min", 256), settings.get("rss_fft_max", 2048), settings.get("rss_scales", 4),
+    ) if c_rss > 0 else None
     # SiFi-GAN's: the excitation's spectrum against the target's with its envelope flattened.
     c_source = float(settings.get("c_source", 0.0)) if isinstance(net_g, sifigan.SiFiGAN) else 0.0
     source_loss = sifigan.SourceLoss(sample_rate, data["hop_length"]).to(device) if c_source > 0 else None
     grad_clip = float(settings.get("grad_clip") or "inf")
+    # ``grad_clip_by_group``: SiFi-GAN's groups each clipped to ``grad_clip``,
+    # so a spike at the output conv does not shrink the source's step.
+    clip_groups = (
+        sifigan_clip_groups(net_g)
+        if settings.get("grad_clip_by_group") and isinstance(net_g, sifigan.SiFiGAN) and math.isfinite(grad_clip)
+        else None
+    )
+    # Nagi's pulses locked to the target's fundamental, and their complex spectrum against its.
+    phase_lock = isinstance(net_g, nagi.Nagi) and bool(settings.get("phase_lock", False))
+    c_locked = float(settings.get("c_locked", 0.0)) if phase_lock else 0.0
+    locked_loss = LockedSpectralLoss(
+        sample_rate, data["hop_length"], settings["loss_fft_sizes"], settings["loss_hop_sizes"],
+        settings["loss_win_lengths"], float(settings.get("locked_max_hz", 6000.0)),
+    ).to(device) if c_locked > 0 else None
+    # Under the same lock, each band's envelope along the glottal cycle against the target's.
+    c_sync = float(settings.get("c_sync", 0.0)) if phase_lock else 0.0
+    sync_loss = SyncEnvelopeLoss(
+        sample_rate, data["hop_length"],
+        settings.get("sync_loss_bands_hz") or (2000, 4000, 6000, 9000, 12000, 16000),
+    ).to(device) if c_sync > 0 else None
     # Clips trained without the measured contrast, as inference runs.
     contrast_dropout = float(settings.get("contrast_dropout", 0.0))
+    # Clips rendered without Nagi's free branch, so the filtered sources stay whole without it.
+    free_dropout = float(settings.get("free_dropout", 0.0)) if getattr(net_g, "free_head", None) is not None else 0.0
 
     if main_rank:
         print_model_summary(
@@ -845,9 +1192,13 @@ def train(ranks: Ranks, spec_path: str) -> None:
         print_settings_panel(
             [
                 ("Model", name),
-                ("Vocoder", f"{'SiFi-GAN' if isinstance(net_g, sifigan.SiFiGAN) else 'ChouwaGAN'}, "
+                ("Vocoder", f"{VOCODER_NAMES[generator_architecture(net_g)]}, "
                             f"{sample_rate} Hz, hop {data['hop_length']}"
-                 + (f", {hparams.get('upsampler', 'sinc')} upsampling" if isinstance(net_g, sifigan.SiFiGAN) else "")),
+                 + (f", {hparams.get('upsampler', 'sinc')} upsampling" if isinstance(net_g, sifigan.SiFiGAN) else "")
+                 + (f", n_fft {net_g.n_fft}, {hparams.get('channels', 16)} channels"
+                    if isinstance(net_g, wavehax.Wavehax) else "")
+                 + (f", control hop {net_g.control_hop}, {net_g.pulse_taps}-tap filters"
+                    if isinstance(net_g, nagi.Nagi) else "")),
                 ("Clips", f"{len(dataset)} ({len(loader)} steps per epoch)"
                  + (f", {held_out} held out" if held_out else "")),
                 ("Batch size", batch_size),
@@ -862,20 +1213,49 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 ("Optimizer", f"AdamW, lr {learning_rate:g}, {lr_scheduler} {settings['lr_decay']}"
                  + (f", final ratio {lr_final_ratio}" if lr_final_ratio is not None else "")
                  + (f", warmup {lr_warmup} steps" if lr_warmup > 0 else "")
+                 + (f", filter weight decay {filter_decay:g}" if decayed else "")
+                 + (f", G clipped to {grad_clip:g} per group" if clip_groups else "")
                  + (f", {plateau_metric} plateau x{plateau.factor:g} after {plateau.patience} x"
                     f" {plateau_interval} steps (at x{plateau.scale:g})" if plateau_interval > 0 else "")),
                 ("Losses", spectral_loss.label + ", FM x2, adversarial"
                  + (f" ramped over {adv_warmup} steps" if adv_warmup > 0 else "")
                  + (f", spectral only until step {aux_steps}" if step < aux_steps else "")
-                 + (f", harmonic contrast and level x{c_harmonic:g}" if harmonic_loss is not None else "")
+                 + (f", harmonic contrast and level x{c_harmonic:g}" if c_harmonic > 0 else "")
+                 + (f", harmonic peaks x{c_harmonic_peak:g}" if c_harmonic_peak > 0 else "")
                  + (f", band envelope x{c_envelope:g}" if envelope_loss is not None else "")
-                 + (f", source x{c_source:g}" if source_loss is not None else "")),
+                 + (f", DDSP mel x{c_ddsp:g}" if c_ddsp > 0 else "")
+                 + (f", DDSP guard x{c_ddsp_guard:g}" if c_ddsp_guard > 0 else "")
+                 + (f", random-scale spectral x{c_rss:g}" if rss_loss is not None else "")
+                 + (f", source x{c_source:g}" if source_loss is not None else "")
+                 + (f", locked pulses x{c_locked:g}" if locked_loss is not None else "")
+                 + (f", cycle envelope x{c_sync:g}" if sync_loss is not None else "")),
                 *([("Band contrast input", f"measured, dropped on {contrast_dropout:g} of clips")]
                   if net_g.contrast is not None else []),
+                *([("Phase lock", "pulses on the target's fundamental")] if phase_lock else []),
+                *([("Free branch", f"{net_g.free_bands} bands, muted on {free_dropout:g} of clips")]
+                  if getattr(net_g, "free_head", None) is not None else []),
+                *([("DDSP input", f"{net_g.ddsp.bands} bands for harmonics and noise, "
+                                  f"{hparams.get('ddsp_channels', 32)} channels"
+                    + (f", mel loss x{c_ddsp:g}" if c_ddsp > 0 else ", no own loss"))]
+                  if getattr(net_g, "ddsp", None) is not None else []),
                 *([("Post-filter", f"{hparams['post_filter_channels']} channels"
                     + (", anti-aliased" if hparams.get("post_filter_antialias") else "")
                     + (", the only part trained" if post_filter_only else ""))]
                   if getattr(net_g, "post_filter", None) is not None else []),
+                *([("Allpass", f"per bin, phase {hparams.get('phase', 'mixed')} under it, mean over "
+                               f"{net_g.allpass_smooth_frames} frames")]
+                  if getattr(net_g, "allpass_head", None) is not None else []),
+                *([("Source extras", ", ".join(name for name, on in (
+                    ("cycle alternation", getattr(net_g, "cycle_alternation", False)),
+                    ("roughness", getattr(net_g, "roughness", False)),
+                    (f"transients ({getattr(net_g, 'transient_fft', 0)}-sample window)",
+                     getattr(net_g, "transient_knots", 0)),
+                ) if on))] if any((getattr(net_g, "cycle_alternation", False), getattr(net_g, "roughness", False),
+                                   getattr(net_g, "transient_knots", 0))) else []),
+                *([("Harmonic envelope", "zero-phase FIR, 1.5 pitch periods each side")]
+                  if getattr(net_g, "pitch_sync_envelope", False) else []),
+                *([("Exciter input", "pulse and noise samples per frame")]
+                  if getattr(net_g, "exciter", None) is not None else []),
                 *([("Synthesis", f"Wavehax, {hparams.get('synthesis_channels', 32)} channels, "
                     f"{hparams.get('synthesis_blocks', 8)} blocks, bins pooled x{hparams.get('synthesis_pool', 4)}"
                     + (" but the last" if hparams.get("synthesis_pool", 4) > 1 else "")
@@ -937,12 +1317,28 @@ def train(ranks: Ranks, spec_path: str) -> None:
                 adv_weight = ramp(step - aux_steps, adv_warmup)
 
                 g_mel = degrade_mel(mel, degradation) if degradation > 0 else mel
+                # The per-module metrics are measured on the step that writes them.
+                measure_modules = (step + 1) % rolling == 0
+                if isinstance(net_g, sifigan.SiFiGAN):
+                    net_g.track_stream = measure_modules
                 conditions = measured_conditions(net_g, y, f0)
                 if conditions and contrast_dropout > 0:
                     keep = torch.rand(y.shape[0], 1, 1, device=device) >= contrast_dropout
                     conditions = (conditions[0] * keep,)
+                if free_dropout > 0:
+                    net_g.free_keep = torch.rand(y.shape[0], 1, device=device) >= free_dropout
                 with autocast():
-                    y_hat = train_g(g_mel, f0, *conditions)
+                    if c_ddsp > 0 or c_ddsp_guard > 0:
+                        y_hat, aux = train_g(g_mel, f0, *conditions, return_aux=True)
+                        ddsp_audio = aux["ddsp"]
+                    elif phase_lock:
+                        ddsp_audio = None
+                        y_hat, pulses = train_g(g_mel, f0, *conditions, target=y, return_harmonic=True)
+                    else:
+                        ddsp_audio = None
+                        y_hat = train_g(g_mel, f0, *conditions)
+                if free_dropout > 0:
+                    net_g.free_keep = None
                 grad_norm_d = None
                 if aux_only:
                     loss_d = loss_d_real = loss_d_fake = y.new_zeros(())
@@ -961,37 +1357,76 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
                 # The generator update reads D and never trains it: frozen, its
                 # backward skips D's weight gradients and still reaches y_hat.
+                # The losses on the output are taken on a leaf of it, their
+                # gradients summed there (D's capped by ``adv_balance``) and
+                # sent through G once; each loss's graph is freed as it goes.
                 net_d.requires_grad_(False)
-                with autocast(), (
-                    torch.nn.utils.parametrize.cached() if adversary.cache_weights else nullcontext()
-                ):
-                    if aux_only:
-                        loss_fm = loss_adv = y.new_zeros(())
-                    else:
-                        loss_adv, loss_fm = adversary.generator_losses(
-                            y, y_hat, adv_scale=adv_weight,
-                            grad_scale=1.0 if scaler is None else scaler.get_scale(),
+                leaf = y_hat.detach().float().requires_grad_(True)
+                with autocast():
+                    loss_mel = spectral_loss(y, leaf)
+                    loss_rec = loss_mel
+                    if ddsp_audio is not None and c_ddsp_guard > 0:
+                        # One-sided per band: never worse than the DDSP render,
+                        # but do not pull the output down where DDSP is worse.
+                        error_wave = spectral_loss.mel_error(y, leaf)
+                        error_ddsp = spectral_loss.mel_error(y, ddsp_audio.detach())
+                        loss_ddsp_guard = F.relu(error_wave - error_ddsp).mean() * c_ddsp_guard
+                        loss_rec = loss_rec + loss_ddsp_guard
+                    if harmonic_loss is not None:
+                        bands, peaks = harmonic_loss(leaf, y, f0, peaks=True)
+                        loss_harmonic, loss_harmonic_peak = bands * c_harmonic, peaks * c_harmonic_peak
+                        loss_rec = loss_rec + loss_harmonic + loss_harmonic_peak
+                    if envelope_loss is not None:
+                        loss_envelope = envelope_loss(leaf, y) * c_envelope
+                        loss_rec = loss_rec + loss_envelope
+                    if sync_loss is not None:
+                        loss_sync = sync_loss(leaf, y, net_g.lock_turns, f0) * c_sync
+                        loss_rec = loss_rec + loss_sync
+                    if rss_loss is not None:
+                        loss_rss = rss_loss(leaf.squeeze(1), y.squeeze(1)) * c_rss
+                        loss_rec = loss_rec + loss_rss
+                (gradient,) = torch.autograd.grad(loss_rec, leaf)
+                balance = y.new_ones(())
+                if aux_only:
+                    loss_fm = loss_adv = y.new_zeros(())
+                else:
+                    with autocast(), (
+                        torch.nn.utils.parametrize.cached() if adversary.cache_weights else nullcontext()
+                    ):
+                        loss_adv, loss_fm, gradient_d = adversary.generator_gradient(
+                            y, leaf, adv_weight, 1.0 if scaler is None else scaler.get_scale()
                         )
-                    loss_mel = spectral_loss(y, y_hat)
-                    loss_g = loss_mel + loss_fm + loss_adv * adv_weight
-                if harmonic_loss is not None:
-                    loss_harmonic = harmonic_loss(y_hat, y, f0) * c_harmonic
-                    loss_g = loss_g + loss_harmonic
-                if envelope_loss is not None:
-                    loss_envelope = envelope_loss(y_hat, y) * c_envelope
-                    loss_g = loss_g + loss_envelope
+                    if adversary.adv_balance > 0:
+                        balance = adversary.adv_balance * gradient.norm() / gradient_d.norm().clamp_min(1e-12)
+                        balance = balance.clamp(max=1.0)
+                    gradient = gradient + gradient_d * balance
+                loss_g = (y_hat.float() * gradient).sum()
+                loss_total = loss_rec.detach() + loss_fm + loss_adv * adv_weight
+                # The losses on G's other outputs stay in the graph.
+                if ddsp_audio is not None:
+                    loss_ddsp = spectral_loss.mel_l1(y, ddsp_audio) * c_ddsp
+                    loss_g, loss_total = loss_g + loss_ddsp, loss_total + loss_ddsp.detach()
                 if source_loss is not None:
                     loss_source = source_loss(net_g.excitation, y, f0) * c_source
-                    loss_g = loss_g + loss_source
+                    loss_g, loss_total = loss_g + loss_source, loss_total + loss_source.detach()
+                if locked_loss is not None:
+                    loss_locked = locked_loss(pulses, y, f0) * c_locked
+                    loss_g, loss_total = loss_g + loss_locked, loss_total + loss_locked.detach()
                 optim_g.zero_grad(set_to_none=True)
                 if scaler is None:
                     loss_g.backward()
                 else:
                     scaler.scale(loss_g).backward()
                     scaler.unscale_(optim_g)
-                module_metrics = generator_gradient_metrics(net_g) if step % METRICS_INTERVAL == 0 else {}
-                grad_norm_g = clip_or_sample_grad_norm(net_g.parameters(), grad_clip, step, METRICS_INTERVAL)
+                module_metrics = generator_gradient_metrics(net_g) if measure_modules else {}
+                if clip_groups:
+                    grad_norm_g = clip_groups_grad_norm(clip_groups, grad_clip)
+                else:
+                    grad_norm_g = clip_or_sample_grad_norm(net_g.parameters(), grad_clip, step, METRICS_INTERVAL)
                 optimizer_step(optim_g, scaler, lr_scale)
+                if decayed:
+                    with torch.no_grad():
+                        torch._foreach_mul_(decayed, 1 - optim_g.param_groups[0]["lr"] * lr_scale * filter_decay)
                 net_d.requires_grad_(True)
                 if scaler is not None:
                     scale = scaler.get_scale()
@@ -1010,15 +1445,29 @@ def train(ranks: Ranks, spec_path: str) -> None:
 
                 losses = {
                     "loss_disc": loss_d, "loss_disc_real": loss_d_real, "loss_disc_fake": loss_d_fake,
-                    "loss_adv": loss_adv, "loss_gen_total": loss_g, "loss_fm": loss_fm,
+                    "loss_adv": loss_adv, "loss_gen_total": loss_total, "loss_fm": loss_fm,
                     "loss_spectral": loss_mel, **spectral_loss.terms,
                 }
                 if harmonic_loss is not None:
                     losses["loss_harmonic"] = loss_harmonic
+                    if c_harmonic_peak > 0:
+                        losses["loss_harmonic_peak"] = loss_harmonic_peak
+                if adversary.adv_balance > 0:
+                    losses["adv_scale"] = balance
+                if ddsp_audio is not None and c_ddsp > 0:
+                    losses["loss_ddsp"] = loss_ddsp
+                if ddsp_audio is not None and c_ddsp_guard > 0:
+                    losses["loss_ddsp_guard"] = loss_ddsp_guard
                 if envelope_loss is not None:
                     losses["loss_envelope"] = loss_envelope
+                if sync_loss is not None:
+                    losses["loss_sync"] = loss_sync
+                if rss_loss is not None:
+                    losses["loss_rss"] = loss_rss
                 if source_loss is not None:
                     losses["loss_source"] = loss_source
+                if locked_loss is not None:
+                    losses["loss_locked"] = loss_locked
                 for key, value in losses.items():
                     stats.values[key].append(value.detach().float())
                     epoch_sums[key] += value.detach().float()
@@ -1048,13 +1497,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
                         stats.values[key].append(value.detach().float())
                     elif main_rank:
                         writer.add_scalar(f"Grad_Norm_Diag/{key[-1].upper()}_Skipped", 1, step)
-                for key, value in module_metrics.items():
-                    if torch.isfinite(value):
-                        stats.values[key].append(value.detach().float())
 
                 if main_rank:
                     if not metrics or (batch_index + 1) % METRICS_INTERVAL == 0:
-                        metrics = f"G={loss_g.item():.4f}  " + (
+                        metrics = f"G={loss_total.item():.4f}  " + (
                             f"D=off until step {aux_steps}" if aux_only else f"D={loss_d.item():.4f}"
                         )
                     progress.update(task, advance=1, metrics=metrics)
@@ -1064,6 +1510,10 @@ def train(ranks: Ranks, spec_path: str) -> None:
                             "learning_rate/lr_d": optim_d.param_groups[0]["lr"] * plateau.scale,
                             "learning_rate/lr_g": optim_g.param_groups[0]["lr"] * plateau.scale,
                             **stats.scalars(),
+                            **{
+                                f"{'stream' if key.startswith('stream_') else 'grad'}/{key}": value.item()
+                                for key, value in module_metrics.items() if torch.isfinite(value)
+                            },
                         }
                         if plateau_interval > 0:
                             scalars["learning_rate/plateau_scale"] = plateau.scale
@@ -1090,7 +1540,7 @@ def train(ranks: Ranks, spec_path: str) -> None:
             print(f"{name} | epoch={epoch} | step={step} | {recorder.record()}")
             if epoch_steps:
                 for key, mean in epoch_means.items():
-                    writer.add_scalar(f"loss_avg/{key}", mean.item(), step)
+                    writer.add_scalar(f"{'loss_avg' if key.startswith('loss_') else 'diag'}/{key}", mean.item(), step)
                 writer.add_scalar("learning_rate/lr_d", optim_d.param_groups[0]["lr"] * plateau.scale, step)
                 writer.add_scalar("learning_rate/lr_g", optim_g.param_groups[0]["lr"] * plateau.scale, step)
         if not step_schedulers:

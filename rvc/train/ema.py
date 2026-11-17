@@ -149,6 +149,12 @@ class WeightEMA:
             # done, and is correct from this step onward.
             self.reseed(model)
             return False
+        if any(shadow[key].shape != value.shape for key, value in self.shadow.items()):
+            # The weights were resized since the average was taken, so its
+            # moments no longer match; the average starts again from the
+            # restored weights.
+            self.reseed(model)
+            return False
         for key, value in self.shadow.items():
             value.copy_(shadow[key])
         self.updates = int(data.get("updates", 0))

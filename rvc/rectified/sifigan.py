@@ -34,6 +34,11 @@ from rvc.rectified.chouwagan import (
     known_contrast,
 )
 
+try:
+    from rvc.rectified import sifigan_triton
+except ImportError:
+    sifigan_triton = None
+
 #: ``architecture`` of a SiFi-GAN rectified vocoder export, and of its runs.
 ARCHITECTURE = "sifigan"
 UPSAMPLERS = ("sinc", "transpose")
@@ -77,7 +82,8 @@ def sinc_kernel(ratio, taps, rolloff, beta):
 
 class SincUpsample(nn.Module):
     """[B, C, T] -> [B, C, T * ratio] by zero stuffing and ``sinc_kernel``;
-    the input is extended by replicating its ends."""
+    the input is extended by replicating its ends. On CUDA with Triton it
+    runs polyphase (``sifigan_triton``), which computes the same."""
 
     def __init__(self, ratio, taps=8, rolloff=0.9, beta=8.0):
         super().__init__()
@@ -89,16 +95,21 @@ class SincUpsample(nn.Module):
         batch, channels, length = x.shape
         # Every channel as a batch item of one: a grouped conv this long is twice as slow.
         x = F.pad(x, (self.taps, self.taps), mode="replicate").reshape(batch * channels, 1, -1)
-        up = F.conv_transpose1d(x, self.kernel.to(x.dtype), stride=self.ratio)
         # Input sample n lands on (n + 2 * taps) * ratio.
         start = 2 * self.taps * self.ratio
+        if sifigan_triton is not None and x.is_cuda:
+            up = sifigan_triton.Interpolate.apply(x.view(batch * channels, -1), self.kernel.view(-1), self.ratio,
+                                                  start, length * self.ratio)
+            return up.view(batch, channels, -1)
+        up = F.conv_transpose1d(x, self.kernel.to(x.dtype), stride=self.ratio)
         return up[..., start:start + length * self.ratio].view(batch, channels, -1)
 
 
 class SincDownsample(nn.Module):
     """[B, C, T] -> [B, C, T // ratio] through ``sinc_kernel`` before keeping
     every ``ratio``-th sample, which a strided conv's short kernel cannot
-    filter enough: what it leaves above the lower Nyquist folds back."""
+    filter enough: what it leaves above the lower Nyquist folds back. On
+    CUDA with Triton it runs as ``sifigan_triton``'s decimation."""
 
     def __init__(self, ratio, taps=8, rolloff=0.9, beta=8.0):
         super().__init__()
@@ -108,12 +119,16 @@ class SincDownsample(nn.Module):
     def forward(self, x):
         batch, channels, pad = x.shape[0], x.shape[1], self.taps * self.ratio
         x = F.pad(x, (pad, pad), mode="replicate").reshape(batch * channels, 1, -1)
+        if sifigan_triton is not None and x.is_cuda:
+            length = (x.shape[-1] - self.kernel.shape[-1]) // self.ratio + 1
+            return sifigan_triton.Decimate.apply(x.view(batch * channels, -1), self.kernel.view(-1), self.ratio,
+                                                 length).view(batch, channels, -1)
         return F.conv1d(x, self.kernel.to(x.dtype), stride=self.ratio).view(batch, channels, -1)
 
 
-def leaky_relu(slope, antialias, width):
-    """LeakyReLU, or with ``antialias`` ChouwaGAN's at twice the rate."""
-    return AntiAliasedLeakyReLU(slope, width) if antialias else nn.LeakyReLU(slope)
+def leaky_relu(slope, ratio, width):
+    """LeakyReLU, or with an oversampling ``ratio`` ChouwaGAN's anti-aliased one."""
+    return AntiAliasedLeakyReLU(slope, width, ratio=ratio) if ratio else nn.LeakyReLU(slope)
 
 
 def upsample_layer(in_channels, out_channels, ratio, upsampler, sinc, activation):
@@ -153,7 +168,8 @@ def pitch_indexing(x, d, dilation):
 
 
 class ResidualBlock(nn.Module):
-    """HiFi-GAN's residual block; ``activation()`` makes each nonlinearity."""
+    """HiFi-GAN's residual block; ``activation()`` makes each nonlinearity.
+    ``first``, when given, is the first layer's activation of ``x``."""
 
     def __init__(self, channels, kernel_size, dilations, activation):
         super().__init__()
@@ -164,9 +180,9 @@ class ResidualBlock(nn.Module):
             for d in dilations
         )
 
-    def forward(self, x):
-        for conv in self.convs:
-            x = x + conv(x)
+    def forward(self, x, first=None):
+        for index, conv in enumerate(self.convs):
+            x = x + (conv[1](first) if index == 0 and first is not None else conv(x))
         return x
 
 
@@ -201,23 +217,38 @@ class SiFiGAN(nn.Module):
     """Normalised log mel [B, n_mels, T], f0 [B, T] (0 unvoiced) and, with
     ``contrast_band_edges``, optionally ``measure_contrast``'s [B, bands + 1, T]
     -> [B, 1, T * hop_length]. The source network's excitation of the last
-    call is kept in ``excitation`` for the source loss.
+    call is kept in ``excitation`` for the source loss; with ``track_stream``
+    set, ``stream_rms`` keeps the RMS of each stage's output and of the
+    output before its clamp or tanh.
 
     ``dense_factors`` default to the original's spans (``release_dense_factors``).
     ``downsampler`` "sinc" filters the excitation's pyramids before each
     decimation, which "strided" (the original's) folds around each stage's
     Nyquist. The nonlinearities at the output rate of the stages in
     ``antialias_stages`` (their blocks', and the next upsampling's and the
-    downsampling's into them) run at twice the rate, through filters of
-    ``antialias_width`` taps per side. ``sinc_taps``, ``sinc_rolloff`` and
-    ``sinc_beta`` design both resamplers."""
+    downsampling's into them) run at ``antialias_ratios`` times the rate (one
+    per stage, 2 by default), through filters of ``antialias_width`` taps per
+    side. ``sinc_taps``, ``sinc_rolloff`` and
+    ``sinc_beta`` design both resamplers.
+
+    ``output_tanh`` false leaves the output linear, clamped to [-1, 1]: the
+    tanh's distortion at the audio rate also folds. ``learn_output_gain``
+    false fixes the weight-norm gains of both output convs at their init, so
+    the filter's residual stream cannot grow while the output gain shrinks to
+    hide it, a gain whose gradient then dwarfs the rest of G's.
+    ``output_bias`` false drops both output convs' biases: a DC the output
+    needs none of, whose gradient is the DC of the whole output's.
+    ``min_channels`` floors the stage widths, which halve from ``channels``:
+    the top stages render the band above the previous stage's Nyquist alone."""
 
     def __init__(self, sample_rate, num_mels, hop_length, channels=512, kernel_size=7,
                  upsample_rates=(8, 8, 4, 2), dense_factors=None,
                  source_dilations=((1,), (1, 2), (1, 2, 4), (1, 2, 4, 8)),
                  filter_kernel_sizes=(3, 5, 7), filter_dilations=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
                  upsampler="sinc", downsampler="strided", sinc_taps=8, sinc_rolloff=0.9, sinc_beta=8.0,
-                 antialias_stages=(), antialias_width=8, sine_amp=0.1, noise_amp=0.003, contrast_band_edges=None):
+                 antialias_stages=(), antialias_width=8, sine_amp=0.1, noise_amp=0.003, contrast_band_edges=None,
+                 output_tanh=True, learn_output_gain=True, antialias_ratios=None, output_bias=True,
+                 min_channels=None):
         super().__init__()
         if upsampler not in UPSAMPLERS:
             raise ValueError(f"upsampler must be one of {UPSAMPLERS}, not {upsampler!r}.")
@@ -233,13 +264,16 @@ class SiFiGAN(nn.Module):
         self.contrast = BandContrast(sample_rate, hop_length, contrast_band_edges) if contrast_band_edges else None
         contrast_inputs = self.contrast.bands + 1 if self.contrast is not None else 0
         stages = len(self.upsample_rates)
-        widths = [channels // 2 ** i for i in range(stages + 1)]
+        widths = [max(channels // 2 ** i, int(min_channels or 1)) for i in range(stages + 1)]
         sinc = dict(taps=int(sinc_taps), rolloff=float(sinc_rolloff), beta=float(sinc_beta))
-        filtered = {int(stage) for stage in antialias_stages}
+        antialias_ratios = antialias_ratios or [2] * len(antialias_stages)
+        if len(antialias_ratios) != len(antialias_stages):
+            raise ValueError("Give one of antialias_ratios per stage of antialias_stages.")
+        ratios = {int(stage): int(ratio) for stage, ratio in zip(antialias_stages, antialias_ratios)}
 
         def activation(stage, slope=0.1):
             """A factory of the nonlinearity at ``stage``'s output rate (-1: the frames')."""
-            return partial(leaky_relu, slope, stage in filtered, int(antialias_width))
+            return partial(leaky_relu, slope, ratios.get(stage, 0), int(antialias_width))
 
         self.input_conv = weight_norm(Conv1d(num_mels + 2 + contrast_inputs, channels, kernel_size,
                                              padding=kernel_size // 2))
@@ -272,11 +306,17 @@ class SiFiGAN(nn.Module):
         self.sn_downsamples, self.fn_downsamples = downsamples(), downsamples()
         last = activation(stages - 1, 0.01)
         self.sn_output = nn.Sequential(last(), weight_norm(nn.Conv1d(widths[-1], 1, kernel_size,
-                                                                       padding=kernel_size // 2)))
+                                                                       padding=kernel_size // 2, bias=output_bias)))
         self.fn_output = nn.Sequential(
-            last(), weight_norm(nn.Conv1d(widths[-1], 1, kernel_size, padding=kernel_size // 2)), nn.Tanh(),
+            last(), weight_norm(nn.Conv1d(widths[-1], 1, kernel_size, padding=kernel_size // 2, bias=output_bias)),
+            *([nn.Tanh()] if output_tanh else []),
         )
+        self.output_tanh = bool(output_tanh)
+        if not learn_output_gain:
+            for output in (self.sn_output, self.fn_output):
+                output[1].parametrizations.weight.original0.requires_grad_(False)
         self.excitation = None
+        self.track_stream, self.stream_rms = False, {}
 
     def compile_blocks(self) -> None:
         for block in (*self.sn_blocks, *self.fn_blocks):
@@ -327,8 +367,11 @@ class SiFiGAN(nn.Module):
         for down in self.sn_downsamples:
             x = down(x)
             embs.append(x)
+        rms = {}
         for i, (up, block) in enumerate(zip(self.sn_upsamples, self.sn_blocks)):
             e = block(up(e) + embs[-i - 1], factors[i])
+            if self.track_stream:
+                rms[f"source{i}"] = e.detach().float().square().mean().sqrt()
         self.excitation = self.sn_output(e)
 
         embs = [e]
@@ -338,8 +381,16 @@ class SiFiGAN(nn.Module):
         for i, up in enumerate(self.fn_upsamples):
             c = up(c) + embs[-i - 1]
             blocks = self.fn_blocks[i * self.filter_kernels:(i + 1) * self.filter_kernels]
-            c = sum(block(c) for block in blocks) / self.filter_kernels
-        return self.fn_output(c)
+            # The blocks' first layers all activate c alike: once for all of them.
+            first = blocks[0].convs[0][0](c)
+            c = sum(block(c, first) for block in blocks) / self.filter_kernels
+            if self.track_stream:
+                rms[f"filter{i}"] = c.detach().float().square().mean().sqrt()
+        output = self.fn_output[:2](c)
+        if self.track_stream:
+            rms["output"] = output.detach().float().square().mean().sqrt()
+            self.stream_rms = rms
+        return torch.tanh(output) if self.output_tanh else output.clamp(-1.0, 1.0)
 
 
 class CheapTrick(nn.Module):

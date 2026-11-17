@@ -1,0 +1,119 @@
+{
+    "architecture": "wavehax",
+    "sample_rate": 32000,
+    "learning_rate": 0.0002,
+    "betas": [
+        0.8,
+        0.9
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "lr_scheduler": "cosine annealing step",
+    "lr_decay": 1.0,
+    "lr_final_ratio": 0.1,
+    "warmup_steps": 1000,
+    "adv_warmup_steps": 0,
+    "ema_decay": 0.0,
+    "grad_clip": 10.0,
+    "segment_size": 11200,
+    "c_mel": 45.0,
+    "c_stft": 0.0,
+    "loss_fft_sizes": [
+        384,
+        768,
+        1536
+    ],
+    "loss_hop_sizes": [
+        96,
+        192,
+        384
+    ],
+    "loss_win_lengths": [
+        384,
+        768,
+        1536
+    ],
+    "c_harmonic": 10.0,
+    "c_envelope": 1.0,
+    "c_ddsp": 10.0,
+    "c_ddsp_guard": 5.0,
+    "envelope_loss_bands_hz": [
+        3000,
+        6000,
+        10000,
+        16000
+    ],
+    "contrast_dropout": 0.3,
+    "aux_epochs": 0.25,
+    "average_heads": false,
+    "gan_loss": "hinge",
+    "volume_aug_prob": 0.5,
+    "seed": 1234,
+    "rolling_loss_steps": 50,
+    "preview_interval": 500,
+    "holdout_clips": 0,
+    "eval_interval": 0,
+    "compile_generator": true,
+    "model": {
+        "n_fft": 1280,
+        "channels": 16,
+        "mult_channels": 3,
+        "kernel_size": [
+            13,
+            7
+        ],
+        "num_blocks": 8,
+        "prior_noise": 0.01,
+        "prior_power": 0.1,
+        "prior_max_hz": null,
+        "use_logmag_phase": false,
+        "contrast_band_edges": [
+            2000,
+            4000,
+            6000,
+            8000,
+            10000,
+            12000
+        ],
+        "mel_prior": false,
+        "ddsp": true,
+        "ddsp_channels": 32,
+        "ddsp_band_min_hz": 100.0,
+        "ddsp_band_ratio": 0.15
+    },
+    "discriminator": {
+        "periods": [
+            2,
+            3,
+            5,
+            7,
+            11
+        ],
+        "mpd_max_channels": 256,
+        "mrd_fft_sizes": [
+            384,
+            768,
+            1536
+        ],
+        "mrd_hop_sizes": [
+            96,
+            192,
+            384
+        ],
+        "mrd_win_lengths": [
+            384,
+            768,
+            1536
+        ],
+        "mrd_compression": 1.0,
+        "mrd_first_channels": 16,
+        "use_san": false,
+        "envelope_bands_hz": [
+            3000,
+            6000,
+            12000,
+            16000
+        ],
+        "envelope_downsample": 4
+    }
+}

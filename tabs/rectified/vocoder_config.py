@@ -1,5 +1,5 @@
 """Gradio tab editing the main settings an experiment's vocoder trains by:
-its copy of the ChouwaGAN or SiFi-GAN recipe for its sample rate."""
+its copy of the ChouwaGAN, SiFi-GAN, Wavehax or Nagi recipe for its sample rate."""
 
 import os
 
@@ -32,7 +32,7 @@ def vocoder_config_tab(model_name, tab):
     )
     architecture = gr.Dropdown(
         label=_("Architecture"),
-        info=_("ChouwaGAN or SiFi-GAN. Reset to defaults switches the experiment to the shipped recipe of the one "
+        info=_("ChouwaGAN, SiFi-GAN, Wavehax or Nagi. Reset to defaults switches the experiment to the shipped recipe of the one "
                "chosen here; each trains in its own vocoder_<architecture> folder."),
         choices=list(GENERATORS),
         interactive=True,

@@ -1,4 +1,4 @@
-"""The rectified pipeline's vocoder, ChouwaGAN or SiFi-GAN: its recipe, shipped
+"""The rectified pipeline's vocoder, ChouwaGAN, SiFi-GAN, Wavehax or Nagi: its recipe, shipped
 per architecture and sample rate in ``rvc/configs/rectified/<architecture>``
 and copied into each experiment on first use (ChouwaGAN's unless the
 experiment is reset to another), and the loader of its exports, which also
@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from rvc.lib.paths import LOGS_DIR, ROOT
-from rvc.rectified import openvpi, sifigan
+from rvc.rectified import nagi, openvpi, sifigan, wavehax
 from rvc.rectified.chouwagan import ARCHITECTURE, SOURCE_F0_FLOOR, ChouwaGAN, known_contrast
 from rvc.rectified.common import load_run_config
 from rvc.rectified.mel import denormalize_mel
@@ -21,7 +21,8 @@ from rvc.rectified.mel import denormalize_mel
 #: Mel settings a vocoder must share with the flow to render its output.
 MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax")
 #: The generator of each ``architecture`` a recipe or an export names.
-GENERATORS = {ARCHITECTURE: ChouwaGAN, sifigan.ARCHITECTURE: sifigan.SiFiGAN}
+GENERATORS = {ARCHITECTURE: ChouwaGAN, sifigan.ARCHITECTURE: sifigan.SiFiGAN, wavehax.ARCHITECTURE: wavehax.Wavehax,
+              nagi.ARCHITECTURE: nagi.Nagi}
 #: Exports rendered but not trained here, OpenVPI's NSF-HiFiGANs, by ``architecture``.
 INFERENCE_ONLY = {openvpi.ARCHITECTURE: openvpi.NSFHiFiGAN, openvpi.LEGACY_ARCHITECTURE: openvpi.NSFHiFiGAN}
 #: Every ``architecture`` an export may name.
@@ -174,7 +175,8 @@ class FlowFeatures(nn.Module):
     goes to a vocoder that reads the same bands, and is dropped otherwise.
     With ``diffuse``, the output goes through a ``Diffuser``, unless the
     vocoder already scatters its harmonics' phases (``source_phase_hz``) or
-    learns them (``post_filter``, the Wavehax ``synthesis``, SiFi-GAN)."""
+    learns them (``post_filter``, the Wavehax ``synthesis``, ``allpass``,
+    SiFi-GAN, Wavehax, Nagi)."""
 
     def __init__(self, vocoder: nn.Module, data: dict, diffuse: bool = True):
         super().__init__()
@@ -183,7 +185,8 @@ class FlowFeatures(nn.Module):
         own_phase = (not isinstance(vocoder, ChouwaGAN)
                      or vocoder.source_phase_hz is not None
                      or vocoder.post_filter is not None
-                     or vocoder.synthesis is not None)
+                     or vocoder.synthesis is not None
+                     or vocoder.allpass_head is not None)
         if diffuse and not own_phase:
             self.diffuser = Diffuser(vocoder.sample_rate, vocoder.noise_fft, vocoder.synthesis_hop, vocoder.hop_length)
         self.n_mels = int(data["n_mels"])
@@ -228,7 +231,7 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict, diffuse: bool = True):
-    """A ChouwaGAN, SiFi-GAN or OpenVPI NSF-HiFiGAN export as a module taking
+    """A ChouwaGAN, SiFi-GAN, Wavehax or OpenVPI NSF-HiFiGAN export as a module taking
     the flow's output for ``data`` and f0 (a ChouwaGAN's through a ``Diffuser``
     with ``diffuse``), and its mel settings.
 

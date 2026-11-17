@@ -35,7 +35,17 @@ upsampling layer and no activation run at the audio rate. With ``synthesis``
 "wavehax", none of that renders: Wavehax's 2D ConvNeXt makes the complex
 spectrogram from the STFTs of the pulse train and the noise, the features and
 the band contrast (``WavehaxSynthesis``), and the network predicts only the
-source's scalars beside them.
+source's scalars beside them. From pc-ddsp (https://github.com/yxlllc/pc-ddsp,
+MIT): with ``allpass``, the network also predicts a phase per harmonic-branch
+bin and frame, smoothed over ``allpass_smooth_frames``, which with ``phase``
+"zero" is the harmonics' whole phase; with ``exciter_input``, it also reads
+each frame's samples of the pulse and of the noise the render draws; with
+``pitch_sync_envelope``, the tract gains become CombSub's zero-phase filter,
+whose impulse response is windowed to 1.5 pitch periods each side.
+For what a pulse train cannot do: ``cycle_alternation`` makes alternate
+cycles differ in gain and length (vocal fry, subharmonics), ``roughness``
+modulates its gain and pitch by noise of 20-120 Hz (rasp, growl), and
+``transient_window`` adds a noise branch with that short a window (bursts).
 """
 
 import math
@@ -67,6 +77,10 @@ SPREAD_INIT_BIAS = -4.0
 PHASE_HEAD_RAMP_HZ = 1000.0
 #: Initial logit of the noise phase's share: about 0.25%, nearly none.
 NOISE_MIX_INIT_BIAS = -6.0
+#: Initial logit of the cycle alternation and roughness depths: about 0.25% of their maximum.
+SOURCE_EXTRA_INIT_BIAS = -6.0
+#: Initial log gain of the transient branch.
+TRANSIENT_INIT_BIAS = -9.0
 #: Floor under a compressed magnitude, as a share of a full-scale sine's:
 #: bounds the slope at silence.
 COMPRESSION_FLOOR = 1e-4
@@ -195,44 +209,50 @@ class ConvNeXtBlock(nn.Module):
 
 
 class AntiAliasedLeakyReLU(nn.Module):
-    """A leaky ReLU at twice the rate, filtered back to it (BigVGAN's
+    """A leaky ReLU at ``ratio`` times the rate, filtered back to it (BigVGAN's
     ``Activation1d``): at the audio rate its products above Nyquist would fold
-    back inharmonically. Kaiser-windowed sinc of ``width`` taps per side at
-    each rate, cut at ``rolloff`` of Nyquist; the input is extended by
-    replicating its ends. On CUDA with Triton it runs as one fused op
-    (``chouwagan_triton``), which computes the same."""
+    back inharmonically. Its corner makes products well past twice the rate,
+    which a ``ratio`` of 4 keeps from folding too. Kaiser-windowed sinc of
+    ``width`` taps per side at the input rate, cut at ``rolloff`` of its
+    Nyquist; the input is extended by replicating its ends. On CUDA with
+    Triton it runs as one fused op (``chouwagan_triton``), which computes the
+    same."""
 
-    def __init__(self, slope=0.1, width=16, rolloff=0.99, beta=6.0):
+    def __init__(self, slope=0.1, width=16, rolloff=0.99, beta=6.0, ratio=2):
         super().__init__()
-        self.slope = float(slope)
-        half = 2 * int(width)
+        self.slope, self.ratio, self.width = float(slope), int(ratio), int(width)
+        half = self.ratio * self.width
         positions = torch.arange(-half, half + 1, dtype=torch.float64)
-        cutoff = 0.25 * rolloff
+        cutoff = 0.5 / self.ratio * rolloff
         kernel = 2 * cutoff * torch.sinc(2 * cutoff * positions)
         kernel = kernel * torch.kaiser_window(len(positions), periodic=False, beta=beta, dtype=torch.float64)
         kernel = kernel / kernel.sum()
         self.register_buffer("kernel", kernel.float().view(1, 1, -1), persistent=False)
         # The fused op's polyphase taps: phase e of the upsampler reads
         # x[q + t - width], and the lowpass reads phase e at q = n - width + i.
-        taps = torch.arange(width * 2 + 1)
-        up = torch.stack([half + e - 2 * (taps - int(width)) for e in (0, 1)])
-        down = torch.stack([2 * taps + e for e in (0, 1)])
+        taps = torch.arange(self.width * 2 + 1)
+        phases = range(self.ratio)
+        up = torch.stack([half + e - self.ratio * (taps - self.width) for e in phases])
+        down = torch.stack([self.ratio * taps + e for e in phases])
         pick = lambda index: torch.where(index <= 2 * half, kernel[index.clamp(max=2 * half)], 0.0)
-        self.register_buffer("up_weight", (2 * pick(up)).float(), persistent=False)
+        self.register_buffer("up_weight", (self.ratio * pick(up)).float(), persistent=False)
         self.register_buffer("down_weight", pick(down).float(), persistent=False)
 
     def forward(self, x):
         if FusedAntiAliasedLeakyReLU is not None and x.is_cuda:
             return FusedAntiAliasedLeakyReLU.apply(x, self.up_weight, self.down_weight, self.slope)
-        channels, length = x.shape[1], x.shape[-1]
+        channels, length, ratio = x.shape[1], x.shape[-1], self.ratio
         kernel = self.kernel.to(x.dtype).expand(channels, 1, -1)
         half = (kernel.shape[-1] - 1) // 2
         # The upsampled signal from half a kernel before the input to half
-        # after it: input sample n lands on 2n + 3 * half of the transposed
-        # conv, and the lowpass then needs no padding.
-        up = F.conv_transpose1d(F.pad(x, (half, half), mode="replicate"), 2 * kernel, stride=2, groups=channels)
-        up = F.leaky_relu(up[..., 2 * half:4 * half + 2 * length], self.slope)
-        return F.conv1d(up, kernel, stride=2, groups=channels)
+        # after it: padded sample n lands on n * ratio + half of the
+        # transposed conv, and the lowpass then needs no padding.
+        pad = 2 * self.width
+        up = F.conv_transpose1d(F.pad(x, (pad, pad), mode="replicate"), ratio * kernel, stride=ratio,
+                                groups=channels)
+        start = pad * ratio
+        up = F.leaky_relu(up[..., start:start + ratio * length + 2 * half], self.slope)
+        return F.conv1d(up, kernel, stride=ratio, groups=channels)
 
 
 class PostFilter(nn.Module):
@@ -435,15 +455,21 @@ class ChouwaGAN(nn.Module):
                  post_filter_channels=0, post_filter_kernel_size=3,
                  post_filter_dilations=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512), post_filter_antialias=False,
                  post_filter_antialias_width=16, synthesis="dsp", synthesis_n_fft=None, synthesis_channels=32,
-                 synthesis_mult_channels=2, synthesis_kernel_size=(13, 7), synthesis_blocks=8, synthesis_pool=4):
+                 synthesis_mult_channels=2, synthesis_kernel_size=(13, 7), synthesis_blocks=8, synthesis_pool=4,
+                 allpass=False, allpass_smooth_frames=4, exciter_input=False, pitch_sync_envelope=False,
+                 cycle_alternation=False, max_alternation_amp=0.5, max_alternation_period=0.1, roughness=False,
+                 roughness_hz=(20.0, 120.0), max_roughness_am=0.5, max_roughness_cents=50.0, transient_window=0,
+                 transient_knots_hz=None):
         super().__init__()
         if phase not in PHASES:
             raise ValueError(f"phase must be one of {PHASES}, not {phase!r}.")
+        if pitch_sync_envelope and phase != "zero":
+            raise ValueError("pitch_sync_envelope is a zero-phase filter: it needs phase 'zero'.")
         if synthesis not in SYNTHESES:
             raise ValueError(f"synthesis must be one of {SYNTHESES}, not {synthesis!r}.")
         gains = synthesis == "dsp"
-        if not gains and (post_filter_channels or phase_head_hz is not None):
-            raise ValueError(f"The {synthesis} synthesis takes no post-filter and no phase head.")
+        if not gains and (post_filter_channels or phase_head_hz is not None or allpass):
+            raise ValueError(f"The {synthesis} synthesis takes no post-filter, no phase head and no allpass.")
         if control_interpolation not in INTERPOLATIONS:
             raise ValueError(f"control_interpolation must be one of {INTERPOLATIONS}, not {control_interpolation!r}.")
         # How the head's gains go from frames to synthesis steps.
@@ -488,6 +514,29 @@ class ChouwaGAN(nn.Module):
             tract_log = minimum_phase_basis(tract, self.harmonic_fft)
         self.register_buffer("tract_log", tract_log.to(torch.complex64), persistent=False)
         self.register_buffer("tract_bands", tract.float(), persistent=False)
+        self.cycle_alternation = bool(cycle_alternation)
+        self.max_alternation_amp = float(max_alternation_amp)
+        # Under 2 / pi, or the warped phase runs backwards.
+        self.max_alternation_period = min(float(max_alternation_period), 0.5)
+        self.roughness = bool(roughness)
+        self.roughness_hz = tuple(float(hz) for hz in roughness_hz)
+        self.max_roughness_am = float(max_roughness_am)
+        self.max_roughness_cents = float(max_roughness_cents)
+        self.transient_knots = 0
+        if transient_window and synthesis == "dsp":
+            self.transient_fft = int(transient_window)
+            knots = torch.tensor(sorted(float(hz) for hz in (transient_knots_hz or (0, sample_rate / 2))),
+                                 dtype=torch.float64)
+            self.transient_knots = len(knots)
+            bins = torch.linspace(0, sample_rate / 2, self.transient_fft // 2 + 1, dtype=torch.float64)
+            self.register_buffer("transient_bands", interpolation_matrix(knots, bins).float(), persistent=False)
+            self.register_buffer("transient_window", torch.hann_window(self.transient_fft), persistent=False)
+        self.pitch_sync_envelope = bool(pitch_sync_envelope)
+        if self.pitch_sync_envelope:
+            # Each tap's distance from 0 in the circular impulse response.
+            taps = torch.arange(self.harmonic_fft)
+            distance = torch.minimum(taps, self.harmonic_fft - taps).float().view(1, -1, 1)
+            self.register_buffer("tap_distance", distance, persistent=False)
         if self.max_phase_spread > 0:
             bins = torch.linspace(0, sample_rate / 2, self.harmonic_fft // 2 + 1, dtype=torch.float64)
             lower, upper, t = interpolation_weights(band_hz, bins)
@@ -550,6 +599,13 @@ class ChouwaGAN(nn.Module):
         )
 
         self.embed = nn.Conv1d(num_mels + 2 + contrast_inputs, dim, 7, padding=3)
+        # pc-ddsp's: each frame's samples of the pulse and of the noise the
+        # render draws, so the controls can follow that noise.
+        self.exciter = nn.Sequential(
+            nn.Conv1d((1 + max(1, self.aspiration_regions)) * self.hop_length, 2 * dim, 3, padding=1),
+            nn.PReLU(2 * dim),
+            nn.Conv1d(2 * dim, dim, 3, padding=1),
+        ) if exciter_input else None
         self.input_norm = nn.LayerNorm(dim, eps=1e-6)
         self.blocks = nn.ModuleList(
             ConvNeXtBlock(dim, intermediate_dim, kernel_size, 1 / num_blocks) for _ in range(num_blocks)
@@ -559,7 +615,10 @@ class ChouwaGAN(nn.Module):
         # synthesis step, the residual's real and imaginary parts, then
         # the voiced noise curve's knots, then aspiration depth (and
         # sharpness, per region), jitter, shimmer and the f0 correction, then
-        # the phase spread per tract band (last, so older exports load).
+        # the phase spread per tract band, the cycle alternation's depth and
+        # period share, the roughness's AM and FM depth, and the transient
+        # gains per knot and synthesis step (each optional one after the
+        # last, so older exports load).
         # Another synthesis reads only the source's scalars; it shapes the rest itself.
         if not gains:
             self.glottal_bands = self.curve_knots = 0
@@ -568,6 +627,8 @@ class ChouwaGAN(nn.Module):
             2 * self.bands if gains and self.residual_bound > 0 else 0, self.curve_knots,
             2 * self.aspiration_regions + 3 if self.aspiration_regions else 4,
             self.bands if gains and self.max_phase_spread > 0 else 0,
+            2 if self.cycle_alternation else 0, 2 if self.roughness else 0,
+            self.transient_knots * self.noise_substeps,
         ]
         self.head = nn.Linear(dim, sum(self.splits))
         # Each turned bin's (cos, sin), and with the noise mix its logit, per harmonic sub-step.
@@ -575,8 +636,19 @@ class ChouwaGAN(nn.Module):
         self.phase_head = (
             nn.Linear(dim, self.phase_outputs * self.phase_bins * self.harmonic_substeps) if self.phase_bins else None
         )
+        # pc-ddsp's allpass: a phase per harmonic-branch bin and frame, in units
+        # of pi, averaged over ``allpass_smooth_frames`` frames.
+        self.allpass_smooth_frames = max(1, int(allpass_smooth_frames))
+        self.allpass_head = nn.Linear(dim, self.harmonic_fft // 2 + 1) if allpass else None
         self.apply(self._init_weights)
         with torch.no_grad():
+            # Both start as nothing: no turn, and no exciter in the features.
+            if self.allpass_head is not None:
+                self.allpass_head.weight.zero_()
+                self.allpass_head.bias.zero_()
+            if self.exciter is not None:
+                self.exciter[-1].weight.zero_()
+                self.exciter[-1].bias.zero_()
             noise_start = self.splits[0] + self.splits[1]
             # A harmonic at ``harmonic_amp`` and the noise ~30 dB under it at the start.
             self.head.bias[noise_start:noise_start + self.splits[2]] = -4.0
@@ -591,8 +663,12 @@ class ChouwaGAN(nn.Module):
                 self.head.bias[sharpness_start:sharpness_start + self.aspiration_regions] = -math.log(
                     self.max_aspiration_sharpness - 1
                 )
-            if self.splits[6]:
-                self.head.bias[-self.splits[6]:] = SPREAD_INIT_BIAS
+            starts = [sum(self.splits[:index]) for index in range(len(self.splits))]
+            # Nearly coherent, nearly no alternation or roughness, transients
+            # ~80 dB under full scale.
+            for index, value in ((6, SPREAD_INIT_BIAS), (7, SOURCE_EXTRA_INIT_BIAS), (8, SOURCE_EXTRA_INIT_BIAS),
+                                 (9, TRANSIENT_INIT_BIAS)):
+                self.head.bias[starts[index]:starts[index] + self.splits[index]] = value
             if self.phase_head is not None:
                 # No turn at the start: cos 1, sin 0.
                 self.phase_head.weight.zero_()
@@ -615,13 +691,14 @@ class ChouwaGAN(nn.Module):
         )
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        # An export from before the phase spread has no rows for it: they
-        # start nearly coherent, as a new model's do.
+        # An export from before the optional head rows (the phase spread on)
+        # lacks the last ones: they start as a new model's do.
         weight, bias = state_dict.get(prefix + "head.weight"), state_dict.get(prefix + "head.bias")
-        missing = self.splits[6]
-        if missing and weight is not None and weight.shape[0] == sum(self.splits) - missing:
-            state_dict[prefix + "head.weight"] = torch.cat((weight, weight.new_zeros(missing, weight.shape[1])))
-            state_dict[prefix + "head.bias"] = torch.cat((bias, bias.new_full((missing,), SPREAD_INIT_BIAS)))
+        if weight is not None and weight.shape[0] < sum(self.splits):
+            missing = sum(self.splits) - weight.shape[0]
+            if missing in {sum(self.splits[index:]) for index in range(6, len(self.splits))}:
+                state_dict[prefix + "head.weight"] = torch.cat((weight, weight.new_zeros(missing, weight.shape[1])))
+                state_dict[prefix + "head.bias"] = torch.cat((bias, self.head.bias[-missing:].detach().to(bias)))
         # Nor a phase head: it starts turning nothing, as a new model's does;
         # one from before the noise mix gets its rows at the start's share.
         if self.phase_head is not None and weight is not None:
@@ -636,10 +713,13 @@ class ChouwaGAN(nn.Module):
                 head_bias = torch.cat((head_bias, head_bias.new_full((rows,), NOISE_MIX_INIT_BIAS)))
                 state_dict[prefix + "phase_head.weight"] = head_weight
                 state_dict[prefix + "phase_head.bias"] = head_bias
-        # Nor a post-filter: it starts as the identity, as a new model's does.
-        if self.post_filter is not None and weight is not None:
-            for key, value in self.post_filter.state_dict().items():
-                state_dict.setdefault(prefix + "post_filter." + key, value.detach().clone())
+        # Nor a post-filter, an allpass or an exciter input: they start as
+        # nothing, as a new model's do.
+        for name in ("post_filter", "allpass_head", "exciter"):
+            module = getattr(self, name)
+            if module is not None and weight is not None:
+                for key, value in module.state_dict().items():
+                    state_dict.setdefault(f"{prefix}{name}.{key}", value.detach().clone())
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     @staticmethod
@@ -657,7 +737,7 @@ class ChouwaGAN(nn.Module):
         """The ``contrast`` input from the audio itself ([B, 1, T] or [B, T])."""
         return known_contrast(self.contrast(audio, f0) / CONTRAST_SCALE)
 
-    def _controls(self, mel, cf0, voiced, contrast):
+    def _controls(self, mel, cf0, voiced, contrast, exciter=None):
         inputs = [mel, torch.log(cf0.clamp(min=SOURCE_F0_FLOOR) / 200.0).unsqueeze(1),
                   voiced.unsqueeze(1).to(mel.dtype)]
         if self.contrast is not None:
@@ -665,12 +745,26 @@ class ChouwaGAN(nn.Module):
                 contrast = mel.new_zeros(mel.shape[0], self.contrast.bands + 1, mel.shape[-1])
             inputs.append(contrast.to(mel.dtype))
         x = self.embed(torch.cat(inputs, dim=1))
+        if exciter is not None:
+            # [B, sources, frames * hop] -> each frame's samples of every source.
+            frames = exciter.unfold(-1, self.hop_length, self.hop_length).permute(0, 1, 3, 2).flatten(1, 2)
+            x = x + self.exciter(frames.to(x.dtype))
         x = self.input_norm(x.transpose(1, 2)).transpose(1, 2)
         for block in self.blocks:
             x = block(x)
         x = self.output_norm(x.transpose(1, 2))
         turns = self.phase_head(x).transpose(1, 2).float() if self.phase_head is not None else None
-        return self.head(x).transpose(1, 2).float(), turns, x.transpose(1, 2)
+        allpass = self.allpass_head(x).transpose(1, 2).float() if self.allpass_head is not None else None
+        return self.head(x).transpose(1, 2).float(), turns, allpass, x.transpose(1, 2)
+
+    def _allpass(self, phase, steps):
+        """[B, bins, frames] in units of pi -> unit phasors [B, bins, steps],
+        the moving mean over ``allpass_smooth_frames`` frames first."""
+        size = self.allpass_smooth_frames
+        if size > 1:
+            phase = F.avg_pool1d(F.pad(phase, ((size - 1) // 2, size // 2), mode="replicate"), size, stride=1)
+        phase = to_steps(phase, steps, self.synthesis_hop, self.hop_length, self.hop_length // 2)
+        return torch.polar(torch.ones_like(phase), math.pi * phase)
 
     def _per_step(self, x, substeps, steps):
         """[B, C * substeps, frames] -> [B, C, steps] at the synthesis steps."""
@@ -680,17 +774,31 @@ class ChouwaGAN(nn.Module):
         size = self.hop_length // substeps
         return to_steps(x, steps, self.synthesis_hop, size, size // 2, self.control_interpolation)
 
-    def _pulse(self, f0, voiced, shimmer):
+    def _pulse(self, f0, voiced, shimmer, alternation=None):
         """The phase-aligned pulse train with every harmonic of ``f0`` below
         Nyquist, those in the top ``taper_hz`` faded by a raised cosine; the
         fade is itself a cosine in the harmonic number, so the faded band is
-        three shifted closed-form sums. Everything at the sample rate."""
+        three shifted closed-form sums. Everything at the sample rate.
+
+        ``alternation`` (depth, period share), each [B, T], makes every other
+        cycle louder and longer than the one before: cos(theta / 2) is +-1 on
+        alternate pulses, so both the gain and the phase warp alternate, which
+        puts the subharmonics of vocal fry and diplophonia at odd multiples of
+        f0 / 2."""
         nyquist = self.sample_rate / 2
         start = nyquist - self.taper_hz
         f0 = f0.double().clamp(min=SOURCE_F0_FLOOR)
-        theta = 2 * math.pi * (torch.cumsum(f0 / self.sample_rate, dim=-1) % 1.0)
-        flat = torch.floor(start / f0)
-        top = torch.ceil(nyquist / f0) - 1
+        theta = 2 * math.pi * (torch.cumsum(f0 / self.sample_rate, dim=-1) % (1.0 if alternation is None else 2.0))
+        top_f0 = f0
+        if alternation is not None:
+            depth, period = (part.double() for part in alternation)
+            half = torch.cos(theta / 2)
+            # Pulse k moves by -+period / (2 f0): periods (1 +- period) / f0.
+            theta = theta - math.pi * period * half
+            # The warp raises the pitch by up to that much: no harmonic past Nyquist.
+            top_f0 = f0 * (1 + 0.5 * math.pi * period)
+        flat = torch.floor(start / top_f0)
+        top = torch.ceil(nyquist / top_f0) - 1
         slope = math.pi * f0 / self.taper_hz
         offset = -math.pi * start / self.taper_hz
         faded = (
@@ -699,7 +807,19 @@ class ChouwaGAN(nn.Module):
             + 0.25 * cosine_sum(theta - slope, -offset, flat + 1, top)
         )
         pulse = (cosine_sum(theta, 0.0, torch.ones_like(flat), flat) + faded).float() * self.harmonic_amp
-        return pulse * voiced * (1 + shimmer), theta.float()
+        if alternation is not None:
+            pulse = pulse * (1 + depth * half).float()
+        # The roughness's AM may reach past -1 on a deep trough.
+        return pulse * voiced * (1 + shimmer).clamp(min=0), theta.float()
+
+    def _roughness(self, batch, samples, device):
+        """[B, T] unit-RMS noise band-limited to ``roughness_hz``: the slow,
+        irregular modulation of a rough or growled voice."""
+        spectrum = torch.fft.rfft(torch.randn(batch, samples, device=device))
+        freqs = torch.fft.rfftfreq(samples, 1 / self.sample_rate, device=device)
+        band = (freqs >= self.roughness_hz[0]) & (freqs <= self.roughness_hz[1])
+        modulation = torch.fft.irfft(spectrum * band, n=samples)
+        return modulation * modulation.square().mean(-1, keepdim=True).clamp(min=1e-12).rsqrt()
 
     def _phase_spread(self, spread):
         """Unit-mean-power random phases [B, bins, steps] for ``spread``
@@ -712,6 +832,17 @@ class ChouwaGAN(nn.Module):
         coherent = torch.sinc(spread[:, lower] * (1 - t) / math.pi) * torch.sinc(spread[:, upper] * t / math.pi)
         power = coherent.square() + (1 - coherent.square()) * self.spread_rho
         return torch.polar(power.rsqrt(), phase)
+
+    def _pitch_sync_gain(self, log_tract, f0):
+        """pc-ddsp CombSub's harmonic filter as a real gain [B, bins, steps]:
+        the band gains' zero-phase impulse response under a Hann window 1.5
+        periods of ``f0`` [B, 1, steps] each side, which smooths the envelope
+        at the pitch's resolution and leaves the phase to the allpass."""
+        magnitude = torch.exp(torch.einsum("bcs,cf->bfs", log_tract, self.tract_bands))
+        response = torch.fft.irfft(magnitude, n=self.harmonic_fft, dim=1)
+        half = 1.5 * self.sample_rate / f0
+        window = 0.5 * (1 + torch.cos(math.pi * (self.tap_distance / half).clamp(max=1)))
+        return torch.fft.rfft(response * window, dim=1).real.to(torch.complex64)
 
     def _source_phase(self, f0):
         """Unit phasors [B, bins, steps] for ``f0`` [B, 1, steps]: each bin of
@@ -770,7 +901,17 @@ class ChouwaGAN(nn.Module):
         steps = samples // self.synthesis_hop + 1
         voiced = f0 > 0
         cf0 = continuous_f0(f0)
-        controls, turns, features = self._controls(mel, cf0, voiced, contrast)
+        # The white noise the render shapes, drawn here so the exciter input reads the same.
+        white = torch.randn(f0.shape[0], max(1, self.aspiration_regions), samples, device=f0.device)
+        exciter = None
+        if self.exciter is not None:
+            with torch.no_grad(), torch.autocast(mel.device.type, enabled=False):
+                # The pulse at the given f0, before the head's correction, jitter and shimmer.
+                at_samples = to_steps(torch.stack((cf0, voiced.float()), 1), samples, 1, self.hop_length,
+                                      self.hop_length // 2)
+                plain, _ = self._pulse(at_samples[:, 0], at_samples[:, 1], torch.zeros_like(at_samples[:, 0]))
+                exciter = torch.cat((plain.unsqueeze(1), white), dim=1)
+        controls, turns, allpass, features = self._controls(mel, cf0, voiced, contrast, exciter)
         device = mel.device.type
         amp = torch.is_autocast_enabled(device), torch.get_autocast_dtype(device)
 
@@ -783,7 +924,8 @@ class ChouwaGAN(nn.Module):
                 return self.post_filter(audio, theta, gate, features)
 
         with torch.autocast(device, enabled=False):
-            tract, glottal, noise, residual, curve, scalars, spread = controls.split(self.splits, dim=1)
+            (tract, glottal, noise, residual, curve, scalars, spread, alternation, rough,
+             transient) = controls.split(self.splits, dim=1)
             log_tract = self._per_step(tract, self.harmonic_substeps, steps).clamp(*LOG_GAIN_RANGE)
             log_glottal = self._per_step(glottal, 1, steps).clamp(*LOG_GAIN_RANGE) if self.glottal_bands else None
             log_noise = self._per_step(noise, self.noise_substeps, steps)
@@ -805,6 +947,8 @@ class ChouwaGAN(nn.Module):
                 if self.phase_noise_mix:
                     mix = torch.sigmoid(parts[2]) * self.phase_ramp
                     noise_phase = self._noise_phase(torch.randn(f0.shape[0], samples, device=f0.device))
+            if allpass is not None:
+                allpass = self._allpass(allpass, steps)
             frame_center = self.hop_length // 2
             aspiration, scalars = scalars.split([scalars.shape[1] - 3, 3], dim=1)
             jitter, shimmer = torch.sigmoid(scalars[:, :2]).unbind(1)
@@ -819,19 +963,42 @@ class ChouwaGAN(nn.Module):
             # Jitter and shimmer as random walks smooth over a synthesis step.
             wobble = to_steps(torch.randn(f0.shape[0], 2, steps, device=f0.device), samples, 1, self.synthesis_hop, 0)
             pitch = pitch * torch.exp2(correction) * (1 + jitter * wobble[:, 0])
-            pulse, theta = self._pulse(pitch, gate, shimmer * wobble[:, 1])
-            if self.source_phase_hz is not None:
+            amplitude = shimmer * wobble[:, 1]
+            depths = []
+            if self.cycle_alternation:
+                depths.append(torch.sigmoid(alternation) * torch.tensor(
+                    [self.max_alternation_amp, self.max_alternation_period], device=f0.device
+                ).view(1, 2, 1))
+            if self.roughness:
+                depths.append(torch.sigmoid(rough) * torch.tensor(
+                    [self.max_roughness_am, self.max_roughness_cents / 1200], device=f0.device
+                ).view(1, 2, 1))
+            if depths:
+                depths = to_steps(torch.cat(depths, dim=1), samples, 1, self.hop_length, frame_center)
+            if self.roughness:
+                modulation = self._roughness(f0.shape[0], samples, f0.device)
+                rough_am, rough_fm = depths[:, -2:].unbind(1)
+                pitch = pitch * torch.exp2(rough_fm * modulation)
+                amplitude = amplitude + rough_am * modulation
+            alternate = (depths[:, 0], depths[:, 1]) if self.cycle_alternation else None
+            pulse, theta = self._pulse(pitch, gate, amplitude, alternate)
+            if self.source_phase_hz is not None or self.pitch_sync_envelope:
                 # The pulse's own f0 at each frame centre.
                 centres = (torch.arange(steps, device=pitch.device) * self.synthesis_hop).clamp(max=samples - 1)
                 step_f0 = pitch.detach()[:, centres].clamp(min=SOURCE_F0_FLOOR).unsqueeze(1)
 
             def harmonic_gain(start, end):
-                log_gain = torch.einsum("bcs,cf->bfs", log_tract[..., start:end].to(torch.complex64), self.tract_log)
-                if log_glottal is not None:
-                    log_gain = log_gain + torch.einsum(
-                        "bcs,cf->bfs", log_glottal[..., start:end].to(torch.complex64), self.glottal_log
+                if self.pitch_sync_envelope:
+                    gain = self._pitch_sync_gain(log_tract[..., start:end], step_f0[..., start:end])
+                else:
+                    log_gain = torch.einsum(
+                        "bcs,cf->bfs", log_tract[..., start:end].to(torch.complex64), self.tract_log
                     )
-                gain = torch.exp(log_gain)
+                    if log_glottal is not None:
+                        log_gain = log_gain + torch.einsum(
+                            "bcs,cf->bfs", log_glottal[..., start:end].to(torch.complex64), self.glottal_log
+                        )
+                    gain = torch.exp(log_gain)
                 if residual is not None:
                     real, imag = residual[..., start:end].chunk(2, dim=1)
                     real = torch.einsum("bcs,cf->bfs", real, self.tract_bands)
@@ -850,6 +1017,8 @@ class ChouwaGAN(nn.Module):
                     gain = torch.cat((gain[:, :first], gain[:, first:] * turn), dim=1)
                 if self.source_phase_hz is not None:
                     gain = gain * self._source_phase(step_f0[..., start:end])
+                if allpass is not None:
+                    gain = gain * allpass[..., start:end]
                 return gain
 
             def noise_gain(start, end):
@@ -866,13 +1035,24 @@ class ChouwaGAN(nn.Module):
                 # cosine cannot be, and it is more so at the top.
                 cycle = torch.cos(theta.unsqueeze(1) - self.aspiration_phase.view(1, -1, 1)) - 1
                 envelope = 1 + depth * (torch.exp(sharpness * cycle) / torch.special.i0e(sharpness) - 1)
-            noise = torch.randn_like(envelope) * envelope
+            noise = white * envelope
 
             if self.synthesis is not None:
                 with torch.autocast(device, dtype=amp[1], enabled=amp[0]):
                     return self.synthesis(torch.cat((pulse.unsqueeze(1), noise), dim=1), features, contrast)
 
             voice = self._render(pulse, self.harmonic_fft, self.harmonic_window, harmonic_gain, steps, samples)
+            if self.transient_knots:
+                # Bursts shorter than the noise branch's window: plosives, attacks.
+                log_transient = self._per_step(transient, self.noise_substeps, steps).clamp(*LOG_GAIN_RANGE)
+
+                def transient_gain(start, end):
+                    return torch.exp(torch.einsum("bks,kf->bfs", log_transient[..., start:end], self.transient_bands))
+
+                voice = voice + self._render(
+                    torch.randn(f0.shape[0], samples, device=f0.device), self.transient_fft, self.transient_window,
+                    transient_gain, steps, samples,
+                )
             if not regions:
                 breath = self._render(noise[:, 0], self.noise_fft, self.noise_window, noise_gain, steps, samples)
                 return finish(voice + breath)
@@ -952,12 +1132,15 @@ class HarmonicLoss(nn.Module):
         members = F.one_hot(torch.bucketize(peaks, self.band_edges / scale), self.bands) * valid.unsqueeze(-1)
         return [(peak(s), valley(s)) for s in spectra], valid, members.to(f0.dtype)
 
-    def forward(self, y_hat, y, f0):
-        """``y_hat`` and ``y`` [B, 1, T], ``f0`` [B, T // hop] (0 unvoiced)."""
+    def forward(self, y_hat, y, f0, peaks=False):
+        """``y_hat`` and ``y`` [B, 1, T], ``f0`` [B, T // hop] (0 unvoiced). With
+        ``peaks``, also the L1 of every harmonic's peak, frame by frame: the
+        band means above let one harmonic sit several dB off for nothing."""
         with torch.autocast(y.device.type, enabled=False):
             f0 = f0.float()
             if not (f0 > 0).any():
-                return y.new_zeros(())
+                zero = y.new_zeros(())
+                return (zero, zero) if peaks else zero
             frames = f0.shape[-1]
             spectra = (self._log_spectrum(y_hat.squeeze(1).float(), frames),
                        self._log_spectrum(y.squeeze(1).float(), frames))
@@ -980,7 +1163,10 @@ class HarmonicLoss(nn.Module):
             contrast_g, level_g = contrast_and_level(*points[0])
             contrast_t, level_t = contrast_and_level(*points[1])
             difference = (contrast_g - contrast_t).abs() + (level_g - level_t).abs()
-            return difference[count > 0].mean()
+            loss = difference[count > 0].mean()
+            if not peaks:
+                return loss
+            return loss, (points[0][0] - points[1][0]).abs()[valid].mean()
 
 
 class BandContrast(HarmonicLoss):
@@ -1150,9 +1336,11 @@ class SpectralDiscriminator(nn.Module):
         if self.phase:
             x = self._phase_relations(x)
         else:
-            x = x.abs().unsqueeze(1)
+            # As a share of a full-scale sine's: raw, the linear magnitude
+            # reaches ~win/2 and its feature maps dwarf the other heads'.
+            x = x.abs().unsqueeze(1) / (0.5 * self.win_length)
             if self.compression != 1.0:
-                x = (x / (0.5 * self.win_length) + self.floor) ** self.compression
+                x = (x + self.floor) ** self.compression
         # On the magnitude, out of autocast: unnormalised, FP16's range is
         # short for its gradient.
         with torch.autocast(x.device.type, enabled=False):
