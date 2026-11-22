@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Keep packages from ~/.local/lib/python* (user site) out of the env.
+export PYTHONNOUSERSITE=1
 
 echo "Welcome to the ShiroRVC Installer!"
 echo
@@ -101,7 +103,11 @@ install_dependencies() {
     "${uv[@]}" "torch==$TORCH_VERSION" "torchaudio==$TORCHAUDIO_VERSION" \
         --upgrade --index-url "$PYTORCH_INDEX_URL" \
         || fail "PyTorch"
-    "${uv[@]}" -r "$INSTALL_DIR/requirements.txt" || fail "requirements.txt"
+    # requirements.lock constrains transitive deps to the tested set. It is
+    # passed as constraints (-c), not requirements, so Windows-only pins in it
+    # such as triton-windows are simply ignored on Linux.
+    "${uv[@]}" -r "$INSTALL_DIR/requirements.txt" -c "$INSTALL_DIR/requirements.lock" \
+        || fail "requirements.txt"
 
     # Translation catalogs: gettext falls back to English without raising
     # when a .mo is missing, so a skipped build looks like working software.

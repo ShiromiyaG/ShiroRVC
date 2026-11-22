@@ -1,4 +1,7 @@
 @echo off
+:: Keep packages from %APPDATA%\Python (user site) out of the env; they
+:: shadow the env's own and can be stale or half-uninstalled.
+set "PYTHONNOUSERSITE=1"
 cls
 setlocal
 title ShiroRVC

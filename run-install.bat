@@ -1,6 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
 title ShiroRVC Installer
+:: Keep packages from %APPDATA%\Python (user site) out of the env; they
+:: shadow the env's own and can be stale or half-uninstalled.
+set "PYTHONNOUSERSITE=1"
 
 echo Welcome to the ShiroRVC Installer!
 echo.
@@ -102,7 +105,10 @@ call "%MINICONDA_DIR%\condabin\conda.bat" activate "%ENV_DIR%" || goto :error
 echo Installing pip packages...
 uv pip install --upgrade setuptools || goto :error
 uv pip install torch==%TORCH_VERSION% torchaudio==%TORCHAUDIO_VERSION% --upgrade --index-url %PYTORCH_INDEX_URL% || goto :error
-uv pip install -r "%INSTALL_DIR%\requirements.txt" || goto :error
+:: requirements.lock constrains every transitive dependency to the tested set.
+:: Without it uv picks the newest pydantic/fastapi, which can land on a
+:: mismatched pair (pydantic 2.14 with typing-inspection 0.4.2 breaks gradio).
+uv pip install -r "%INSTALL_DIR%\requirements.txt" -c "%INSTALL_DIR%\requirements.lock" || goto :error
 
 :: Translation catalogs: gettext falls back to English without raising
 :: when a .mo is missing, so a skipped build looks like working software.

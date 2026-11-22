@@ -446,6 +446,13 @@ def run_extract_script(
 
 
 # Train
+def _resolve_precision(precision) -> str:
+    """``auto`` -> what this machine supports; an unsupported choice falls back."""
+    from rvc.configs.config import resolve_training_precision
+
+    return resolve_training_precision(precision, warn=True)
+
+
 def run_train_script(
     model_name: str,
     epoch_save_frequency: int,
@@ -465,7 +472,7 @@ def run_train_script(
     d_pretrained_path: str = None,
     vocoder: str = "hifi",
     use_checkpointing: bool = False,
-    precision: str = "fp32",
+    precision: str = "auto",
     compile_vocoder: bool = False,
     torch_compile_mode: str = "default",
     overtrain_detector: bool = False,
@@ -510,7 +517,7 @@ def run_train_script(
         use_warmup=bool(use_warmup),
         warmup_duration=int(warmup_duration),
         use_checkpointing=bool(use_checkpointing),
-        precision=str(precision).lower(),
+        precision=_resolve_precision(precision),
         compile_vocoder=bool(compile_vocoder),
         torch_compile_mode=str(torch_compile_mode),
         overtrain_detector=bool(overtrain_detector),
@@ -726,7 +733,7 @@ def run_rectified_vocoder_train_script(
     pretrained_d: str = "",
     checkpoints: str = "latest",
     fresh: bool = False,
-    precision: str = "fp32",
+    precision: str = "auto",
     mel_degradation: float = 0.0,
 ):
     return _run_rectified_trainer(
@@ -741,7 +748,7 @@ def run_rectified_vocoder_train_script(
             "pretrained_d": pretrained_d or "",
             "checkpoints": str(checkpoints),
             "fresh": bool(fresh),
-            "precision": str(precision).lower(),
+            "precision": _resolve_precision(precision),
             "mel_degradation": float(mel_degradation or 0.0),
         },
     )
@@ -758,7 +765,7 @@ def run_rectified_flow_train_script(
     learning_rate: float = 0.0,
     checkpoints: str = "latest",
     fresh: bool = False,
-    precision: str = "fp32",
+    precision: str = "auto",
     compile: bool = False,
     torch_compile_mode: str = "default",
     feature_cache: bool = True,
@@ -785,7 +792,7 @@ def run_rectified_flow_train_script(
             "learning_rate": float(learning_rate or 0.0),
             "checkpoints": str(checkpoints),
             "fresh": bool(fresh),
-            "precision": str(precision).lower(),
+            "precision": _resolve_precision(precision),
             "compile": bool(compile),
             "torch_compile_mode": str(torch_compile_mode),
             "feature_cache": bool(feature_cache),

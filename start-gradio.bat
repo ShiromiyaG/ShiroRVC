@@ -10,6 +10,9 @@ if /i "%cd%"=="C:\Windows\System32" (
 
 setlocal
 title ShiroRVC
+:: Keep packages from %APPDATA%\Python (user site) out of the env; they
+:: shadow the env's own and can be stale or half-uninstalled.
+set "PYTHONNOUSERSITE=1"
 
 if not exist env (
     echo Please run 'run-install.bat' first to set up the environment.

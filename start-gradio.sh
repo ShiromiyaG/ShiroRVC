@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Keep packages from ~/.local/lib/python* (user site) out of the env.
+export PYTHONNOUSERSITE=1
 set -euo pipefail
 
 # Only on a terminal: `clear` would write escape codes into a redirected log.

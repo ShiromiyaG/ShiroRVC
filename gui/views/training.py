@@ -60,8 +60,9 @@ def apply_precision_support(precision: SearchableCombo, devices: list[dict]) -> 
     """Pick the default precision from the best device's capability.
 
     No CUDA device disables the picker at FP32; below 7.0 (no FP16 tensor
-    cores) it stays available at FP32; at 7.0 or better it defaults to FP16.
-    BF16 is never the default, and below 8.0 it has no native kernels.
+    cores) it stays available at FP32; at 7.0 it defaults to FP16 and at 8.0
+    or better (native BF16 kernels) to BF16 -- the same order as
+    ``rvc.configs.config.detect_training_precision``.
     """
 
     best = -1
@@ -77,7 +78,8 @@ def apply_precision_support(precision: SearchableCombo, devices: list[dict]) -> 
 
     combo = precision.combo
     precision.setEnabled(has_cuda)
-    combo.setCurrentIndex(combo.findData("fp16" if has_tensor_cores else "fp32"))
+    default = "bf16" if best >= 8 else "fp16" if has_tensor_cores else "fp32"
+    combo.setCurrentIndex(combo.findData(default))
     if not has_cuda:
         tooltip = _("Autocast needs a CUDA GPU, so the setting would do nothing.")
     elif not has_tensor_cores:

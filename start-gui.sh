@@ -1,6 +1,8 @@
 #!/bin/sh
 # Launcher for the Qt interface.
 set -e
+# Keep packages from ~/.local/lib/python* (user site) out of the env.
+export PYTHONNOUSERSITE=1
 
 INSTALL_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$INSTALL_DIR"

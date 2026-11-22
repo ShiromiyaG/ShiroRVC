@@ -619,11 +619,13 @@ TRAIN_OWN = [
     ),
     click.option(
         "--precision",
-        type=click.Choice(["fp32", "fp16", "bf16"], case_sensitive=False),
-        default="fp32",
+        type=click.Choice(["auto", "fp32", "fp16", "bf16"], case_sensitive=False),
+        default="auto",
         show_default=True,
         help=(
-            "Autocast dtype over FP32 master weights. fp16 adds a GradScaler; "
+            "Autocast dtype over FP32 master weights. auto picks bf16 on Ampere+, "
+            "fp16 on Volta/Turing, else fp32; a choice the GPU cannot run falls "
+            "back. fp16 adds a GradScaler; "
             "bf16 needs none and keeps losses, residual streams, the excitation "
             "and the output layer in FP32. fp32 is no autocast (with TF32 if the "
             "model config enables it)."
@@ -663,7 +665,7 @@ RECTIFIED_TRAIN_FLOW_OWN = [
         help="Training checkpoints to keep: the latest, all, or none. Without them only the exports are saved and a stopped run starts over; exports are always kept.",
     ),
     click.option("--fresh", type=click.BOOL, default=False, show_default=True, help="Ignore this run's checkpoints and start over."),
-    click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
+    click.option("--precision", type=click.Choice(["auto", "fp32", "fp16", "bf16"]), default="auto", show_default=True, help="Training precision. auto picks the best this GPU supports."),
     click.option("--compile", type=click.BOOL, default=False, show_default=True, help="torch.compile the flow backbone. Needs CUDA and Triton."),
     click.option(
         "--torch_compile_mode",
@@ -707,7 +709,7 @@ RECTIFIED_TRAIN_VOCODER_OWN = [
         help="Training checkpoints to keep: the latest, all, or none. Without them only the exports are saved and a stopped run starts over; exports are always kept.",
     ),
     click.option("--fresh", type=click.BOOL, default=False, show_default=True, help="Ignore this run's checkpoints and start over."),
-    click.option("--precision", type=click.Choice(["fp32", "fp16", "bf16"]), default="fp32", show_default=True, help="Training precision."),
+    click.option("--precision", type=click.Choice(["auto", "fp32", "fp16", "bf16"]), default="auto", show_default=True, help="Training precision. auto picks the best this GPU supports."),
     click.option("--mel_degradation", type=click.FloatRange(0, 1), default=0.0, show_default=True, help="Trains on mels blurred, dulled and noised up to this strength, so the vocoder tolerates a flow's imperfect mels. 0 is off; 0.5 is a moderate start."),
 ]
 

@@ -91,22 +91,80 @@ def bf16_is_supported() -> bool:
         return False
 
 
-def get_training_precision() -> str:
-    """The persisted training precision: ``"fp32"``, ``"fp16"`` or ``"bf16"``.
+def detect_training_precision() -> str:
+    """The best precision this machine supports natively.
 
-    Absent means *undecided*: the machine is asked instead (FP16 where it pays,
-    else FP32), and the answer is not written back, so the file records only
-    what a person chose.  A config from before ``precision`` existed is read
-    through its ``use_fp16`` key.
+    BF16 where there are native kernels (Ampere / compute 8.0+, or ROCm that
+    reports it): FP32's range, so no GradScaler and no overflow-skipped steps,
+    with the precision-sensitive paths kept in FP32 by
+    ``apply_precision_policy``.  Else FP16 where there are FP16 tensor cores
+    (7.0+).  Else FP32.
+    """
+
+    if bf16_is_supported():
+        return "bf16"
+    if fp16_is_supported():
+        return "fp16"
+    return "fp32"
+
+
+def get_precision_preference() -> str:
+    """What the person chose: ``"auto"``, ``"fp32"``, ``"fp16"`` or ``"bf16"``.
+
+    Absent means *auto*.  The detected answer is never written back, so the
+    file records only an explicit choice and a config carried to another
+    machine re-detects there.  A config from before ``precision`` existed is
+    read through its ``use_fp16`` key.
     """
 
     stored = _read_app_config()
     precision = str(stored.get("precision", "")).lower()
-    if precision in TRAINING_PRECISIONS:
+    if precision in TRAINING_PRECISIONS or precision == "auto":
         return precision
     if "use_fp16" in stored:
         return "fp16" if stored["use_fp16"] else "fp32"
-    return "fp16" if fp16_is_supported() else "fp32"
+    return "auto"
+
+
+def resolve_training_precision(precision=None, *, warn: bool = False) -> str:
+    """Turn a requested precision into one this machine can actually run.
+
+    ``None``/``"auto"`` detects.  An explicit choice is kept unless the
+    hardware cannot do it: autocast without a CUDA device does nothing, and
+    BF16 without native kernels is emulated and slow, so those fall back to
+    the best supported precision.  FP16 below 7.0 is kept: it still halves
+    activation memory, which is a trade someone may want.
+    """
+
+    requested = str(precision or "auto").lower()
+    if requested == "auto":
+        return detect_training_precision()
+    if requested not in TRAINING_PRECISIONS:
+        raise ValueError(
+            f"Unknown precision {precision!r}; expected auto or one of {TRAINING_PRECISIONS}."
+        )
+
+    resolved = requested
+    if requested != "fp32" and not torch.cuda.is_available():
+        resolved = "fp32"
+    elif requested == "bf16" and not bf16_is_supported():
+        resolved = "fp16" if fp16_is_supported() else "fp32"
+
+    if warn and resolved != requested:
+        from rvc.lib.terminal import warning
+
+        warning(
+            f"{requested.upper()} is not supported natively on this machine; "
+            f"training in {resolved.upper()} instead.",
+            tag="[CONFIG]",
+        )
+    return resolved
+
+
+def get_training_precision() -> str:
+    """The precision the next run will train in, already resolved."""
+
+    return resolve_training_precision(get_precision_preference())
 
 def singleton(cls):
     instances = {}
@@ -160,7 +218,10 @@ class Config:
 
     def get_precision(self):
         precision = get_training_precision()
-        return precision if precision == "fp32" else f"{precision} (autocast)"
+        label = precision if precision == "fp32" else f"{precision} (autocast)"
+        if get_precision_preference() == "auto":
+            label += ", auto"
+        return label
 
     def check_precision(self, precision=None):
         """Report the precision the next run would start with.
@@ -169,9 +230,18 @@ class Config:
         is on screen even before the change handler has written it; falling back
         to the persisted value keeps the method callable with no arguments.
         """
-        precision = str(precision or get_training_precision()).lower()
+        requested = str(precision or get_precision_preference()).lower()
+        precision = resolve_training_precision(requested)
         tf32 = torch.backends.cuda.matmul.allow_tf32
-        lines = [
+        lines = []
+        if requested == "auto":
+            lines.append(f"Auto: this machine trains in {precision.upper()}.")
+        elif requested != precision:
+            lines.append(
+                f"{requested.upper()} is not supported natively here, so runs"
+                f" fall back to {precision.upper()}."
+            )
+        lines += [
             "Master weights and optimizer state: FP32 (always).",
             f"TF32 matmul/conv currently: {'on' if tf32 else 'off'}"
             " - set per model with 'tf32' in its config.json.",
@@ -187,15 +257,8 @@ class Config:
                 " RefineGAN2/WaveNet residual streams and the output layer stay"
                 " in FP32."
             )
-            if torch.cuda.is_available() and not bf16_is_supported():
-                lines.append(
-                    "This GPU has no native BF16 (compute capability 8.0+), so it"
-                    " would be emulated and slow."
-                )
         else:
             lines.append("Autocast: off - no autocast, no GradScaler.")
-        if precision != "fp32" and not torch.cuda.is_available():
-            lines.append("No CUDA device visible, so the setting will do nothing here.")
         return "\n".join(lines)
 
     def device_config(self):
